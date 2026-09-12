@@ -1,0 +1,589 @@
+{
+  "name": "perfchecker-vscode",
+  "displayName": "PerfChecker",
+  "description": "Explore, configure and launch PerfChecker feature suites.",
+  "version": "0.1.0",
+  "publisher": "mirage-interactive-fr",
+  "author": "Mirage Interactive",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode.git"
+  },
+  "homepage": "https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode#readme",
+  "bugs": {
+    "url": "https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode/issues"
+  },
+  "license": "MIT",
+  "icon": "media/perfchecker.png",
+  "pricing": "Free",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Testing",
+    "Visualization"
+  ],
+  "keywords": [
+    "Julia",
+    "performance",
+    "benchmark",
+    "profiling",
+    "flame graph",
+    "allocations",
+    "testing"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "PerfChecker executes the workspace's Julia performance scripts."
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "activationEvents": [
+    "onView:perfchecker.runs",
+    "onView:perfchecker.scenarios",
+    "onCommand:perfchecker.openDesigner"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "perfchecker.discoverTestItems",
+        "title": "PerfChecker: Discover existing test items",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "perfchecker.configureAdvisor",
+        "title": "PerfChecker: Configure advisor and manage models",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "perfchecker.catalogTools",
+        "title": "PerfChecker: Browse tool catalogue"
+      },
+      {
+        "command": "perfchecker.syncScenarios",
+        "title": "PerfChecker: Relate scenarios to CI"
+      },
+      {
+        "command": "perfchecker.narrateAdvice",
+        "title": "PerfChecker: Explain evidence with configured model"
+      },
+      {
+        "command": "perfchecker.investigateScenarios",
+        "title": "PerfChecker: Run bounded investigation"
+      },
+      {
+        "command": "perfchecker.openInvestigations",
+        "title": "PerfChecker: Open investigations",
+        "icon": "$(inspect)"
+      },
+      {
+        "command": "perfchecker.discoverScenarios",
+        "title": "PerfChecker: Discover scenarios from tests",
+        "icon": "$(search)"
+      },
+      {
+        "command": "perfchecker.measureScenarios",
+        "title": "PerfChecker: Measure shared scenarios",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "perfchecker.diagnoseScenarios",
+        "title": "PerfChecker: Diagnose shared scenarios",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "perfchecker.adviseScenarios",
+        "title": "PerfChecker: Advise from saved evidence",
+        "icon": "$(lightbulb)"
+      },
+      {
+        "command": "perfchecker.compareScenarios",
+        "title": "PerfChecker: Compare scenario measurements",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "perfchecker.cancelInvestigation",
+        "title": "PerfChecker: Cancel investigation",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "perfchecker.prepareScenario",
+        "title": "PerfChecker: Prepare a shared case from a test"
+      },
+      {
+        "command": "perfchecker.openInvestigationSource",
+        "title": "PerfChecker: Open investigation source"
+      },
+      {
+        "command": "perfchecker.refresh",
+        "title": "PerfChecker: Refresh plan",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "perfchecker.initialize",
+        "title": "PerfChecker: Create feature suite",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "perfchecker.runAll",
+        "title": "PerfChecker: Run suite",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "perfchecker.runNode",
+        "title": "PerfChecker: Run selection",
+        "icon": "$(run)"
+      },
+      {
+        "command": "perfchecker.openEntrypoint",
+        "title": "PerfChecker: Open check script",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "perfchecker.openOutput",
+        "title": "PerfChecker: Open visual output",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "perfchecker.showLog",
+        "title": "PerfChecker: Show worker output",
+        "icon": "$(output)"
+      },
+      {
+        "command": "perfchecker.openDesigner",
+        "title": "PerfChecker: Open visual suite editor",
+        "icon": "$(layout)"
+      },
+      {
+        "command": "perfchecker.saveConfiguration",
+        "title": "PerfChecker: Save shared UI configuration",
+        "icon": "$(save)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "perfchecker",
+          "title": "PerfChecker",
+          "icon": "media/perfchecker.svg"
+        }
+      ]
+    },
+    "views": {
+      "perfchecker": [
+        {
+          "id": "perfchecker.scenarios",
+          "name": "Scenarios & advice"
+        },
+        {
+          "id": "perfchecker.runs",
+          "name": "Feature suites"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "perfchecker.runs",
+        "contents": "No PerfChecker plan is loaded.\n[Refresh plan](command:perfchecker.refresh)\n[Create a suite](command:perfchecker.initialize)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "perfchecker.configureAdvisor",
+          "when": "view == perfchecker.scenarios",
+          "group": "navigation"
+        },
+        {
+          "command": "perfchecker.openInvestigations",
+          "when": "view == perfchecker.scenarios",
+          "group": "navigation"
+        },
+        {
+          "command": "perfchecker.discoverScenarios",
+          "when": "view == perfchecker.scenarios",
+          "group": "navigation"
+        },
+        {
+          "command": "perfchecker.cancelInvestigation",
+          "when": "view == perfchecker.scenarios",
+          "group": "navigation"
+        },
+        {
+          "command": "perfchecker.refresh",
+          "when": "view == perfchecker.runs",
+          "group": "navigation"
+        },
+        {
+          "command": "perfchecker.openDesigner",
+          "when": "view == perfchecker.runs",
+          "group": "navigation"
+        },
+        {
+          "command": "perfchecker.openOutput",
+          "when": "view == perfchecker.runs",
+          "group": "navigation"
+        },
+        {
+          "command": "perfchecker.showLog",
+          "when": "view == perfchecker.runs",
+          "group": "navigation"
+        },
+        {
+          "command": "perfchecker.runAll",
+          "when": "view == perfchecker.runs",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "perfchecker.openOutput",
+          "when": "view == perfchecker.runs",
+          "group": "inline@1"
+        },
+        {
+          "command": "perfchecker.runNode",
+          "when": "view == perfchecker.runs",
+          "group": "inline@2"
+        },
+        {
+          "command": "perfchecker.openEntrypoint",
+          "when": "view == perfchecker.runs && viewItem == perfchecker.run",
+          "group": "inline@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "PerfChecker",
+      "properties": {
+        "perfchecker.testItemTags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "resource",
+          "description": "Measure existing TestItemRunner items matching any selected tag. Empty selects all except test_only."
+        },
+        "perfchecker.testItemExcludeTags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "resource",
+          "description": "Additional native test item tags to exclude from performance runs."
+        },
+        "perfchecker.testItemSamples": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "scope": "resource",
+          "description": "Explicit repetitions of each existing test item, each in a fresh process. There are no automatic warmups."
+        },
+        "perfchecker.advisorEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow explicitly requested optional advice. Disable to use deterministic advice only; installed model files are retained."
+        },
+        "perfchecker.advisorConfig": {
+          "type": "string",
+          "default": "",
+          "description": "Optional advisor JSON configuration path, including custom Julia provider packages. Empty uses the advisor settings below."
+        },
+        "perfchecker.advisorEndpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:8081/v1/chat/completions",
+          "description": "Configured model endpoint. No model is downloaded or launched by the extension."
+        },
+        "perfchecker.advisorModel": {
+          "type": "string",
+          "default": "local",
+          "description": "Model identifier served by the configured endpoint."
+        },
+        "perfchecker.advisorProtocol": {
+          "type": "string",
+          "enum": [
+            "chat_completions",
+            "chat_completions_schema",
+            "ollama",
+            "mcp_http"
+          ],
+          "default": "chat_completions",
+          "description": "Model or MCP advice-tool protocol. MCP requires a selected tool that can answer a prompt with evidence. Custom Julia protocols can be selected in advisorConfig."
+        },
+        "perfchecker.advisorInstructions": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "description": "Customize the advice request, for example: suggest how to reduce allocations without changing the public API. Empty uses the default evidence-based performance advice prompt. Evidence references and result validation remain required."
+        },
+        "perfchecker.advisorMcpTool": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit MCP advice tool to call. Required for mcp_http; choose a tool that returns advice rather than modifying the target project."
+        },
+        "perfchecker.advisorMcpPromptArgument": {
+          "type": "string",
+          "default": "prompt",
+          "description": "Name of the selected MCP tool argument receiving the customized prompt and bounded PerfChecker evidence."
+        },
+        "perfchecker.advisorMcpArguments": {
+          "type": "object",
+          "default": {},
+          "description": "Additional arguments required by the selected MCP advice tool. Do not put secrets or the prompt argument here."
+        },
+        "perfchecker.advisorMcpResponse": {
+          "type": "string",
+          "enum": [
+            "text",
+            "structured"
+          ],
+          "default": "text",
+          "description": "Text displays advice without executing any proposed action. Structured requires JSON evidence references and permits selecting declared experiments when advisorInvestigates is enabled."
+        },
+        "perfchecker.advisorMcpVersion": {
+          "type": "string",
+          "enum": [
+            "2026-07-28",
+            "2025-11-25"
+          ],
+          "default": "2026-07-28",
+          "description": "MCP Streamable HTTP protocol version supported by your server. Unsupported versions fail explicitly."
+        },
+        "perfchecker.advisorAllowRemote": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicitly allow sending bounded evidence to an HTTPS remote endpoint. Provider charges may apply."
+        },
+        "perfchecker.advisorKeyEnvironment": {
+          "type": "string",
+          "default": "",
+          "description": "Name of the environment variable containing an optional credential. Never enter the credential itself."
+        },
+        "perfchecker.advisorTimeout": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 3600,
+          "default": 90,
+          "description": "Maximum seconds per model worker, including startup."
+        },
+        "perfchecker.advisorInvestigates": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the configured model to select from declared experiments within investigation limits."
+        },
+        "perfchecker.investigationMaxExperiments": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 4,
+          "description": "Maximum declared experiments in one investigation."
+        },
+        "perfchecker.investigationBudgetSeconds": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 86400,
+          "default": 300,
+          "description": "Total investigation time budget, including model requests."
+        },
+        "perfchecker.scenarioCatalog": {
+          "type": "string",
+          "default": "perf/scenarios.toml",
+          "description": "Catalogue receiving explicitly adopted shared scenarios, relative to the package workspace."
+        },
+        "perfchecker.scenarioProject": {
+          "type": "string",
+          "default": "perf",
+          "description": "Julia environment for scenario measurements and optional analyzers. Tools are never installed automatically."
+        },
+        "perfchecker.investigationReports": {
+          "type": "string",
+          "default": "perf/results/investigations",
+          "description": "Saved investigation evidence inside the package workspace."
+        },
+        "perfchecker.analysisTools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "default": [
+            "jet",
+            "alloccheck",
+            "latency"
+          ],
+          "description": "Analyzers selected by default. Available tools are supplied by the configured Julia controller after discovery."
+        },
+        "perfchecker.analysisTimeout": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 3600,
+          "default": 120,
+          "scope": "resource",
+          "description": "Maximum seconds per isolated measurement or analyzer worker."
+        },
+        "perfchecker.scenarioThreads": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Julia threads per isolated scenario worker."
+        },
+        "perfchecker.scenarioSamples": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "Fresh-state measurement samples per scenario and collector."
+        },
+        "perfchecker.juliaExecutable": {
+          "type": "string",
+          "scope": "resource",
+          "default": "julia",
+          "description": "Julia executable or juliaup launcher."
+        },
+        "perfchecker.runnerProject": {
+          "type": "string",
+          "scope": "resource",
+          "default": "perf",
+          "description": "Controller project, relative to the workspace."
+        },
+        "perfchecker.suite": {
+          "type": "string",
+          "scope": "resource",
+          "default": "perf/suite.jl",
+          "description": "Suite file, relative to the workspace."
+        },
+        "perfchecker.factory": {
+          "type": "string",
+          "default": "build_suite",
+          "description": "Zero-argument Julia function that constructs the suite."
+        },
+        "perfchecker.profile": {
+          "type": "string",
+          "enum": [
+            "quick",
+            "ci",
+            "historical",
+            "release"
+          ],
+          "default": "quick"
+        },
+        "perfchecker.reports": {
+          "type": "string",
+          "default": "perf/results/vscode",
+          "description": "Report directory, relative to the workspace."
+        },
+        "perfchecker.uiConfiguration": {
+          "type": "string",
+          "default": "perf/perfchecker-ui.json",
+          "description": "Shared VS Code/web/Documenter configuration."
+        },
+        "perfchecker.gitTargets": {
+          "type": "array",
+          "default": [],
+          "description": "Named Git branches, tags, or commits measured alongside releases and the working tree.",
+          "items": {
+            "type": "object",
+            "required": [
+              "package",
+              "label",
+              "revision"
+            ],
+            "properties": {
+              "package": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string",
+                "description": "Optional Git URL or local repository. The suite package source is used when empty."
+              },
+              "compatibility_version": {
+                "type": "string",
+                "description": "Version used to select a compatible workload implementation."
+              }
+            }
+          }
+        },
+        "perfchecker.comparisonPolicies": {
+          "type": "array",
+          "default": [],
+          "description": "Exact or grouped references used to compare named candidate targets.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "package",
+              "comparison_key",
+              "baselines",
+              "candidates",
+              "aggregation"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "package": {
+                "type": "string"
+              },
+              "feature": {
+                "type": "string"
+              },
+              "comparison_key": {
+                "type": "string"
+              },
+              "baselines": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "candidates": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "aggregation": {
+                "type": "string",
+                "enum": [
+                  "median",
+                  "mean",
+                  "minimum",
+                  "maximum"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm test",
+    "compile": "tsc -p ./",
+    "check": "tsc -p ./ --noEmit",
+    "test": "npm run compile && node --test --test-concurrency=1 test/*.test.mjs",
+    "package": "vsce package",
+    "package:pre-release": "vsce package --pre-release",
+    "publish:pre-release": "vsce publish --pre-release"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^5.7.2"
+  }
+}
