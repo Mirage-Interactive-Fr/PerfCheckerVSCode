@@ -240,7 +240,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   }
 
   private async advisorConfig(directory: string): Promise<string> {
-    if (!this.setting('advisorEnabled', true)) throw new Error('Optional advisor is disabled. Open Conseiller et modèles to configure it.');
+    if (!this.setting('advisorEnabled', true)) throw new Error('Optional advisor is disabled. Open Advisor and models to configure it.');
     const configured = this.setting('advisorConfig', '');
     if (configured) return this.absolute('advisorConfig', '');
     await fs.mkdir(directory, {recursive: true});

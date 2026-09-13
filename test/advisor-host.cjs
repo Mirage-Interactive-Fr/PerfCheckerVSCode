@@ -14,7 +14,7 @@ exports.run = async () => {
     if (req.url === '/api/tags') return res.end(JSON.stringify({models: [{name: 'tiny:latest', size: 523000000}]}));
     if (req.url !== '/mcp') {res.statusCode = 404; return res.end('{}');}
     const result = body.method === 'tools/list' ? {tools: [{name: 'ask', description: 'Performance advice', inputSchema: {type: 'object', required: ['question'], properties: {question: {type: 'string'}}}}]} :
-      {content: [{type: 'text', text: 'Vérifie les allocations puis compare les deux implémentations. <script>not executable</script>'}]};
+      {content: [{type: 'text', text: 'Check allocations, then compare both implementations. <script>not executable</script>'}]};
     res.end(JSON.stringify({jsonrpc: '2.0', id: body.id, result}));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -24,7 +24,7 @@ exports.run = async () => {
     assert.ok(extension); await extension.activate();
     await vscode.commands.executeCommand('perfchecker.configureAdvisor'); checks.push('configuration webview opened in actual VS Code host');
     const config = {protocol: 'mcp_http', endpoint: `http://127.0.0.1:${port}/mcp`, model: 'mock MCP', timeout: 120,
-      mcp_tool: '', instructions: 'Préserver l’API publique.', mcp_response: 'text', mcp_prompt_argument: 'question'};
+      mcp_tool: '', instructions: 'Preserve the API publique.', mcp_response: 'text', mcp_prompt_argument: 'question'};
     const probe = await vscode.commands.executeCommand('perfchecker.advisorSetupAction', {action: 'probe', config});
     assert.equal(probe.status, 'complete'); assert.equal(probe.tools[0].name, 'ask');
     assert.equal(calls.filter(c => c.body.method === 'tools/call').length, 0); checks.push('MCP discovery through real isolated Julia worker without tool invocation');

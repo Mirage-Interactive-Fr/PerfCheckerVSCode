@@ -35,12 +35,12 @@ export class AdvisorSetup implements vscode.Disposable {
   async open() {
     if (this.panel) {this.panel.reveal(); return;}
     const initial = await this.initial();
-    this.panel = vscode.window.createWebviewPanel('perfchecker.advisorSetup', 'PerfChecker · Conseiller et modèles', vscode.ViewColumn.One,
+    this.panel = vscode.window.createWebviewPanel('perfchecker.advisorSetup', 'PerfChecker · Advisor and models', vscode.ViewColumn.One,
       {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
     const webview = this.panel.webview, nonce = randomUUID();
     const resource = (name: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
     const data = JSON.stringify(initial).replace(/</g, '\\u003c');
-    webview.html = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('investigation.css')}"><link rel="stylesheet" href="${resource('advisor-panel.css')}"><title>Conseiller et modèles</title></head><body><main id="advisor-root"></main><script nonce="${nonce}" src="${resource('advisor-panel.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorPanel(document.getElementById('advisor-root'),m=>api.postMessage(m),${data});window.addEventListener('message',e=>panel.receive(e.data));</script></body></html>`;
+    webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('investigation.css')}"><link rel="stylesheet" href="${resource('advisor-panel.css')}"><title>Advisor and models</title></head><body><main id="advisor-root"></main><script nonce="${nonce}" src="${resource('advisor-panel.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorPanel(document.getElementById('advisor-root'),m=>api.postMessage(m),${data});window.addEventListener('message',e=>panel.receive(e.data));</script></body></html>`;
     this.panel.onDidDispose(() => {this.cancel(); this.panel = undefined;});
     webview.onDidReceiveMessage(async message => {
       try {
@@ -66,10 +66,10 @@ export class AdvisorSetup implements vscode.Disposable {
       if (input.action === 'save' && input.config === null) {
         await this.settings().update('advisorEnabled', false, vscode.ConfigurationTarget.Workspace);
         await this.settings().update('advisorInvestigates', false, vscode.ConfigurationTarget.Workspace);
-        return {status: 'complete', message: 'Conseils déterministes uniquement. Les fichiers de modèles restent installés.'};
+        return {status: 'complete', message: 'Rule-based advice only. Model files remain installed.'};
       }
       const result = await vscode.window.withProgress({location: vscode.ProgressLocation.Notification,
-        title: 'PerfChecker · Conseiller et modèles', cancellable: true}, async (_progress, token) => {
+        title: 'PerfChecker · Advisor and models', cancellable: true}, async (_progress, token) => {
         const subscription = token.onCancellationRequested(() => this.cancel());
         try {return await this.invoke({...input, action: input.action === 'save' ? 'validate' : input.action});}
         finally {subscription.dispose();}
@@ -85,7 +85,7 @@ export class AdvisorSetup implements vscode.Disposable {
         await settings.update('advisorInvestigates', Boolean(input.investigates), vscode.ConfigurationTarget.Workspace);
         await settings.update('investigationMaxExperiments', max, vscode.ConfigurationTarget.Workspace);
         await settings.update('investigationBudgetSeconds', budget, vscode.ConfigurationTarget.Workspace);
-        return {status: 'complete', message: `Configuration enregistrée : ${file}. Aucun appel de génération effectué.`};
+        return {status: 'complete', message: `Configuration saved: ${file}. No generation request was made.`};
       }
       return result;
     } finally {this.busy = false; this.child = undefined;}
@@ -109,7 +109,7 @@ export class AdvisorSetup implements vscode.Disposable {
         child.on('error', e => {clearTimeout(timeout); reject(e);});
         child.on('close', code => {
           clearTimeout(timeout);
-          if (this.cancelled) return resolve({status: 'cancelled', message: 'Opération interrompue. Le serveur peut conserver des fichiers partiels ; actualise son inventaire.'});
+          if (this.cancelled) return resolve({status: 'cancelled', message: 'Operation cancelled. The server may retain partial files; refresh its inventory.'});
           try {resolve(JSON.parse(output));} catch {reject(new Error(code ? error || 'Julia setup worker failed.' : 'Invalid setup response.'));}
         });
       });
