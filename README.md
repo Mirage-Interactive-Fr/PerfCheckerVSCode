@@ -23,10 +23,16 @@ The item timer includes setup, imports, assertions and cleanup. Green means
 correctness passed, with measurements retained; no regression budget has been
 compared. Ordinary Julia/TestItemRunner execution is unchanged: automatic exclusion
 of `:check_only`/`:perf_only` in Julia's Test Explorer needs upstream support.
-For a measurement-only item that must be safe under Julia's **Run All**, use
-`skip=(get(ENV, "PERFCHECKER_TESTITEM_MODE", "") != "performance")` on its
-`@testitem` declaration. PerfChecker sets this marker only in measured item workers;
-Julia's ordinary runner then skips the item. This guard is opt-in per declaration.
+For a measurement-only item that must be safe under Julia's **Run All**, use:
+
+```julia
+@testitem "Measured case" tags=[:check_only] skip=(get(ENV, "PERFCHECKER_TESTITEM_MODE", "") != "performance") begin
+    @test sum(1:1000) == 500500
+end
+```
+
+PerfChecker sets this marker only in measured item workers; Julia's ordinary
+runner then skips the item. This guard is opt-in per declaration.
 
 The investigation panel connects shared tests, declared performance scenarios, optional analyzers and saved evidence. It also provides a searchable tool catalogue, proposed CI coverage, bounded investigations and optional explanations from a configured model.
 
