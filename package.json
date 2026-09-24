@@ -47,7 +47,8 @@
   "activationEvents": [
     "onView:perfchecker.runs",
     "onView:perfchecker.scenarios",
-    "onCommand:perfchecker.openDesigner"
+    "onCommand:perfchecker.openDesigner",
+    "onCommand:perfchecker.openDesignerForWorkspace"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -160,6 +161,10 @@
         "command": "perfchecker.openDesigner",
         "title": "PerfChecker: Open visual suite editor",
         "icon": "$(layout)"
+      },
+      {
+        "command": "perfchecker.openDesignerForWorkspace",
+        "title": "PerfChecker: Open visual suite editor for workspace"
       },
       {
         "command": "perfchecker.saveConfiguration",
@@ -402,7 +407,7 @@
         "perfchecker.scenarioProject": {
           "type": "string",
           "default": "perf",
-          "description": "Julia environment for scenario measurements and optional analyzers. Tools are never installed automatically."
+          "description": "Julia environment for scenario measurements and optional analyzers. The default perf uses perf/controller only if perf/Project.toml is absent. Tools are never installed automatically."
         },
         "perfchecker.investigationReports": {
           "type": "string",
@@ -452,7 +457,7 @@
           "type": "string",
           "scope": "resource",
           "default": "perf",
-          "description": "Controller project, relative to the workspace."
+          "description": "Controller project, relative to the workspace. With the default perf value, perf/controller is used only if perf/Project.toml is absent. Explicit settings always win."
         },
         "perfchecker.suite": {
           "type": "string",

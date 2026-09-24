@@ -8,6 +8,7 @@ import { promises as fs } from 'node:fs';
 import * as readline from 'node:readline';
 import {registerInvestigations} from './investigation';
 import {registerNativeTestItems} from './testitems';
+import {currentWorkspaceFolder, resolveControllerProject, selectWorkspaceFolder} from './workspace-root';
 import {
   ComparisonRecord, PlanRun, SuitePlan, SuiteRunOutput, VersionSeries,
   comparisonsForRuns, logicalFeature, moveRun, outputsForRuns, parseGitReference,
@@ -361,6 +362,9 @@ class Controller {
   private resultsPanel?: vscode.WebviewPanel;
   private plan?: SuitePlan;
   private uiConfiguration?: any;
+  private selectedWorkspace?: vscode.Uri;
+  private readonly preparations = new Map<string, Promise<void>>();
+  private readonly readyControllers = new Set<string>();
 
   constructor(private readonly context: vscode.ExtensionContext, readonly tree: PlanTree,
     private readonly tests: vscode.TestController) {}
@@ -368,22 +372,38 @@ class Controller {
   reportError(error: unknown): void { this.output.appendLine(String(error)); }
   showLog(): void { this.output.show(true); }
 
+  private folder(): vscode.WorkspaceFolder {
+    return currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);
+  }
+
+  private selectWorkspace(requested?: vscode.Uri | vscode.WorkspaceFolder): void {
+    const folder = selectWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders, requested);
+    if (this.selectedWorkspace?.toString() === folder.uri.toString()) return;
+    if (!this.selectedWorkspace && this.plan && vscode.workspace.workspaceFolders?.length === 1) {
+      this.selectedWorkspace = folder.uri;
+      return;
+    }
+    this.selectedWorkspace = folder.uri;
+    this.plan = undefined;
+    this.uiConfiguration = undefined;
+    this.tree.refresh();
+    this.tests.items.replace([]);
+  }
+
   private root(): string {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) throw new Error('Open a package workspace first.');
-    return folder.uri.fsPath;
+    return this.folder().uri.fsPath;
   }
 
   private setting(name: string): string {
-    return vscode.workspace.getConfiguration('perfchecker').get<string>(name)!;
+    return vscode.workspace.getConfiguration('perfchecker', this.folder().uri).get<string>(name)!;
   }
 
   private gitTargets(): GitTarget[] {
-    return vscode.workspace.getConfiguration('perfchecker').get<GitTarget[]>('gitTargets', []);
+    return vscode.workspace.getConfiguration('perfchecker', this.folder().uri).get<GitTarget[]>('gitTargets', []);
   }
 
   private effectiveGitTargets(): GitTarget[] {
-    const inspected = vscode.workspace.getConfiguration('perfchecker').inspect<GitTarget[]>('gitTargets');
+    const inspected = vscode.workspace.getConfiguration('perfchecker', this.folder().uri).inspect<GitTarget[]>('gitTargets');
     const explicitlyConfigured = inspected?.workspaceFolderValue !== undefined ||
       inspected?.workspaceValue !== undefined || inspected?.globalValue !== undefined;
     return explicitlyConfigured ? this.gitTargets() : (this.uiConfiguration?.targets ?? this.gitTargets());
@@ -466,11 +486,11 @@ class Controller {
   }
 
   private comparisonPolicies(): ComparisonPolicyConfig[] {
-    return vscode.workspace.getConfiguration('perfchecker').get<ComparisonPolicyConfig[]>('comparisonPolicies', []);
+    return vscode.workspace.getConfiguration('perfchecker', this.folder().uri).get<ComparisonPolicyConfig[]>('comparisonPolicies', []);
   }
 
   private effectiveComparisonPolicies(): ComparisonPolicyConfig[] {
-    const inspected = vscode.workspace.getConfiguration('perfchecker').inspect<ComparisonPolicyConfig[]>('comparisonPolicies');
+    const inspected = vscode.workspace.getConfiguration('perfchecker', this.folder().uri).inspect<ComparisonPolicyConfig[]>('comparisonPolicies');
     const explicitlyConfigured = inspected?.workspaceFolderValue !== undefined ||
       inspected?.workspaceValue !== undefined || inspected?.globalValue !== undefined;
     return explicitlyConfigured ? this.comparisonPolicies() :
@@ -485,18 +505,55 @@ class Controller {
     return path.resolve(this.root(), this.setting(setting));
   }
 
+  private controllerProject() {
+    return resolveControllerProject(this.root(),
+      vscode.workspace.getConfiguration('perfchecker', this.folder().uri));
+  }
+
+  private async prepareController(project: string): Promise<void> {
+    if (this.readyControllers.has(project)) return;
+    let pending = this.preparations.get(project);
+    if (!pending) {
+      const executable = this.setting('juliaExecutable');
+      pending = Promise.resolve(vscode.window.withProgress({location: vscode.ProgressLocation.Notification,
+        title: 'PerfChecker: preparing controller', cancellable: false}, async () => {
+        this.output.show(true);
+        this.output.appendLine(`Preparing PerfChecker controller: ${project}`);
+        this.output.appendLine(`> ${executable} --startup-file=no --project=${JSON.stringify(project)} -e "using Pkg; Pkg.instantiate()"`);
+        const code = await new Promise<number>((resolve, reject) => {
+          const child = spawn(executable, ['--startup-file=no', `--project=${project}`,
+            '-e', 'using Pkg; Pkg.instantiate()'], {cwd: project, windowsHide: true,
+            env: {...process.env, JULIA_LOAD_PATH: ['@', '@stdlib'].join(path.delimiter),
+              JULIA_PKG_PRECOMPILE_AUTO: '0'}});
+          child.stdout.on('data', value => this.output.append(String(value)));
+          child.stderr.on('data', value => this.output.append(String(value)));
+          child.on('error', reject);
+          child.on('close', value => resolve(value ?? 2));
+        });
+        if (code !== 0) throw new Error(`PerfChecker controller preparation failed (exit ${code}). Check PerfChecker output and the dependencies/sources in ${path.join(project, 'Project.toml')}, then retry.`);
+        this.readyControllers.add(project);
+        this.output.appendLine(`PerfChecker controller ready: ${project}`);
+      })).finally(() => { this.preparations.delete(project); });
+      this.preparations.set(project, pending);
+    }
+    await pending;
+  }
+
   private async invoke(command: string, args: string[], progress?: (value: any) => void,
     emitted?: (value: string) => void): Promise<number> {
     const executable = this.setting('juliaExecutable');
-    const project = this.absolute('runnerProject');
+    const controller = this.controllerProject();
+    const project = controller.project;
     const juliaArgs = [
       '--startup-file=no', `--project=${project}`,
       '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', command, ...args,
     ];
     this.output.show(true);
+    this.output.appendLine(`Controller project: ${project} (${controller.reason})`);
     this.output.appendLine(`> ${executable} ${juliaArgs.map(value => JSON.stringify(value)).join(' ')}`);
     return await new Promise<number>((resolve, reject) => {
-      const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true});
+      const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true,
+        env: {...process.env, JULIA_LOAD_PATH: ['@', '@stdlib'].join(path.delimiter)}});
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
       let pending = '';
@@ -521,13 +578,23 @@ class Controller {
   }
 
   async refresh(): Promise<void> {
+    const workspace = this.folder().uri.toString();
+    const controller = this.controllerProject();
+    const suite = this.absolute('suite');
+    if (!(await fs.stat(suite).catch(() => undefined))?.isFile()) {
+      throw new Error(`PerfChecker suite file not found at ${suite}. Check perfchecker.suite for this folder.`);
+    }
+    await this.prepareController(controller.project);
+    if (this.folder().uri.toString() !== workspace) {
+      throw new Error('PerfChecker workspace changed during controller preparation. Choose the folder again.');
+    }
     await vscode.window.withProgress({location: vscode.ProgressLocation.Window, title: 'PerfChecker: planning'}, async () => {
       await fs.mkdir(this.context.globalStorageUri.fsPath, {recursive: true});
       try { this.uiConfiguration = JSON.parse(await fs.readFile(this.absolute('uiConfiguration'), 'utf8')); }
       catch { this.uiConfiguration = undefined; }
       const output = path.join(this.context.globalStorageUri.fsPath, 'suite-plan.json');
       const code = await this.invoke('plan', [
-        `--suite=${this.absolute('suite')}`, `--factory=${this.setting('factory')}`,
+        `--suite=${suite}`, `--factory=${this.setting('factory')}`,
         `--profile=${this.setting('profile')}`, `--output=${output}`,
         ...this.candidateArguments(),
         ...this.comparisonArguments(),
@@ -883,7 +950,8 @@ class Controller {
 
   private nonce(): string { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
-  async openDesigner(): Promise<void> {
+  async openDesigner(folder?: vscode.Uri | vscode.WorkspaceFolder): Promise<void> {
+    this.selectWorkspace(folder);
     if (!this.plan) await this.refresh();
     if (this.designer) { this.designer.reveal(); this.postPlan(); return; }
     this.designer = vscode.window.createWebviewPanel('perfchecker.designer', 'PerfChecker suite', vscode.ViewColumn.One,
@@ -944,7 +1012,7 @@ class Controller {
     }
     const identities = normalized.map(target => `${target.package}\0${target.label}`);
     if (new Set(identities).size !== identities.length) throw new Error('Git target labels must be unique per package.');
-    await vscode.workspace.getConfiguration('perfchecker').update('gitTargets', normalized,
+    await vscode.workspace.getConfiguration('perfchecker', this.folder().uri).update('gitTargets', normalized,
       vscode.ConfigurationTarget.WorkspaceFolder);
     await this.refresh();
   }
@@ -974,7 +1042,7 @@ class Controller {
     if (new Set(normalized.map(policy => policy.id)).size !== normalized.length) {
       throw new Error('Comparison policy identifiers must be unique.');
     }
-    await vscode.workspace.getConfiguration('perfchecker').update('comparisonPolicies', normalized,
+    await vscode.workspace.getConfiguration('perfchecker', this.folder().uri).update('comparisonPolicies', normalized,
       vscode.ConfigurationTarget.WorkspaceFolder);
     await this.refresh();
   }
@@ -1006,17 +1074,19 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('perfchecker.openEntrypoint', (node: PerfNode) => controller.open(node)),
     vscode.commands.registerCommand('perfchecker.openOutput', (node?: PerfNode) => controller.openOutput(node)),
     vscode.commands.registerCommand('perfchecker.showLog', () => controller.showLog()),
-    vscode.commands.registerCommand('perfchecker.openDesigner', () => controller.openDesigner()),
+    vscode.commands.registerCommand('perfchecker.openDesigner',
+      (folder?: vscode.Uri | vscode.WorkspaceFolder) => controller.openDesigner(folder)),
+    vscode.commands.registerCommand('perfchecker.openDesignerForWorkspace',
+      (folder?: vscode.Uri | vscode.WorkspaceFolder) => {
+        if (folder === undefined) throw new Error('Pass an open workspace folder or URI to perfchecker.openDesignerForWorkspace.');
+        return controller.openDesigner(folder);
+      }),
     vscode.commands.registerCommand('perfchecker.saveConfiguration', () => controller.saveConfiguration()),
     view.onDidChangeCheckboxState(event => {
       for (const [node, state] of event.items) {
         for (const run of node.runs) state === vscode.TreeItemCheckboxState.Checked ? tree.selected.add(run.id) : tree.selected.delete(run.id);
       }
     }));
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  const suite = vscode.workspace.getConfiguration('perfchecker', folder?.uri).get<string>('suite', 'perf/suite.jl');
-  if (folder) void fs.access(path.resolve(folder.uri.fsPath, suite)).then(
-    () => controller.refresh().catch(error => controller.reportError(error)), () => undefined);
 }
 
 export function deactivate(): void {}

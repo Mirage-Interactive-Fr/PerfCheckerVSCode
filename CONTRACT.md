@@ -15,6 +15,21 @@ julia --startup-file=no --project=<workspace>/perf \
 The controller project owns the PerfChecker.jl version and Julia environment.
 The measured worker remains isolated by PerfChecker.jl; Node.js and VS Code are
 never loaded into a timed worker.
+With the default project setting, `perf/controller` is used only when
+`perf/Project.toml` is absent and `perf/controller/Project.toml` is present.
+Explicit folder-scoped settings take precedence; missing inputs fail before a
+controller is launched.
+
+The public VS Code command `perfchecker.openDesignerForWorkspace` requires a
+`vscode.Uri | vscode.WorkspaceFolder` argument naming an open local folder.
+Companions can detect its contribution in `packageJSON` before activating this
+extension. The legacy `perfchecker.openDesigner` accepts an optional
+`vscode.Uri | vscode.WorkspaceFolder` argument for an open local workspace folder.
+The argument is required in a multi-root window. The CLI plan and factory use that
+folder as their working directory and resolve `perfchecker.*` settings for that
+folder. Investigation and advisor commands share that selection and reject
+multi-root requests made before a folder is selected. Activation alone does not
+plan a suite in a multi-root window.
 
 ## Consumed contracts
 

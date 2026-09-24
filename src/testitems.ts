@@ -4,6 +4,7 @@ import {promises as fs} from 'node:fs';
 import * as path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {selectedTestItems, nativeItemDuration} from './investigationModel';
+import {resolveControllerProject} from './workspace-root';
 
 interface NativeItem {id: string; name: string; file: string; tags: string[]; source_sha256: string}
 
@@ -13,7 +14,7 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
   context.subscriptions.push(output);
   const controls = new Map<string, {refresh: () => Promise<void>; run: (request: vscode.TestRunRequest, token: vscode.CancellationToken) => Promise<void>}>();
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    const tests = vscode.tests.createTestController(`perfchecker.testitems.${folder.uri.toString()}`, `PerfChecker items · ${folder.name}`);
+    const tests = vscode.tests.createTestController(`perfchecker.testitems.${folder.uri.toString()}`, `PerfChecker — mesures · ${folder.name}`);
     context.subscriptions.push(tests);
     let declarations: NativeItem[] = [];
     let busy = false;
@@ -24,10 +25,13 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
     };
     const invoke = async (args: string[], token?: vscode.CancellationToken): Promise<{code: number; payload: any}> => {
       assertWorkspace();
+      const controller = resolveControllerProject(folder.uri.fsPath,
+        vscode.workspace.getConfiguration('perfchecker', folder.uri));
+      output.appendLine(`Controller project: ${controller.project} (${controller.reason})`);
       const directory = path.join(context.globalStorageUri.fsPath, 'native-testitems', randomUUID());
       await fs.mkdir(directory, {recursive:true});
       const destination = path.join(directory, 'result.json');
-      const project = path.resolve(folder.uri.fsPath, setting('runnerProject', 'perf'));
+      const project = controller.project;
       const env: NodeJS.ProcessEnv = {...process.env, JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)};
       delete env.JULIA_PROJECT;
       const code = await new Promise<number>((resolve,reject) => {
@@ -107,7 +111,7 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
     };
     tests.resolveHandler = () => refresh();
     tests.refreshHandler = () => refresh();
-    tests.createRunProfile('Measure existing test items',vscode.TestRunProfileKind.Run,run,true);
+    tests.createRunProfile('PerfChecker — mesures',vscode.TestRunProfileKind.Run,run,true);
     controls.set(folder.uri.toString(),{refresh,run});
   }
   context.subscriptions.push(vscode.commands.registerCommand('perfchecker.discoverTestItems',async()=>{

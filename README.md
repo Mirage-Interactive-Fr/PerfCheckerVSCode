@@ -4,9 +4,14 @@
 
 Set `perfchecker.runnerProject` to a Julia environment containing PerfChecker and
 TestItemRunner 1.3.2 or later in 1.x. Run **PerfChecker: Discover existing test items**,
-then select individual items in the **PerfChecker items** Testing controller.
-Untagged items are shared; `:perf_only` is included and `:test_only` is excluded.
-`testItemTags` and `testItemExcludeTags` narrow selection. Each item runs once by
+then select individual items in the **PerfChecker — mesures** Test Explorer controller.
+Its **PerfChecker — mesures** run profile measures items independently of the Julia
+extension's functional test controller; it does not intercept Julia test runs.
+In the RC, untagged items are shared, `:perf_only` is performance-only, and
+`:test_only` is functional-only. Shared items may appear in both controllers as
+two distinct actions. Set `perfchecker.testItemTags` to `["perf_only"]` to show only
+performance-only items in the PerfChecker controller. `testItemExcludeTags` further
+narrows selection. Each item runs once by
 default, in an isolated process; `testItemSamples` explicitly changes repetition.
 Save workspace changes before measuring. Cancellation stops the measured process tree.
 
@@ -80,6 +85,31 @@ perf/results/vscode/
 Every path is configurable in VS Code settings. The controller environment owns
 the PerfChecker.jl version, so upgrading the extension does not silently change
 the benchmark engine used by a project.
+When the default `perfchecker.runnerProject` is `perf` but `perf/Project.toml` is
+absent, PerfChecker selects `perf/controller/Project.toml` if it exists. The
+selection is reported in the PerfChecker output channel. An explicitly configured
+project always wins, even when its `Project.toml` is missing; that case shows a
+path-specific error. `perf/runner` is never selected automatically. The same
+rule applies to the default `perfchecker.scenarioProject` for investigations.
+
+### Opening from another VS Code extension
+
+Companion extensions should detect the contributed command
+`perfchecker.openDesignerForWorkspace` in the installed extension's `packageJSON`
+before activation, then pass an open folder's `vscode.Uri` or
+`vscode.WorkspaceFolder`. This command requires the argument. The older
+`perfchecker.openDesigner` accepts one optional argument: a `vscode.Uri` or
+`vscode.WorkspaceFolder` identifying an open local workspace folder. For example,
+`vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace', folder.uri)` opens
+that folder's suite with its folder-scoped PerfChecker settings. In a single-folder
+window, the command palette and existing no-argument calls keep working. In a
+multi-root window, callers must provide the folder explicitly; a missing or foreign
+folder is rejected before the suite factory runs. Activation in a multi-root
+window does not plan a suite automatically. Opening the designer does plan the
+selected suite, so callers should invoke it only after an explicit user action.
+Investigation and advisor commands use the same selected folder. Until one is
+selected, those commands reject a multi-root window instead of choosing its first
+folder. Native test item controllers already belong to individual folders.
 
 ## Development
 

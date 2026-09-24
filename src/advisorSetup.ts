@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import {spawn, ChildProcess} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
+import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 
 const mapping: Record<string, [string, unknown]> = {
   endpoint: ['advisorEndpoint', 'http://127.0.0.1:8081/v1/chat/completions'], model: ['advisorModel', 'local'],
@@ -18,9 +19,11 @@ export class AdvisorSetup implements vscode.Disposable {
   private child?: ChildProcess;
   private cancelled = false;
   private busy = false;
+  private panelWorkspace?: string;
   constructor(private context: vscode.ExtensionContext) {}
-  private settings() {return vscode.workspace.getConfiguration('perfchecker', vscode.workspace.workspaceFolders?.[0]?.uri);}
-  private root() {const folder = vscode.workspace.workspaceFolders?.[0]; if (!folder) throw new Error('Open a package workspace first.'); return folder.uri.fsPath;}
+  private folder() {return currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);}
+  private settings() {return vscode.workspace.getConfiguration('perfchecker', this.folder().uri);}
+  private root() {return this.folder().uri.fsPath;}
   private async initial() {
     const settings = this.settings(), file = settings.get<string>('advisorConfig', '');
     let config: Record<string, unknown>;
@@ -33,8 +36,11 @@ export class AdvisorSetup implements vscode.Disposable {
       max_experiments: settings.get('investigationMaxExperiments', 4), budget_seconds: settings.get('investigationBudgetSeconds', 300)};
   }
   async open() {
+    const workspace = this.folder().uri.toString();
+    if (this.panel && this.panelWorkspace !== workspace) this.panel.dispose();
     if (this.panel) {this.panel.reveal(); return;}
     const initial = await this.initial();
+    this.panelWorkspace = workspace;
     this.panel = vscode.window.createWebviewPanel('perfchecker.advisorSetup', 'PerfChecker · Advisor and models', vscode.ViewColumn.One,
       {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
     const webview = this.panel.webview, nonce = randomUUID();
@@ -44,6 +50,7 @@ export class AdvisorSetup implements vscode.Disposable {
     this.panel.onDidDispose(() => {this.cancel(); this.panel = undefined;});
     webview.onDidReceiveMessage(async message => {
       try {
+        if (this.folder().uri.toString() !== workspace) throw new Error('PerfChecker folder changed. Reopen advisor settings.');
         if (message.type === 'advisorCancel') this.cancel();
         else if (message.type === 'advisorHelp') await vscode.env.openExternal(vscode.Uri.parse('https://docs.ollama.com/quickstart'));
         else if (message.type === 'advisorAction') {
@@ -54,6 +61,7 @@ export class AdvisorSetup implements vscode.Disposable {
     }, undefined, this.context.subscriptions);
   }
   async action(input: any): Promise<any> {
+    this.folder();
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before connecting an advisor.');
     if (this.busy) throw new Error('A setup operation is already running.');
     if (!['save', 'probe', 'models', 'pull', 'delete', 'unload'].includes(input?.action)) throw new Error('Unknown advisor action.');
@@ -64,8 +72,8 @@ export class AdvisorSetup implements vscode.Disposable {
     this.busy = true; this.cancelled = false;
     try {
       if (input.action === 'save' && input.config === null) {
-        await this.settings().update('advisorEnabled', false, vscode.ConfigurationTarget.Workspace);
-        await this.settings().update('advisorInvestigates', false, vscode.ConfigurationTarget.Workspace);
+        await this.settings().update('advisorEnabled', false, vscode.ConfigurationTarget.WorkspaceFolder);
+        await this.settings().update('advisorInvestigates', false, vscode.ConfigurationTarget.WorkspaceFolder);
         return {status: 'complete', message: 'Rule-based advice only. Model files remain installed.'};
       }
       const result = await vscode.window.withProgress({location: vscode.ProgressLocation.Notification,
@@ -80,11 +88,11 @@ export class AdvisorSetup implements vscode.Disposable {
         await fs.mkdir(path.dirname(file), {recursive: true});
         // Keep optional/custom provider fields validated by the common Julia contract.
         await fs.writeFile(file, JSON.stringify(result.config, null, 2) + '\n', 'utf8');
-        await settings.update('advisorConfig', path.relative(this.root(), file).replaceAll('\\', '/'), vscode.ConfigurationTarget.Workspace);
-        await settings.update('advisorEnabled', true, vscode.ConfigurationTarget.Workspace);
-        await settings.update('advisorInvestigates', Boolean(input.investigates), vscode.ConfigurationTarget.Workspace);
-        await settings.update('investigationMaxExperiments', max, vscode.ConfigurationTarget.Workspace);
-        await settings.update('investigationBudgetSeconds', budget, vscode.ConfigurationTarget.Workspace);
+        await settings.update('advisorConfig', path.relative(this.root(), file).replaceAll('\\', '/'), vscode.ConfigurationTarget.WorkspaceFolder);
+        await settings.update('advisorEnabled', true, vscode.ConfigurationTarget.WorkspaceFolder);
+        await settings.update('advisorInvestigates', Boolean(input.investigates), vscode.ConfigurationTarget.WorkspaceFolder);
+        await settings.update('investigationMaxExperiments', max, vscode.ConfigurationTarget.WorkspaceFolder);
+        await settings.update('investigationBudgetSeconds', budget, vscode.ConfigurationTarget.WorkspaceFolder);
         return {status: 'complete', message: `Configuration saved: ${file}. No generation request was made.`};
       }
       return result;
@@ -96,7 +104,8 @@ export class AdvisorSetup implements vscode.Disposable {
     try {
       const file = path.join(directory, 'request.json');
       await fs.writeFile(file, JSON.stringify(input), {flag: 'wx'});
-      const settings = this.settings(), project = path.resolve(this.root(), settings.get('runnerProject', 'perf'));
+      const settings = this.settings();
+      const project = resolveControllerProject(this.root(), settings).project;
       return await new Promise((resolve, reject) => {
         const child = spawn(settings.get('juliaExecutable', 'julia'), ['--startup-file=no', `--project=${project}`,
           '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', 'advisor-setup', `--source=${file}`, `--project=${project}`],

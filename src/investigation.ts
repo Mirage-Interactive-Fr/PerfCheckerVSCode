@@ -4,6 +4,7 @@ import {promises as fs, createReadStream} from 'node:fs';
 import * as path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
 import {registerAdvisorSetup} from './advisorSetup';
+import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {InvestigationReport, Proposal, Scenario, draftCase, parseInvestigation,
   reportSummary, scenarioKey, scenarioToml, selectedScenarios, workspacePath, scenarioOutcome, selectedTestItems} from './investigationModel';
 
@@ -31,9 +32,10 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   private tests = vscode.tests.createTestController('perfchecker.scenarios', 'PerfChecker scenarios');
   private output = vscode.window.createOutputChannel('PerfChecker investigations');
   private lastMessage = 'Discover existing tests or open saved evidence.';
+  private activeWorkspace?: string;
 
   constructor(private context: vscode.ExtensionContext) {
-    this.history = context.workspaceState.get<History[]>('investigationHistory', []);
+    this.history = [];
     context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(event => {
       if (!event.contentChanges.length || event.document.uri.scheme !== 'file' || !this.discovery) return;
       const relative = path.relative(this.root(), event.document.uri.fsPath).replaceAll('\\', '/');
@@ -69,15 +71,39 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   private *testItems(): IterableIterator<vscode.TestItem> {
     const items: vscode.TestItem[] = []; this.tests.items.forEach(item => items.push(item)); yield* items;
   }
+  private folder(): vscode.WorkspaceFolder {
+    const folder = currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);
+    const key = folder.uri.toString();
+    if (this.activeWorkspace !== key) {
+      if (this.activeWorkspace) {
+        if (this.busy) throw new Error('Wait for the active PerfChecker investigation before changing folders.');
+        this.discovery = undefined;
+        this.report = undefined;
+        this.advice = undefined;
+        this.displayedHistoryId = undefined;
+        this.tests.items.replace([]);
+        this.diagnostics.clear();
+        this.panel?.dispose();
+        this.panel = undefined;
+      }
+      const previous = vscode.workspace.workspaceFolders?.length === 1 ?
+        this.context.workspaceState.get<History[]>('investigationHistory', []) : [];
+      this.history = this.context.workspaceState.get<History[]>(`investigationHistory:${key}`, previous);
+    }
+    this.activeWorkspace = key;
+    return folder;
+  }
   private root(): string {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) throw new Error('Open a package workspace first.');
-    return folder.uri.fsPath;
+    return this.folder().uri.fsPath;
   }
   private setting<T>(key: string, fallback: T): T {
-    return vscode.workspace.getConfiguration('perfchecker', vscode.workspace.workspaceFolders?.[0]?.uri).get<T>(key, fallback);
+    return vscode.workspace.getConfiguration('perfchecker', this.folder().uri).get<T>(key, fallback);
   }
   private absolute(key: string, fallback: string): string {return path.resolve(this.root(), this.setting(key, fallback));}
+  private project(key: 'runnerProject' | 'scenarioProject' = 'runnerProject'): string {
+    return resolveControllerProject(this.root(),
+      vscode.workspace.getConfiguration('perfchecker', this.folder().uri), key).project;
+  }
   private declared(): Scenario[] {return this.discovery?.declared ?? [];}
   private analyzers() {
     return this.discovery?.analyzers ?? this.report?.analyzers ??
@@ -97,6 +123,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   }
 
   async open(): Promise<void> {
+    const workspace = this.folder().uri.toString();
     if (this.panel) {this.panel.reveal(); this.refresh(); return;}
     this.panel = vscode.window.createWebviewPanel('perfchecker.investigation', 'PerfChecker · Investigate', vscode.ViewColumn.One,
       {enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
@@ -108,6 +135,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     this.panel.onDidDispose(() => {this.panel = undefined;});
     webview.onDidReceiveMessage(async message => {
       try {
+        if (this.folder().uri.toString() !== workspace) throw new Error('PerfChecker folder changed. Reopen investigations.');
         if (message.type === 'ready') this.refresh();
         else if (message.type === 'execute' && actions.includes(message.action)) {
           await this.execute(message.action, Array.isArray(message.keys) ? message.keys.map(String) : undefined,
@@ -131,6 +159,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   }
 
   async execute(action: Action, keys?: string[], tools?: string[]): Promise<InvestigationReport | undefined> {
+    const workspace = this.folder().uri.toString();
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before running PerfChecker.');
     if (this.busy) throw new Error('An investigation is already running; cancel it or wait for completion.');
     if (!actions.includes(action)) throw new Error('Unknown action.');
@@ -160,7 +189,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
       const selection = path.join(directory, 'selection.json');
       await fs.writeFile(selection, JSON.stringify(chosen.map(({id, implementation}) => ({id, implementation}))), {flag: 'wx'});
       args.push(`--catalog=${catalog}`, `--selection=${selection}`,
-        `--project=${this.absolute('scenarioProject', 'perf')}`,
+        `--project=${this.project('scenarioProject')}`,
         `--timeout=${this.setting('analysisTimeout', 120)}`, `--threads=${this.setting('scenarioThreads', 1)}`);
       if (action === 'run') args.push(`--samples=${this.setting('scenarioSamples', 10)}`);
       else {
@@ -184,7 +213,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
         await fs.mkdir(directory, {recursive: true}); source = path.join(directory, 'evidence.json');
         await fs.writeFile(source, JSON.stringify(report.advice), {flag: 'wx'});
       }
-      args.push(`--source=${source}`, `--project=${this.absolute('scenarioProject', 'perf')}`,
+      args.push(`--source=${source}`, `--project=${this.project('scenarioProject')}`,
         `--advisor-config=${await this.advisorConfig(directory)}`);
     } else if (action === 'advise') {
       const evidence = await this.pickHistory(['diagnose', 'run'], 'Choose saved evidence — the program will not run again');
@@ -235,7 +264,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
       this.busy = false; this.child = undefined;
       if (this.cancelled) this.lastMessage = 'Cancelled. Completed artifacts are retained; remaining configurations are not qualified.';
       this.history = [history, ...this.history].slice(0, 50);
-      await this.context.workspaceState.update('investigationHistory', this.history); this.refresh();
+      await this.context.workspaceState.update(`investigationHistory:${workspace}`, this.history); this.refresh();
     }
   }
 
@@ -260,7 +289,10 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   private async invoke(command: string, args: string[], directory: string): Promise<{code: number; stdout: string}> {
     if (this.cancelled) return {code: 130, stdout: ''};
     const executable = this.setting('juliaExecutable', 'julia');
-    const juliaArgs = ['--startup-file=no', `--project=${this.absolute('runnerProject', 'perf')}`,
+    const controller = resolveControllerProject(this.root(),
+      vscode.workspace.getConfiguration('perfchecker', this.folder().uri));
+    this.output.appendLine(`Controller project: ${controller.project} (${controller.reason})`);
+    const juliaArgs = ['--startup-file=no', `--project=${controller.project}`,
       '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', command, ...args];
     this.output.appendLine(`PerfChecker ${command}`);
     return await new Promise((resolve, reject) => {
@@ -429,7 +461,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     action.command = {command: 'perfchecker.openInvestigations', title: 'Open PerfChecker advice'};
     return [action];
   }
-  error(error: unknown): void {this.lastMessage = String(error); this.output.appendLine(String(error)); this.refresh(); void vscode.window.showErrorMessage(`PerfChecker: ${error}`);}
+  error(error: unknown): void {this.lastMessage = String(error); this.output.appendLine(String(error)); try {this.refresh();} catch {/* no selected multi-root folder */} void vscode.window.showErrorMessage(`PerfChecker: ${error}`);}
   dispose(): void {this.cancel(); this.panel?.dispose(); this.diagnostics.dispose(); this.tests.dispose(); this.output.dispose(); this.change.dispose(); this.lenses.dispose();}
 }
 

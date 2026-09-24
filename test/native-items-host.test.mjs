@@ -9,6 +9,8 @@ import path from 'node:path';
 
 test('native item controller preserves selection, exclusions, cancellation and trusted workspace', async()=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'perfchecker-native-'));
+  await fs.mkdir(path.join(root,'perf','controller'),{recursive:true});
+  await fs.writeFile(path.join(root,'perf','controller','Project.toml'),'name = "PerfController"\n');
   const calls=[],controllers=[],commands=new Map(),disposable=()=>({dispose(){}});
   class Items {values=[];replace(values){this.values=values;}forEach(fn){this.values.forEach(fn);}}
   const uri=p=>({fsPath:p,toString:()=>`file://${p}`});
@@ -18,9 +20,9 @@ test('native item controller preserves selection, exclusions, cancellation and t
       getWorkspaceFolder:()=>folder,getConfiguration:()=>({get:(_key,fallback)=>fallback})},
     window:{createOutputChannel:()=>({...disposable(),append(){},appendLine(){},show(){}})},
     commands:{registerCommand:(name,fn)=>{commands.set(name,fn);return disposable();}},
-    tests:{createTestController:()=>{
-      const c={items:new Items(),...disposable(),createTestItem:(id,label,uri)=>({id,label,uri}),
-        createRunProfile:(_name,_kind,fn)=>{c.handler=fn;},
+    tests:{createTestController:(id,label)=>{
+      const c={id,label,items:new Items(),...disposable(),createTestItem:(id,label,uri)=>({id,label,uri}),
+        createRunProfile:(name,_kind,fn)=>{c.profileName=name;c.handler=fn;},
         createTestRun:()=>{const r={events:[],end(){this.ended=true;},appendOutput(){}};
           for(const key of ['enqueued','started','passed','failed','errored','skipped'])r[key]=item=>r.events.push([key,item.id]);
           c.lastRun=r;return r;}};controllers.push(c);return c;
@@ -45,7 +47,12 @@ test('native item controller preserves selection, exclusions, cancellation and t
   try {
     register({subscriptions:[],globalStorageUri:uri(path.join(root,'storage'))});
     assert.equal(calls.length,0);
+    assert.equal(controllers.length,1);
+    assert.equal(controllers[0].id,`perfchecker.testitems.${folder.uri.toString()}`);
+    assert.equal(controllers[0].label,'PerfChecker — mesures · demo');
+    assert.equal(controllers[0].profileName,'PerfChecker — mesures');
     await commands.get('perfchecker.discoverTestItems')();
+    assert.ok(calls[0].args.includes(`--project=${path.join(root,'perf','controller')}`));
     const c=controllers[0];assert.equal(c.items.values.length,2);
     await c.handler({include:[c.items.values[0],c.items.values[0]],exclude:[]},token);
     assert.deepEqual(c.lastRun.events.filter(e=>e[0]==='passed'),[['passed','a']]);assert.equal(c.lastRun.ended,true);
