@@ -4,7 +4,7 @@ import {promises as fs} from 'node:fs';
 import * as path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {selectedTestItems, nativeItemDuration} from './investigationModel';
-import {resolveControllerProject} from './workspace-root';
+import {resolveControllerProject, resolveWorkspaceFolder} from './workspace-root';
 
 interface NativeItem {id: string; name: string; file: string; tags: string[]; source_sha256: string}
 
@@ -13,7 +13,9 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
   const output = vscode.window.createOutputChannel('PerfChecker test items');
   context.subscriptions.push(output);
   const controls = new Map<string, {refresh: () => Promise<void>; run: (request: vscode.TestRunRequest, token: vscode.CancellationToken) => Promise<void>}>();
-  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+  const ensureController = (folder: vscode.WorkspaceFolder) => {
+    const existing = controls.get(folder.uri.toString());
+    if (existing) return existing;
     const tests = vscode.tests.createTestController(`perfchecker.testitems.${folder.uri.toString()}`, `PerfChecker — mesures · ${folder.name}`);
     context.subscriptions.push(tests);
     let declarations: NativeItem[] = [];
@@ -112,11 +114,15 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
     tests.resolveHandler = () => refresh();
     tests.refreshHandler = () => refresh();
     tests.createRunProfile('PerfChecker — mesures',vscode.TestRunProfileKind.Run,run,true);
-    controls.set(folder.uri.toString(),{refresh,run});
-  }
-  context.subscriptions.push(vscode.commands.registerCommand('perfchecker.discoverTestItems',async()=>{
+    const control = {refresh,run};
+    controls.set(folder.uri.toString(),control);
+    return control;
+  };
+  context.subscriptions.push(vscode.commands.registerCommand('perfchecker.discoverTestItems',async(requested?: vscode.Uri | vscode.WorkspaceFolder)=>{
     const folders = vscode.workspace.workspaceFolders ?? [];
-    const folder = folders.length===1 ? folders[0] : await vscode.window.showWorkspaceFolderPick();
-    if (folder) await controls.get(folder.uri.toString())?.refresh();
+    const folder = requested === undefined ?
+      (folders.length===1 ? folders[0] : await vscode.window.showWorkspaceFolderPick()) :
+      resolveWorkspaceFolder<vscode.WorkspaceFolder>(folders, requested);
+    if (folder) await ensureController(folder).refresh();
   }));
 }

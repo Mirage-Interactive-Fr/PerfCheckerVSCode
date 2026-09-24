@@ -5,12 +5,16 @@
 Set `perfchecker.runnerProject` to a Julia environment containing PerfChecker and
 TestItemRunner 1.3.2 or later in 1.x. Run **PerfChecker: Discover existing test items**,
 then select individual items in the **PerfChecker — mesures** Test Explorer controller.
+The measurement controller is created only for the chosen folder when discovery is
+requested. In a multi-root workspace, the command prompts for a folder; companion
+extensions may pass an open folder URI directly to `perfchecker.discoverTestItems`.
 Its **PerfChecker — mesures** run profile measures items independently of the Julia
 extension's functional test controller; it does not intercept Julia test runs.
-In the RC, untagged items are shared, `:perf_only` is performance-only, and
-`:test_only` is functional-only. Shared items may appear in both controllers as
+In the RC, untagged items are shared, `:check_only` is measurement-only,
+`:perf_only` is its supported alias, and `:test_only` is functional-only. Shared
+items may appear in both controllers as
 two distinct actions. Set `perfchecker.testItemTags` to `["perf_only"]` to show only
-performance-only items in the PerfChecker controller. `testItemExcludeTags` further
+measurement-only items in the PerfChecker controller. `testItemExcludeTags` further
 narrows selection. Each item runs once by
 default, in an isolated process; `testItemSamples` explicitly changes repetition.
 Save workspace changes before measuring. Cancellation stops the measured process tree.
@@ -18,7 +22,11 @@ Save workspace changes before measuring. Cancellation stops the measured process
 The item timer includes setup, imports, assertions and cleanup. Green means
 correctness passed, with measurements retained; no regression budget has been
 compared. Ordinary Julia/TestItemRunner execution is unchanged: automatic exclusion
-of `:perf_only` in that runner needs upstream support.
+of `:check_only`/`:perf_only` in Julia's Test Explorer needs upstream support.
+For a measurement-only item that must be safe under Julia's **Run All**, use
+`skip=(get(ENV, "PERFCHECKER_TESTITEM_MODE", "") != "performance")` on its
+`@testitem` declaration. PerfChecker sets this marker only in measured item workers;
+Julia's ordinary runner then skips the item. This guard is opt-in per declaration.
 
 The investigation panel connects shared tests, declared performance scenarios, optional analyzers and saved evidence. It also provides a searchable tool catalogue, proposed CI coverage, bounded investigations and optional explanations from a configured model.
 

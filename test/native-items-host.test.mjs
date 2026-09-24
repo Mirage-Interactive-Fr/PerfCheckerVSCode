@@ -13,7 +13,7 @@ test('native item controller preserves selection, exclusions, cancellation and t
   await fs.writeFile(path.join(root,'perf','controller','Project.toml'),'name = "PerfController"\n');
   const calls=[],controllers=[],commands=new Map(),disposable=()=>({dispose(){}});
   class Items {values=[];replace(values){this.values=values;}forEach(fn){this.values.forEach(fn);}}
-  const uri=p=>({fsPath:p,toString:()=>`file://${p}`});
+  const uri=p=>({scheme:'file',fsPath:p,toString:()=>`file://${p}`});
   const folder={name:'demo',uri:uri(root)};
   const mock={Uri:{file:uri},TestTag:class {constructor(id){this.id=id;}},TestMessage:class {},
     TestRunProfileKind:{Run:1},workspace:{isTrusted:true,workspaceFolders:[folder],textDocuments:[],
@@ -47,19 +47,23 @@ test('native item controller preserves selection, exclusions, cancellation and t
   try {
     register({subscriptions:[],globalStorageUri:uri(path.join(root,'storage'))});
     assert.equal(calls.length,0);
+    assert.equal(controllers.length,0);
+    await commands.get('perfchecker.discoverTestItems')();
     assert.equal(controllers.length,1);
     assert.equal(controllers[0].id,`perfchecker.testitems.${folder.uri.toString()}`);
     assert.equal(controllers[0].label,'PerfChecker — mesures · demo');
     assert.equal(controllers[0].profileName,'PerfChecker — mesures');
-    await commands.get('perfchecker.discoverTestItems')();
     assert.ok(calls[0].args.includes(`--project=${path.join(root,'perf','controller')}`));
+    await commands.get('perfchecker.discoverTestItems')(folder.uri);
+    assert.equal(calls.length,2);
+    await assert.rejects(commands.get('perfchecker.discoverTestItems')(uri(path.join(root,'other'))),/not an open/);
     const c=controllers[0];assert.equal(c.items.values.length,2);
     await c.handler({include:[c.items.values[0],c.items.values[0]],exclude:[]},token);
     assert.deepEqual(c.lastRun.events.filter(e=>e[0]==='passed'),[['passed','a']]);assert.equal(c.lastRun.ended,true);
     assert.deepEqual(calls.filter(c=>!c.args.includes('--list')).map(c=>c.args.find(v=>v.startsWith('--item-id='))),['--item-id=a']);
-    assert.ok(calls[1].args.includes('--samples=1'));
-    assert.equal(calls[1].options.env.JULIA_PROJECT,undefined);
-    assert.equal(calls[1].options.env.JULIA_LOAD_PATH,['@','@stdlib'].join(path.delimiter));
+    assert.ok(calls[2].args.includes('--samples=1'));
+    assert.equal(calls[2].options.env.JULIA_PROJECT,undefined);
+    assert.equal(calls[2].options.env.JULIA_LOAD_PATH,['@','@stdlib'].join(path.delimiter));
     const count=calls.length;
     await c.handler({include:[]},token);assert.equal(calls.length,count);
     await c.handler({include:[c.items.values[0]],exclude:[{id:'a'}]},token);assert.equal(calls.length,count);
