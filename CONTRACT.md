@@ -31,6 +31,17 @@ folder. Investigation and advisor commands share that selection and reject
 multi-root requests made before a folder is selected. Activation alone does not
 plan a suite in a multi-root window.
 
+`perfchecker.runLandscapeLiveForWorkspace(folderUri, qualitySlug)` is a separate,
+explicit command. It validates the same open folder identity and a current
+Beautiful Landscape quality entry, then uses PerfChecker.jl's public
+`ExternalCommandSpec`, `run_external_command`, `write_run_bundle`, and
+`verify_run_bundle` APIs. A provider at `perf/live_provider.jl` writes
+`perfchecker-provider-result/1` to `PERFCHECKER_OUTPUT`; the resulting bundle lives
+under `perf/results/live`, outside the CPU suite report directory. The extension
+validates quality, effective resolution, timestamps, hardware availability,
+submission timing scope and millisecond metric definitions before archival.
+Provider failure or cancellation never becomes completed evidence.
+
 ## Consumed contracts
 
 The 1.0 pre-release extension line accepts these versioned interfaces:

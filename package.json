@@ -48,7 +48,8 @@
     "onView:perfchecker.runs",
     "onView:perfchecker.scenarios",
     "onCommand:perfchecker.openDesigner",
-    "onCommand:perfchecker.openDesignerForWorkspace"
+    "onCommand:perfchecker.openDesignerForWorkspace",
+    "onCommand:perfchecker.runLandscapeLiveForWorkspace"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -167,6 +168,10 @@
         "title": "PerfChecker: Open visual suite editor for workspace"
       },
       {
+        "command": "perfchecker.runLandscapeLiveForWorkspace",
+        "title": "PerfChecker: Measure Beautiful Landscape live graphics for workspace"
+      },
+      {
         "command": "perfchecker.saveConfiguration",
         "title": "PerfChecker: Save shared UI configuration",
         "icon": "$(save)"
@@ -200,6 +205,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "perfchecker.runLandscapeLiveForWorkspace",
+          "when": "false"
+        }
+      ],
       "view/title": [
         {
           "command": "perfchecker.configureAdvisor",

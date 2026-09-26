@@ -125,6 +125,32 @@ Investigation and advisor commands use the same selected folder. Until one is
 selected, those commands reject a multi-root window instead of choosing its first
 folder. Native test item controllers already belong to individual folders.
 
+### Explicit live graphics measurement
+
+A companion may call `perfchecker.runLandscapeLiveForWorkspace(folder.uri, qualitySlug)`
+after the user chooses a Beautiful Landscape quality profile and requests a live
+measurement. Both arguments are required. The command checks the open local folder,
+the quality contract and `perf/live_provider.jl` before launch. The provider must
+write `perfchecker-provider-result/1` JSON to `PERFCHECKER_OUTPUT`, using the
+explicit `--quality=<slug>` argument. It runs in the game project; PerfChecker runs
+in the folder's configured controller project. The controller must already contain
+the PerfChecker RC. No package installation or suite factory runs automatically.
+
+The provider's `suite` is `etendu-beautiful-landscape-live`. Its `environment`
+contains `quality_profile`, effective `width` and `height`, `resolution_source`,
+`hardware.cpu_name` and `hardware.gpu_name` (use `unavailable` if unknown),
+`gpu_timing="unavailable"`, `physical_presentation="unavailable"`,
+`scene_sha256`, `scene_file_changed_during_run=false`, and a `timing_boundary` naming
+`SDL_SubmitGPUCommandBuffer`. It supplies UTC `started_at` and `finished_at` ending
+in `Z`, and numeric millisecond observations in both `landscape.cpu.*` and
+`landscape.submit_interval.*` families. GPU duration and physical display FPS are
+not observations without corresponding instruments.
+
+PerfChecker archives a verified `perfchecker-run-bundle/1` at
+`perf/results/live/run-<uuid>/` and opens its manifest. This evidence is separate
+from the CPU suite's `suite-result.json` and VS Code's Testing results. A failed,
+cancelled, stale, or incomplete provider does not produce a completed live bundle.
+
 ## Development
 
 ## Shared scenarios and investigations

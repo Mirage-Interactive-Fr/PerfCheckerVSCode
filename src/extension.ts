@@ -8,7 +8,9 @@ import { promises as fs } from 'node:fs';
 import * as readline from 'node:readline';
 import {registerInvestigations} from './investigation';
 import {registerNativeTestItems} from './testitems';
-import {currentWorkspaceFolder, resolveControllerProject, selectWorkspaceFolder} from './workspace-root';
+import {executeLiveProvider, prepareLiveProvider} from './live-provider';
+import {currentWorkspaceFolder, resolveControllerProject, resolveWorkspaceFolder,
+  selectWorkspaceFolder} from './workspace-root';
 import {
   ComparisonRecord, PlanRun, SuitePlan, SuiteRunOutput, VersionSeries,
   comparisonsForRuns, logicalFeature, moveRun, outputsForRuns, parseGitReference,
@@ -1063,6 +1065,55 @@ export function activate(context: vscode.ExtensionContext): void {
   const tree = new PlanTree();
   const tests = vscode.tests.createTestController('perfchecker', 'PerfChecker');
   const controller = new Controller(context, tree, tests);
+  const runLandscapeLive = async (requested?: vscode.Uri | vscode.WorkspaceFolder,
+      quality?: string): Promise<string> => {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before measuring live graphics.');
+    if (requested === undefined) throw new Error('Pass an open workspace folder URI to perfchecker.runLandscapeLiveForWorkspace.');
+    const folder = resolveWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders, requested);
+    const identity = folder.uri.toString();
+    const prepared = await prepareLiveProvider(folder.uri.fsPath, quality as string);
+    const settings = () => vscode.workspace.getConfiguration('perfchecker', folder.uri);
+    const configuration = () => JSON.stringify(['juliaExecutable', 'runnerProject']
+      .map(key => settings().get(key)));
+    const selectedConfiguration = configuration();
+    const ensureCurrent = async () => {
+      if (!vscode.workspace.isTrusted ||
+          !vscode.workspace.workspaceFolders?.some(candidate => candidate.uri.toString() === identity) ||
+          configuration() !== selectedConfiguration)
+        throw new Error('The workspace or PerfChecker controller changed; start the measurement again.');
+      const fresh = await prepareLiveProvider(folder.uri.fsPath, prepared.quality);
+      if (fresh.root !== prepared.root || fresh.provider !== prepared.provider ||
+          fresh.qualityDigest !== prepared.qualityDigest)
+        throw new Error('The live provider or render quality changed; start the measurement again.');
+    };
+    await ensureCurrent();
+    const controllerProject = resolveControllerProject(prepared.root, settings());
+    const julia = settings().get<string>('juliaExecutable', 'julia');
+    const reports = path.join(prepared.root, 'perf', 'results', 'live');
+    const output = vscode.window.createOutputChannel('PerfChecker Live');
+    context.subscriptions.push(output);
+    output.appendLine(`Live measurement: ${folder.name} · ${prepared.quality}`);
+    output.appendLine(`Controller: ${controllerProject.project} (${controllerProject.reason})`);
+    const directory = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: `PerfChecker · live graphics · ${prepared.quality}`,
+      cancellable: true,
+    }, async (_progress, token) => {
+      await ensureCurrent();
+      return executeLiveProvider({...prepared, controller: controllerProject.project,
+        julia, reports}, token, line => output.append(line));
+    });
+    await ensureCurrent();
+    const manifestPath = path.join(directory, 'manifest.json');
+    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    if (manifest.schema_version !== 'perfchecker-run-bundle/1' ||
+        manifest.state !== 'complete' || manifest.environment?.quality_profile !== prepared.quality)
+      throw new Error('The live bundle does not contain matching completed evidence.');
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(manifestPath)),
+      {preview: false});
+    void vscode.window.showInformationMessage(`Live measurement archived: ${directory}`);
+    return directory;
+  };
   tests.createRunProfile('Run', vscode.TestRunProfileKind.Run,
     request => controller.runTests(request), true);
   const view = vscode.window.createTreeView('perfchecker.runs', {treeDataProvider: tree,
@@ -1081,6 +1132,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (folder === undefined) throw new Error('Pass an open workspace folder or URI to perfchecker.openDesignerForWorkspace.');
         return controller.openDesigner(folder);
       }),
+    vscode.commands.registerCommand('perfchecker.runLandscapeLiveForWorkspace', runLandscapeLive),
     vscode.commands.registerCommand('perfchecker.saveConfiguration', () => controller.saveConfiguration()),
     view.onDidChangeCheckboxState(event => {
       for (const [node, state] of event.items) {
