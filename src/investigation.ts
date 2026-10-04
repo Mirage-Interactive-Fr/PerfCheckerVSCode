@@ -2,8 +2,10 @@ import * as vscode from 'vscode';
 import {spawn, ChildProcess} from 'node:child_process';
 import {promises as fs, createReadStream} from 'node:fs';
 import * as path from 'node:path';
+import {StringDecoder} from 'node:string_decoder';
 import {createHash, randomUUID} from 'node:crypto';
 import {registerAdvisorSetup} from './advisorSetup';
+import {AdvisorChat, ChatEvidence} from './advisorChat';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {InvestigationReport, Proposal, Scenario, draftCase, parseInvestigation,
   reportSummary, scenarioKey, scenarioToml, selectedScenarios, workspacePath, scenarioOutcome, selectedTestItems} from './investigationModel';
@@ -127,11 +129,13 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     if (this.panel) {this.panel.reveal(); this.refresh(); return;}
     this.panel = vscode.window.createWebviewPanel('perfchecker.investigation', 'PerfChecker · Investigate', vscode.ViewColumn.One,
       {enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
+    this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
     const webview = this.panel.webview;
     const script = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'investigation.js'));
     const style = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'investigation.css'));
+    const logo = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.png'));
     const nonce = randomUUID();
-    webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${style}"><title>PerfChecker investigations</title></head><body><header><p class="eyebrow">PerfChecker</p><h1>Understand. Improve. Verify.</h1><p>Shared scenarios connect tests, measurements and evidence-based advice.</p></header><div id="app" aria-live="polite"></div><script nonce="${nonce}" src="${script}"></script></body></html>`;
+    webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${style}"><title>PerfChecker investigations</title></head><body><header class="brand-heading"><img src="${logo}" alt="PerfChecker"><div><p class="eyebrow">PerfChecker</p><h1>Understand. Improve. Verify.</h1><p>Shared scenarios connect tests, measurements and evidence-based advice.</p></div></header><div id="app" aria-live="polite"></div><script nonce="${nonce}" src="${script}"></script></body></html>`;
     this.panel.onDidDispose(() => {this.panel = undefined;});
     webview.onDidReceiveMessage(async message => {
       try {
@@ -298,14 +302,20 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     return await new Promise((resolve, reject) => {
       const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true, detached: process.platform !== 'win32'});
       this.child = child;
-      let stdout = ''; let log = ''; let exceeded = false;
+      const stdoutDecoder = new StringDecoder('utf8'), stderrDecoder = new StringDecoder('utf8');
+      let stdout = ''; let log = ''; let size = 0; let exceeded = false;
+      const append = (text: string, output: boolean) => {
+        this.output.append(text); log = (log + text).slice(-2_000_000);
+        if (output && !exceeded) stdout += text;
+      };
       const consume = (chunk: Buffer, output: boolean) => {
-        const text = chunk.toString(); this.output.append(text); log = (log + text).slice(-2_000_000);
-        if (output) {stdout += text; if (stdout.length > 32_000_000) {exceeded = true; this.cancel();}}
+        if (output) {size += chunk.length; if (size > 32_000_000) {exceeded = true; this.cancel();}}
+        append((output ? stdoutDecoder : stderrDecoder).write(chunk), output);
       };
       child.stdout?.on('data', chunk => consume(chunk, true)); child.stderr?.on('data', chunk => consume(chunk, false));
       child.on('error', reject);
       child.on('close', code => {
+        append(stdoutDecoder.end(), true); append(stderrDecoder.end(), false);
         void fs.appendFile(path.join(directory, 'worker.log'), log).then(() => {
           if (exceeded) reject(new Error('Controller output exceeded 32 MB; inspect the worker log.'));
           else resolve({code: code ?? 2, stdout});
@@ -328,6 +338,22 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     const stat = await fs.stat(file);
     if (stat.size > 32_000_000) throw new Error('Report is larger than 32 MB; open the raw artifact.');
     return parseInvestigation(JSON.parse(await fs.readFile(file, 'utf8')));
+  }
+  chatEvidence(): ChatEvidence[] {
+    this.folder();
+    return this.history.filter(item => ['advise', 'diagnose', 'run', 'investigate'].includes(item.action) && item.report && item.status === 'complete')
+      .map(item => ({id: item.id, label: `${item.action} · ${item.created} · ${item.summary}`}));
+  }
+  async readChatEvidence(id: string): Promise<InvestigationReport> {
+    this.folder();
+    if (!this.chatEvidence().some(item => item.id === id)) throw new Error('Saved evidence is no longer available.');
+    const item = this.history.find(item => item.id === id)!;
+    const file = item.action === 'advise' || item.action === 'investigate' ? item.report! : path.join(item.directory, 'advice', 'advice.json');
+    workspacePath(await fs.realpath(this.root()), await fs.realpath(file));
+    const report = await this.readReport(file);
+    const advice = item.action === 'investigate' ? report.advice : report;
+    if (advice?.schema_version !== 'perfchecker-advice/1') throw new Error('This report has no saved advice.');
+    return advice;
   }
   private async pickHistory(actions: Action[], title: string, preferred?: string): Promise<History | undefined> {
     const displayed = this.history.find(item => item.id === preferred && actions.includes(item.action) && item.report);
@@ -468,10 +494,19 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
 export function registerInvestigations(context: vscode.ExtensionContext): void {
   registerAdvisorSetup(context);
   const controller = new InvestigationController(context);
+  const chat = new AdvisorChat(context, () => controller.chatEvidence(), id => controller.readChatEvidence(id));
   const command = (name: string, callback: (...args: any[]) => unknown) => vscode.commands.registerCommand(name, async (...args) => {
     try {return await callback(...args);} catch (error) {controller.error(error); throw error;}
   });
-  context.subscriptions.push(controller,
+  context.subscriptions.push(controller, chat,
+    command('perfchecker.openChat', () => chat.open()),
+    command('perfchecker.chatSend', input => chat.send(input?.question, input?.evidenceId)),
+    command('perfchecker.chatState', () => chat.state()),
+    command('perfchecker.chatClear', evidenceId => chat.clear(evidenceId)),
+    command('perfchecker.chatCancel', () => chat.cancel()),
+    command('perfchecker.prepareImplementation', () => chat.implement()),
+    command('perfchecker.applyImplementation', () => chat.apply()),
+    command('perfchecker.restoreImplementation', () => chat.apply(true)),
     vscode.window.createTreeView('perfchecker.scenarios', {treeDataProvider: controller, showCollapseAll: true}),
     vscode.languages.registerCodeLensProvider({language: 'julia', scheme: 'file'}, controller),
     vscode.languages.registerCodeActionsProvider({language: 'julia', scheme: 'file'}, controller, {providedCodeActionKinds: [vscode.CodeActionKind.QuickFix]}),

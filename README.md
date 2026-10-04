@@ -1,5 +1,16 @@
 # PerfChecker for VS Code
 
+PerfChecker 1.0 brings a full Studio, interactive plots, Julia tools, MCP
+conversation, and reviewed agent implementation with Git recovery into VS Code.
+Use a controller environment containing PerfChecker.jl 1.0.0 or later.
+
+The user guides are maintained with PerfChecker.jl on its existing documentation host:
+
+- [VS Code guide](https://mirage-interactive-fr.github.io/PerfChecker/stable/interfaces/vscode)
+- [Complete extension configuration](https://mirage-interactive-fr.github.io/PerfChecker/stable/interfaces/vscode-configuration)
+- [Plots, notebooks and Julia tools](https://mirage-interactive-fr.github.io/PerfChecker/stable/interfaces/vscode-workflows)
+- [MCP advice, implementation and recovery](https://mirage-interactive-fr.github.io/PerfChecker/stable/mcp-advisor)
+
 ## Measure existing Julia test items
 
 Set `perfchecker.runnerProject` to a Julia environment containing PerfChecker and
@@ -10,7 +21,7 @@ requested. In a multi-root workspace, the command prompts for a folder; companio
 extensions may pass an open folder URI directly to `perfchecker.discoverTestItems`.
 Its **PerfChecker — mesures** run profile measures items independently of the Julia
 extension's functional test controller; it does not intercept Julia test runs.
-In the RC, untagged items are shared, `:check_only` is measurement-only,
+Untagged items are shared, `:check_only` is measurement-only,
 `:perf_only` is its supported alias, and `:test_only` is functional-only. Shared
 items may appear in both controllers as
 two distinct actions. Set `perfchecker.testItemTags` to `["perf_only"]` to show only
@@ -50,6 +61,16 @@ the Julia package or enter measured workers.
 
 ## Features
 
+- Open **PerfChecker: Open Studio** for a full editor workspace with investigations,
+  plots, Julia tools and advisor conversation. The sidebar remains a launcher.
+- Ask an explicitly configured MCP advice tool, review its answer, then optionally
+  ask an implementation tool to prepare changes in an isolated Git checkout.
+  Review the diff before applying; restore the checkpoint if the repository has
+  not changed. Conversation is kept in memory; Git recovery survives editor restarts.
+  Starting a new conversation preserves the current proposal and its restore action.
+- Open a folder-scoped Julia terminal, create an unsaved Julia investigation
+  notebook, open native notebooks, and debug saved Julia source using the Julia
+  extension. Select an installed notebook kernel explicitly.
 - Browse `package → business feature → check type → target` in the activity bar
   and native Test Explorer.
 - Select BenchmarkTools, Chairmarks, allocations, CPU/wall-time profiles and
@@ -69,7 +90,7 @@ the Julia package or enter measured workers.
 - Julia available as `julia`, or configured through
   `perfchecker.juliaExecutable`.
 - A controller environment in the opened package workspace, normally `perf`,
-  containing PerfChecker.jl and a `suite.jl` with `build_suite()`.
+  containing PerfChecker.jl 1.0.0 or later and a `suite.jl` with `build_suite()`.
 
 The extension invokes the public PerfChecker CLI and reads only versioned JSON,
 JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundary.
@@ -80,12 +101,13 @@ JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundar
 Set-Location C:\path\to\PerfCheckerVSCode
 npm ci
 npm test
-npm run package:pre-release -- --out perfchecker-vscode-0.1.0.vsix
-code --install-extension .\perfchecker-vscode-0.1.0.vsix --force
+npm run package -- --out perfchecker-vscode-1.0.0.vsix
+code --install-extension .\perfchecker-vscode-1.0.0.vsix --force
 ```
 
 Reload VS Code, open a Julia package workspace, then select the PerfChecker icon
-or run **PerfChecker: Open visual suite editor** from the command palette.
+or run **PerfChecker: Open Studio** from the command palette. Studio also opens
+the suite editor and existing report viewers.
 
 ## Workspace defaults
 
@@ -134,7 +156,7 @@ the quality contract and `perf/live_provider.jl` before launch. The provider mus
 write `perfchecker-provider-result/1` JSON to `PERFCHECKER_OUTPUT`, using the
 explicit `--quality=<slug>` argument. It runs in the game project; PerfChecker runs
 in the folder's configured controller project. The controller must already contain
-the PerfChecker RC. No package installation or suite factory runs automatically.
+PerfChecker.jl 1.0.0 or later. No package installation or suite factory runs automatically.
 
 The provider's `suite` is `etendu-beautiful-landscape-live`. Its `environment`
 contains `quality_profile`, effective `width` and `height`, `resolution_source`,
@@ -208,12 +230,73 @@ and the new workspace path. Set `PERFCHECKER_HOST_RESULT` to an output JSON path
 The test exercises real Julia discovery, measurement, JET findings, CodeLens,
 Problems, evidence actions and cancellation. Do not use your normal editor profile.
 
+### Chat, implementation and recovery qualification
+
+`npm test` includes the chat model and Git checkpoint tests, including dirty/staged
+state, ignored-but-staged files, binary/non-UTF8 byte preservation, drift, nested
+folder boundaries, split indexes, linked worktrees and diff limits. Browser tests
+are opt-in and use an existing Playwright/Chromium installation:
+
+```sh
+PERFCHECKER_PLAYWRIGHT_MODULE=/existing/playwright \
+PERFCHECKER_BROWSER=/existing/chromium node test/advisor-chat.browser.cjs
+```
+
+The Linux native-host fixtures deliberately require a **new sacrificial** Git
+workspace named `/tmp/perfchecker-chat-host-*`, with an initial HEAD,
+`.perfchecker-test-fixture` containing `sacrificial` and a final newline,
+`source.jl` containing saved text, and `untracked.txt` containing
+`original untracked` and a final newline. Add an ignored file containing
+`PRIVATE_NOT_ATTACHED` and stage a version of `source.jl` before changing its
+on-disk content. In `.vscode/settings.json`, set absolute `juliaExecutable`,
+`runnerProject` and `scenarioProject` paths. The prepared controller must contain
+PerfChecker.jl 1.0.0 or later and HTTP; no package installation occurs in
+these tests. Use new profile/extensions directories and keep their paths for the
+second process. Workspace-trust disabling below belongs only to these fixtures.
+
+```sh
+PERFCHECKER_HOST_RESULT=/tmp/chat-host-result.json code \
+  --extensionDevelopmentPath="$PWD" \
+  --extensionTestsPath="$PWD/test/advisor-chat-host.cjs" \
+  --user-data-dir=/tmp/chat-test-profile --extensions-dir=/tmp/chat-test-extensions \
+  --disable-extensions --disable-workspace-trust /tmp/perfchecker-chat-host-FIXTURE
+
+# After the first test succeeds, reuse that exact profile, extensions and workspace.
+PERFCHECKER_HOST_RESULT=/tmp/chat-recovery-result.json code \
+  --extensionDevelopmentPath="$PWD" \
+  --extensionTestsPath="$PWD/test/advisor-chat-recovery-host.cjs" \
+  --user-data-dir=/tmp/chat-test-profile --extensions-dir=/tmp/chat-test-extensions \
+  --disable-extensions --disable-workspace-trust /tmp/perfchecker-chat-host-FIXTURE
+```
+
+The first test starts a local MCP mock and exercises actual VS Code/Julia
+conversation, privacy, tool errors, cancellation, isolated edits, reviewed apply
+and restore. The second reconstructs the proposal in a fresh extension host and
+applies/restores it without the MCP server or stored conversation.
+
+`test/agent-mcp-host.cjs` instead requires a real responding agent. Create a fresh
+`/tmp/perfchecker-agent-host-*` Git fixture with the same marker/settings, and
+`source.jl` defining `score(xs) = sum([x * x for x in xs])`. Supply a new private
+`PERFCHECKER_AGENT_BRIDGE_DIR=/tmp/perfchecker-agent-bridge-*`, the output variable
+`PERFCHECKER_HOST_RESULT`, and launch it with `--extensionTestsPath` as above using
+its own profile. The bridge writes `ready.json` and then `request-N.json`; a
+separately operated agent reads each request and writes `response-N.json` containing
+`{"text":"its actual reply"}`. For the implementation request, that agent edits
+only the supplied checkout and runs its chosen validation. The host waits up to
+600 seconds, then verifies unchanged advice-mode source, reviewed application,
+the Julia result, warm allocation reduction and restoration. The extension does
+not include that agent or automatically connect to Codex.
+
+Inspect the result JSON, then remove the sacrificial workspace, profile,
+extensions, bridge and result files. Do not run these destructive fixture checks
+against an existing project or your normal editor profile.
+
 ## Build locally
 
 ```powershell
 npm ci
 npm test
-npm run package:pre-release -- --out perfchecker-vscode.vsix
+npm run package -- --out perfchecker-vscode.vsix
 ```
 
 `npm test` compiles TypeScript and runs the model/contract tests. The generated
@@ -221,21 +304,24 @@ npm run package:pre-release -- --out perfchecker-vscode.vsix
 
 ## Marketplace publication
 
+Publish the stable extension only after PerfChecker.jl 1.0.0 is available in
+Julia's General registry. Build and test the exact VSIX before publishing it.
+
 The immutable Marketplace identity is
 `mirage-interactive-fr.perfchecker-vscode`. Repository extraction therefore does
 not change extension settings, commands, or installations.
 
-For a manual pre-release:
+For a manual stable release:
 
 ```powershell
 npx vsce login mirage-interactive-fr
-npx vsce publish --packagePath .\perfchecker-vscode-0.1.0.vsix --pre-release
+npx vsce publish --packagePath .\perfchecker-vscode-1.0.0.vsix
 ```
 
 Publishing requires a free Microsoft identity and Marketplace publisher, not a
 paid Azure subscription. Never commit a publication token. The future release
-workflow can use Marketplace trusted publishing after the dedicated GitHub
-repository exists.
+workflow can use Marketplace identity-based publishing after its identity and
+publisher permissions have been configured.
 
 ## License
 
@@ -244,26 +330,20 @@ MIT. See [LICENSE](LICENSE).
 ## Optional MCP advice
 
 Open **PerfChecker: Configure advisor and manage models** for the guided panel.
-It supports connection checks, selection from discovered MCP tools or models,
-custom instructions, deterministic-only mode, and bounded investigation settings.
-Local Ollama models can be downloaded, unloaded or removed after an explicit
-confirmation; sizes are reported by the server and may include shared layers.
-The panel does not install Ollama itself or download anything on opening.
-Configuration is saved to the selected advisor file or `perf/advisor.json`.
-Use a credential environment variable name, never a token, in the panel.
+Discover and configure an MCP HTTP advice tool in text mode, then open
+**PerfChecker: Chat with performance advisor**. Nothing is generated on opening.
+Source files are not attached automatically; typed messages and explicitly selected
+bounded evidence are sent when requested. Replies remain unverified advice.
 
-In **Model settings**, choose `mcp_http`, the MCP endpoint, an explicit advice
-tool (`advisorMcpTool`) and its prompt argument (`advisorMcpPromptArgument`).
-`advisorInstructions` customizes the request; `advisorMcpArguments` supplies
-other required arguments. Use protocol revision `2026-07-28` or `2025-11-25`
-according to the server. A remote HTTPS server requires `advisorAllowRemote`
-and optionally `advisorKeyEnvironment` (the variable name, never the key).
+Implementation requires a separate explicit tool configuration in the chat's
+**Implementation** tab. The supplied checkout is not an operating-system sandbox:
+use a trusted agent that respects the path and can access the local filesystem.
+Preparation creates a checkpoint; application requires a separate reviewed action.
+The extension uses the controller's public `chat` and `implement` commands, which
+are supplied by PerfChecker.jl 1.0.0 or later; an older controller fails
+visibly instead of providing an implementation fallback. The extension does not
+include, install or start an agent backend.
 
-`advisorMcpResponse=text` is the default: **Explain with configured model**
-displays unverified advice without executing suggestions. To select declared
-experiments, use `structured` and explicitly enable `advisorInvestigates`, with
-count/time limits. `advisorConfig` can instead point to a shared provider JSON
-file and takes precedence over these individual settings.
-
-The server must provide an assistant/advice tool. The extension does not install
-or start it. Stdio and OAuth login are not supported by this HTTP adapter.
+See the canonical [MCP guide](https://mirage-interactive-fr.github.io/PerfChecker/stable/mcp-advisor)
+for provider configuration, credentials, supported revisions, transmission,
+cancellation and recovery. Stdio and OAuth login are not supported by this adapter.

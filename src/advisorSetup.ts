@@ -14,6 +14,17 @@ const mapping: Record<string, [string, unknown]> = {
   mcp_arguments: ['advisorMcpArguments', {}], mcp_version: ['advisorMcpVersion', '2026-07-28'], mcp_response: ['advisorMcpResponse', 'text']
 };
 
+export async function readAdvisorConfiguration(folder: vscode.WorkspaceFolder): Promise<Record<string, unknown>> {
+  const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
+  const file = settings.get<string>('advisorConfig', '');
+  if (!file) return Object.fromEntries(Object.entries(mapping).map(([key, [setting, fallback]]) => [key, settings.get(setting, fallback)]));
+  const location = path.resolve(folder.uri.fsPath, file);
+  if ((await fs.stat(location)).size > 32000) throw new Error('Advisor configuration exceeds 32 KB.');
+  const config = JSON.parse(await fs.readFile(location, 'utf8'));
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Invalid advisor configuration.');
+  return config;
+}
+
 export class AdvisorSetup implements vscode.Disposable {
   private panel?: vscode.WebviewPanel;
   private child?: ChildProcess;
@@ -26,12 +37,7 @@ export class AdvisorSetup implements vscode.Disposable {
   private root() {return this.folder().uri.fsPath;}
   private async initial() {
     const settings = this.settings(), file = settings.get<string>('advisorConfig', '');
-    let config: Record<string, unknown>;
-    if (file) {
-      const location = path.resolve(this.root(), file);
-      if ((await fs.stat(location)).size > 32000) throw new Error('Advisor configuration exceeds 32 KB.');
-      config = JSON.parse(await fs.readFile(location, 'utf8'));
-    } else config = Object.fromEntries(Object.entries(mapping).map(([key, [setting, fallback]]) => [key, settings.get(setting, fallback)]));
+    const config = await readAdvisorConfiguration(this.folder());
     return {config, config_location: path.resolve(this.root(), file || 'perf/advisor.json'), enabled: settings.get('advisorEnabled', true), investigates: settings.get('advisorInvestigates', false),
       max_experiments: settings.get('investigationMaxExperiments', 4), budget_seconds: settings.get('investigationBudgetSeconds', 300)};
   }
@@ -46,7 +52,8 @@ export class AdvisorSetup implements vscode.Disposable {
     const webview = this.panel.webview, nonce = randomUUID();
     const resource = (name: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
     const data = JSON.stringify(initial).replace(/</g, '\\u003c');
-    webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('investigation.css')}"><link rel="stylesheet" href="${resource('advisor-panel.css')}"><title>Advisor and models</title></head><body><main id="advisor-root"></main><script nonce="${nonce}" src="${resource('advisor-panel.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorPanel(document.getElementById('advisor-root'),m=>api.postMessage(m),${data});window.addEventListener('message',e=>panel.receive(e.data));</script></body></html>`;
+    this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+    webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('investigation.css')}"><link rel="stylesheet" href="${resource('advisor-panel.css')}"><title>Advisor and models</title></head><body><header class="advisor-brand"><img src="${resource('perfchecker.png')}" alt="PerfChecker"><span>PerfChecker · Connections and models</span></header><main id="advisor-root"></main><script nonce="${nonce}" src="${resource('advisor-panel.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorPanel(document.getElementById('advisor-root'),m=>api.postMessage(m),${data});window.addEventListener('message',e=>panel.receive(e.data));</script></body></html>`;
     this.panel.onDidDispose(() => {this.cancel(); this.panel = undefined;});
     webview.onDidReceiveMessage(async message => {
       try {
@@ -103,7 +110,7 @@ export class AdvisorSetup implements vscode.Disposable {
     const directory = await fs.mkdtemp(path.join(temporaryRoot, 'perfchecker-setup-'));
     try {
       const file = path.join(directory, 'request.json');
-      await fs.writeFile(file, JSON.stringify(input), {flag: 'wx'});
+      await fs.writeFile(file, JSON.stringify(input), {flag: 'wx', mode: 0o600});
       const settings = this.settings();
       const project = resolveControllerProject(this.root(), settings).project;
       return await new Promise((resolve, reject) => {

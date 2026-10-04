@@ -51,7 +51,7 @@ test('live provider requires the exact workspace quality and an owned provider',
   }
 });
 
-test('live provider archives a real RC bundle without a GPU', {
+test('live provider archives a real bundle without a GPU', {
   skip: !process.env.PERFCHECKER_TEST_CONTROLLER,
 }, async () => {
   const root = await fixture();

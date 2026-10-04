@@ -80,6 +80,8 @@ test('multi-root activation does not plan; explicit designer plans only the sele
         },
       },
       window: {
+        onDidCloseTerminal: () => ({dispose() {}}),
+        onDidChangeActiveTextEditor: () => ({dispose() {}}),
         createOutputChannel: () => ({show() {}, append() {}, appendLine() {}}),
         createTreeView: () => ({onDidChangeCheckboxState: () => ({})}),
         withProgress: (_options, callback) => callback(),

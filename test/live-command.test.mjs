@@ -32,6 +32,8 @@ test('explicit live command keeps multi-root quality and bundle separate from th
       EventEmitter: class {event=()=>undefined;fire(){}},workspace,
       Uri:{file:fsPath=>uri(fsPath)},
       window: {
+        onDidCloseTerminal: () => ({dispose() {}}),
+        onDidChangeActiveTextEditor: () => ({dispose() {}}),
         createOutputChannel:()=>({append(){},appendLine(){}}),
         createTreeView:()=>({onDidChangeCheckboxState:()=>({})}),
         withProgress:(_options,callback)=>callback({}, {
