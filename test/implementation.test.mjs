@@ -114,6 +114,37 @@ test('ordinary CRLF conversion preserves original on-disk bytes through apply an
   await applyImplementation(proposal);assert.equal(await fs.readFile(path.join(root,'line-endings.txt'),'utf8'),'candidate\r\n');
   await applyImplementation(proposal,true);assert.deepEqual(await fs.readFile(path.join(root,'line-endings.txt')),before);
 }));
+test('global and local text conversions never change checkpoint, checkout or restored bytes',()=>fixture(async root=>{
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'perfchecker-git-eol-test-'));
+  const configuration=path.join(directory,'global-config'), previous=process.env.GIT_CONFIG_GLOBAL;
+  try {
+    await fs.writeFile(configuration,'[core]\n\tautocrlf = true\n\teol = crlf\n');
+    process.env.GIT_CONFIG_GLOBAL=configuration;
+    for (const localConversion of ['true','false']) {
+      await git(root,'config','core.autocrlf',localConversion);
+      for (const attributes of ['', '*.jl text eol=crlf\n', '*.jl text eol=lf\n', '*.jl text=auto\n']) {
+      await fs.writeFile(path.join(root,'.gitattributes'),attributes);
+      for (const ending of ['\n','\r\n','\r\nsecond line\n']) {
+        const original=Buffer.from(`original${ending}`), candidate=Buffer.from(`optimized${ending}`);
+        await fs.writeFile(path.join(root,'source.jl'),original);
+        const head=await git(root,'rev-parse','HEAD'), index=await fs.readFile(path.join(root,'.git','index'));
+        const checkout=await createImplementationCheckout(root);let proposal;
+        try {
+          assert.deepEqual(await fs.readFile(path.join(checkout.workspace,'source.jl')),original);
+          await fs.writeFile(path.join(checkout.workspace,'source.jl'),candidate);proposal=await checkout.collect();
+        } finally {await checkout.dispose();}
+        await applyImplementation(proposal);assert.deepEqual(await fs.readFile(path.join(root,'source.jl')),candidate);
+        const recovered=await recoverImplementationProposal(root,proposal.backupRef,proposal.candidateRef,true);
+        await applyImplementation(recovered,true);assert.deepEqual(await fs.readFile(path.join(root,'source.jl')),original);
+        assert.equal(await git(root,'rev-parse','HEAD'),head);assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),index);
+      }
+      }
+    }
+  } finally {
+    if(previous===undefined)delete process.env.GIT_CONFIG_GLOBAL;else process.env.GIT_CONFIG_GLOBAL=previous;
+    await fs.rm(directory,{recursive:true,force:true});
+  }
+}));
 test('custom content filters and filters introduced by an agent are rejected before execution',()=>fixture(async root=>{
   await fs.writeFile(path.join(root,'.gitattributes'),'*.jl filter=unsafe\n');
   await git(root,'config','filter.unsafe.clean','this-executable-must-not-be-invoked');

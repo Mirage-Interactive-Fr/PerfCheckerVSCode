@@ -57,8 +57,29 @@ async function tree(root: string, directory: string, base?: string): Promise<str
       if (!['unspecified', 'unset'].includes(attributes[index + 2])) throw new Error('Implementation does not support Git clean/smudge filters, Git LFS, working-tree encodings or ident expansion. The on-disk backup cannot be guaranteed for these files.');
     }
     await git(root, ['add', '--all', '--', '.'], undefined, environment);
+    // A performance checkpoint records the bytes on disk, including LF/CRLF
+    // mixtures. Git's normal staging conversions must not change that backup.
+    const entries = (await git(root, ['ls-files', '--stage', '-z'], undefined, environment)).split('\0').filter(Boolean);
+    const rawEntries: string[] = [];
+    for (const entry of entries) {
+      const separator = entry.indexOf('\t'), metadata = entry.slice(0, separator).split(' '), file = entry.slice(separator + 1);
+      if (metadata[0] === '160000') continue; // The existing submodule guard rejects this tree.
+      const location = path.resolve(root, file), stat = await fs.lstat(location);
+      const bytes = stat.isSymbolicLink() ? Buffer.from(await fs.readlink(location)) : await fs.readFile(location);
+      const blob = (await git(root, ['hash-object', '-w', '--no-filters', '--stdin'], bytes)).trim();
+      rawEntries.push(`${metadata[0]} ${blob}\t${file}\0`);
+    }
+    await git(root, ['update-index', '-z', '--index-info'], rawEntries.join(''), environment);
     return (await git(root, ['write-tree'], undefined, environment)).trim();
   } finally {await fs.rm(index, {force: true}); await fs.rm(`${index}.lock`, {force: true});}
+}
+
+/** Overrides are confined to private Git metadata, never to the user's repository. */
+async function rawCheckoutAttributes(root: string): Promise<string> {
+  const attributes = path.join(root, '.git', 'info', 'attributes');
+  await fs.mkdir(path.dirname(attributes), {recursive: true});
+  await fs.writeFile(attributes, '* -text -filter -working-tree-encoding -ident\n');
+  return attributes;
 }
 async function commit(root: string, value: string, parent: string, message: string) {
   return (await git(root, ['commit-tree', value, '-p', parent], `${message}\n`, {
@@ -157,8 +178,11 @@ export async function createImplementationCheckout(workspace: string) {
     const checkout = path.join(directory, 'checkout'); await fs.mkdir(checkout);
     await git(checkout, ['init', '--quiet']);
     await git(checkout, ['config', 'core.hooksPath', path.join(directory, 'disabled-hooks')]);
+    await git(checkout, ['config', 'core.autocrlf', 'false']);
     await git(checkout, ['fetch', '--quiet', '--no-tags', repository, backupRef]);
-    await git(checkout, ['checkout', '--quiet', '--detach', base]);
+    const attributes = await rawCheckoutAttributes(checkout);
+    try {await git(checkout, ['checkout', '--quiet', '--detach', base]);}
+    finally {await fs.rm(attributes, {force: true});}
     const relative = path.relative(repository, workspace);
     const isolatedWorkspace = path.join(checkout, relative);
     const dispose = () => fs.rm(directory, {recursive: true, force: true});
@@ -190,7 +214,14 @@ export async function applyImplementation(proposal: ImplementationProposal, rest
     const current = await tree(proposal.repository, directory, expected);
     const expectedTree = (await git(proposal.repository, ['rev-parse', `${expected}^{tree}`])).trim();
     if (current !== expectedTree) throw new Error('Code changed since the proposal was prepared. Review those edits before applying or restoring. The Git checkpoint is retained.');
-    const args = ['apply', '--binary', '--whitespace=nowarn', ...(restore ? ['--reverse'] : [])];
+    // Apply the raw diff through private Git metadata so global/local text/eol
+    // attributes cannot silently rewrite bytes in the user's working tree.
+    const patchRepository = path.join(directory, 'patch'); await fs.mkdir(patchRepository);
+    await git(patchRepository, ['init', '--quiet']);
+    await git(patchRepository, ['config', 'core.autocrlf', 'false']);
+    await rawCheckoutAttributes(patchRepository);
+    const args = [`--git-dir=${path.join(patchRepository, '.git')}`, `--work-tree=${proposal.repository}`,
+      'apply', '--binary', '--whitespace=nowarn', ...(restore ? ['--reverse'] : [])];
     await git(proposal.repository, [...args, '--check', '-'], proposal.patchBytes);
     await git(proposal.repository, [...args, '-'], proposal.patchBytes);
     proposal.applied = !restore;

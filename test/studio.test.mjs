@@ -13,7 +13,7 @@ const disposable=()=>({dispose(){}});
 test('Studio is side effect free and scopes notebooks, terminals and Julia debugging to an explicit workspace',async()=>{
   const temporary=await mkdtemp(path.join(tmpdir(),'perfchecker-studio-'));
   const first={name:'first',uri:uri(path.join(temporary,'first'))};
-  const second={name:'second',uri:uri(path.join(temporary,'second $workspace "quotes"'))};
+  const second={name:'second',uri:uri(path.join(temporary,process.platform === 'win32' ? "second $workspace 'quotes'" : 'second $workspace "quotes"'))};
   const commands=new Map(),panels=[],terminals=[],notebooks=[],debugged=[],invocations=[],scopes=[];
   let closeTerminal,changeEditor,chosen,hasJulia=false;
   const vscode={

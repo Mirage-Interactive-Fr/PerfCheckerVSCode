@@ -124,8 +124,9 @@ Before sending implementation, the extension requires saved editor buffers, a Gi
 repository with an existing HEAD, no merge conflicts or submodules, and no absolute
 or external symlinks. Git clean/smudge/LFS filters, working-tree encodings and ident
 expansion are rejected before filter execution because their on-disk roundtrip
-cannot be guaranteed. Ordinary CRLF conversion is supported and tested. A copied
-temporary index snapshots on-disk tracked changes,
+cannot be guaranteed. LF, CRLF and mixed endings are preserved as exact on-disk
+bytes even with global/local Git text conversion and `text`/`eol` attributes.
+A copied temporary index records raw blobs without filters and snapshots tracked changes,
 non-ignored untracked files and ignored files already staged, without modifying
 HEAD or the real index. It retains a commit at
 `refs/perfchecker/checkpoints/<uuid>` and prepares a separate Git repository in the
@@ -139,7 +140,9 @@ to 32 MB. Apply/restore use its original bytes, including binary/non-UTF8 files;
 the text preview reports when replacement characters cannot represent those bytes.
 A separate **Apply reviewed changes** action checks that the entire checkpointed
 repository tree has not drifted, then applies the reviewed patch without updating
-staging or HEAD. **Restore previous code** uses the reverse patch and the same drift
+staging or HEAD. Patch application uses private temporary Git metadata with text
+conversion disabled; it does not edit the user's Git attributes or configuration.
+**Restore previous code** uses the reverse patch and the same drift
 guard, removing files introduced by that proposal and restoring previously deleted
 untracked files. Later unrelated repository edits also trigger the conservative
 drift rejection. Failed or cancelled requests never auto-apply a partial proposal.

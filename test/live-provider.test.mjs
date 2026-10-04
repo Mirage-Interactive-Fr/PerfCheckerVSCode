@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
 import {createRequire} from 'node:module';
-import {mkdtemp, mkdir, readFile, readdir, rm, writeFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -13,7 +13,7 @@ const qualities = 'schema = "beautiful-landscape-quality/1"\n[profiles.desktop-n
 const token = {isCancellationRequested: false, onCancellationRequested: () => ({dispose() {}})};
 
 async function fixture() {
-  const root = await mkdtemp(path.join(tmpdir(), 'perfchecker-live-'));
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'perfchecker-live-')));
   await mkdir(path.join(root, 'config'));
   await mkdir(path.join(root, 'perf'));
   await writeFile(path.join(root, 'EtenduGame.toml'), manifest);

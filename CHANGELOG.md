@@ -18,6 +18,8 @@
 - CSP-compatible allocation colors and normalized plots; one-source allocation
   charts render the full circle, and unavailable normalized ratios retain gaps.
 - Expanded unit, browser and real VS Code host qualification.
+- Exact Git recovery preserves LF, CRLF, mixed endings and non-UTF8 bytes under
+  Git text conversion settings; streamed Julia output preserves Unicode.
 
 Requires PerfChecker.jl 1.0.0 or later. Usage and configuration guides are part of
 the stable PerfChecker.jl documentation.
