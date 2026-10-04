@@ -68,7 +68,7 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await commands.get('perfchecker.newNotebook')(second.uri);
     assert.equal(notebooks[0].type,'jupyter-notebook');assert.equal(notebooks[0].data.cells.length,8);
     const code=notebooks[0].data.cells[1].value;
-    assert.match(code,/\\\$workspace/);assert.match(code,/\\"quotes\\"/);assert.doesNotMatch(code,/instantiate|Pkg.add/);
+    assert.match(code,/\\\$workspace/);assert.match(code,process.platform === 'win32' ? /'quotes'/ : /\\"quotes\\"/);assert.doesNotMatch(code,/instantiate|Pkg.add/);
     assert.equal(notebooks[0].data.metadata.metadata.language_info.name,'julia');
     assert.deepEqual(await readdir(second.uri.fsPath),['perf']);
     const terminal=await commands.get('perfchecker.openTerminal')(second.uri);
