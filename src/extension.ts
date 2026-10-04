@@ -1,13 +1,21 @@
+import { normalizedChart, type NormalizedPlot } from './normalized-plot';
 import * as vscode from 'vscode';
+import {randomUUID} from 'node:crypto';
 import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 import { createReadStream } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import * as readline from 'node:readline';
+import {registerInvestigations} from './investigation';
+import {registerNativeTestItems} from './testitems';
+import {registerStudio} from './studio';
+import {executeLiveProvider, prepareLiveProvider} from './live-provider';
+import {currentWorkspaceFolder, resolveControllerProject, resolveWorkspaceFolder,
+  selectWorkspaceFolder} from './workspace-root';
 import {
   ComparisonRecord, PlanRun, SuitePlan, SuiteRunOutput, VersionSeries,
   comparisonsForRuns, logicalFeature, moveRun, outputsForRuns, parseGitReference,
-  seriesForRuns,
+  seriesForRuns, testOutcome,
 } from './model';
 
 type NodeKind = 'package' | 'feature' | 'check' | 'run';
@@ -36,7 +44,9 @@ interface VersionSeriesFile {
   schema_version: string;
   run_id?: string;
   series: VersionSeries[];
+  plots?: NormalizedPlot[];
 }
+
 
 interface VersionComparisonFile {
   schema_version: string;
@@ -156,16 +166,18 @@ function quantile(sorted: number[], fraction: number): number {
 
 function distributionPlot(observations: ProfileObservation[], id: string): string {
   const sorted = observations.map(item => item.value).filter(finite).sort((a, b) => a - b);
-  if (!sorted.length) return '';
+  if (!sorted.length) return '<p class="muted">No finite numeric samples are available for this distribution.</p>';
   const minimum = sorted[0]; const maximum = sorted[sorted.length - 1];
   const q1 = quantile(sorted, .25); const median = quantile(sorted, .5); const q3 = quantile(sorted, .75);
   const width = 700; const height = 100; const padding = 18;
   const x = (value: number) => maximum === minimum ? width / 2 : padding + (value - minimum) * (width - padding * 2) / (maximum - minimum);
-  const sampled = sorted.length <= 320 ? sorted : sorted.filter((_, index) => index % Math.ceil(sorted.length / 320) === 0);
+  const sampled: {value: number; rank: number}[] = [];
+  const step = Math.max(1, Math.ceil(sorted.length / 320));
+  for (let index = 0; index < sorted.length; index += step) sampled.push({value: sorted[index], rank: index + 1});
   const unit = observations[0].unit;
-  const points = sampled.map((value, index) => {
-    const label = `${formatValue(value, '', unit)} · sample ${index + 1}/${sorted.length}`;
-    return `<circle class="sample hover-value" tabindex="0" data-detail="${html(label)}" data-target="${html(id)}" cx="${x(value)}" cy="${62 + (index % 5) * 5}" r="2.7"><title>${html(label)}</title></circle>`;
+  const points = sampled.map(({value, rank}, index) => {
+    const label = `${formatValue(value, '', unit)} · sorted sample ${rank}/${sorted.length}`;
+    return `<circle class="sample hover-value" tabindex="0" aria-label="${html(label)}" data-detail="${html(label)}" data-target="${html(id)}" cx="${x(value)}" cy="${62 + (index % 5) * 5}" r="2.7"><title>${html(label)}</title></circle>`;
   }).join('');
   const stats = `min ${formatValue(minimum, '', unit)} · Q1 ${formatValue(q1, '', unit)} · median ${formatValue(median, '', unit)} · Q3 ${formatValue(q3, '', unit)} · max ${formatValue(maximum, '', unit)}`;
   return `<svg class="distribution" viewBox="0 0 ${width} ${height}" role="img" aria-label="Sample distribution"><line class="whisker" x1="${x(minimum)}" x2="${x(maximum)}" y1="42" y2="42"></line><rect class="box" x="${x(q1)}" y="28" width="${Math.max(x(q3) - x(q1), 1)}" height="28"></rect><line class="median" x1="${x(median)}" x2="${x(median)}" y1="26" y2="58"></line>${points}</svg><pre class="plot-detail" id="${html(id)}">${html(stats)}</pre>`;
@@ -174,12 +186,13 @@ function distributionPlot(observations: ProfileObservation[], id: string): strin
 function allocationPlot(observations: ProfileObservation[], id: string): string {
   const values = new Map<string, number>();
   for (const observation of observations) {
+    if (!finite(observation.value) || observation.value <= 0) continue;
     const file = observation.attributes.source_file ?? observation.attributes.stack?.at(-1) ?? 'unknown';
     const label = observation.attributes.source_line ? `${file}:${observation.attributes.source_line}` : file;
     values.set(label, (values.get(label) ?? 0) + observation.value);
   }
   let entries = [...values.entries()].sort((a, b) => b[1] - a[1]);
-  if (!entries.length) return '';
+  if (!entries.length) return '<p class="muted">No positive allocation samples are available to calculate shares.</p>';
   if (entries.length > 14) {
     const other = entries.slice(13).reduce((sum, entry) => sum + entry[1], 0);
     entries = [...entries.slice(0, 13), ['Other lines', other]];
@@ -193,10 +206,11 @@ function allocationPlot(observations: ProfileObservation[], id: string): string 
     const x1 = 100 + 82 * Math.cos(angle); const y1 = 100 + 82 * Math.sin(angle);
     const x2 = 100 + 82 * Math.cos(next); const y2 = 100 + 82 * Math.sin(next);
     const detail = `${label}\n${formatBytes(value)} · ${(100 * value / total).toFixed(2)}%`;
-    const wedge = `<path class="pie-slice hover-value" tabindex="0" style="fill:${palette[index % palette.length]}" data-detail="${html(detail)}" data-target="${html(id)}" d="M100 100 L${x1} ${y1} A82 82 0 ${large} 1 ${x2} ${y2} Z"><title>${html(detail)}</title></path>`;
+    const geometry = entries.length === 1 ? 'M100 18 A82 82 0 1 1 100 182 A82 82 0 1 1 100 18 Z' : `M100 100 L${x1} ${y1} A82 82 0 ${large} 1 ${x2} ${y2} Z`;
+    const wedge = `<path class="pie-slice hover-value" tabindex="0" aria-label="${html(detail)}" fill="${palette[index % palette.length]}" data-detail="${html(detail)}" data-target="${html(id)}" d="${geometry}"><title>${html(detail)}</title></path>`;
     angle = next; return wedge;
   }).join('');
-  const legend = entries.map(([label, value], index) => `<li><i style="background:${palette[index % palette.length]}"></i><span title="${html(label)}">${html(path.basename(label))}</span><b>${(100 * value / total).toFixed(1)}%</b></li>`).join('');
+  const legend = entries.map(([label, value], index) => `<li><svg width="12" height="12" aria-hidden="true"><rect width="12" height="12" fill="${palette[index % palette.length]}"/></svg><span title="${html(label)}">${html(path.basename(label))}</span><b>${(100 * value / total).toFixed(1)}%</b></li>`).join('');
   return `<div class="allocation-layout"><svg class="pie" viewBox="0 0 200 200" role="img" aria-label="Allocation share">${wedges}</svg><ol class="allocation-legend">${legend}</ol></div><pre class="plot-detail" id="${html(id)}">Hover or focus a slice to inspect its source line.</pre>`;
 }
 
@@ -237,7 +251,7 @@ function flameGraph(observations: ProfileObservation[], id: string): string {
       parent = node;
     }
   }
-  if (!root.value) return '';
+  if (!root.value) return '<p class="muted">No positive profile weights are available for this call stack.</p>';
   const rows: string[] = [];
   let maximumDepth = 0; let rendered = 0;
   const width = 1000; const rowHeight = 25;
@@ -265,7 +279,7 @@ function flameGraph(observations: ProfileObservation[], id: string): string {
     visit(child, cursor, span, 0); cursor += span;
   }
   const truncated = rendered >= 1800 ? '<p class="notice">View limited to 1,800 frames. Open a single test for full detail.</p>' : '';
-  return `<div class="flame-wrap"><svg class="flame" viewBox="0 0 ${width} ${(maximumDepth + 1) * rowHeight}" role="img">${rows.join('')}</svg></div><pre class="flame-detail" id="${html(id)}">Hover or focus a frame to inspect it.</pre>${truncated}`;
+  return `<div class="flame-wrap"><svg class="flame" viewBox="0 0 ${width} ${(maximumDepth + 1) * rowHeight}" role="img" aria-label="Profile call stacks weighted by ${html(observations[0].metric)}">${rows.join('')}</svg></div><pre class="flame-detail" id="${html(id)}">Hover or focus a frame to inspect it.</pre>${truncated}`;
 }
 
 class PerfNode {
@@ -352,9 +366,14 @@ class PlanTree implements vscode.TreeDataProvider<PerfNode>, vscode.TreeDragAndD
 class Controller {
   private readonly output = vscode.window.createOutputChannel('PerfChecker');
   private designer?: vscode.WebviewPanel;
+  private designerBusy = false;
   private resultsPanel?: vscode.WebviewPanel;
   private plan?: SuitePlan;
   private uiConfiguration?: any;
+  private selectedWorkspace?: vscode.Uri;
+  private workspaceOperations = 0;
+  private readonly preparations = new Map<string, Promise<void>>();
+  private readonly readyControllers = new Set<string>();
 
   constructor(private readonly context: vscode.ExtensionContext, readonly tree: PlanTree,
     private readonly tests: vscode.TestController) {}
@@ -362,22 +381,45 @@ class Controller {
   reportError(error: unknown): void { this.output.appendLine(String(error)); }
   showLog(): void { this.output.show(true); }
 
+  private folder(): vscode.WorkspaceFolder {
+    const folder = currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);
+    if (this.selectedWorkspace?.toString() !== folder.uri.toString()) {
+      if (this.workspaceOperations > 0) throw new Error('Wait for the active PerfChecker suite action before changing folders.');
+      this.selectedWorkspace = folder.uri;
+      this.plan = undefined;
+      this.uiConfiguration = undefined;
+      this.tree.refresh();
+      this.tests.items.replace([]);
+      this.designer?.dispose(); this.designer = undefined;
+      this.resultsPanel?.dispose(); this.resultsPanel = undefined;
+    }
+    return folder;
+  }
+
+  private selectWorkspace(requested?: vscode.Uri | vscode.WorkspaceFolder): void {
+    if (requested !== undefined) selectWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders, requested);
+    this.folder();
+  }
+
+  private async inWorkspace<T>(action: () => Promise<T>): Promise<T> {
+    this.folder(); this.workspaceOperations += 1;
+    try {return await action();} finally {this.workspaceOperations -= 1;}
+  }
+
   private root(): string {
-    const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) throw new Error('Open a package workspace first.');
-    return folder.uri.fsPath;
+    return this.folder().uri.fsPath;
   }
 
   private setting(name: string): string {
-    return vscode.workspace.getConfiguration('perfchecker').get<string>(name)!;
+    return vscode.workspace.getConfiguration('perfchecker', this.folder().uri).get<string>(name)!;
   }
 
   private gitTargets(): GitTarget[] {
-    return vscode.workspace.getConfiguration('perfchecker').get<GitTarget[]>('gitTargets', []);
+    return vscode.workspace.getConfiguration('perfchecker', this.folder().uri).get<GitTarget[]>('gitTargets', []);
   }
 
   private effectiveGitTargets(): GitTarget[] {
-    const inspected = vscode.workspace.getConfiguration('perfchecker').inspect<GitTarget[]>('gitTargets');
+    const inspected = vscode.workspace.getConfiguration('perfchecker', this.folder().uri).inspect<GitTarget[]>('gitTargets');
     const explicitlyConfigured = inspected?.workspaceFolderValue !== undefined ||
       inspected?.workspaceValue !== undefined || inspected?.globalValue !== undefined;
     return explicitlyConfigured ? this.gitTargets() : (this.uiConfiguration?.targets ?? this.gitTargets());
@@ -460,11 +502,11 @@ class Controller {
   }
 
   private comparisonPolicies(): ComparisonPolicyConfig[] {
-    return vscode.workspace.getConfiguration('perfchecker').get<ComparisonPolicyConfig[]>('comparisonPolicies', []);
+    return vscode.workspace.getConfiguration('perfchecker', this.folder().uri).get<ComparisonPolicyConfig[]>('comparisonPolicies', []);
   }
 
   private effectiveComparisonPolicies(): ComparisonPolicyConfig[] {
-    const inspected = vscode.workspace.getConfiguration('perfchecker').inspect<ComparisonPolicyConfig[]>('comparisonPolicies');
+    const inspected = vscode.workspace.getConfiguration('perfchecker', this.folder().uri).inspect<ComparisonPolicyConfig[]>('comparisonPolicies');
     const explicitlyConfigured = inspected?.workspaceFolderValue !== undefined ||
       inspected?.workspaceValue !== undefined || inspected?.globalValue !== undefined;
     return explicitlyConfigured ? this.comparisonPolicies() :
@@ -479,18 +521,55 @@ class Controller {
     return path.resolve(this.root(), this.setting(setting));
   }
 
+  private controllerProject() {
+    return resolveControllerProject(this.root(),
+      vscode.workspace.getConfiguration('perfchecker', this.folder().uri));
+  }
+
+  private async prepareController(project: string): Promise<void> {
+    if (this.readyControllers.has(project)) return;
+    let pending = this.preparations.get(project);
+    if (!pending) {
+      const executable = this.setting('juliaExecutable');
+      pending = Promise.resolve(vscode.window.withProgress({location: vscode.ProgressLocation.Notification,
+        title: 'PerfChecker: preparing controller', cancellable: false}, async () => {
+        this.output.show(true);
+        this.output.appendLine(`Preparing PerfChecker controller: ${project}`);
+        this.output.appendLine(`> ${executable} --startup-file=no --project=${JSON.stringify(project)} -e "using Pkg; Pkg.instantiate()"`);
+        const code = await new Promise<number>((resolve, reject) => {
+          const child = spawn(executable, ['--startup-file=no', `--project=${project}`,
+            '-e', 'using Pkg; Pkg.instantiate()'], {cwd: project, windowsHide: true,
+            env: {...process.env, JULIA_LOAD_PATH: ['@', '@stdlib'].join(path.delimiter),
+              JULIA_PKG_PRECOMPILE_AUTO: '0'}});
+          child.stdout.on('data', value => this.output.append(String(value)));
+          child.stderr.on('data', value => this.output.append(String(value)));
+          child.on('error', reject);
+          child.on('close', value => resolve(value ?? 2));
+        });
+        if (code !== 0) throw new Error(`PerfChecker controller preparation failed (exit ${code}). Check PerfChecker output and the dependencies/sources in ${path.join(project, 'Project.toml')}, then retry.`);
+        this.readyControllers.add(project);
+        this.output.appendLine(`PerfChecker controller ready: ${project}`);
+      })).finally(() => { this.preparations.delete(project); });
+      this.preparations.set(project, pending);
+    }
+    await pending;
+  }
+
   private async invoke(command: string, args: string[], progress?: (value: any) => void,
     emitted?: (value: string) => void): Promise<number> {
     const executable = this.setting('juliaExecutable');
-    const project = this.absolute('runnerProject');
+    const controller = this.controllerProject();
+    const project = controller.project;
     const juliaArgs = [
       '--startup-file=no', `--project=${project}`,
       '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', command, ...args,
     ];
     this.output.show(true);
+    this.output.appendLine(`Controller project: ${project} (${controller.reason})`);
     this.output.appendLine(`> ${executable} ${juliaArgs.map(value => JSON.stringify(value)).join(' ')}`);
     return await new Promise<number>((resolve, reject) => {
-      const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true});
+      const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true,
+        env: {...process.env, JULIA_LOAD_PATH: ['@', '@stdlib'].join(path.delimiter)}});
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
       let pending = '';
@@ -515,13 +594,27 @@ class Controller {
   }
 
   async refresh(): Promise<void> {
+    return this.inWorkspace(() => this.refreshPlan());
+  }
+
+  private async refreshPlan(): Promise<void> {
+    const workspace = this.folder().uri.toString();
+    const controller = this.controllerProject();
+    const suite = this.absolute('suite');
+    if (!(await fs.stat(suite).catch(() => undefined))?.isFile()) {
+      throw new Error(`PerfChecker suite file not found at ${suite}. Check perfchecker.suite for this folder.`);
+    }
+    await this.prepareController(controller.project);
+    if (this.folder().uri.toString() !== workspace) {
+      throw new Error('PerfChecker workspace changed during controller preparation. Choose the folder again.');
+    }
     await vscode.window.withProgress({location: vscode.ProgressLocation.Window, title: 'PerfChecker: planning'}, async () => {
       await fs.mkdir(this.context.globalStorageUri.fsPath, {recursive: true});
       try { this.uiConfiguration = JSON.parse(await fs.readFile(this.absolute('uiConfiguration'), 'utf8')); }
       catch { this.uiConfiguration = undefined; }
       const output = path.join(this.context.globalStorageUri.fsPath, 'suite-plan.json');
       const code = await this.invoke('plan', [
-        `--suite=${this.absolute('suite')}`, `--factory=${this.setting('factory')}`,
+        `--suite=${suite}`, `--factory=${this.setting('factory')}`,
         `--profile=${this.setting('profile')}`, `--output=${output}`,
         ...this.candidateArguments(),
         ...this.comparisonArguments(),
@@ -529,6 +622,7 @@ class Controller {
       if (code !== 0) throw new Error(`PerfChecker plan failed with code ${code}.`);
       const plan = JSON.parse(await fs.readFile(output, 'utf8')) as SuitePlan;
       if (plan.schema_version !== 'perfchecker-suite-plan/1') throw new Error('Unsupported suite plan.');
+      if (this.folder().uri.toString() !== workspace) throw new Error('PerfChecker workspace changed during planning. Choose the folder again.');
       this.plan = plan;
       this.tree.refresh(plan);
       try {
@@ -583,9 +677,14 @@ class Controller {
   }
 
   async runTests(request: vscode.TestRunRequest): Promise<void> {
+    return this.inWorkspace(() => this.runSelectedTests(request));
+  }
+
+  private async runSelectedTests(request: vscode.TestRunRequest): Promise<void> {
     if (!this.plan) await this.refresh();
-    const excluded = new Set(this.collectTestIds(request.exclude));
-    const ids = this.collectTestIds(request.include).filter(id => !excluded.has(id));
+    const excluded = new Set(this.collectTestIds(request.exclude ?? []));
+    const ids = [...new Set(this.collectTestIds(request.include).filter(id => !excluded.has(id)))];
+    if (!ids.length) return;
     const items = new Map<string, vscode.TestItem>();
     const index = (item: vscode.TestItem) => {
       items.set(item.id, item); item.children.forEach(index);
@@ -595,11 +694,12 @@ class Controller {
     ids.forEach(id => { const item = items.get(id); if (item) run.enqueued(item); });
     const started = new Set<string>();
     let currentItem: vscode.TestItem | undefined;
+    const reports = path.join(this.absolute('reports'), 'test-runs', randomUUID());
     try {
       const args = [
         `--suite=${this.absolute('suite')}`, `--factory=${this.setting('factory')}`,
         `--profile=${this.setting('profile')}`,
-        `--reports=${this.absolute('reports')}`, '--progress=jsonl',
+        `--reports=${reports}`, '--progress=jsonl',
         ...this.candidateArguments(),
         ...this.comparisonArguments(),
         ...ids.flatMap(id => [`--run-id=${id}`]),
@@ -612,12 +712,18 @@ class Controller {
         }
         currentItem = current ? items.get(current) : currentItem;
       }, text => run.appendOutput(text, undefined, currentItem));
+      let evidence: SuiteResultFile | undefined;
+      try { evidence = JSON.parse(await fs.readFile(path.join(reports, 'suite-result.json'), 'utf8')); }
+      catch { /* Never infer qualification from a process exit or an older report. */ }
       for (const id of ids) {
         const item = items.get(id); if (!item) continue;
         const planned = this.plan?.runs.find(candidate => candidate.id === id);
-        if (planned?.status !== 'ready') run.skipped(item);
-        else if (code === 0) run.passed(item);
-        else run.failed(item, new vscode.TestMessage(`Inspect the PerfChecker report; the suite exited with code ${code}.`));
+        const outcome = testOutcome(planned!, evidence?.schema_version === 'perfchecker-suite-result/1' ? evidence.runs : undefined);
+        const message = new vscode.TestMessage(`${outcome.message} Suite exit: ${code}. Report: ${reports}`);
+        if (outcome.state === 'passed') run.passed(item);
+        else if (outcome.state === 'failed') run.failed(item, message);
+        else if (outcome.state === 'errored') run.errored(item, message);
+        else {run.skipped(item); run.appendOutput(`${id}: ${outcome.message}\r\n`, undefined, item);}
       }
     } catch (error) {
       for (const id of ids) {
@@ -637,9 +743,24 @@ class Controller {
   }
 
   async run(node?: PerfNode, explicitIds?: string[], revealOutput = false): Promise<void> {
+    return this.inWorkspace(() => this.runSelection(node, explicitIds, revealOutput));
+  }
+
+  async runAll(): Promise<void> {
+    return this.inWorkspace(async () => {
+      if (!this.plan) await this.refresh();
+      await this.runSelection(undefined, this.plan!.runs.map(run => run.id));
+    });
+  }
+
+  private async runSelection(node?: PerfNode, explicitIds?: string[], revealOutput = false): Promise<void> {
     if (!this.plan) await this.refresh();
     const ids = explicitIds ?? this.ids(node);
     if (!ids.length) throw new Error('Select at least one run.');
+    const current = new Map(this.plan!.runs.map(run => [run.id, run]));
+    if (ids.some(id => !current.has(id)) || node?.runs.some(run => current.get(run.id)?.entrypoint !== run.entrypoint)) {
+      throw new Error('This selection belongs to an earlier plan or workspace. Refresh and select current runs.');
+    }
     await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: `PerfChecker · ${ids.length} run(s)`, cancellable: false,
@@ -670,7 +791,15 @@ class Controller {
   }
 
   async open(nodeOrRun: PerfNode | PlanRun): Promise<void> {
+    return this.inWorkspace(() => this.openSelection(nodeOrRun));
+  }
+
+  private async openSelection(nodeOrRun: PerfNode | PlanRun): Promise<void> {
+    if (!this.plan) await this.refresh();
     const run = nodeOrRun instanceof PerfNode ? nodeOrRun.runs[0] : nodeOrRun;
+    if (!run || this.plan!.runs.find(item => item.id === run.id)?.entrypoint !== run.entrypoint) {
+      throw new Error('This source selection belongs to an earlier plan or workspace. Refresh and select current runs.');
+    }
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(run.entrypoint));
     await vscode.window.showTextDocument(document, {preview: true});
   }
@@ -736,6 +865,7 @@ class Controller {
     versionFile?: VersionSeriesFile, comparisonFile?: VersionComparisonFile,
     observations: ProfileObservation[] = []): string {
     const nonce = this.nonce();
+    const logo = this.resultsPanel!.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.png'));
     const outputs = outputsForRuns(suite?.runs ?? [], runs);
     const selectedVersions = new Set(runs.map(run => run.version));
     const series = seriesForRuns(versionFile?.series ?? [], runs);
@@ -751,6 +881,13 @@ class Controller {
       `data-version="${html(version)}" data-status="${html(status)}" ` +
       `data-search="${html(search.toLowerCase())}"`;
     const counts = new Map<string, number>();
+    const overlayCards = (versionFile?.plots ?? []).filter(plot => plot.kind === 'normalized_metrics' &&
+      runs.some(run => run.package === plot.options.package && run.feature === plot.options.feature)).map((plot, index) => {
+      const backend = definitionBackend(plot.options.collector);
+      const attributes = filterAttributes('series', plot.options.package, plot.options.workload, backend,
+        plot.options.reference_version, '', plot.title);
+      return `<article class="chart-card" ${attributes}><h3>${html(plot.title)}</h3>${normalizedChart(plot, `normalized-${index}`)}</article>`;
+    }).join('');
     outputs.forEach(output => counts.set(output.status, (counts.get(output.status) ?? 0) + 1));
     const countCards = [...counts.entries()].map(([status, count]) =>
       `<div class="stat ${html(status)}"><strong>${count}</strong><span>${html(status)}</span></div>`).join('');
@@ -784,11 +921,11 @@ class Controller {
     }).join('');
     const groups = new Map<string, ProfileObservation[]>();
     for (const observation of observations.filter(item => Array.isArray(item.attributes.stack))) {
-      const key = `${observation.case_id}|${observation.target_id}|${observation.measurement_definition}`;
+      const key = JSON.stringify([observation.case_id, observation.target_id, observation.measurement_definition]);
       const group = groups.get(key) ?? []; group.push(observation); groups.set(key, group);
     }
     const flames = [...groups.entries()].slice(0, 24).map(([key, group], index) => {
-      const [caseId, version, definition] = key.split('|');
+      const [caseId, version, definition] = JSON.parse(key) as string[];
       const label = definition.includes('profile-allocs') ? 'Allocation flame graph' :
         definition.includes('walltime') ? 'Wall-time flame graph' : 'CPU flame graph';
       const packageName = group[0].attributes.package ?? '';
@@ -799,11 +936,11 @@ class Controller {
     }).join('');
     const distributions = new Map<string, ProfileObservation[]>();
     for (const observation of observations.filter(item => !item.measurement_definition.includes('profile-') && !item.measurement_definition.includes('line-tracking'))) {
-      const key = `${observation.case_id}|${observation.target_id}|${observation.measurement_definition}`;
+      const key = JSON.stringify([observation.case_id, observation.target_id, observation.measurement_definition]);
       const group = distributions.get(key) ?? []; group.push(observation); distributions.set(key, group);
     }
     const distributionCards = [...distributions.entries()].slice(0, 48).map(([key, group], index) => {
-      const [caseId, version, definition] = key.split('|');
+      const [caseId, version, definition] = JSON.parse(key) as string[];
       const collector = definition.includes('chairmarks') ? 'Chairmarks' : definition.includes('benchmarktools') ? 'BenchmarkTools' : 'Samples';
       const packageName = group[0].attributes.package ?? '';
       const backend = definitionBackend(definition);
@@ -813,11 +950,11 @@ class Controller {
     }).join('');
     const allocationGroups = new Map<string, ProfileObservation[]>();
     for (const observation of observations.filter(item => item.metric === 'julia.alloc.bytes' && (item.measurement_definition.includes('profile-allocs') || item.measurement_definition.includes('line-tracking')))) {
-      const key = `${observation.case_id}|${observation.target_id}|${observation.measurement_definition}`;
+      const key = JSON.stringify([observation.case_id, observation.target_id, observation.measurement_definition]);
       const group = allocationGroups.get(key) ?? []; group.push(observation); allocationGroups.set(key, group);
     }
     const allocations = [...allocationGroups.entries()].slice(0, 24).map(([key, group], index) => {
-      const [caseId, version, definition] = key.split('|');
+      const [caseId, version, definition] = JSON.parse(key) as string[];
       const packageName = group[0].attributes.package ?? '';
       const backend = definitionBackend(definition);
       const workload = group[0].attributes.workload ?? logicalFeature({feature: group[0].attributes.feature ?? caseId, backend});
@@ -828,17 +965,25 @@ class Controller {
       .map(value => `<option value="${html(value)}">${html(value)}</option>`).join('');
     const checkOptions = [...new Set(runs.map(run => run.backend))].sort()
       .map(value => `<option value="${html(value)}">${html(checkLabel(value))}</option>`).join('');
-    const filters = `<section class="result-filters"><label>Search<input id="result-search" type="search" placeholder="Feature, metric, version…"></label><label>Package<select id="result-package"><option value="">All packages</option>${optionList(runs.map(run => run.package))}</select></label><label>Feature<select id="result-workload"><option value="">All features</option>${optionList(runs.map(logicalFeature))}</select></label><label>Check<select id="result-backend"><option value="">All checks</option>${checkOptions}</select></label><label>View<select id="result-kind"><option value="">All views</option><option value="run">Run summaries</option><option value="distribution">Distributions</option><option value="allocation">Allocations</option><option value="flame">Flame graphs</option><option value="series">Version series</option><option value="comparison">Comparisons</option></select></label><label>Status<select id="result-status"><option value="">All statuses</option><option value="pass">Pass</option><option value="error">Error</option><option value="unavailable">Unavailable</option><option value="regression">Regression</option><option value="diagnostic">Diagnostic</option></select></label><label>Sort<select id="result-sort"><option value="name">Name</option><option value="version">Version</option><option value="status">Status</option></select></label><strong id="visible-count"></strong></section>`;
+    const filters = `<section class="result-filters"><label>Search<input id="result-search" type="search" placeholder="Feature, metric, version…"></label><label>Package<select id="result-package"><option value="">All packages</option>${optionList(runs.map(run => run.package))}</select></label><label>Feature<select id="result-workload"><option value="">All features</option>${optionList(runs.map(logicalFeature))}</select></label><label>Check<select id="result-backend"><option value="">All checks</option>${checkOptions}</select></label><label>View<select id="result-kind"><option value="">All views</option><option value="run">Run summaries</option><option value="distribution">Distributions</option><option value="allocation">Allocations</option><option value="flame">Flame graphs</option><option value="series">Version series</option><option value="comparison">Comparisons</option></select></label><label>Status<select id="result-status"><option value="">All statuses</option><option value="pass">Pass</option><option value="error">Error</option><option value="unavailable">Unavailable</option><option value="regression">Regression</option><option value="diagnostic">Diagnostic</option></select></label><label>Sort<select id="result-sort"><option value="name">Name</option><option value="version">Version</option><option value="status">Status</option></select></label><strong id="visible-count" role="status" aria-live="polite"></strong></section>`;
     const empty = !suite ? `<section class="empty"><h2>No persisted output yet</h2><p>Run this selection first. PerfChecker will write results to <code>${html(this.absolute('reports'))}</code>.</p></section>` :
       !outputs.length ? `<section class="empty"><h2>No matching output</h2><p>The report exists, but it does not contain this package, feature or version. Run this node to refresh it.</p></section>` : '';
-    return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'"><style nonce="${nonce}">
-      :root{color-scheme:light dark;font-family:var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-editor-background)}body{margin:0;padding:24px}.top,.toolbar,.summary,.result-card header,.chart-card header,.flame-card header{display:flex;align-items:center}.top{justify-content:space-between;gap:20px}.top h1{margin:.2rem 0}.eyebrow{letter-spacing:.15em;color:var(--vscode-descriptionForeground);font-size:11px}.toolbar{gap:8px;flex-wrap:wrap}button{cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;border-radius:4px;padding:7px 10px}.meta,.muted,small{color:var(--vscode-descriptionForeground)}.summary{gap:10px;margin:20px 0;flex-wrap:wrap}.stat{min-width:72px;padding:10px 14px;border:1px solid var(--vscode-panel-border);border-radius:6px;display:grid}.stat strong{font-size:20px}.result-filters{position:sticky;top:0;z-index:5;display:grid;grid-template-columns:minmax(190px,2fr) repeat(6,minmax(110px,1fr));gap:8px;align-items:end;margin:18px 0;padding:12px;border:1px solid var(--vscode-panel-border);border-radius:7px;background:var(--vscode-editor-background)}.result-filters label{display:grid;gap:4px;font-size:11px;color:var(--vscode-descriptionForeground)}.result-filters input,.result-filters select{min-width:0;padding:6px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border)}#visible-count{padding:7px;white-space:nowrap}.result-list,.chart-grid,.flame-grid{display:grid;gap:12px}.chart-grid{grid-template-columns:repeat(auto-fit,minmax(350px,1fr))}.result-card,.chart-card,.flame-card,.empty{border:1px solid var(--vscode-panel-border);border-radius:7px;padding:14px;background:var(--vscode-sideBar-background)}.result-card header,.chart-card header,.flame-card header{justify-content:space-between;gap:12px}.result-card header>div,.chart-card header>div,.flame-card header>div{display:grid;gap:3px}.status{font-size:11px;padding:3px 7px;border-radius:999px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground)}.status.pass,.stat.pass{border-color:var(--vscode-testing-iconPassed)}.status.error,.status.fail,.stat.error{border-color:var(--vscode-testing-iconFailed)}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin-top:12px}.metrics>div{display:grid;border-left:2px solid var(--vscode-focusBorder);padding-left:8px}.metrics span{color:var(--vscode-descriptionForeground);font-size:11px;text-transform:capitalize}.message,.notice{padding:8px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-textBlockQuote-border)}section h2{margin-top:28px}.spark,.distribution{width:100%;height:110px;overflow:visible}.spark polyline{fill:none;stroke:var(--vscode-charts-blue);stroke-width:2}.spark .point,.sample{fill:var(--vscode-charts-blue)}.spark .point.current{fill:var(--vscode-charts-orange);stroke:var(--vscode-editor-background);stroke-width:2}.hover-value{outline:none;cursor:crosshair}.hover-value:hover,.hover-value:focus{stroke:var(--vscode-focusBorder);stroke-width:3;filter:brightness(1.18)}.distribution .whisker,.distribution .median{stroke:var(--vscode-foreground);stroke-width:2}.distribution .box{fill:var(--vscode-charts-blue);fill-opacity:.28;stroke:var(--vscode-charts-blue)}.plot-detail,.flame-detail{white-space:pre-wrap;min-height:34px;padding:7px;background:var(--vscode-textCodeBlock-background);border-radius:4px}.version-values{display:flex;gap:6px;flex-wrap:wrap}.version-values span{font-size:11px;padding:3px 6px;background:var(--vscode-badge-background);border-radius:4px}.version-values .current{outline:2px solid var(--vscode-focusBorder)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--vscode-panel-border)}.table-wrap,.flame-wrap{overflow:auto}.delta.worse{color:var(--vscode-testing-iconFailed)}.delta.better{color:var(--vscode-testing-iconPassed)}.flame-card{margin-bottom:12px}.flame{min-width:800px;width:100%;height:auto}.flame-node{outline:none}.flame-node rect{fill:var(--vscode-charts-blue);stroke:var(--vscode-editor-background);stroke-width:.6}.flame-node.dynamic rect{fill:var(--vscode-charts-red)}.flame-node.unstable rect{fill:var(--vscode-charts-purple)}.flame-node.gc rect{fill:var(--vscode-charts-orange)}.flame-node:hover rect,.flame-node:focus rect{stroke:var(--vscode-focusBorder);stroke-width:2;filter:brightness(1.2)}.flame-node text{font-size:11px;fill:var(--vscode-editor-foreground);pointer-events:none}.legend{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 16px}.legend i,.allocation-legend i{display:inline-block;width:12px;height:12px;margin-right:5px;vertical-align:-2px}.legend .normal{background:var(--vscode-charts-blue)}.legend .dynamic{background:var(--vscode-charts-red)}.legend .unstable{background:var(--vscode-charts-purple)}.legend .gc{background:var(--vscode-charts-orange)}.allocation-layout{display:grid;grid-template-columns:190px 1fr;gap:12px;align-items:center}.pie{width:190px;height:190px}.allocation-legend{list-style:none;margin:0;padding:0;display:grid;gap:5px}.allocation-legend li{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:5px;align-items:center}.allocation-legend span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}[hidden]{display:none!important}code{user-select:all}@media(max-width:1100px){.result-filters{grid-template-columns:repeat(4,minmax(120px,1fr))}}@media(max-width:700px){body{padding:14px}.top{align-items:flex-start;flex-direction:column}.result-filters{position:static;grid-template-columns:1fr 1fr}.chart-grid{grid-template-columns:1fr}.allocation-layout{grid-template-columns:1fr}}
-    </style></head><body><header class="top"><div><div class="eyebrow">PERFCHECKER OUTPUT</div><h1>${html(title)}</h1><div class="meta">${suite ? `${html(suite.suite)} · ${html(suite.profile)} · ${html(suite.finished_at)}` : html(this.absolute('reports'))}</div></div><div class="toolbar"><button data-report="suite-report.md">Summary</button><button data-report="suite-result.json">JSON</button><button data-report="version-comparison.md">Comparisons</button><button data-report="version-series.json">Series JSON</button></div></header>${empty}${suite ? filters : ''}${suite ? `<div class="summary">${countCards}<div class="stat"><strong>${outputs.length}</strong><span>runs</span></div></div>` : ''}${distributionCards ? `<section><h2>Benchmark and measurement distributions</h2><div class="chart-grid">${distributionCards}</div></section>` : ''}${allocations ? `<section><h2>Allocation views</h2><div class="chart-grid">${allocations}</div></section>` : ''}${flames ? `<section><h2>Flame graphs</h2><div class="legend"><span><i class="normal"></i>Normal</span><span><i class="dynamic"></i>Runtime dispatch</span><span><i class="unstable"></i>Non-concrete inference</span><span><i class="gc"></i>GC</span></div><div class="flame-grid">${flames}</div></section>` : ''}${runCards ? `<section><h2>Run output</h2><div class="result-list">${runCards}</div></section>` : ''}${seriesCards ? `<section><h2>Version series</h2><div class="chart-grid">${seriesCards}</div></section>` : ''}${comparisonRows ? `<section><h2>Version comparisons</h2>${comparisons.length > visibleComparisons.length ? `<p class="notice">Showing ${visibleComparisons.length} of ${comparisons.length} comparisons. Open the Markdown report for all records.</p>` : ''}<div class="table-wrap"><table><thead><tr><th>Check</th><th>Metric</th><th>Versions</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Status</th></tr></thead><tbody>${comparisonRows}</tbody></table></div></section>` : ''}<script nonce="${nonce}">const vscode=acquireVsCodeApi();document.querySelectorAll('[data-report]').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:'report',name:button.dataset.report})));document.querySelectorAll('.flame-node,.hover-value').forEach(node=>{const show=()=>{const target=document.getElementById(node.dataset.target);if(target)target.textContent=node.dataset.detail};node.addEventListener('mouseenter',show);node.addEventListener('focus',show)});const controls=['result-search','result-package','result-workload','result-backend','result-kind','result-status','result-sort'].map(id=>document.getElementById(id)).filter(Boolean);const apply=()=>{const value=id=>document.getElementById(id)?.value||'';const query=value('result-search').trim().toLowerCase();const fields={package:value('result-package'),workload:value('result-workload'),backend:value('result-backend'),kind:value('result-kind'),status:value('result-status')};const items=[...document.querySelectorAll('[data-result-item]')];for(const item of items){const matches=(!query||item.dataset.search.includes(query))&&Object.entries(fields).every(([key,expected])=>!expected||item.dataset[key]===expected);item.hidden=!matches}const mode=value('result-sort');for(const container of document.querySelectorAll('.result-list,.chart-grid,.flame-grid,tbody')){[...container.children].sort((a,b)=>{const key=mode==='version'?'version':mode==='status'?'status':'search';return(a.dataset[key]||'').localeCompare(b.dataset[key]||'',undefined,{numeric:true})}).forEach(item=>container.appendChild(item))}const sections=new Set(items.map(item=>item.closest('section')).filter(Boolean));for(const section of sections)section.hidden=![...section.querySelectorAll('[data-result-item]')].some(item=>!item.hidden);const visible=items.filter(item=>!item.hidden).length;const counter=document.getElementById('visible-count');if(counter)counter.textContent=visible+' / '+items.length};controls.forEach(control=>control.addEventListener('input',apply));apply();</script></body></html>`;
+    return `<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${this.resultsPanel!.webview.cspSource}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'"><style nonce="${nonce}">
+      :root{color-scheme:light dark;font-family:var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-editor-background)}body{margin:0;padding:28px;max-width:1560px;margin:auto}*{box-sizing:border-box}.brand-heading{display:flex;align-items:center;gap:18px}.brand-heading>img{width:72px;height:72px;object-fit:contain}.normalized-legend{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px}.normalized-chart{display:block}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--vscode-focusBorder);outline-offset:2px}.top,.toolbar,.summary,.result-card header,.chart-card header,.flame-card header{display:flex;align-items:center}.top{justify-content:space-between;gap:20px}.top h1{margin:.2rem 0}.eyebrow{letter-spacing:.15em;color:var(--vscode-descriptionForeground);font-size:11px}.toolbar{gap:8px;flex-wrap:wrap}button{cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;border-radius:4px;padding:7px 10px}.meta,.muted,small{color:var(--vscode-descriptionForeground)}.summary{gap:10px;margin:20px 0;flex-wrap:wrap}.stat{min-width:72px;padding:10px 14px;border:1px solid var(--vscode-panel-border);border-radius:6px;display:grid}.stat strong{font-size:20px}.result-filters{position:sticky;top:0;z-index:5;display:grid;grid-template-columns:minmax(190px,2fr) repeat(6,minmax(110px,1fr));gap:8px;align-items:end;margin:18px 0;padding:12px;border:1px solid var(--vscode-panel-border);border-radius:7px;background:var(--vscode-editor-background)}.result-filters label{display:grid;gap:4px;font-size:11px;color:var(--vscode-descriptionForeground)}.result-filters input,.result-filters select{min-width:0;padding:6px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border)}#visible-count{padding:7px;white-space:nowrap;grid-column:1/-1;font-size:11px;font-weight:normal;color:var(--vscode-descriptionForeground)}.result-list,.chart-grid,.flame-grid{display:grid;gap:12px}.chart-grid{grid-template-columns:repeat(auto-fit,minmax(min(350px,100%),1fr))}.result-card,.chart-card,.flame-card,.empty{min-width:0;overflow-wrap:anywhere;border:1px solid var(--vscode-panel-border);border-radius:7px;padding:14px;background:var(--vscode-sideBar-background)}.result-card header,.chart-card header,.flame-card header{justify-content:space-between;gap:12px}.result-card header>div,.chart-card header>div,.flame-card header>div{display:grid;gap:3px}.status{font-size:11px;padding:3px 7px;border-radius:999px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground)}.status.pass,.stat.pass{border-color:var(--vscode-testing-iconPassed)}.status.error,.status.fail,.stat.error{border-color:var(--vscode-testing-iconFailed)}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin-top:12px}.metrics>div{display:grid;border-left:2px solid var(--vscode-focusBorder);padding-left:8px}.metrics span{color:var(--vscode-descriptionForeground);font-size:11px;text-transform:capitalize}.message,.notice{padding:8px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-textBlockQuote-border)}section h2{margin-top:28px}.spark,.distribution{width:100%;height:110px;overflow:visible}.spark polyline{fill:none;stroke:var(--vscode-charts-blue);stroke-width:2}.spark .point,.sample{fill:var(--vscode-charts-blue)}.spark .point.current{fill:var(--vscode-charts-orange);stroke:var(--vscode-editor-background);stroke-width:2}.hover-value{outline:none;cursor:crosshair}.hover-value:hover,.hover-value:focus{stroke:var(--vscode-focusBorder);stroke-width:3;filter:brightness(1.18)}.distribution .whisker,.distribution .median{stroke:var(--vscode-foreground);stroke-width:2}.distribution .box{fill:var(--vscode-charts-blue);fill-opacity:.28;stroke:var(--vscode-charts-blue)}.plot-detail,.flame-detail{white-space:pre-wrap;min-height:34px;padding:7px;background:var(--vscode-textCodeBlock-background);border-radius:4px}.version-values{display:flex;gap:6px;flex-wrap:wrap}.version-values span{font-size:11px;padding:3px 6px;background:var(--vscode-badge-background);border-radius:4px}.version-values .current{outline:2px solid var(--vscode-focusBorder)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--vscode-panel-border)}.table-wrap,.flame-wrap{overflow:auto}.delta.worse{color:var(--vscode-testing-iconFailed)}.delta.better{color:var(--vscode-testing-iconPassed)}.flame-card{margin-bottom:12px}.flame{min-width:800px;width:100%;height:auto}.flame-node{outline:none}.flame-node rect{fill:var(--vscode-charts-blue);stroke:var(--vscode-editor-background);stroke-width:.6}.flame-node.dynamic rect{fill:var(--vscode-charts-red)}.flame-node.unstable rect{fill:var(--vscode-charts-purple)}.flame-node.gc rect{fill:var(--vscode-charts-orange)}.flame-node:hover rect,.flame-node:focus rect{stroke:var(--vscode-focusBorder);stroke-width:2;filter:brightness(1.2)}.flame-node text{font-size:11px;fill:var(--vscode-editor-foreground);pointer-events:none}.legend{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 16px}.legend i,.allocation-legend i{display:inline-block;width:12px;height:12px;margin-right:5px;vertical-align:-2px}.legend .normal{background:var(--vscode-charts-blue)}.legend .dynamic{background:var(--vscode-charts-red)}.legend .unstable{background:var(--vscode-charts-purple)}.legend .gc{background:var(--vscode-charts-orange)}.allocation-layout{display:grid;grid-template-columns:190px 1fr;gap:12px;align-items:center}.pie{width:190px;height:190px}.allocation-legend{list-style:none;margin:0;padding:0;display:grid;gap:5px}.allocation-legend li{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:5px;align-items:center}.allocation-legend span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}[hidden]{display:none!important}code{user-select:all}@media(max-width:1100px){.result-filters{grid-template-columns:repeat(4,minmax(120px,1fr))}}@media(max-width:700px){body{padding:14px}.top{align-items:flex-start;flex-direction:column}.result-filters{position:static;grid-template-columns:1fr 1fr}.chart-grid{grid-template-columns:1fr}.allocation-layout{grid-template-columns:1fr}}
+    </style></head><body><header class="top"><div class="brand-heading"><img src="${html(logo)}" alt="PerfChecker"><div><div class="eyebrow">PERFCHECKER OUTPUT</div><h1>${html(title)}</h1><div class="meta">${suite ? `${html(suite.suite)} · ${html(suite.profile)} · ${html(suite.finished_at)}` : html(this.absolute('reports'))}</div></div></div><div class="toolbar"><button data-report="suite-report.md">Summary</button><button data-report="suite-result.json">JSON</button><button data-report="version-comparison.md">Comparisons</button><button data-report="version-series.json">Series JSON</button></div></header>${empty}${suite ? filters : ''}${suite ? `<div class="summary">${countCards}<div class="stat"><strong>${outputs.length}</strong><span>runs</span></div></div>` : ''}${overlayCards ? `<section><h2>Overlaid measurements · minimum = 1</h2>${overlayCards}</section>` : ''}${distributionCards ? `<section><h2>Benchmark and measurement distributions</h2><div class="chart-grid">${distributionCards}</div></section>` : ''}${allocations ? `<section><h2>Allocation views</h2><div class="chart-grid">${allocations}</div></section>` : ''}${flames ? `<section><h2>Flame graphs</h2><div class="legend"><span><i class="normal"></i>Normal</span><span><i class="dynamic"></i>Runtime dispatch</span><span><i class="unstable"></i>Non-concrete inference</span><span><i class="gc"></i>GC</span></div><div class="flame-grid">${flames}</div></section>` : ''}${runCards ? `<section><h2>Run output</h2><div class="result-list">${runCards}</div></section>` : ''}${seriesCards ? `<section><h2>Version series</h2><div class="chart-grid">${seriesCards}</div></section>` : ''}${comparisonRows ? `<section><h2>Version comparisons</h2>${comparisons.length > visibleComparisons.length ? `<p class="notice">Showing ${visibleComparisons.length} of ${comparisons.length} comparisons. Open the Markdown report for all records.</p>` : ''}<div class="table-wrap"><table><thead><tr><th>Check</th><th>Metric</th><th>Versions</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Status</th></tr></thead><tbody>${comparisonRows}</tbody></table></div></section>` : ''}<script nonce="${nonce}">const vscode=acquireVsCodeApi();document.querySelectorAll('[data-report]').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:'report',name:button.dataset.report})));document.querySelectorAll('.flame-node,.hover-value').forEach(node=>{const show=()=>{const target=document.getElementById(node.dataset.target);if(target)target.textContent=node.dataset.detail};node.addEventListener('mouseenter',show);node.addEventListener('focus',show)});const controls=['result-search','result-package','result-workload','result-backend','result-kind','result-status','result-sort'].map(id=>document.getElementById(id)).filter(Boolean);const apply=()=>{const value=id=>document.getElementById(id)?.value||'';const query=value('result-search').trim().toLowerCase();const fields={package:value('result-package'),workload:value('result-workload'),backend:value('result-backend'),kind:value('result-kind'),status:value('result-status')};const items=[...document.querySelectorAll('[data-result-item]')];for(const item of items){const matches=(!query||item.dataset.search.includes(query))&&Object.entries(fields).every(([key,expected])=>!expected||item.dataset[key]===expected);item.hidden=!matches}const mode=value('result-sort');for(const container of document.querySelectorAll('.result-list,.chart-grid,.flame-grid,tbody')){[...container.children].sort((a,b)=>{const key=mode==='version'?'version':mode==='status'?'status':'search';return(a.dataset[key]||'').localeCompare(b.dataset[key]||'',undefined,{numeric:true})}).forEach(item=>container.appendChild(item))}const sections=new Set(items.map(item=>item.closest('section')).filter(Boolean));for(const section of sections)section.hidden=![...section.querySelectorAll('[data-result-item]')].some(item=>!item.hidden);const visible=items.filter(item=>!item.hidden).length;const counter=document.getElementById('visible-count');if(counter)counter.textContent=visible+' / '+items.length};controls.forEach(control=>control.addEventListener('input',apply));apply();</script></body></html>`;
   }
 
   async openOutput(nodeOrRun?: PerfNode | PlanRun, explicitRuns?: PlanRun[]): Promise<void> {
+    return this.inWorkspace(() => this.openOutputSelection(nodeOrRun, explicitRuns));
+  }
+
+  private async openOutputSelection(nodeOrRun?: PerfNode | PlanRun, explicitRuns?: PlanRun[]): Promise<void> {
     if (!this.plan) await this.refresh();
     const runs = explicitRuns ?? (nodeOrRun instanceof PerfNode ? nodeOrRun.runs : nodeOrRun ? [nodeOrRun] : this.plan?.runs ?? []);
+    const current = new Map(this.plan!.runs.map(run => [run.id, run]));
+    if (runs.some(run => current.get(run.id)?.entrypoint !== run.entrypoint)) {
+      throw new Error('This output selection belongs to an earlier plan or workspace. Refresh and select current runs.');
+    }
     const title = nodeOrRun instanceof PerfNode ? `${nodeOrRun.label} output` : nodeOrRun ?
       `${nodeOrRun.package} · ${nodeOrRun.feature} · ${nodeOrRun.version}` :
       explicitRuns ? `${runs.length} selected run${runs.length === 1 ? '' : 's'}` : `${this.plan?.suite ?? 'Suite'} output`;
@@ -850,9 +995,14 @@ class Controller {
     const observations = await this.reportObservations(runs, versionFile?.run_id);
     if (!this.resultsPanel) {
       this.resultsPanel = vscode.window.createWebviewPanel('perfchecker.output', 'PerfChecker output', vscode.ViewColumn.One,
-        {enableScripts: true, retainContextWhenHidden: true});
-      this.resultsPanel.onDidDispose(() => { this.resultsPanel = undefined; });
+        {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
+      this.resultsPanel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+      const panel = this.resultsPanel, workspace = this.folder().uri.toString();
+      this.resultsPanel.onDidDispose(() => { if (this.resultsPanel === panel) this.resultsPanel = undefined; });
       this.resultsPanel.webview.onDidReceiveMessage(async message => {
+        let sameWorkspace = false;
+        try {sameWorkspace = currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders).uri.toString() === workspace;} catch {/* selected folder was closed */}
+        if (!sameWorkspace) {void vscode.window.showWarningMessage('PerfChecker folder changed. Reopen results for the selected folder.'); return;}
         if (message.type === 'report') await this.openReportFile(String(message.name));
       });
     } else this.resultsPanel.reveal(vscode.ViewColumn.One);
@@ -860,25 +1010,40 @@ class Controller {
     this.resultsPanel.webview.html = this.resultPage(title, runs, suite, versionFile, comparisonFile, observations);
   }
 
-  private nonce(): string { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+  private nonce(): string { return randomUUID(); }
 
-  async openDesigner(): Promise<void> {
+  async openDesigner(folder?: vscode.Uri | vscode.WorkspaceFolder): Promise<void> {
+    this.selectWorkspace(folder);
     if (!this.plan) await this.refresh();
     if (this.designer) { this.designer.reveal(); this.postPlan(); return; }
     this.designer = vscode.window.createWebviewPanel('perfchecker.designer', 'PerfChecker suite', vscode.ViewColumn.One,
       {enableScripts: true, retainContextWhenHidden: true});
     const nonce = this.nonce();
+    this.designer.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+    const logo = this.designer.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.png'));
     const script = this.designer.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'designer.js'));
     const style = this.designer.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'designer.css'));
-    this.designer.webview.html = `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${this.designer.webview.cspSource}; script-src 'nonce-${nonce}'"><link rel="stylesheet" href="${style}"></head><body>
-      <header><div><small>PERFCHECKER</small><h1>Suite editor</h1></div><div class="actions"><button id="refresh">Refresh</button><button id="results">Results</button><button id="save">Save configuration</button><button id="run" class="primary">Run selection</button></div></header>
-      <section class="filters"><input id="search" placeholder="Filter package, feature or check…"><select id="package"><option value="">All packages</option></select><select id="sort"><option value="suite">Suite order</option><option value="package">Package</option><option value="feature">Feature</option><option value="version">Version</option></select><input id="from" list="versions" placeholder="From version"><input id="to" list="versions" placeholder="To version"><datalist id="versions"></datalist></section>
-      <section class="check-filter"><strong>Check types</strong><div id="check-types"></div></section>
-      <section class="selection-actions"><button id="select-visible">Select visible</button><button id="clear-visible">Clear visible</button><label><input id="open-after-run" type="checkbox" checked> Open visual results after the run</label></section>
-      <div id="progress" hidden><div></div><span></span></div><main><section><h2>Workload runs <span id="count"></span></h2><p class="hint">A feature is the workload. BenchmarkTools, Chairmarks, allocations and profiles are selectable check types. Use ▥ for visual output and ↗ for the check script.</p><div id="cards"></div></section>
-      <aside><section class="aside-panel"><h2>Comparison targets</h2><p class="hint">Choose a discovered branch, tag, or recent commit. You can also paste a GitHub/GitLab URL or a reference such as <code>owner/repository@branch</code>.</p><div id="target-list"></div><label>Package<select id="target-package"></select></label><label>Discovered Git reference<select id="target-reference"><option value="">Loading references…</option></select></label><div class="target-scan"><small id="target-source-status">Looking for the package repository…</small><button id="refresh-targets" title="Scan Git references again">Refresh</button></div><label>Or paste a reference<input id="target-revision" placeholder="Branch, tag, commit, or Git URL"></label><label>Display label (optional)<input id="target-label" placeholder="Filled from the selected reference"></label><details><summary>Advanced target options</summary><label>Git source override<input id="target-source" placeholder="Use the package source"></label><label>Workload compatibility<select id="target-compatibility"><option value="">Automatic</option></select></label></details><p id="target-error" class="form-error" hidden></p><button id="add-target">Add comparison target</button></section><section class="aside-panel"><h2>Comparison matrix</h2><p class="hint">One checked reference is an exact comparison. Several references form an aggregated reference group.</p><div id="comparison-list"></div><label>Package<select id="comparison-package"></select></label><label>Feature<select id="comparison-feature"></select></label><label>Reference aggregation<select id="comparison-aggregation"><option value="median">Median</option><option value="mean">Mean</option><option value="minimum">Minimum</option><option value="maximum">Maximum</option></select></label><h3>Reference targets</h3><div id="baseline-targets" class="target-options"></div><h3>Candidate targets</h3><div id="candidate-targets" class="target-options"></div><button id="add-comparison">Add comparison</button></section><section class="aside-panel"><h2>Documentation block</h2><label>Identifier<input id="doc-id" value="performance"></label><label>Title<input id="doc-title" value="Performance"></label><label>Interactive URL<input id="doc-url" placeholder="https://…"></label><fieldset><legend>Views</legend><label><input type="checkbox" name="view" value="summary" checked> Summary</label><label><input type="checkbox" name="view" value="comparison" checked> Comparisons</label><label><input type="checkbox" name="view" value="plots" checked> Plots</label><label><input type="checkbox" name="view" value="observations"> Observations</label><label><input type="checkbox" name="view" value="diagnostics"> Diagnostics</label><label><input type="checkbox" name="view" value="artifacts"> Artifacts</label></fieldset><p class="hint">The saved JSON is consumed by VS Code, Oxygen-compatible tooling and Documenter via <code>read_document_blocks</code>.</p></section></aside></main><script nonce="${nonce}" src="${script}"></script></body></html>`;
-    this.designer.onDidDispose(() => { this.designer = undefined; });
+    this.designer.webview.html = `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${this.designer.webview.cspSource}; style-src ${this.designer.webview.cspSource}; script-src 'nonce-${nonce}'"><link rel="stylesheet" href="${style}"></head><body>
+      <header><div class="brand-heading"><img src="${html(logo)}" alt="PerfChecker"><div><small>PERFCHECKER</small><h1>Suite editor</h1></div></div><div class="actions"><button id="refresh">Refresh</button><button id="results">Results</button><button id="save">Save configuration</button><button id="run" class="primary">Run selection</button></div></header>
+      <section class="filters"><input id="search" aria-label="Filter workload runs" placeholder="Filter package, feature or check…"><select id="package" aria-label="Package filter"><option value="">All packages</option></select><select id="target-filter" aria-label="Target filter"><option value="">All targets</option></select><select id="target-kind" aria-label="Target kind filter"><option value="">All target kinds</option></select><select id="sort" aria-label="Sort workload runs"><option value="suite">Suite order</option><option value="package">Package</option><option value="feature">Feature</option><option value="version">Version</option></select><input id="from" aria-label="From version" list="versions" placeholder="From version"><input id="to" aria-label="To version" list="versions" placeholder="To version"><datalist id="versions"></datalist></section>
+      <section class="check-filter"><strong>Include check types</strong><div id="check-types"></div></section>
+      <section class="selection-actions"><button id="select-visible">Select visible</button><button id="clear-visible">Clear visible</button><button id="clear-all">Clear selection</button><button id="reset-filters">Reset filters</button><label><input id="open-after-run" type="checkbox" checked> Open visual results after the run</label></section>
+      <p class="selection-hint">Check types include or exclude all matching runs. Search, target and release-range filters preserve the selection; hidden selected runs remain included.</p><details class="selection-preview"><summary id="selection-summary">Preview selected runs</summary><div id="selection-preview"></div></details><p id="designer-error" class="form-error" role="alert" hidden></p><div id="progress" hidden><div></div><span></span></div><main><section><h2>Workload runs <span id="count"></span></h2><p class="hint">A feature is the workload. BenchmarkTools, Chairmarks, allocations and profiles are selectable check types. Use ▥ for visual output and ↗ for the check script.</p><div id="cards"></div><p id="rendered-count" class="hint"></p><button id="show-more" hidden>Show more workloads</button></section>
+      <aside><section class="aside-panel"><h2>Comparison targets</h2><p class="hint">Choose a discovered branch, tag, or recent commit. You can also paste a GitHub/GitLab URL or a reference such as <code>owner/repository@branch</code>.</p><div id="target-list"></div><label>Package<select id="target-package"></select></label><label>Discovered Git reference<select id="target-reference"><option value="">Loading references…</option></select></label><div class="target-scan"><small id="target-source-status">Looking for the package repository…</small><button id="refresh-targets" title="Scan Git references again">Refresh</button></div><label>Or paste a reference<input id="target-revision" placeholder="Branch, tag, commit, or Git URL"></label><label>Display label (optional)<input id="target-label" placeholder="Filled from the selected reference"></label><details><summary>Advanced target options</summary><label>Git source override<input id="target-source" placeholder="Use the package source"></label><label>Workload compatibility<select id="target-compatibility"><option value="">Automatic</option></select></label></details><p id="target-error" class="form-error" hidden></p><button id="add-target">Add comparison target</button></section><section class="aside-panel"><h2>Comparison matrix</h2><p class="hint">One checked reference is an exact comparison. Several references form an aggregated reference group.</p><div id="comparison-list"></div><label>Package<select id="comparison-package"></select></label><label>Feature<select id="comparison-feature"></select></label><label>Reference aggregation<select id="comparison-aggregation"><option value="median">Median</option><option value="mean">Mean</option><option value="minimum">Minimum</option><option value="maximum">Maximum</option></select></label><h3>Reference targets</h3><div id="baseline-targets" class="target-options"></div><h3>Candidate targets</h3><div id="candidate-targets" class="target-options"></div><p id="comparison-error" class="form-error" role="alert" hidden></p><button id="add-comparison">Add comparison</button></section><section class="aside-panel"><h2>Documentation block</h2><label>Identifier<input id="doc-id" value="performance"></label><label>Title<input id="doc-title" value="Performance"></label><label>Interactive URL<input id="doc-url" placeholder="https://…"></label><fieldset><legend>Views</legend><label><input type="checkbox" name="view" value="summary" checked> Summary</label><label><input type="checkbox" name="view" value="comparison" checked> Comparisons</label><label><input type="checkbox" name="view" value="plots" checked> Plots</label><label><input type="checkbox" name="view" value="observations"> Observations</label><label><input type="checkbox" name="view" value="diagnostics"> Diagnostics</label><label><input type="checkbox" name="view" value="artifacts"> Artifacts</label></fieldset><p class="hint">The saved JSON is consumed by VS Code, Oxygen-compatible tooling and Documenter via <code>read_document_blocks</code>.</p></section></aside></main><script nonce="${nonce}" src="${script}"></script></body></html>`;
+    const workspace = this.folder().uri.toString(), designer = this.designer;
+    this.designer.onDidDispose(() => { if (this.designer === designer) this.designer = undefined; });
     this.designer.webview.onDidReceiveMessage(async message => {
+      let sameWorkspace = false;
+      try {sameWorkspace = currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders).uri.toString() === workspace;} catch {/* selected folder was closed */}
+      if (!sameWorkspace) {
+        void designer.webview.postMessage({type: 'designerError', error: 'PerfChecker folder changed. Reopen the suite editor for the selected folder.'}); return;
+      }
+      const mutates = ['run', 'refresh', 'save', 'targets', 'addTarget', 'comparisons'].includes(message?.type);
+      if (mutates && this.designerBusy) {
+        void this.designer?.webview.postMessage({type: 'designerError', error: 'Wait for the current PerfChecker action to finish.'}); return;
+      }
+      if (mutates) {this.workspaceOperations += 1; this.designerBusy = true; void this.designer?.webview.postMessage({type: 'designerBusy', busy: true});}
+      try {
       if (message.type === 'open') await this.open(message.run as PlanRun);
       if (message.type === 'run') await this.run(undefined, message.ids as string[], Boolean(message.reveal));
       if (message.type === 'output') await this.openOutput(message.run as PlanRun | undefined,
@@ -900,12 +1065,14 @@ class Controller {
         catch (error) { void this.designer?.webview.postMessage({type: 'targetError', error: String(error)}); }
       }
       if (message.type === 'comparisons') await this.updateComparisonPolicies(message.comparisons as ComparisonPolicyConfig[]);
+      } catch (error) {void this.designer?.webview.postMessage({type: 'designerError', error: String(error)});}
+      finally {if (mutates) {this.workspaceOperations -= 1; this.designerBusy = false; void this.designer?.webview.postMessage({type: 'designerBusy', busy: false});}}
     });
     this.postPlan();
   }
 
   private postPlan(): void {
-    if (this.plan && this.designer) void this.designer.webview.postMessage({type: 'plan', plan: this.plan,
+    if (this.plan && this.designer) void this.designer.webview.postMessage({type: 'plan', plan: this.plan, workspace: this.folder().uri.toString(),
       configuration: this.uiConfiguration, targets: this.effectiveGitTargets(),
       comparisons: this.effectiveComparisonPolicies()});
   }
@@ -923,7 +1090,7 @@ class Controller {
     }
     const identities = normalized.map(target => `${target.package}\0${target.label}`);
     if (new Set(identities).size !== identities.length) throw new Error('Git target labels must be unique per package.');
-    await vscode.workspace.getConfiguration('perfchecker').update('gitTargets', normalized,
+    await vscode.workspace.getConfiguration('perfchecker', this.folder().uri).update('gitTargets', normalized,
       vscode.ConfigurationTarget.WorkspaceFolder);
     await this.refresh();
   }
@@ -953,7 +1120,7 @@ class Controller {
     if (new Set(normalized.map(policy => policy.id)).size !== normalized.length) {
       throw new Error('Comparison policy identifiers must be unique.');
     }
-    await vscode.workspace.getConfiguration('perfchecker').update('comparisonPolicies', normalized,
+    await vscode.workspace.getConfiguration('perfchecker', this.folder().uri).update('comparisonPolicies', normalized,
       vscode.ConfigurationTarget.WorkspaceFolder);
     await this.refresh();
   }
@@ -969,28 +1136,86 @@ class Controller {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  registerStudio(context);
+  registerNativeTestItems(context);
+  registerInvestigations(context);
   const tree = new PlanTree();
   const tests = vscode.tests.createTestController('perfchecker', 'PerfChecker');
   const controller = new Controller(context, tree, tests);
+  const runLandscapeLive = async (requested?: vscode.Uri | vscode.WorkspaceFolder,
+      quality?: string): Promise<string> => {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before measuring live graphics.');
+    if (requested === undefined) throw new Error('Pass an open workspace folder URI to perfchecker.runLandscapeLiveForWorkspace.');
+    const folder = resolveWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders, requested);
+    const identity = folder.uri.toString();
+    const prepared = await prepareLiveProvider(folder.uri.fsPath, quality as string);
+    const settings = () => vscode.workspace.getConfiguration('perfchecker', folder.uri);
+    const configuration = () => JSON.stringify(['juliaExecutable', 'runnerProject']
+      .map(key => settings().get(key)));
+    const selectedConfiguration = configuration();
+    const ensureCurrent = async () => {
+      if (!vscode.workspace.isTrusted ||
+          !vscode.workspace.workspaceFolders?.some(candidate => candidate.uri.toString() === identity) ||
+          configuration() !== selectedConfiguration)
+        throw new Error('The workspace or PerfChecker controller changed; start the measurement again.');
+      const fresh = await prepareLiveProvider(folder.uri.fsPath, prepared.quality);
+      if (fresh.root !== prepared.root || fresh.provider !== prepared.provider ||
+          fresh.qualityDigest !== prepared.qualityDigest)
+        throw new Error('The live provider or render quality changed; start the measurement again.');
+    };
+    await ensureCurrent();
+    const controllerProject = resolveControllerProject(prepared.root, settings());
+    const julia = settings().get<string>('juliaExecutable', 'julia');
+    const reports = path.join(prepared.root, 'perf', 'results', 'live');
+    const output = vscode.window.createOutputChannel('PerfChecker Live');
+    context.subscriptions.push(output);
+    output.appendLine(`Live measurement: ${folder.name} · ${prepared.quality}`);
+    output.appendLine(`Controller: ${controllerProject.project} (${controllerProject.reason})`);
+    const directory = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: `PerfChecker · live graphics · ${prepared.quality}`,
+      cancellable: true,
+    }, async (_progress, token) => {
+      await ensureCurrent();
+      return executeLiveProvider({...prepared, controller: controllerProject.project,
+        julia, reports}, token, line => output.append(line));
+    });
+    await ensureCurrent();
+    const manifestPath = path.join(directory, 'manifest.json');
+    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    if (manifest.schema_version !== 'perfchecker-run-bundle/1' ||
+        manifest.state !== 'complete' || manifest.environment?.quality_profile !== prepared.quality)
+      throw new Error('The live bundle does not contain matching completed evidence.');
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(manifestPath)),
+      {preview: false});
+    void vscode.window.showInformationMessage(`Live measurement archived: ${directory}`);
+    return directory;
+  };
   tests.createRunProfile('Run', vscode.TestRunProfileKind.Run,
     request => controller.runTests(request), true);
   const view = vscode.window.createTreeView('perfchecker.runs', {treeDataProvider: tree,
     dragAndDropController: tree, manageCheckboxStateManually: true, showCollapseAll: true});
   context.subscriptions.push(view, tests, vscode.commands.registerCommand('perfchecker.refresh', () => controller.refresh()),
     vscode.commands.registerCommand('perfchecker.initialize', () => controller.initialize()),
-    vscode.commands.registerCommand('perfchecker.runAll', () => controller.run(undefined, tree.plan?.runs.map(run => run.id))),
+    vscode.commands.registerCommand('perfchecker.runAll', () => controller.runAll()),
     vscode.commands.registerCommand('perfchecker.runNode', (node?: PerfNode) => controller.run(node)),
     vscode.commands.registerCommand('perfchecker.openEntrypoint', (node: PerfNode) => controller.open(node)),
     vscode.commands.registerCommand('perfchecker.openOutput', (node?: PerfNode) => controller.openOutput(node)),
     vscode.commands.registerCommand('perfchecker.showLog', () => controller.showLog()),
-    vscode.commands.registerCommand('perfchecker.openDesigner', () => controller.openDesigner()),
+    vscode.commands.registerCommand('perfchecker.openDesigner',
+      (folder?: vscode.Uri | vscode.WorkspaceFolder) => controller.openDesigner(folder)),
+    vscode.commands.registerCommand('perfchecker.openDesignerForWorkspace',
+      (folder?: vscode.Uri | vscode.WorkspaceFolder) => {
+        if (folder === undefined) throw new Error('Pass an open workspace folder or URI to perfchecker.openDesignerForWorkspace.');
+        return controller.openDesigner(folder);
+      }),
+    vscode.commands.registerCommand('perfchecker.runLandscapeLiveForWorkspace', runLandscapeLive),
     vscode.commands.registerCommand('perfchecker.saveConfiguration', () => controller.saveConfiguration()),
     view.onDidChangeCheckboxState(event => {
       for (const [node, state] of event.items) {
         for (const run of node.runs) state === vscode.TreeItemCheckboxState.Checked ? tree.selected.add(run.id) : tree.selected.delete(run.id);
       }
     }));
-  void controller.refresh().catch(error => controller.reportError(error));
 }
 
 export function deactivate(): void {}

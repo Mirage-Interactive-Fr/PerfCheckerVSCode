@@ -20,6 +20,17 @@ test('filters and sorts the common plan', () => {
   assert.deepEqual(filterRuns(runs, {search: 'render'}).map(run => run.id), ['b']);
 });
 
+test('a workload filter retains its collectors while an exact leaf still isolates one', () => {
+  const exports = [
+    {id:'timing',package:'Bibliography',feature:'export_bibtex',workload:'export_bibtex',backend:'benchmark',version:'dev@0.4.0',description:''},
+    {id:'allocations',package:'Bibliography',feature:'export_bibtex_allocations',workload:'export_bibtex',backend:'profile_alloc',version:'dev@0.4.0',description:''},
+    {id:'cpu',package:'Bibliography',feature:'export_bibtex_profile',workload:'export_bibtex',backend:'profile',version:'dev@0.4.0',description:''},
+  ];
+  assert.deepEqual(filterRuns(exports,{features:['export_bibtex']}).map(run=>run.id),['timing','allocations','cpu']);
+  assert.deepEqual(filterRuns(exports,{features:['export_bibtex'],backends:['profile_alloc']}).map(run=>run.id),['allocations']);
+  assert.deepEqual(filterRuns(exports,{features:['export_bibtex_profile']}).map(run=>run.id),['cpu']);
+});
+
 test('drag ordering is stable', () => {
   assert.deepEqual(moveRun(['a', 'b', 'c'], 'c', 'a'), ['c', 'a', 'b']);
 });

@@ -27,6 +27,7 @@ export interface SuitePlan {
 }
 
 export interface SuiteRunOutput {
+  qualification?: {verdict?: string};
   package: string;
   feature: string;
   workload?: string;
@@ -37,6 +38,24 @@ export interface SuiteRunOutput {
   elapsed_seconds: number;
   message: string;
   summary: Record<string, unknown>;
+}
+
+/** Missing/ambiguous evidence is never a green test, even when the CLI exits 0. */
+export function testOutcome(plan: PlanRun, results?: SuiteRunOutput[]): {
+  state: 'passed' | 'failed' | 'errored' | 'skipped'; message: string;
+} {
+  if (!plan || plan.status !== 'ready') return {state: 'skipped', message: plan?.reason || 'Not ready'};
+  const matching = results?.filter(run => run.package === plan.package && run.feature === plan.feature
+    && run.version === plan.version && run.target_kind === plan.target_kind && run.comparison_key === plan.comparison_key);
+  if (matching?.length !== 1) return {state: 'errored', message: 'Missing or ambiguous current-run qualification'};
+  const result = matching[0], verdict = result.qualification?.verdict;
+  if (result.status === 'pass' && (verdict === 'validated' || verdict === 'validated_with_warnings'))
+    return {state: 'passed', message: verdict};
+  if ((result.status === 'pass' && (verdict === 'executed' || verdict === 'executed_with_warnings')) || result.status === 'skipped')
+    return {state: 'skipped', message: result.message || 'Executed, not validated'};
+  if (result.status === 'invalid' || verdict === 'invalid')
+    return {state: 'failed', message: result.message || String(verdict)};
+  return {state: 'errored', message: result.message || `Unqualified result: ${verdict ?? result.status}`};
 }
 
 export interface VersionPoint {
@@ -184,7 +203,8 @@ export function filterRuns(runs: PlanRun[], filter: RunFilter): PlanRun[] {
   const needle = (filter.search ?? '').trim().toLocaleLowerCase();
   const selected = runs.filter(run => {
     if (filter.packages?.length && !filter.packages.includes(run.package)) return false;
-    if (filter.features?.length && !filter.features.includes(run.feature)) return false;
+    if (filter.features?.length && !filter.features.includes(run.feature) &&
+        !filter.features.includes(logicalFeature(run))) return false;
     if (filter.backends?.length && !filter.backends.includes(run.backend)) return false;
     if (run.target_kind === 'release' && filter.fromVersion && compareVersions(run.version, filter.fromVersion) < 0) return false;
     if (run.target_kind === 'release' && filter.toVersion && compareVersions(run.version, filter.toVersion) > 0) return false;

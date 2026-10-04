@@ -4,3 +4,6 @@ dist/
 *.log
 .vscode/
 
+
+.lab/
+validation/

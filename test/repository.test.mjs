@@ -14,4 +14,3 @@ test('repository metadata targets the standalone extension repository', () => {
     'https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode.git');
   assert.equal(manifest.repository.directory, undefined);
 });
-

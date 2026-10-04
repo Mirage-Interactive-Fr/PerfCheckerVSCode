@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
   workflow_dispatch:
 
@@ -11,7 +11,12 @@ permissions:
 
 jobs:
   test-and-package:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -20,9 +25,20 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - name: Install browser test tooling (development only)
+        run: npm install --no-save --ignore-scripts playwright@1.62.1
+      - run: npx playwright install --with-deps chromium
+      - name: Validate advisor setup in a browser
+        run: node test/advisor-panel.browser.cjs
+      - name: Validate advice and implementation in a browser
+        run: node test/advisor-chat.browser.cjs
+      - name: Validate Studio, complete selections and plots in a browser
+        run: node --test test/webviews-browser.test.mjs
+        env:
+          PERFCHECKER_BROWSER_TESTS: "1"
       - name: Validate Marketplace package
-        run: npm run package:pre-release -- --out perfchecker-vscode.vsix
+        run: npm run package -- --out perfchecker-vscode.vsix
       - uses: actions/upload-artifact@v7
         with:
-          name: perfchecker-vscode
+          name: perfchecker-vscode-${{ matrix.os }}
           path: perfchecker-vscode.vsix
