@@ -42,6 +42,13 @@ validates quality, effective resolution, timestamps, hardware availability,
 submission timing scope and millisecond metric definitions before archival.
 Provider failure or cancellation never becomes completed evidence.
 
+Suite, native Testing and investigation controllers accept a portable stdin
+cancellation request. Exit 130 means interruption finished after cleanup; other
+nonzero exits remain errors. The extension waits up to 60 seconds before forced
+termination and warns that cleanup and detached-worker termination are not
+guaranteed after that fallback. A local MCP cancellation may leave the remote
+agent running.
+
 ## Consumed contracts
 
 The stable 1.0 extension line accepts these versioned interfaces:

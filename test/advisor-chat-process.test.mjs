@@ -7,14 +7,20 @@ import {mkdtemp, mkdir, writeFile, readFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 
-let reply = '', workerError = '', exitCode = 0;
+let reply = '', workerError = '', exitCode = 0, largeChunks = false;
 const spawn = () => {
   const child = new EventEmitter();
   child.stdout = new PassThrough(); child.stderr = new PassThrough();
   setImmediate(() => {
     // Every byte boundary is exercised, including inside accents and emoji.
-    for (const byte of Buffer.from(reply)) child.stdout.write(Buffer.from([byte]));
-    for (const byte of Buffer.from(workerError)) child.stderr.write(Buffer.from([byte]));
+    if (largeChunks) {
+      child.stdout.write(Buffer.from(reply));
+      for (let i = 0; i < 32; i++) child.stdout.write(Buffer.alloc(65_536, 120));
+      child.stderr.write(Buffer.from(workerError));
+    } else {
+      for (const byte of Buffer.from(reply)) child.stdout.write(Buffer.from([byte]));
+      for (const byte of Buffer.from(workerError)) child.stderr.write(Buffer.from([byte]));
+    }
     child.stdout.end(); child.stderr.end(); child.emit('close', exitCode);
   });
   return child;
@@ -65,4 +71,27 @@ test('investigation subprocess preserves Unicode evidence and logs across byte c
     assert.ok(display.includes(workerError)); assert.ok(display.includes('scénario 🧪'));
     assert.equal(await readFile(path.join(root, 'worker.log'), 'utf8'), reply + workerError);
   } finally {await rm(root, {recursive: true, force: true});}
+});
+
+test('output overflow stays bounded while final cleanup errors remain visible', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'perfchecker-investigation-overflow-'));
+  try {
+    await mkdir(path.join(root, 'perf'));
+    await writeFile(path.join(root, 'perf', 'Project.toml'), '[deps]\n');
+    const controller = Object.create(InvestigationController.prototype);
+    controller.root = () => root; controller.folder = () => ({uri: {fsPath: root}});
+    controller.setting = (_name, fallback) => fallback;
+    let display = '', cancellations = 0;
+    controller.output = {append: text => {display += text;}, appendLine: text => {display += text;}};
+    controller.cancel = () => {cancellations++;};
+    reply = 'x'.repeat(32_000_001); workerError = 'x'.repeat(200_000) + '\nCleanup incomplete; retained at /private/inventory\n';
+    exitCode = 2; largeChunks = true;
+    await assert.rejects(controller.invoke('run', [], root), /exceeded 32 MB/);
+    assert.equal(cancellations, 1);
+    assert.ok(display.length < 70_000);
+    assert.match(display, /retained at \/private\/inventory/);
+    const log = await readFile(path.join(root, 'worker.log'), 'utf8');
+    assert.ok(log.length <= 65_536);
+    assert.match(log, /retained at \/private\/inventory/);
+  } finally {largeChunks = false; await rm(root, {recursive: true, force: true});}
 });

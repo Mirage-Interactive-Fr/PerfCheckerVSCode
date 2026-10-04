@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {selectedTestItems, nativeItemDuration} from './investigationModel';
 import {resolveControllerProject, resolveWorkspaceFolder} from './workspace-root';
+import {cancellableJulia, controllerCancellation} from './controllerCancellation';
 
 interface NativeItem {id: string; name: string; file: string; tags: string[]; source_sha256: string}
 
@@ -39,21 +40,21 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
       const code = await new Promise<number>((resolve,reject) => {
         if (token?.isCancellationRequested) {resolve(130); return;}
         const child = spawn(setting('juliaExecutable','julia'), ['--startup-file=no',`--project=${project}`,
-          '-e','using PerfChecker, TestItemRunner; exit(perfchecker_main(ARGS))','--','testitems',
+          '-e',cancellableJulia('using PerfChecker, TestItemRunner; exit(perfchecker_main(ARGS))'),'--','testitems',
           `--root=${folder.uri.fsPath}`,`--project=${project}`,`--output=${destination}`, ...args],
           {cwd:folder.uri.fsPath,windowsHide:true,detached:process.platform!=='win32',env});
-        const cancel = () => {
-          if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-          if (process.platform === 'win32') spawn('taskkill',['/PID',String(child.pid),'/T','/F'],{windowsHide:true}).on('error',()=>child.kill());
-          else {try {process.kill(-child.pid,'SIGKILL');} catch {child.kill('SIGKILL');}}
-        };
-        const subscription = token?.onCancellationRequested(cancel);
+        const stop = controllerCancellation(child, (message, forced) => {
+          output.appendLine(message); if (forced) void vscode.window.showWarningMessage(message);
+        });
+        const subscription = token?.onCancellationRequested(() => stop.request());
         child.stdout.on('data',chunk=>output.append(String(chunk)));
         child.stderr.on('data',chunk=>output.append(String(chunk)));
-        child.on('error',error=>{subscription?.dispose();reject(error);});
-        child.on('close',value=>{subscription?.dispose();resolve(value??2);});
-        if (token?.isCancellationRequested) cancel();
+        child.on('error',error=>{subscription?.dispose();stop.dispose();reject(error);});
+        child.on('close',value=>{subscription?.dispose();stop.dispose();resolve(value??2);});
+        if (token?.isCancellationRequested) stop.request();
       });
+      if (token?.isCancellationRequested && code !== 0 && code !== 130)
+        throw new Error('Cancellation failed during controller cleanup. Inspect PerfChecker output.');
       if (token?.isCancellationRequested) return {code:130,payload:undefined};
       const stat = await fs.stat(destination).catch(()=>undefined);
       if (!stat) throw new Error(`TestItemRunner did not return evidence (exit ${code}). Ensure PerfChecker and TestItemRunner >= 1.3.2 are in ${project}. See the output channel.`);

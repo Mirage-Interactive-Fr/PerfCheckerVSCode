@@ -7,6 +7,7 @@ import {createHash, randomUUID} from 'node:crypto';
 import {registerAdvisorSetup} from './advisorSetup';
 import {AdvisorChat, ChatEvidence} from './advisorChat';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
+import {cancellableJulia, controllerCancellation} from './controllerCancellation';
 import {InvestigationReport, Proposal, Scenario, draftCase, parseInvestigation,
   reportSummary, scenarioKey, scenarioToml, selectedScenarios, workspacePath, scenarioOutcome, selectedTestItems} from './investigationModel';
 
@@ -19,6 +20,7 @@ const escape = (value: unknown) => String(value ?? '').replace(/[&<>"']/g, c => 
 export class InvestigationController implements vscode.TreeDataProvider<Node>, vscode.CodeLensProvider, vscode.CodeActionProvider, vscode.Disposable {
   private panel?: vscode.WebviewPanel;
   private child?: ChildProcess;
+  private stopController?: ReturnType<typeof controllerCancellation>;
   private cancelled = false;
   private busy = false;
   private discovery?: InvestigationReport;
@@ -136,7 +138,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     const logo = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.png'));
     const nonce = randomUUID();
     webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${style}"><title>PerfChecker investigations</title></head><body><header class="brand-heading"><img src="${logo}" alt="PerfChecker"><div><p class="eyebrow">PerfChecker</p><h1>Understand. Improve. Verify.</h1><p>Shared scenarios connect tests, measurements and evidence-based advice.</p></div></header><div id="app" aria-live="polite"></div><script nonce="${nonce}" src="${script}"></script></body></html>`;
-    this.panel.onDidDispose(() => {this.panel = undefined;});
+    this.panel.onDidDispose(() => {this.cancel(); this.panel = undefined;});
     webview.onDidReceiveMessage(async message => {
       try {
         if (this.folder().uri.toString() !== workspace) throw new Error('PerfChecker folder changed. Reopen investigations.');
@@ -240,7 +242,10 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
         const subscription = token.onCancellationRequested(() => this.cancel());
         try {return await this.invoke(command, args, directory);} finally {subscription.dispose();}
       });
-      if (this.cancelled) {history.status = 'cancelled'; history.summary = 'Stopped — remaining configurations are not qualified.'; return;}
+      if (this.cancelled) {
+        if (code !== 0 && code !== 130) throw new Error('Cancellation did not finish cleanly. Inspect the PerfChecker output for cleanup failures and retained inventories.');
+        history.status = 'cancelled'; history.summary = 'Stopped after controller cleanup — remaining configurations are not qualified.'; return;
+      }
       const reportPath = path.join(directory, filename);
       if (action === 'run') await fs.writeFile(reportPath, stdout, 'utf8');
       const report = await this.readReport(reportPath);
@@ -266,7 +271,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
       history.status = 'error'; history.summary = String(error); this.lastMessage = String(error); throw error;
     } finally {
       this.busy = false; this.child = undefined;
-      if (this.cancelled) this.lastMessage = 'Cancelled. Completed artifacts are retained; remaining configurations are not qualified.';
+      if (this.cancelled && history.status === 'cancelled') this.lastMessage = 'Cancelled after controller cleanup. Completed artifacts are retained; remaining configurations are not qualified.';
       this.history = [history, ...this.history].slice(0, 50);
       await this.context.workspaceState.update(`investigationHistory:${workspace}`, this.history); this.refresh();
     }
@@ -297,25 +302,46 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
       vscode.workspace.getConfiguration('perfchecker', this.folder().uri));
     this.output.appendLine(`Controller project: ${controller.project} (${controller.reason})`);
     const juliaArgs = ['--startup-file=no', `--project=${controller.project}`,
-      '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', command, ...args];
+      '-e', cancellableJulia('using PerfChecker; exit(perfchecker_main(ARGS))'), '--', command, ...args];
     this.output.appendLine(`PerfChecker ${command}`);
     return await new Promise((resolve, reject) => {
       const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true, detached: process.platform !== 'win32'});
       this.child = child;
+      const stop = controllerCancellation(child, (message, forced) => {
+        this.output.appendLine(message); this.lastMessage = message; this.refresh();
+        if (forced) void vscode.window.showWarningMessage(message);
+      });
+      this.stopController = stop;
       const stdoutDecoder = new StringDecoder('utf8'), stderrDecoder = new StringDecoder('utf8');
-      let stdout = ''; let log = ''; let size = 0; let exceeded = false;
+      let stdout = ''; let log = ''; let size = 0; let exceeded = false; let finalErrors = '';
       const append = (text: string, output: boolean) => {
+        if (exceeded) return;
         this.output.append(text); log = (log + text).slice(-2_000_000);
         if (output && !exceeded) stdout += text;
       };
       const consume = (chunk: Buffer, output: boolean) => {
-        if (output) {size += chunk.length; if (size > 32_000_000) {exceeded = true; this.cancel();}}
+        if (exceeded) {
+          if (!output) finalErrors = (finalErrors + stderrDecoder.write(chunk)).slice(-65_536);
+          return;
+        }
+        if (output) {
+          size += chunk.length;
+          if (size > 32_000_000) {
+            exceeded = true;
+            this.output.appendLine('Controller output truncated at 32 MB; cancelling and waiting for cleanup.');
+            this.cancel(); return;
+          }
+        }
         append((output ? stdoutDecoder : stderrDecoder).write(chunk), output);
       };
       child.stdout?.on('data', chunk => consume(chunk, true)); child.stderr?.on('data', chunk => consume(chunk, false));
       child.on('error', reject);
       child.on('close', code => {
-        append(stdoutDecoder.end(), true); append(stderrDecoder.end(), false);
+        stop.dispose(); if (this.stopController === stop) this.stopController = undefined;
+        if (exceeded) {
+          stdoutDecoder.end(); finalErrors = (finalErrors + stderrDecoder.end()).slice(-65_536);
+          if (finalErrors) {this.output.append(finalErrors); log = (log + finalErrors).slice(-2_000_000);}
+        } else {append(stdoutDecoder.end(), true); append(stderrDecoder.end(), false);}
         void fs.appendFile(path.join(directory, 'worker.log'), log).then(() => {
           if (exceeded) reject(new Error('Controller output exceeded 32 MB; inspect the worker log.'));
           else resolve({code: code ?? 2, stdout});
@@ -327,11 +353,7 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   cancel(): void {
     if (!this.busy) return;
     this.cancelled = true;
-    const child = this.child;
-    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
-    if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {windowsHide: true}).on('error', () => child.kill());
-    else {try {process.kill(-child.pid, 'SIGKILL');} catch {child.kill('SIGKILL');}}
-    this.lastMessage = 'Cancelling isolated processes…'; this.refresh();
+    this.stopController?.request();
   }
 
   private async readReport(file: string): Promise<InvestigationReport> {
