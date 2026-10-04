@@ -10,6 +10,7 @@ import {registerInvestigations} from './investigation';
 import {registerNativeTestItems} from './testitems';
 import {registerStudio} from './studio';
 import {executeLiveProvider, prepareLiveProvider} from './live-provider';
+import {cancellableJulia, controllerCancellation} from './controllerCancellation';
 import {currentWorkspaceFolder, resolveControllerProject, resolveWorkspaceFolder,
   selectWorkspaceFolder} from './workspace-root';
 import {
@@ -372,11 +373,21 @@ class Controller {
   private uiConfiguration?: any;
   private selectedWorkspace?: vscode.Uri;
   private workspaceOperations = 0;
+  private suiteRunning = false;
+  private readonly activeControllers = new Set<ReturnType<typeof controllerCancellation>>();
   private readonly preparations = new Map<string, Promise<void>>();
   private readonly readyControllers = new Set<string>();
 
   constructor(private readonly context: vscode.ExtensionContext, readonly tree: PlanTree,
-    private readonly tests: vscode.TestController) {}
+    private readonly tests: vscode.TestController) {
+    context.subscriptions.push({dispose: () => this.activeControllers.forEach(stop => stop.request())});
+  }
+
+  private async exclusiveSuite<T>(action: () => Promise<T>): Promise<T> {
+    if (this.suiteRunning) throw new Error('Wait for the active suite and its cleanup before starting another run.');
+    this.suiteRunning = true;
+    try {return await action();} finally {this.suiteRunning = false;}
+  }
 
   reportError(error: unknown): void { this.output.appendLine(String(error)); }
   showLog(): void { this.output.show(true); }
@@ -556,20 +567,28 @@ class Controller {
   }
 
   private async invoke(command: string, args: string[], progress?: (value: any) => void,
-    emitted?: (value: string) => void): Promise<number> {
+    emitted?: (value: string) => void, token?: vscode.CancellationToken): Promise<number> {
+    if (token?.isCancellationRequested) return 130;
     const executable = this.setting('juliaExecutable');
     const controller = this.controllerProject();
     const project = controller.project;
     const juliaArgs = [
       '--startup-file=no', `--project=${project}`,
-      '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', command, ...args,
+      '-e', cancellableJulia('using PerfChecker; exit(perfchecker_main(ARGS))'), '--', command, ...args,
     ];
     this.output.show(true);
     this.output.appendLine(`Controller project: ${project} (${controller.reason})`);
     this.output.appendLine(`> ${executable} ${juliaArgs.map(value => JSON.stringify(value)).join(' ')}`);
     return await new Promise<number>((resolve, reject) => {
       const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true,
+        detached: process.platform !== 'win32',
         env: {...process.env, JULIA_LOAD_PATH: ['@', '@stdlib'].join(path.delimiter)}});
+      const stop = controllerCancellation(child, (message, forced) => {
+        this.output.appendLine(message); emitted?.(`${message}\r\n`);
+        if (forced) void vscode.window.showWarningMessage(message);
+      });
+      this.activeControllers.add(stop);
+      const subscription = token?.onCancellationRequested(() => stop.request());
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
       let pending = '';
@@ -588,8 +607,9 @@ class Controller {
       child.stdout.on('data', consume);
       child.stdout.on('end', () => { if (pending) publish(pending); pending = ''; });
       child.stderr.on('data', text => { this.output.append(text); emitted?.(String(text).replace(/(?<!\r)\n/g, '\r\n')); });
-      child.on('error', reject);
-      child.on('close', code => resolve(code ?? 2));
+      child.on('error', error => {subscription?.dispose(); stop.dispose(); this.activeControllers.delete(stop); reject(error);});
+      child.on('close', code => {subscription?.dispose(); stop.dispose(); this.activeControllers.delete(stop); resolve(code ?? 2);});
+      if (token?.isCancellationRequested) stop.request();
     });
   }
 
@@ -676,11 +696,11 @@ class Controller {
     return collected;
   }
 
-  async runTests(request: vscode.TestRunRequest): Promise<void> {
-    return this.inWorkspace(() => this.runSelectedTests(request));
+  async runTests(request: vscode.TestRunRequest, token?: vscode.CancellationToken): Promise<void> {
+    return this.inWorkspace(() => this.exclusiveSuite(() => this.runSelectedTests(request, token)));
   }
 
-  private async runSelectedTests(request: vscode.TestRunRequest): Promise<void> {
+  private async runSelectedTests(request: vscode.TestRunRequest, token?: vscode.CancellationToken): Promise<void> {
     if (!this.plan) await this.refresh();
     const excluded = new Set(this.collectTestIds(request.exclude ?? []));
     const ids = [...new Set(this.collectTestIds(request.include).filter(id => !excluded.has(id)))];
@@ -711,7 +731,13 @@ class Controller {
           started.add(current);
         }
         currentItem = current ? items.get(current) : currentItem;
-      }, text => run.appendOutput(text, undefined, currentItem));
+      }, text => run.appendOutput(text, undefined, currentItem), token);
+      if (token?.isCancellationRequested && code !== 0 && code !== 130)
+        throw new Error('Cancellation failed during cleanup. Inspect PerfChecker output and retained inventories.');
+      if (code === 130) {
+        ids.forEach(id => {const item = items.get(id); if (item) run.skipped(item);});
+        return;
+      }
       let evidence: SuiteResultFile | undefined;
       try { evidence = JSON.parse(await fs.readFile(path.join(reports, 'suite-result.json'), 'utf8')); }
       catch { /* Never infer qualification from a process exit or an older report. */ }
@@ -743,14 +769,14 @@ class Controller {
   }
 
   async run(node?: PerfNode, explicitIds?: string[], revealOutput = false): Promise<void> {
-    return this.inWorkspace(() => this.runSelection(node, explicitIds, revealOutput));
+    return this.inWorkspace(() => this.exclusiveSuite(() => this.runSelection(node, explicitIds, revealOutput)));
   }
 
   async runAll(): Promise<void> {
-    return this.inWorkspace(async () => {
+    return this.inWorkspace(() => this.exclusiveSuite(async () => {
       if (!this.plan) await this.refresh();
       await this.runSelection(undefined, this.plan!.runs.map(run => run.id));
-    });
+    }));
   }
 
   private async runSelection(node?: PerfNode, explicitIds?: string[], revealOutput = false): Promise<void> {
@@ -761,10 +787,10 @@ class Controller {
     if (ids.some(id => !current.has(id)) || node?.runs.some(run => current.get(run.id)?.entrypoint !== run.entrypoint)) {
       throw new Error('This selection belongs to an earlier plan or workspace. Refresh and select current runs.');
     }
-    await vscode.window.withProgress({
+    const completed = await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
-      title: `PerfChecker · ${ids.length} run(s)`, cancellable: false,
-    }, async report => {
+      title: `PerfChecker · ${ids.length} run(s)`, cancellable: true,
+    }, async (report, token) => {
       let previous = 0;
       const args = [
         `--suite=${this.absolute('suite')}`, `--factory=${this.setting('factory')}`,
@@ -780,14 +806,16 @@ class Controller {
           message: value.current_run ? `${value.current_run.package} · ${value.current_run.feature} · ${value.current_run.version}` : value.state});
         previous = percent;
         this.designer?.webview.postMessage({type: 'progress', value});
-      });
+      }, undefined, token);
+      if (code === 130) {this.output.appendLine('Cancelled after controller cleanup.'); return false;}
+      if (code !== 0) throw new Error(`PerfChecker run failed with code ${code}. Inspect PerfChecker output for cleanup errors and retained inventories.`);
       if (revealOutput) {
         const selectedRuns = this.plan?.runs.filter(run => ids.includes(run.id)) ?? [];
         await this.openOutput(undefined, selectedRuns);
       }
-      if (code !== 0) throw new Error(`PerfChecker run failed with code ${code}.`);
+      return true;
     });
-    void vscode.window.showInformationMessage('PerfChecker run completed.');
+    if (completed) void vscode.window.showInformationMessage('PerfChecker run completed.');
   }
 
   async open(nodeOrRun: PerfNode | PlanRun): Promise<void> {
@@ -1031,7 +1059,10 @@ class Controller {
       <p class="selection-hint">Check types include or exclude all matching runs. Search, target and release-range filters preserve the selection; hidden selected runs remain included.</p><details class="selection-preview"><summary id="selection-summary">Preview selected runs</summary><div id="selection-preview"></div></details><p id="designer-error" class="form-error" role="alert" hidden></p><div id="progress" hidden><div></div><span></span></div><main><section><h2>Workload runs <span id="count"></span></h2><p class="hint">A feature is the workload. BenchmarkTools, Chairmarks, allocations and profiles are selectable check types. Use ▥ for visual output and ↗ for the check script.</p><div id="cards"></div><p id="rendered-count" class="hint"></p><button id="show-more" hidden>Show more workloads</button></section>
       <aside><section class="aside-panel"><h2>Comparison targets</h2><p class="hint">Choose a discovered branch, tag, or recent commit. You can also paste a GitHub/GitLab URL or a reference such as <code>owner/repository@branch</code>.</p><div id="target-list"></div><label>Package<select id="target-package"></select></label><label>Discovered Git reference<select id="target-reference"><option value="">Loading references…</option></select></label><div class="target-scan"><small id="target-source-status">Looking for the package repository…</small><button id="refresh-targets" title="Scan Git references again">Refresh</button></div><label>Or paste a reference<input id="target-revision" placeholder="Branch, tag, commit, or Git URL"></label><label>Display label (optional)<input id="target-label" placeholder="Filled from the selected reference"></label><details><summary>Advanced target options</summary><label>Git source override<input id="target-source" placeholder="Use the package source"></label><label>Workload compatibility<select id="target-compatibility"><option value="">Automatic</option></select></label></details><p id="target-error" class="form-error" hidden></p><button id="add-target">Add comparison target</button></section><section class="aside-panel"><h2>Comparison matrix</h2><p class="hint">One checked reference is an exact comparison. Several references form an aggregated reference group.</p><div id="comparison-list"></div><label>Package<select id="comparison-package"></select></label><label>Feature<select id="comparison-feature"></select></label><label>Reference aggregation<select id="comparison-aggregation"><option value="median">Median</option><option value="mean">Mean</option><option value="minimum">Minimum</option><option value="maximum">Maximum</option></select></label><h3>Reference targets</h3><div id="baseline-targets" class="target-options"></div><h3>Candidate targets</h3><div id="candidate-targets" class="target-options"></div><p id="comparison-error" class="form-error" role="alert" hidden></p><button id="add-comparison">Add comparison</button></section><section class="aside-panel"><h2>Documentation block</h2><label>Identifier<input id="doc-id" value="performance"></label><label>Title<input id="doc-title" value="Performance"></label><label>Interactive URL<input id="doc-url" placeholder="https://…"></label><fieldset><legend>Views</legend><label><input type="checkbox" name="view" value="summary" checked> Summary</label><label><input type="checkbox" name="view" value="comparison" checked> Comparisons</label><label><input type="checkbox" name="view" value="plots" checked> Plots</label><label><input type="checkbox" name="view" value="observations"> Observations</label><label><input type="checkbox" name="view" value="diagnostics"> Diagnostics</label><label><input type="checkbox" name="view" value="artifacts"> Artifacts</label></fieldset><p class="hint">The saved JSON is consumed by VS Code, Oxygen-compatible tooling and Documenter via <code>read_document_blocks</code>.</p></section></aside></main><script nonce="${nonce}" src="${script}"></script></body></html>`;
     const workspace = this.folder().uri.toString(), designer = this.designer;
-    this.designer.onDidDispose(() => { if (this.designer === designer) this.designer = undefined; });
+    this.designer.onDidDispose(() => {
+      this.activeControllers.forEach(stop => stop.request());
+      if (this.designer === designer) this.designer = undefined;
+    });
     this.designer.webview.onDidReceiveMessage(async message => {
       let sameWorkspace = false;
       try {sameWorkspace = currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders).uri.toString() === workspace;} catch {/* selected folder was closed */}
@@ -1192,7 +1223,7 @@ export function activate(context: vscode.ExtensionContext): void {
     return directory;
   };
   tests.createRunProfile('Run', vscode.TestRunProfileKind.Run,
-    request => controller.runTests(request), true);
+    (request, token) => controller.runTests(request, token), true);
   const view = vscode.window.createTreeView('perfchecker.runs', {treeDataProvider: tree,
     dragAndDropController: tree, manageCheckboxStateManually: true, showCollapseAll: true});
   context.subscriptions.push(view, tests, vscode.commands.registerCommand('perfchecker.refresh', () => controller.refresh()),

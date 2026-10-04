@@ -28,7 +28,10 @@ two distinct actions. Set `perfchecker.testItemTags` to `["perf_only"]` to show 
 measurement-only items in the PerfChecker controller. `testItemExcludeTags` further
 narrows selection. Each item runs once by
 default, in an isolated process; `testItemSamples` explicitly changes repetition.
-Save workspace changes before measuring. Cancellation stops the measured process tree.
+Save workspace changes before measuring. Cancellation asks the Julia controller
+to stop and waits for worker cleanup. A cleanup failure remains an error.
+After one minute without exit, a visible forced-stop warning explains that
+traces, private inventories or detached workers may remain.
 
 The item timer includes setup, imports, assertions and cleanup. Green means
 correctness passed, with measurements retained; no regression budget has been
@@ -205,7 +208,10 @@ Settings for this workflow:
 
 History is stored inside the workspace. Read JSON/Markdown, regenerate advice
 without running the target, or compare two saved measurements. Unmeasured
-configurations remain visible. Cancel stops the investigation's own process tree.
+configurations remain visible. Cancel waits for the investigation controller to
+exit after cleanup, with the same one-minute forced-stop fallback. Closing its
+panel requests cancellation too. Cancelling a local MCP request does not guarantee
+that a remote agent stops.
 
 The existing suite editor, result viewer and bundle commands remain available.
 Projects such as Étendu3D keep their own pinned controller and workspace settings;

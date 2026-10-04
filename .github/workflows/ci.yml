@@ -10,6 +10,52 @@ permissions:
   contents: read
 
 jobs:
+  native-cancellation:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      PERFCHECKER_TEST_CONTROLLER: ${{ runner.temp }}/perfchecker-cancellation-controller
+      PERFCHECKER_TEST_CORE: ${{ github.workspace }}/validation-core
+      PERFCHECKER_TEST_JULIA: julia
+      JULIA_NUM_THREADS: '1'
+      JULIA_NUM_PRECOMPILE_TASKS: '1'
+      JULIA_NUM_GC_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      JULIA_PKG_PRECOMPILE_AUTO: '0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: Mirage-Interactive-Fr/PerfChecker.jl
+          ref: d8a8be5bfa84d82ba832806f60a48e73718b3dd4
+          path: validation-core
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+          arch: x64
+      - run: npm ci
+      - run: npm run compile
+      - name: Prepare exact stable controller source
+        shell: bash
+        run: julia --startup-file=no -e 'using Pkg; Pkg.activate(ENV["PERFCHECKER_TEST_CONTROLLER"]); Pkg.develop(path=ENV["PERFCHECKER_TEST_CORE"]); Pkg.instantiate()'
+      - name: Validate portable cleanup, failure and forced fallback
+        run: node --test test/controller-cancellation.test.mjs
+      - name: Validate actual VS Code suite cancellation on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a node test/run-cancellation-host.mjs
+      - name: Validate actual VS Code suite cancellation on Windows
+        if: runner.os == 'Windows'
+        run: node test/run-cancellation-host.mjs
+
   test-and-package:
     strategy:
       fail-fast: false
