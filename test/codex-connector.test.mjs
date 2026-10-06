@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import Module, {createRequire} from 'node:module';
 import {spawn as nativeSpawn} from 'node:child_process';
 import * as nativeChildProcess from 'node:child_process';
-import {mkdtemp, writeFile, readFile, mkdir, rm, access} from 'node:fs/promises';
+import {mkdtemp, writeFile, readFile, mkdir, rm, realpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 
@@ -77,7 +77,7 @@ test('implementation accepts a canonical PerfChecker checkout and uses workspace
     assert.equal((await tool(connector,'implement_perfchecker',{prompt:'Implement reviewed advice.',workspace:checkout})).isError,undefined);
     assert.equal(await readFile(path.join(checkout,'source.txt'),'utf8'),'optimized\n');assert.equal(await readFile(path.join(root,'source.txt'),'utf8'),'original\n');
     const captured=JSON.parse(await readFile(path.join(checkout,'captured.json'),'utf8'));
-    assert.equal(captured.args[captured.args.indexOf('-C')+1],checkout);assert.equal(captured.args[captured.args.indexOf('--sandbox')+1],'workspace-write');
+    assert.equal(captured.args[captured.args.indexOf('-C')+1],await realpath(checkout));assert.equal(captured.args[captured.args.indexOf('--sandbox')+1],'workspace-write');
     assert.match(captured.prompt,/Do not publish, push, deploy/);
   } finally {await connector.dispose();await rm(temporary,{recursive:true,force:true});}
 }));
