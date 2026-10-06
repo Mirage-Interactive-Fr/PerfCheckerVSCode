@@ -97,7 +97,10 @@ test('real webviews preserve full selection, handle Git targets and render inter
       await route.fulfill({contentType,body:await readFile(path.resolve('media',name))});
     });
     const load=async type=>{html=panels.find(panel=>panel.type===type).webview.html;await page.goto('http://perfchecker.test/view');};
-    const send=message=>page.evaluate(value=>window.dispatchEvent(new MessageEvent('message',{data:value})),message);
+    const send=message=>page.evaluate(value=>{
+      if(value.type==='targetOptions' && value.requestId===undefined)value.requestId=window.messages.findLast(item=>item.type==='discoverTargets').requestId;
+      window.dispatchEvent(new MessageEvent('message',{data:value}));
+    },message);
     await load('perfchecker.designer');await send({type:'plan',workspace:folder.uri.toString(),plan});
     await page.waitForFunction(()=>document.querySelectorAll('.check-type').length===9);
     assert.equal(await page.locator('#cards .card').count(),3);
@@ -120,6 +123,24 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await page.locator('#target-reference').selectOption('abc123');
     await page.locator('#add-target').click();const targetMessage=await page.evaluate(()=>window.messages.findLast(message=>message.type==='addTarget'));
     assert.equal(targetMessage.target.reference,'abc123');assert.equal(targetMessage.target.label,'abc123');
+    const sha1='1'.repeat(40),sha2='2'.repeat(40),sha3='3'.repeat(40),sha4='4'.repeat(40);
+    await send({type:'targetOptions',package:'Example',repository:root,options:[
+      {kind:'branch',label:'branch: same',revision:'refs/heads/same',commit:sha1},
+      {kind:'tag',label:'tag: same',revision:'refs/tags/same',commit:sha2},
+      {kind:'remote',label:'remote: origin/same',revision:'refs/remotes/origin/same',commit:sha3},
+      {kind:'remote',label:'remote: upstream/same',revision:'refs/remotes/upstream/same',commit:sha4},
+    ]});
+    for(const [ref,sha]of [['refs/heads/same',sha1],['refs/tags/same',sha2],['refs/remotes/origin/same',sha3],['refs/remotes/upstream/same',sha4]]){
+      await page.locator('#target-reference').selectOption(ref);await page.locator('#add-target').click();
+      const selected=await page.evaluate(()=>window.messages.findLast(message=>message.type==='addTarget').target);
+      assert.equal(selected.reference,sha);assert.equal(selected.source,root);
+    }
+    await page.locator('#refresh-targets').click();const lastRequest=await page.evaluate(()=>window.messages.findLast(message=>message.type==='discoverTargets'));
+    await send({type:'targetOptions',requestId:lastRequest.requestId-1,package:'Example',repository:'stale',options:[],error:'stale failure'});
+    assert.equal(await page.locator('#target-error').isVisible(),false);
+    await page.locator('#cancel-targets').click();assert.equal((await page.evaluate(()=>window.messages.at(-1))).type,'cancelTargets');
+    await send({type:'targetOptions',requestId:lastRequest.requestId,package:'Example',repository:'',options:[],error:'Git discovery cancelled. Refresh to try again.'});
+    assert.match(await page.locator('#target-error').innerText(),/cancelled/);assert.equal(await page.locator('#cancel-targets').isVisible(),false);
     await page.locator('#target-revision').fill('https://github.com/example/Example.jl/tree/fast');assert.equal(await page.locator('#target-label').inputValue(),'');await page.locator('#add-target').click();
     assert.match((await page.evaluate(()=>window.messages.findLast(message=>message.type==='addTarget'))).target.reference,/github/);
     await page.locator('#add-comparison').click();assert.equal(await page.locator('#comparison-error').isVisible(),true);

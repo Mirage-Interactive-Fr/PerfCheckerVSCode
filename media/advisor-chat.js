@@ -13,7 +13,9 @@ function mountAdvisorChat(root, send, logo) {
   const title = node('div'); title.append(node('p', 'PERFCHECKER / ASSISTANT', 'eyebrow'), node('h1', 'From evidence to better code.'));
   const workspace = node('p', 'Workspace conversation', 'subtle'); title.append(workspace); header.append(title);
   const settings = button('Advisor settings', () => send({type: 'chatSettings'}), 'secondary');
-  header.append(settings); root.append(header);
+  const connectCodex = button('Connect Codex CLI', () => send({type: 'chatConnectCodex'}), 'secondary');
+  const disconnectCodex = button('Disconnect Codex', () => send({type: 'chatDisconnectCodex'}), 'secondary');
+  header.append(connectCodex, disconnectCodex, settings); root.append(header);
   const tabs = node('div', '', 'tabs'); tabs.setAttribute('role', 'tablist'); tabs.setAttribute('aria-label', 'Assistant mode');
   const adviceTab = button('01 · Advice', () => setMode('advice'));
   const implementationTab = button('02 · Implementation', () => setMode('implementation'));
@@ -90,7 +92,9 @@ function mountAdvisorChat(root, send, logo) {
   const status = node('p', '', 'status'); status.setAttribute('role', 'status'); root.append(status);
   function setMode(value) {mode = value; renderControls();}
   function renderControls() {
-    for (const element of [evidence, clear, settings, saveTool, ...Object.values(fields), question, discard, verify]) element.disabled = state.busy;
+    for (const element of [evidence, clear, settings, connectCodex, disconnectCodex, saveTool, ...Object.values(fields), question, discard, verify]) element.disabled = state.busy;
+    connectCodex.hidden = Boolean(state.connection); disconnectCodex.hidden = !state.connection;
+    if (state.connection) for (const element of [saveTool, ...Object.values(fields)]) element.disabled = true;
     sendButton.disabled = state.busy || !question.value.trim(); cancel.hidden = !state.busy; implementationCancel.hidden = !state.busy;
     implementation.hidden = mode !== 'implementation';
     advicePane.hidden = mode !== 'advice';
@@ -122,7 +126,7 @@ function mountAdvisorChat(root, send, logo) {
     const completed = state.busy && !value.busy && !value.pending;
     state = value;
     if (completed) question.value = '';
-    workspace.textContent = `${value.workspace} · MCP conversation`;
+    workspace.textContent = `${value.workspace} · ${value.connection || 'Configured MCP conversation'}`;
     evidence.replaceChildren();
     for (const item of [{id: '', label: 'No saved evidence · usage and configuration questions'}, ...value.evidence]) {
       const option = node('option', item.label); option.value = item.id; evidence.append(option);

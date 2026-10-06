@@ -37,7 +37,7 @@ test('drag ordering is stable', () => {
 
 test('Git comparison targets accept refs and pasted repository URLs', () => {
   assert.deepEqual(parseGitReference('refs/remotes/origin/feature/faster-parser'), {
-    revision: 'feature/faster-parser', suggestedLabel: 'feature/faster-parser',
+    revision: 'refs/remotes/origin/feature/faster-parser', suggestedLabel: 'refs/remotes/origin/feature/faster-parser',
   });
   assert.deepEqual(parseGitReference('https://github.com/Mirage-Interactive-Fr/PerfChecker.jl/tree/feature/ui'), {
     revision: 'feature/ui', source: 'https://github.com/Mirage-Interactive-Fr/PerfChecker.jl.git',
@@ -48,6 +48,8 @@ test('Git comparison targets accept refs and pasted repository URLs', () => {
     suggestedLabel: 'v1.0.0',
   });
   assert.equal(parseGitReference('0123456789abcdef0123456789abcdef01234567').suggestedLabel, '0123456789ab');
+  assert.equal(parseGitReference('https://github.com/example/Example.jl/releases/tag/same').revision, 'refs/tags/same');
+  assert.equal(parseGitReference('https://gitlab.com/group/Example.jl/-/tags/same').revision, 'refs/tags/same');
   assert.throws(() => parseGitReference('https://github.com/Mirage-Interactive-Fr/PerfChecker.jl'),
     /does not identify/);
 });

@@ -129,10 +129,10 @@ export function parseGitReference(input: string, sourceInput = ''): ParsedGitRef
     const gitlab = url.pathname.match(/^\/(.+\/[^/]+?)(?:\.git)?\/-\/(tree|commit|tags)\/(.+)$/);
     if (github) {
       source ||= `${url.origin}/${github[1]}/${github[2]}.git`;
-      value = readableReference(github[4]);
+      value = `${github[3] === 'releases/tag' || github[3] === 'tags' ? 'refs/tags/' : ''}${readableReference(github[4])}`;
     } else if (gitlab) {
       source ||= `${url.origin}/${gitlab[1]}.git`;
-      value = readableReference(gitlab[3]);
+      value = `${gitlab[2] === 'tags' ? 'refs/tags/' : ''}${readableReference(gitlab[3])}`;
     } else if (url.hash.length > 1) {
       value = readableReference(url.hash.slice(1));
       url.hash = '';
@@ -148,8 +148,6 @@ export function parseGitReference(input: string, sourceInput = ''): ParsedGitRef
     }
   }
 
-  value = value.replace(/^refs\/heads\//, '').replace(/^refs\/tags\//, '')
-    .replace(/^refs\/remotes\/[^/]+\//, '');
   if (!value || value === 'HEAD') throw new Error('Choose a concrete branch, tag, or commit.');
   return {revision: value, ...(source ? {source} : {}),
     suggestedLabel: /^[0-9a-f]{13,40}$/i.test(value) ? value.slice(0, 12) : value};

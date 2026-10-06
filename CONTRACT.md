@@ -170,4 +170,30 @@ Companions retain explicit folder selection through `openStudioForWorkspace(uri)
 chat and implementation use that selected folder and reject an unselected multi-root
 workspace. Advice mode can be used without Git. Configuration/transmission and
 user-facing recovery instructions are maintained in the canonical PerfChecker
-[MCP guide](https://mirage-interactive-fr.github.io/PerfChecker/stable/mcp-advisor).
+[MCP guide](https://perfchecker.mirageinteractive.fr/mcp-advisor.html).
+
+### Optional local Codex connector
+
+`perfchecker.connectCodex` explicitly connects an installed, authenticated native
+CLI; `perfchecker.disconnectCodex` restores the saved provider. This in-memory
+override takes precedence over `advisorConfig` and supplies both tool selections
+without changing JSON files, settings or saved credentials. Setup saves are
+refused while connected. The endpoint is an authenticated POST-only loopback MCP
+server with `ask_perfchecker(prompt)` and `implement_perfchecker(prompt, workspace)`;
+the implementation path must resolve into a temporary PerfChecker checkout.
+
+The CLI preflight checks version, help capabilities and login status. Calls use
+`--no-daemon exec --json --ephemeral --ignore-user-config --ignore-rules`, explicit
+`read-only`/`workspace-write` sandbox policies and `approval_policy="never"`.
+Project `.codex` directories are refused, including configurations in ancestors
+up to the containing Git root, before CLI invocation. Custom user configuration
+and profiles are not inherited; account authentication and CLI default model are
+used. Native Windows executables are supported; shell launchers are refused.
+
+The random bearer token exists only in extension memory and a temporary process
+environment variable inherited by Julia workers. It is removed from Codex's
+environment and on disconnect. Origins are refused. Requests, CLI output and final
+replies are bounded; one model call runs at a time. Timeout, client disconnect and
+extension disposal terminate the owned local process group/tree and await its
+exit. The connector does not control a remote model provider's in-flight work or
+promise sandbox support beyond that of the selected CLI and platform.

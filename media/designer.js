@@ -5,6 +5,8 @@ let selected = new Set();
 let selectedChecks = new Set();
 let labels = {};
 let targets = [];
+let targetRequestId = 0;
+let targetRepository = '';
 let comparisons = [];
 let workspace;
 let renderLimit = 120;
@@ -202,15 +204,19 @@ function requestTargetOptions() {
   select.replaceChildren(new Option('Loading references…', ''));
   byId('target-source-status').textContent = 'Looking for branches, tags, and recent commits…';
   showTargetError();
-  vscode.postMessage({type: 'discoverTargets', package: packageName, source: byId('target-source').value.trim()});
+  byId('cancel-targets').hidden = false;
+  vscode.postMessage({type: 'discoverTargets', requestId: ++targetRequestId, package: packageName, source: byId('target-source').value.trim()});
 }
 
 function renderTargetOptions(message) {
   if (message.package !== byId('target-package').value) return;
+  if (message.requestId !== targetRequestId) return;
+  byId('cancel-targets').hidden = true;
+  targetRepository = message.repository || '';
   const select = byId('target-reference');
   const placeholder = new Option(message.error ? 'References unavailable' : 'Choose a reference…', '');
   const groups = [];
-  for (const [kind, title] of [['branch', 'Branches'], ['tag', 'Tags'], ['commit', 'Recent commits']]) {
+  for (const [kind, title] of [['branch', 'Branches'], ['remote', 'Remote branches'], ['tag', 'Tags'], ['commit', 'Recent commits']]) {
     const options = (message.options || []).filter(option => option.kind === kind);
     if (!options.length) continue;
     const group = document.createElement('optgroup');
@@ -219,6 +225,7 @@ function renderTargetOptions(message) {
       const option = new Option(`${reference.label}${reference.detail ? ` — ${reference.detail}` : ''}`, reference.revision);
       option.dataset.label = reference.label;
       option.dataset.kind = reference.kind;
+      option.dataset.commit = reference.commit || '';
       return option;
     }));
     groups.push(group);
@@ -317,16 +324,20 @@ byId('target-reference').addEventListener('change', event => {
   showTargetError();
 });
 byId('refresh-targets').addEventListener('click', requestTargetOptions);
+byId('cancel-targets').addEventListener('click', () => vscode.postMessage({type: 'cancelTargets'}));
 byId('target-revision').addEventListener('input', () => {
   if(byId('target-label').value.trim() === automaticTargetLabel)byId('target-label').value='';
   automaticTargetLabel='';showTargetError();
 });
 byId('add-target').addEventListener('click', () => {
+  const option = byId('target-reference').selectedOptions[0];
+  const reference = byId('target-revision').value.trim() || byId('target-reference').value;
+  const discovered = option?.value === reference && option.dataset.commit;
   const target = {
     package: byId('target-package').value,
     label: byId('target-label').value.trim(),
-    reference: byId('target-revision').value.trim() || byId('target-reference').value,
-    source: byId('target-source').value.trim(),
+    reference: discovered || reference,
+    source: byId('target-source').value.trim() || (discovered ? targetRepository : ''),
     compatibility_version: byId('target-compatibility').value.trim(),
   };
   if (!target.package || !target.reference) {
