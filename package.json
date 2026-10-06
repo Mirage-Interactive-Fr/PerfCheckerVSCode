@@ -9,7 +9,7 @@
     "type": "git",
     "url": "https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode.git"
   },
-  "homepage": "https://mirage-interactive-fr.github.io/PerfChecker/stable/interfaces/vscode",
+  "homepage": "https://perfchecker.mirageinteractive.fr/interfaces/vscode.html",
   "bugs": {
     "url": "https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode/issues"
   },
@@ -225,6 +225,16 @@
         "command": "perfchecker.restoreImplementation",
         "title": "PerfChecker: Restore implementation checkpoint",
         "icon": "$(discard)"
+      },
+      {
+        "command": "perfchecker.connectCodex",
+        "title": "PerfChecker: Connect authenticated Codex CLI",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "perfchecker.disconnectCodex",
+        "title": "PerfChecker: Disconnect local Codex",
+        "icon": "$(debug-disconnect)"
       }
     ],
     "viewsContainers": {
@@ -698,6 +708,12 @@
           "default": "workspace",
           "scope": "resource",
           "description": "Name of the MCP implementation tool argument receiving the isolated checkout path. The agent must honor this path."
+        },
+        "perfchecker.codexExecutable": {
+          "type": "string",
+          "default": "codex",
+          "scope": "resource",
+          "description": "Authenticated Codex CLI executable. Connect explicitly from Chat. Requires exec support for ephemeral, ignore-user-config, ignore-rules and sandbox flags; custom Codex configuration and profiles are not inherited."
         }
       }
     }

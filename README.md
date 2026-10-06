@@ -6,10 +6,10 @@ Use a controller environment containing PerfChecker.jl 1.0.0 or later.
 
 The user guides are maintained with PerfChecker.jl on its existing documentation host:
 
-- [VS Code guide](https://mirage-interactive-fr.github.io/PerfChecker/stable/interfaces/vscode)
-- [Complete extension configuration](https://mirage-interactive-fr.github.io/PerfChecker/stable/interfaces/vscode-configuration)
-- [Plots, notebooks and Julia tools](https://mirage-interactive-fr.github.io/PerfChecker/stable/interfaces/vscode-workflows)
-- [MCP advice, implementation and recovery](https://mirage-interactive-fr.github.io/PerfChecker/stable/mcp-advisor)
+- [VS Code guide](https://perfchecker.mirageinteractive.fr/interfaces/vscode.html)
+- [Complete extension configuration](https://perfchecker.mirageinteractive.fr/interfaces/vscode-configuration.html)
+- [Plots, notebooks and Julia tools](https://perfchecker.mirageinteractive.fr/interfaces/vscode-workflows.html)
+- [MCP advice, implementation and recovery](https://perfchecker.mirageinteractive.fr/mcp-advisor.html)
 
 ## Measure existing Julia test items
 
@@ -71,6 +71,9 @@ the Julia package or enter measured workers.
   Review the diff before applying; restore the checkpoint if the repository has
   not changed. Conversation is kept in memory; Git recovery survives editor restarts.
   Starting a new conversation preserves the current proposal and its restore action.
+- Connect an already authenticated Codex CLI from Chat for the same advice and
+  reviewed implementation workflow. The temporary local connection preserves
+  your saved provider configuration and ends when disconnected or the editor closes.
 - Open a folder-scoped Julia terminal, create an unsaved Julia investigation
   notebook, open native notebooks, and debug saved Julia source using the Julia
   extension. Select an installed notebook kernel explicitly.
@@ -215,12 +218,12 @@ that a remote agent stops.
 
 The existing suite editor, result viewer and bundle commands remain available.
 Projects such as Étendu3D keep their own pinned controller and workspace settings;
-this lab build does not migrate or replace their environments. Test it with a
+this extension does not migrate or replace their environments. Test it with a
 separate extension development profile before choosing a deployment.
 
 ### Extension host integration test (opt-in)
 
-Prepare a controller containing the lab PerfChecker, SharedScenarioDemo,
+Prepare a controller containing PerfChecker.jl 1.0.0 or later, SharedScenarioDemo,
 BenchmarkTools, Chairmarks and JET. Then create a **new** scratch workspace:
 
 ```text
@@ -291,7 +294,8 @@ separately operated agent reads each request and writes `response-N.json` contai
 only the supplied checkout and runs its chosen validation. The host waits up to
 600 seconds, then verifies unchanged advice-mode source, reviewed application,
 the Julia result, warm allocation reduction and restoration. The extension does
-not include that agent or automatically connect to Codex.
+not automatically connect an agent. The optional local Codex connector below
+offers an explicitly selected alternative to that manual bridge.
 
 Inspect the result JSON, then remove the sacrificial workspace, profile,
 extensions, bridge and result files. Do not run these destructive fixture checks
@@ -348,8 +352,60 @@ Preparation creates a checkpoint; application requires a separate reviewed actio
 The extension uses the controller's public `chat` and `implement` commands, which
 are supplied by PerfChecker.jl 1.0.0 or later; an older controller fails
 visibly instead of providing an implementation fallback. The extension does not
-include, install or start an agent backend.
+install an agent backend. Its explicit **Connect Codex CLI** action starts an
+authenticated installed CLI on demand through a temporary local MCP endpoint;
+generic external MCP agents remain supported.
 
-See the canonical [MCP guide](https://mirage-interactive-fr.github.io/PerfChecker/stable/mcp-advisor)
+See the canonical [MCP guide](https://perfchecker.mirageinteractive.fr/mcp-advisor.html)
 for provider configuration, credentials, supported revisions, transmission,
 cancellation and recovery. Stdio and OAuth login are not supported by this adapter.
+
+### Connect an installed Codex CLI
+
+Authenticate your CLI using `codex login` in your own terminal. Set
+`perfchecker.codexExecutable` if `codex` is not on VS Code's PATH, open Chat, then
+choose **Connect Codex CLI**. Version, supported flags and login status are checked
+without starting a model turn. This requires `--no-daemon`, `--ignore-user-config`
+and `--ignore-rules`, in addition to the standard `exec` sandbox/ephemeral/output
+flags; Codex CLI 0.159.2 was qualified. Unsupported executables fail explicitly.
+Windows requires the native `.exe`; npm `.cmd`/`.bat` launchers are unsupported.
+
+The connector uses the existing account and default CLI model. Custom user
+profiles, model/provider configuration, MCP servers, hooks and rules are not
+inherited. Workspaces or implementation copies containing project `.codex`
+configuration are refused. CLI sandbox support depends on the installation and
+platform; a copied checkout does not itself provide an operating-system sandbox.
+The agent can inspect files under its working directory; your configured model
+provider processes the requested context and ordinary CLI usage charges apply.
+
+Advice uses `read-only`; implementation uses `workspace-write` only in a canonical
+temporary PerfChecker checkout. Both run without the shared Codex daemon.
+The loopback endpoint and its automatic authentication token live only for this
+editor session. **Disconnect Codex** restores your previous provider settings;
+reconnect after reloading the editor. Git proposals and checkpoints remain
+recoverable without the agent connection. Never save the temporary endpoint.
+
+After compiling, reproduce the opt-in named-agent qualification in a sacrificial
+Node/Git workspace with your already authenticated CLI:
+
+```sh
+PERFCHECKER_TEST_CODEX=/path/to/codex node --test test/codex-real.test.mjs
+```
+
+This sends real model requests and verifies advice, isolated editing, Node
+semantics, diff, apply, byte-identical restoration and cancellation after a turn
+starts. It removes its temporary files. The default tests use a sacrificial CLI
+to verify errors, limits, process-tree termination and authentication separately.
+
+The complete opt-in editor/controller qualification uses a prepared controller:
+
+```sh
+PERFCHECKER_TEST_CODEX=/path/to/codex \
+PERFCHECKER_TEST_CONTROLLER=/path/to/prepared/controller \
+PERFCHECKER_TEST_JULIA=/path/to/julia \
+PERFCHECKER_VSCODE_EXECUTABLE=/path/to/code node test/run-codex-host.mjs
+```
+
+It opens an isolated editor profile and sacrificial Git workspace, checks the real
+Julia MCP conversation and reviewed changes, then confirms that disconnect restores
+an existing saved provider. It uses the account's model quota and removes its fixtures.

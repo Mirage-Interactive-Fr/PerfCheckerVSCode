@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import {spawn, ChildProcess} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
+import {localAdvisorConnection} from './advisorConnection';
 
 const mapping: Record<string, [string, unknown]> = {
   endpoint: ['advisorEndpoint', 'http://127.0.0.1:8081/v1/chat/completions'], model: ['advisorModel', 'local'],
@@ -15,6 +16,8 @@ const mapping: Record<string, [string, unknown]> = {
 };
 
 export async function readAdvisorConfiguration(folder: vscode.WorkspaceFolder): Promise<Record<string, unknown>> {
+  const local = localAdvisorConnection(folder.uri.toString());
+  if (local) return {...local.config};
   const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
   const file = settings.get<string>('advisorConfig', '');
   if (!file) return Object.fromEntries(Object.entries(mapping).map(([key, [setting, fallback]]) => [key, settings.get(setting, fallback)]));
@@ -38,7 +41,8 @@ export class AdvisorSetup implements vscode.Disposable {
   private async initial() {
     const settings = this.settings(), file = settings.get<string>('advisorConfig', '');
     const config = await readAdvisorConfiguration(this.folder());
-    return {config, config_location: path.resolve(this.root(), file || 'perf/advisor.json'), enabled: settings.get('advisorEnabled', true), investigates: settings.get('advisorInvestigates', false),
+    const local = localAdvisorConnection(this.folder().uri.toString());
+    return {config, config_location: local ? 'Temporary local Codex connection; disconnect before editing saved settings' : path.resolve(this.root(), file || 'perf/advisor.json'), enabled: local ? true : settings.get('advisorEnabled', true), investigates: local ? false : settings.get('advisorInvestigates', false),
       max_experiments: settings.get('investigationMaxExperiments', 4), budget_seconds: settings.get('investigationBudgetSeconds', 300)};
   }
   async open() {
@@ -69,6 +73,7 @@ export class AdvisorSetup implements vscode.Disposable {
   }
   async action(input: any): Promise<any> {
     this.folder();
+    if (localAdvisorConnection(this.folder().uri.toString())) throw new Error('Disconnect the local Codex connector before editing or testing saved provider settings. Its temporary endpoint must not be saved.');
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before connecting an advisor.');
     if (this.busy) throw new Error('A setup operation is already running.');
     if (!['save', 'probe', 'models', 'pull', 'delete', 'unload'].includes(input?.action)) throw new Error('Unknown advisor action.');

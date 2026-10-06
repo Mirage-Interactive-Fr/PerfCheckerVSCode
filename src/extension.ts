@@ -11,6 +11,8 @@ import {registerNativeTestItems} from './testitems';
 import {registerStudio} from './studio';
 import {executeLiveProvider, prepareLiveProvider} from './live-provider';
 import {cancellableJulia, controllerCancellation} from './controllerCancellation';
+import {discoverGitReferences, resolveGitRevision} from './gitReferences';
+import {shutdownCodexConnections} from './codexIntegration';
 import {currentWorkspaceFolder, resolveControllerProject, resolveWorkspaceFolder,
   selectWorkspaceFolder} from './workspace-root';
 import {
@@ -60,13 +62,6 @@ interface GitTarget {
   revision: string;
   source?: string;
   compatibility_version?: string;
-}
-
-interface GitReferenceOption {
-  kind: 'branch' | 'tag' | 'commit';
-  label: string;
-  revision: string;
-  detail: string;
 }
 
 interface ComparisonPolicyConfig {
@@ -377,10 +372,12 @@ class Controller {
   private readonly activeControllers = new Set<ReturnType<typeof controllerCancellation>>();
   private readonly preparations = new Map<string, Promise<void>>();
   private readonly readyControllers = new Set<string>();
+  private targetDiscovery?: AbortController;
 
   constructor(private readonly context: vscode.ExtensionContext, readonly tree: PlanTree,
     private readonly tests: vscode.TestController) {
     context.subscriptions.push({dispose: () => this.activeControllers.forEach(stop => stop.request())});
+    context.subscriptions.push({dispose: () => this.targetDiscovery?.abort()});
   }
 
   private async exclusiveSuite<T>(action: () => Promise<T>): Promise<T> {
@@ -440,22 +437,7 @@ class Controller {
     return targets.map(target => `--candidate=${JSON.stringify(target)}`);
   }
 
-  private async git(args: string[], cwd = this.root()): Promise<string> {
-    return await new Promise<string>((resolve, reject) => {
-      const child = spawn('git', args, {cwd, windowsHide: true});
-      let stdout = ''; let stderr = '';
-      child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-      child.stdout.on('data', value => { stdout += value; });
-      child.stderr.on('data', value => { stderr += value; });
-      child.once('error', reject);
-      child.once('close', code => code === 0 ? resolve(stdout) :
-        reject(new Error(stderr.trim() || `git ${args[0]} exited with code ${code}`)));
-    });
-  }
-
-  private async discoverGitReferences(packageName: string, sourceInput = ''): Promise<{
-    repository: string; source: string; options: GitReferenceOption[];
-  }> {
+  private gitSource(packageName: string, sourceInput = ''): string {
     if (!this.plan?.runs.some(run => run.package === packageName)) {
       throw new Error(`Unknown package ${packageName}.`);
     }
@@ -463,53 +445,7 @@ class Controller {
       run.target_kind === 'dev' && run.target_source)?.target_source ??
       this.plan.runs.find(run => run.package === packageName && run.target_source)?.target_source ??
       this.root();
-    const requestedSource = sourceInput.trim();
-    const source = requestedSource || defaultSource || this.root();
-    const options: GitReferenceOption[] = [];
-    const seen = new Set<string>();
-    const add = (option: GitReferenceOption) => {
-      if (!option.revision || option.revision === 'HEAD' || seen.has(option.revision)) return;
-      seen.add(option.revision); options.push(option);
-    };
-
-    if (/^(?:https?|ssh):\/\//i.test(source) || /^git@[^:]+:/i.test(source)) {
-      const refs = await this.git(['ls-remote', '--heads', '--tags', source]);
-      for (const line of refs.split(/\r?\n/)) {
-        const [sha, ref = ''] = line.trim().split(/\s+/, 2);
-        if (!sha || ref.endsWith('^{}')) continue;
-        const branch = ref.match(/^refs\/heads\/(.+)$/);
-        const tag = ref.match(/^refs\/tags\/(.+)$/);
-        if (branch) add({kind: 'branch', label: branch[1], revision: branch[1], detail: sha.slice(0, 12)});
-        if (tag) add({kind: 'tag', label: tag[1], revision: tag[1], detail: sha.slice(0, 12)});
-      }
-      return {repository: source, source: requestedSource, options};
-    }
-
-    const local = path.isAbsolute(source) ? source : path.resolve(this.root(), source);
-    const stat = await fs.stat(local);
-    const cwd = stat.isDirectory() ? local : path.dirname(local);
-    const repository = (await this.git(['rev-parse', '--show-toplevel'], cwd)).trim();
-    const refs = await this.git(['for-each-ref', '--sort=-committerdate',
-      '--format=%(refname)%09%(objectname:short)%09%(subject)',
-      'refs/heads', 'refs/remotes', 'refs/tags'], repository);
-    for (const line of refs.split(/\r?\n/)) {
-      const [ref = '', short = '', ...subjectParts] = line.split('\t');
-      const subject = subjectParts.join('\t');
-      const branch = ref.match(/^refs\/heads\/(.+)$/);
-      const remote = ref.match(/^refs\/remotes\/[^/]+\/(.+)$/);
-      const tag = ref.match(/^refs\/tags\/(.+)$/);
-      const revision = branch?.[1] ?? remote?.[1] ?? tag?.[1];
-      if (!revision) continue;
-      add({kind: tag ? 'tag' : 'branch', label: revision, revision,
-        detail: [short, subject].filter(Boolean).join(' · ')});
-    }
-    const commits = await this.git(['log', '-25', '--pretty=format:%H%x09%h%x09%s'], repository);
-    for (const line of commits.split(/\r?\n/)) {
-      const [revision = '', short = '', ...subjectParts] = line.split('\t');
-      if (revision) add({kind: 'commit', label: short, revision,
-        detail: subjectParts.join('\t')});
-    }
-    return {repository, source: requestedSource, options};
+    return sourceInput.trim() || defaultSource || this.root();
   }
 
   private comparisonPolicies(): ComparisonPolicyConfig[] {
@@ -1057,9 +993,10 @@ class Controller {
       <section class="check-filter"><strong>Include check types</strong><div id="check-types"></div></section>
       <section class="selection-actions"><button id="select-visible">Select visible</button><button id="clear-visible">Clear visible</button><button id="clear-all">Clear selection</button><button id="reset-filters">Reset filters</button><label><input id="open-after-run" type="checkbox" checked> Open visual results after the run</label></section>
       <p class="selection-hint">Check types include or exclude all matching runs. Search, target and release-range filters preserve the selection; hidden selected runs remain included.</p><details class="selection-preview"><summary id="selection-summary">Preview selected runs</summary><div id="selection-preview"></div></details><p id="designer-error" class="form-error" role="alert" hidden></p><div id="progress" hidden><div></div><span></span></div><main><section><h2>Workload runs <span id="count"></span></h2><p class="hint">A feature is the workload. BenchmarkTools, Chairmarks, allocations and profiles are selectable check types. Use ▥ for visual output and ↗ for the check script.</p><div id="cards"></div><p id="rendered-count" class="hint"></p><button id="show-more" hidden>Show more workloads</button></section>
-      <aside><section class="aside-panel"><h2>Comparison targets</h2><p class="hint">Choose a discovered branch, tag, or recent commit. You can also paste a GitHub/GitLab URL or a reference such as <code>owner/repository@branch</code>.</p><div id="target-list"></div><label>Package<select id="target-package"></select></label><label>Discovered Git reference<select id="target-reference"><option value="">Loading references…</option></select></label><div class="target-scan"><small id="target-source-status">Looking for the package repository…</small><button id="refresh-targets" title="Scan Git references again">Refresh</button></div><label>Or paste a reference<input id="target-revision" placeholder="Branch, tag, commit, or Git URL"></label><label>Display label (optional)<input id="target-label" placeholder="Filled from the selected reference"></label><details><summary>Advanced target options</summary><label>Git source override<input id="target-source" placeholder="Use the package source"></label><label>Workload compatibility<select id="target-compatibility"><option value="">Automatic</option></select></label></details><p id="target-error" class="form-error" hidden></p><button id="add-target">Add comparison target</button></section><section class="aside-panel"><h2>Comparison matrix</h2><p class="hint">One checked reference is an exact comparison. Several references form an aggregated reference group.</p><div id="comparison-list"></div><label>Package<select id="comparison-package"></select></label><label>Feature<select id="comparison-feature"></select></label><label>Reference aggregation<select id="comparison-aggregation"><option value="median">Median</option><option value="mean">Mean</option><option value="minimum">Minimum</option><option value="maximum">Maximum</option></select></label><h3>Reference targets</h3><div id="baseline-targets" class="target-options"></div><h3>Candidate targets</h3><div id="candidate-targets" class="target-options"></div><p id="comparison-error" class="form-error" role="alert" hidden></p><button id="add-comparison">Add comparison</button></section><section class="aside-panel"><h2>Documentation block</h2><label>Identifier<input id="doc-id" value="performance"></label><label>Title<input id="doc-title" value="Performance"></label><label>Interactive URL<input id="doc-url" placeholder="https://…"></label><fieldset><legend>Views</legend><label><input type="checkbox" name="view" value="summary" checked> Summary</label><label><input type="checkbox" name="view" value="comparison" checked> Comparisons</label><label><input type="checkbox" name="view" value="plots" checked> Plots</label><label><input type="checkbox" name="view" value="observations"> Observations</label><label><input type="checkbox" name="view" value="diagnostics"> Diagnostics</label><label><input type="checkbox" name="view" value="artifacts"> Artifacts</label></fieldset><p class="hint">The saved JSON is consumed by VS Code, Oxygen-compatible tooling and Documenter via <code>read_document_blocks</code>.</p></section></aside></main><script nonce="${nonce}" src="${script}"></script></body></html>`;
+      <aside><section class="aside-panel"><h2>Comparison targets</h2><p class="hint">Choose a discovered branch, tag, or recent commit. You can also paste a GitHub/GitLab URL or a reference such as <code>owner/repository@branch</code>.</p><div id="target-list"></div><label>Package<select id="target-package"></select></label><label>Discovered Git reference<select id="target-reference"><option value="">Loading references…</option></select></label><div class="target-scan"><small id="target-source-status">Looking for the package repository…</small><button id="refresh-targets" title="Scan Git references again">Refresh</button><button id="cancel-targets" hidden>Cancel discovery</button></div><label>Or paste a reference<input id="target-revision" placeholder="Branch, tag, commit, or Git URL"></label><label>Display label (optional)<input id="target-label" placeholder="Filled from the selected reference"></label><details><summary>Advanced target options</summary><label>Git source override<input id="target-source" placeholder="Use the package source"></label><label>Workload compatibility<select id="target-compatibility"><option value="">Automatic</option></select></label></details><p id="target-error" class="form-error" hidden></p><button id="add-target">Add comparison target</button></section><section class="aside-panel"><h2>Comparison matrix</h2><p class="hint">One checked reference is an exact comparison. Several references form an aggregated reference group.</p><div id="comparison-list"></div><label>Package<select id="comparison-package"></select></label><label>Feature<select id="comparison-feature"></select></label><label>Reference aggregation<select id="comparison-aggregation"><option value="median">Median</option><option value="mean">Mean</option><option value="minimum">Minimum</option><option value="maximum">Maximum</option></select></label><h3>Reference targets</h3><div id="baseline-targets" class="target-options"></div><h3>Candidate targets</h3><div id="candidate-targets" class="target-options"></div><p id="comparison-error" class="form-error" role="alert" hidden></p><button id="add-comparison">Add comparison</button></section><section class="aside-panel"><h2>Documentation block</h2><label>Identifier<input id="doc-id" value="performance"></label><label>Title<input id="doc-title" value="Performance"></label><label>Interactive URL<input id="doc-url" placeholder="https://…"></label><fieldset><legend>Views</legend><label><input type="checkbox" name="view" value="summary" checked> Summary</label><label><input type="checkbox" name="view" value="comparison" checked> Comparisons</label><label><input type="checkbox" name="view" value="plots" checked> Plots</label><label><input type="checkbox" name="view" value="observations"> Observations</label><label><input type="checkbox" name="view" value="diagnostics"> Diagnostics</label><label><input type="checkbox" name="view" value="artifacts"> Artifacts</label></fieldset><p class="hint">The saved JSON is consumed by VS Code, Oxygen-compatible tooling and Documenter via <code>read_document_blocks</code>.</p></section></aside></main><script nonce="${nonce}" src="${script}"></script></body></html>`;
     const workspace = this.folder().uri.toString(), designer = this.designer;
     this.designer.onDidDispose(() => {
+      this.targetDiscovery?.abort();
       this.activeControllers.forEach(stop => stop.request());
       if (this.designer === designer) this.designer = undefined;
     });
@@ -1082,14 +1019,19 @@ class Controller {
       if (message.type === 'refresh') await this.refresh();
       if (message.type === 'save') await this.saveConfiguration(message.configuration);
       if (message.type === 'targets') await this.updateGitTargets(message.targets as GitTarget[]);
+      if (message.type === 'cancelTargets') this.targetDiscovery?.abort();
       if (message.type === 'discoverTargets') {
+        this.targetDiscovery?.abort();
+        const discovery = new AbortController(); this.targetDiscovery = discovery;
         try {
-          const result = await this.discoverGitReferences(String(message.package ?? ''), String(message.source ?? ''));
-          void this.designer?.webview.postMessage({type: 'targetOptions', package: message.package, ...result});
+          const source = this.gitSource(String(message.package ?? ''), String(message.source ?? ''));
+          const result = await discoverGitReferences(source, this.root(), {signal: discovery.signal});
+          if (this.targetDiscovery === discovery) void designer.webview.postMessage({type: 'targetOptions', package: message.package,
+            requestId: message.requestId, ...result});
         } catch (error) {
-          void this.designer?.webview.postMessage({type: 'targetOptions', package: message.package,
+          if (this.targetDiscovery === discovery) void designer.webview.postMessage({type: 'targetOptions', package: message.package, requestId: message.requestId,
             repository: '', source: message.source ?? '', options: [], error: String(error)});
-        }
+        } finally {if (this.targetDiscovery === discovery) this.targetDiscovery = undefined;}
       }
       if (message.type === 'addTarget') {
         try { await this.addGitTarget(message.target); }
@@ -1130,8 +1072,11 @@ class Controller {
     const parsed = parseGitReference(String(input?.reference ?? ''), String(input?.source ?? ''));
     const label = String(input?.label ?? '').trim() || parsed.suggestedLabel;
     const compatibility = String(input?.compatibility_version ?? '').trim();
-    const target: GitTarget = {package: String(input?.package ?? '').trim(), label,
-      revision: parsed.revision, ...(parsed.source ? {source: parsed.source} : {}),
+    const packageName = String(input?.package ?? '').trim();
+    const source = this.gitSource(packageName, parsed.source ?? '');
+    const revision = await resolveGitRevision(source, this.root(), parsed.revision);
+    const target: GitTarget = {package: packageName, label,
+      revision, source,
       ...(compatibility ? {compatibility_version: compatibility} : {})};
     await this.updateGitTargets([...this.effectiveGitTargets(), target]);
   }
@@ -1249,4 +1194,4 @@ export function activate(context: vscode.ExtensionContext): void {
     }));
 }
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {await shutdownCodexConnections();}

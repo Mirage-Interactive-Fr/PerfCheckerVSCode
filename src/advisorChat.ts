@@ -7,6 +7,7 @@ import {StringDecoder} from 'node:string_decoder';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {readAdvisorConfiguration} from './advisorSetup';
+import {localAdvisorConnection} from './advisorConnection';
 import {ChatMessage, prepareChatMessages, completeChatMessages, chatReply} from './advisorChatModel';
 import {InvestigationReport} from './investigationModel';
 import {createImplementationCheckout, applyImplementation, recoverImplementationProposal, recoverActiveImplementationProposal, saveActiveImplementationProposal, ImplementationProposal} from './implementation';
@@ -49,12 +50,15 @@ export class AdvisorChat implements vscode.Disposable {
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
     return {type: 'chatState', workspace: folder.name, messages: this.messages, evidenceId: this.evidenceId,
       evidence: this.evidenceOptions(), busy: this.busy, status: this.status, pending: this.pending,
-      implementation: {tool: settings.get('advisorImplementationMcpTool', ''),
+      connection: localAdvisorConnection(folder.uri.toString())?.label,
+      implementation: localAdvisorConnection(folder.uri.toString())?.implementation ?? {tool: settings.get('advisorImplementationMcpTool', ''),
         promptArgument: settings.get('advisorImplementationMcpPromptArgument', 'prompt'),
         workspaceArgument: settings.get('advisorImplementationMcpWorkspaceArgument', 'workspace')},
       proposal: this.proposal ? {patch: this.proposal.patch, lossyPreview: this.proposal.lossyPreview, files: this.proposal.files, applied: this.proposal.applied} : undefined,
       implementationSummary: this.implementationSummary, backupRef: this.proposal?.backupRef ?? this.backupRef};
   }
+  isBusy() {return this.busy;}
+  connectionChanged() {this.status = localAdvisorConnection(this.folder().uri.toString()) ? 'Codex connected for this editor session. Advice is read-only; implementation requires review.' : 'Local Codex disconnected. Saved provider configuration is active again. Reconnect after an editor restart.'; this.publish();}
   private publish() {
     if (this.disposed) return;
     try {void this.panel?.webview.postMessage(this.state());} catch {/* selected folder was closed */}
@@ -78,6 +82,8 @@ export class AdvisorChat implements vscode.Disposable {
         else if (message?.type === 'chatClear') this.clear(message.evidenceId);
         else if (message?.type === 'chatCancel') this.cancel();
         else if (message?.type === 'chatSettings') await vscode.commands.executeCommand('perfchecker.configureAdvisor');
+        else if (message?.type === 'chatConnectCodex') await vscode.commands.executeCommand('perfchecker.connectCodex');
+        else if (message?.type === 'chatDisconnectCodex') await vscode.commands.executeCommand('perfchecker.disconnectCodex');
         else if (message?.type === 'implementationSettings') await this.saveImplementationSettings(message);
         else if (message?.type === 'chatImplement') await this.implement(true);
         else if (message?.type === 'chatApply') await this.apply();
@@ -104,7 +110,7 @@ export class AdvisorChat implements vscode.Disposable {
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before connecting an advisor.');
     if (this.busy) throw new Error('An advisor request is already running.');
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
-    if (!settings.get('advisorEnabled', true)) throw new Error('Optional advisor is disabled. Open Advisor settings to configure it.');
+    if (!settings.get('advisorEnabled', true) && !localAdvisorConnection(folder.uri.toString())) throw new Error('Optional advisor is disabled. Open Advisor settings to configure it.');
     if (typeof evidenceId !== 'string' || (evidenceId && !this.evidenceOptions().some(item => item.id === evidenceId))) throw new Error('Saved evidence is no longer available.');
     const prepared = prepareChatMessages(evidenceId === this.evidenceId ? this.messages : [], question);
     // Lock before any asynchronous read so double submissions cannot overlap.
@@ -135,6 +141,7 @@ export class AdvisorChat implements vscode.Disposable {
   private async saveImplementationSettings(input: any) {
     const folder = this.folder();
     if (this.busy) throw new Error('Wait for the current request.');
+    if (localAdvisorConnection(folder.uri.toString())) throw new Error('The local Codex connector supplies its implementation tool. Disconnect it to configure your saved provider.');
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before configuring implementation.');
     if (typeof input.tool !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(input.tool) ||
       ![input.promptArgument, input.workspaceArgument].every(value => typeof value === 'string' && /^[A-Za-z_][A-Za-z_0-9.-]{0,127}$/.test(value)) ||
@@ -153,12 +160,13 @@ export class AdvisorChat implements vscode.Disposable {
     if (vscode.workspace.textDocuments.some(document => document.isDirty && document.uri.scheme === 'file' &&
       this.containsFile(folder.uri.fsPath, document.uri.fsPath))) throw new Error('Save your files before preparing a Git checkpoint.');
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
-    if (!settings.get('advisorEnabled', true)) throw new Error('Optional advisor is disabled.');
-    const tool = settings.get<string>('advisorImplementationMcpTool', '');
+    const local = localAdvisorConnection(folder.uri.toString());
+    if (!settings.get('advisorEnabled', true) && !local) throw new Error('Optional advisor is disabled.');
+    const tool = local?.implementation.tool ?? settings.get<string>('advisorImplementationMcpTool', '');
     if (!tool) throw new Error('Configure an explicit MCP implementation tool first.');
     if (!/^[A-Za-z0-9_.-]{1,128}$/.test(tool)) throw new Error('Invalid MCP implementation tool name.');
-    const promptArgument = settings.get<string>('advisorImplementationMcpPromptArgument', 'prompt');
-    const workspaceArgument = settings.get<string>('advisorImplementationMcpWorkspaceArgument', 'workspace');
+    const promptArgument = local?.implementation.promptArgument ?? settings.get<string>('advisorImplementationMcpPromptArgument', 'prompt');
+    const workspaceArgument = local?.implementation.workspaceArgument ?? settings.get<string>('advisorImplementationMcpWorkspaceArgument', 'workspace');
     if (![promptArgument, workspaceArgument].every(value => /^[A-Za-z_][A-Za-z_0-9.-]{0,127}$/.test(value)) || promptArgument === workspaceArgument) throw new Error('Configure two distinct MCP prompt and workspace argument names.');
     if (!warningShown) void vscode.window.showWarningMessage('Agent edits may be incorrect. PerfChecker saves a Git checkpoint and prepares an isolated copy. Review the diff before applying, then rerun checks.');
     this.busy = true; this.cancelled = false;
