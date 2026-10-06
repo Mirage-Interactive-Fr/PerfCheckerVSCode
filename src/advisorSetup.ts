@@ -5,7 +5,7 @@ import * as os from 'node:os';
 import {spawn, ChildProcess} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
-import {localAdvisorConnection} from './advisorConnection';
+import {assertSavedAdvisorConfiguration, localAdvisorConnection, onLocalAdvisorConnectionChanged} from './advisorConnection';
 
 const mapping: Record<string, [string, unknown]> = {
   endpoint: ['advisorEndpoint', 'http://127.0.0.1:8081/v1/chat/completions'], model: ['advisorModel', 'local'],
@@ -34,10 +34,24 @@ export class AdvisorSetup implements vscode.Disposable {
   private cancelled = false;
   private busy = false;
   private panelWorkspace?: string;
-  constructor(private context: vscode.ExtensionContext) {}
+  private connectionGenerations = new Map<string, number>();
+  private unsubscribeConnection: () => void;
+  constructor(private context: vscode.ExtensionContext) {
+    this.unsubscribeConnection = onLocalAdvisorConnectionChanged(workspace => {
+      this.connectionGenerations.set(workspace, this.connectionGeneration(workspace) + 1);
+      if (this.panelWorkspace === workspace) this.panel?.dispose();
+    });
+  }
   private folder() {return currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);}
   private settings() {return vscode.workspace.getConfiguration('perfchecker', this.folder().uri);}
   private root() {return this.folder().uri.fsPath;}
+  private connectionGeneration(workspace: string) {return this.connectionGenerations.get(workspace) ?? 0;}
+  private assertWorkspace(workspace: string) {
+    let current: string | undefined;
+    try {current = this.folder().uri.toString();} catch {/* removed workspace */}
+    if (!vscode.workspace.isTrusted || current !== workspace)
+      throw new Error('PerfChecker folder or trust changed. Reopen Advisor settings before continuing.');
+  }
   private async initial() {
     const settings = this.settings(), file = settings.get<string>('advisorConfig', '');
     const config = await readAdvisorConfiguration(this.folder());
@@ -49,11 +63,14 @@ export class AdvisorSetup implements vscode.Disposable {
     const workspace = this.folder().uri.toString();
     if (this.panel && this.panelWorkspace !== workspace) this.panel.dispose();
     if (this.panel) {this.panel.reveal(); return;}
+    const generation = this.connectionGeneration(workspace);
     const initial = await this.initial();
+    this.assertWorkspace(workspace);
+    if (generation !== this.connectionGeneration(workspace)) throw new Error('Advisor connection changed. Reopen settings to load your provider.');
     this.panelWorkspace = workspace;
     this.panel = vscode.window.createWebviewPanel('perfchecker.advisorSetup', 'PerfChecker · Advisor and models', vscode.ViewColumn.One,
       {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
-    const webview = this.panel.webview, nonce = randomUUID();
+    const panel = this.panel, webview = panel.webview, nonce = randomUUID();
     const resource = (name: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
     const data = JSON.stringify(initial).replace(/</g, '\\u003c');
     this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
@@ -61,6 +78,7 @@ export class AdvisorSetup implements vscode.Disposable {
     this.panel.onDidDispose(() => {this.cancel(); this.panel = undefined;});
     webview.onDidReceiveMessage(async message => {
       try {
+        if (this.panel !== panel) throw new Error('Advisor connection changed. Reopen settings to load your saved provider.');
         if (this.folder().uri.toString() !== workspace) throw new Error('PerfChecker folder changed. Reopen advisor settings.');
         if (message.type === 'advisorCancel') this.cancel();
         else if (message.type === 'advisorHelp') await vscode.env.openExternal(vscode.Uri.parse('https://docs.ollama.com/quickstart'));
@@ -72,8 +90,11 @@ export class AdvisorSetup implements vscode.Disposable {
     }, undefined, this.context.subscriptions);
   }
   async action(input: any): Promise<any> {
-    this.folder();
-    if (localAdvisorConnection(this.folder().uri.toString())) throw new Error('Disconnect the local Codex connector before editing or testing saved provider settings. Its temporary endpoint must not be saved.');
+    const folder = this.folder(), workspace = folder.uri.toString(), root = folder.uri.fsPath;
+    const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri), generation = this.connectionGeneration(workspace);
+    const file = path.resolve(root, settings.get<string>('advisorConfig', '') || 'perf/advisor.json');
+    if (localAdvisorConnection(workspace)) throw new Error('Disconnect the local Codex connector before editing or testing saved provider settings. Its temporary endpoint must not be saved.');
+    assertSavedAdvisorConfiguration(input?.config);
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before connecting an advisor.');
     if (this.busy) throw new Error('A setup operation is already running.');
     if (!['save', 'probe', 'models', 'pull', 'delete', 'unload'].includes(input?.action)) throw new Error('Unknown advisor action.');
@@ -84,23 +105,29 @@ export class AdvisorSetup implements vscode.Disposable {
     this.busy = true; this.cancelled = false;
     try {
       if (input.action === 'save' && input.config === null) {
-        await this.settings().update('advisorEnabled', false, vscode.ConfigurationTarget.WorkspaceFolder);
-        await this.settings().update('advisorInvestigates', false, vscode.ConfigurationTarget.WorkspaceFolder);
+        await settings.update('advisorEnabled', false, vscode.ConfigurationTarget.WorkspaceFolder);
+        await settings.update('advisorInvestigates', false, vscode.ConfigurationTarget.WorkspaceFolder);
         return {status: 'complete', message: 'Rule-based advice only. Model files remain installed.'};
       }
+      const project = resolveControllerProject(root, settings).project;
+      const julia = settings.get<string>('juliaExecutable', 'julia');
       const result = await vscode.window.withProgress({location: vscode.ProgressLocation.Notification,
         title: 'PerfChecker · Advisor and models', cancellable: true}, async (_progress, token) => {
         const subscription = token.onCancellationRequested(() => this.cancel());
-        try {return await this.invoke({...input, action: input.action === 'save' ? 'validate' : input.action});}
+        if (token.isCancellationRequested) this.cancel();
+        try {return await this.invoke({...input, action: input.action === 'save' ? 'validate' : input.action}, root, project, julia);}
         finally {subscription.dispose();}
       });
       if (input.action === 'save' && result.status === 'complete') {
-        const settings = this.settings();
-        const file = path.resolve(this.root(), settings.get<string>('advisorConfig', '') || 'perf/advisor.json');
+        this.assertWorkspace(workspace);
+        if (this.cancelled || generation !== this.connectionGeneration(workspace) || localAdvisorConnection(workspace)) throw new Error('Advisor connection changed or setup was cancelled. Reopen settings before saving your provider.');
+        assertSavedAdvisorConfiguration(result.config);
         await fs.mkdir(path.dirname(file), {recursive: true});
+        this.assertWorkspace(workspace);
+        if (this.cancelled || generation !== this.connectionGeneration(workspace)) throw new Error('Setup changed or was cancelled before saving. Reopen Advisor settings.');
         // Keep optional/custom provider fields validated by the common Julia contract.
         await fs.writeFile(file, JSON.stringify(result.config, null, 2) + '\n', 'utf8');
-        await settings.update('advisorConfig', path.relative(this.root(), file).replaceAll('\\', '/'), vscode.ConfigurationTarget.WorkspaceFolder);
+        await settings.update('advisorConfig', path.relative(root, file).replaceAll('\\', '/'), vscode.ConfigurationTarget.WorkspaceFolder);
         await settings.update('advisorEnabled', true, vscode.ConfigurationTarget.WorkspaceFolder);
         await settings.update('advisorInvestigates', Boolean(input.investigates), vscode.ConfigurationTarget.WorkspaceFolder);
         await settings.update('investigationMaxExperiments', max, vscode.ConfigurationTarget.WorkspaceFolder);
@@ -110,18 +137,18 @@ export class AdvisorSetup implements vscode.Disposable {
       return result;
     } finally {this.busy = false; this.child = undefined;}
   }
-  private async invoke(input: any): Promise<any> {
+  private async invoke(input: any, root: string, project: string, julia: string): Promise<any> {
     const temporaryRoot = path.resolve(os.tmpdir());
     const directory = await fs.mkdtemp(path.join(temporaryRoot, 'perfchecker-setup-'));
     try {
+      if (this.cancelled) return {status: 'cancelled', message: 'Setup operation cancelled before starting a worker.'};
       const file = path.join(directory, 'request.json');
       await fs.writeFile(file, JSON.stringify(input), {flag: 'wx', mode: 0o600});
-      const settings = this.settings();
-      const project = resolveControllerProject(this.root(), settings).project;
+      if (this.cancelled) return {status: 'cancelled', message: 'Setup operation cancelled before starting a worker.'};
       return await new Promise((resolve, reject) => {
-        const child = spawn(settings.get('juliaExecutable', 'julia'), ['--startup-file=no', `--project=${project}`,
+        const child = spawn(julia, ['--startup-file=no', `--project=${project}`,
           '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', 'advisor-setup', `--source=${file}`, `--project=${project}`],
-        {cwd: this.root(), windowsHide: true, detached: process.platform !== 'win32'});
+        {cwd: root, windowsHide: true, detached: process.platform !== 'win32'});
         this.child = child;
         let output = '', error = '';
         const timeout = setTimeout(() => this.cancel(), (Math.min(Number(input.config?.timeout) || 120, 3600) + 60) * 1000);
@@ -140,13 +167,14 @@ export class AdvisorSetup implements vscode.Disposable {
     }
   }
   cancel() {
+    if (this.busy) this.cancelled = true;
     const child = this.child;
     if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
     this.cancelled = true;
     if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {windowsHide: true}).on('error', () => child.kill());
     else {try {process.kill(-child.pid, 'SIGKILL');} catch {child.kill('SIGKILL');}}
   }
-  dispose() {this.cancel(); this.panel?.dispose();}
+  dispose() {this.unsubscribeConnection(); this.cancel(); this.panel?.dispose();}
 }
 
 export function registerAdvisorSetup(context: vscode.ExtensionContext) {

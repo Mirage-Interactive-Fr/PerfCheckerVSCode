@@ -12,6 +12,10 @@ export function registerCodexConnections(context: vscode.ExtensionContext, busy:
   let connecting = false;
   let disposed = false, preflight: AbortController | undefined;
   const folder = () => currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);
+  const workspaceUnchanged = (key: string, signal: AbortSignal) => {
+    try {return !disposed && !signal.aborted && vscode.workspace.isTrusted && folder().uri.toString() === key;}
+    catch {return false;}
+  };
   const disconnect = async (key: string) => {
     setLocalAdvisorConnection(key); const connector = connectors.get(key); connectors.delete(key);
     await connector?.dispose(); try {changed();} catch {/* a workspace may have been closed */}
@@ -25,16 +29,16 @@ export function registerCodexConnections(context: vscode.ExtensionContext, busy:
     connecting = true;
     preflight = new AbortController();
     try {
-      const selected = folder(), key = selected.uri.toString();
+      const selected = folder(), key = selected.uri.toString(), signal = preflight.signal;
       const settings = vscode.workspace.getConfiguration('perfchecker', selected.uri);
       const cli = settings.get<string>('codexExecutable', 'codex').trim();
       if (!cli) throw new Error('Set PerfChecker: Codex Executable to your authenticated CLI, then reconnect.');
-      const version = await inspectCodex(cli, selected.uri.fsPath, preflight.signal);
-      if (disposed || !vscode.workspace.isTrusted || folder().uri.toString() !== key) throw new Error('Workspace changed. Connect Codex again.');
+      const version = await inspectCodex(cli, selected.uri.fsPath, signal);
+      if (!workspaceUnchanged(key, signal)) throw new Error('Workspace changed. Connect Codex again.');
       await disconnect(key);
       const timeout = Math.min(Math.max(Number(settings.get('advisorTimeout', 90)) || 90, 1), 3600);
       const connector = await new CodexConnector({cli, root: selected.uri.fsPath, timeoutMs: timeout * 1000}).start();
-      if (disposed) {await connector.dispose(); throw new Error('Workspace closed before Codex connected. Reopen it to reconnect.');}
+      if (!workspaceUnchanged(key, signal)) {await connector.dispose(); throw new Error('Workspace changed before Codex connected. Reopen or select it, then connect again.');}
       connectors.set(key, connector);
       setLocalAdvisorConnection(key, {label: `${version} · local connector`,
         config: {protocol: 'mcp_http', endpoint: connector.endpoint, model: 'Codex CLI', timeout,
