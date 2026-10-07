@@ -108,7 +108,9 @@ async function resource(context,workspace,controller,threads,previousEditorActio
     await eventually(async()=>(await frame.locator('body').innerText()).includes('native_editor_branch'),
       'The chosen native quick fix opens the evidence for the same workspace');
     assert.equal(await fs.readFile(factory,'utf8'),source,'Quick fix opens evidence without editing source');
-    assert.equal(settings.get('scenarioProject'),controller);
+    const currentSettings=vscode.workspace.getConfiguration('perfchecker',uri);
+    assert.equal(currentSettings.get('scenarioProject'),controller);
+    assert.equal(currentSettings.inspect('scenarioProject')?.workspaceFolderValue,controller);
     context.proof('native-codelens-and-quickfix',{workspace:path.basename(workspace),controller,
       sourceUri:sourceUri.toString(),sourceSha256:sha(Buffer.from(source)),threads,
       proposalCodeLensNativeClick:true,diagnosisCodeLensNativeClick:true,quickFixNativeChoice:true,
