@@ -122,10 +122,10 @@ function configurationCoverage(properties,checks){
     advisorMcpPromptArgument:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],
     advisorMcpArguments:['advisor-native-provider-and-tool-discovery','native-mcp-custom-arguments'],advisorMcpResponse:['provider-controls','native-mcp-advice-implementation-restore'],
     advisorMcpVersion:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],advisorAllowRemote:['native-advisor-remote-opt-in-contract'],advisorKeyEnvironment:['native-narrative-custom-instruction-and-environment-key'],advisorTimeout:['native-mcp-advice-implementation-restore','native-narrative-configured-deadline'],
-    advisorInvestigates:['investigation-real-bounded-work'],investigationMaxExperiments:['investigation-real-bounded-work'],investigationBudgetSeconds:['investigation-real-bounded-work'],
+    advisorInvestigates:['investigation-real-bounded-work','native-investigation-enabled-model-decision'],investigationMaxExperiments:['investigation-real-bounded-work'],investigationBudgetSeconds:['investigation-real-bounded-work','native-investigation-elapsed-budget'],
     scenarioCatalog:['investigation-adoption','native-codelens-and-quickfix'],scenarioProject:['native-codelens-and-quickfix','native-active-controller-runtime-settings'],
     investigationReports:['investigation-real-measurement','native-codelens-and-quickfix'],analysisTools:['investigation-analyzer-jet','investigation-analyzer-alloccheck','native-codelens-and-quickfix'],
-    analysisTimeout:['investigation-real-measurement'],scenarioThreads:['native-codelens-and-quickfix'],scenarioSamples:['investigation-real-measurement','native-mcp-selected-measured-evidence'],
+    analysisTimeout:['investigation-real-measurement','native-analysis-configured-deadline'],scenarioThreads:['native-codelens-and-quickfix'],scenarioSamples:['investigation-real-measurement','native-mcp-selected-measured-evidence'],
     juliaExecutable:['native-julia-terminal','official-julia-debug','native-active-controller-runtime-settings'],runnerProject:['multi-root-explicit-routing','official-julia-debug','native-active-controller-runtime-settings'],
     suite:['suite-selection-and-save'],factory:['suite-selection-and-save'],profile:['all-supported-collectors-measured'],reports:['result-controls','computed-reference-aggregation'],
     uiConfiguration:['save-palette-command','native-suite-save-palette'],gitTargets:['git-reference-controls'],comparisonPolicies:['computed-reference-aggregation'],
@@ -148,11 +148,16 @@ function configurationCoverage(properties,checks){
   };
   return Object.keys(properties).map(option=>{
     const key=option.replace(/^perfchecker\./,''),evidence=checks.filter(check=>check.assertionsCompleted===true&&(paths[key]||[]).includes(check.name));
-    const deadlineVerified=key==='advisorTimeout'&&evidence.some(check=>check.name==='native-narrative-configured-deadline');
+    const deadlineVerified=evidence.some(check=>({advisorTimeout:'native-narrative-configured-deadline',analysisTimeout:'native-analysis-configured-deadline',
+      investigationBudgetSeconds:'native-investigation-elapsed-budget',advisorInvestigates:'native-investigation-enabled-model-decision'})[key]===check.name);
     const status=!evidence.length?'unverified':key==='codexExecutable'?'prerequisite-verified':pathOnly.has(key)&&!deadlineVerified?'path-exercised':'effect-verified';
+    const qualifiedLimit=deadlineVerified?({advisorTimeout:'One actual 45-second request expiry is asserted; other configured limits are not implied.',
+      analysisTimeout:'One actual 45-second sleeping scenario expires; every analyzer and deadline value is not implied.',
+      investigationBudgetSeconds:'One real 45-second elapsed budget interrupts a running scenario and leaves experiments unexecuted.',
+      advisorInvestigates:'One controlled structured MCP stop decision is asserted with preserved custom fields; external inference is not qualified.'})[key]:undefined;
     return {option,status,evidence:evidence.map(check=>({name:check.name,case:check.case,status:check.status||'validated-effect'})),
       scope:'Actual values asserted by the cited case only; API-written test settings and native UI changes are not interchangeable.',
-      ...(limits[key]?{limit:limits[key]}:{})};
+      ...(qualifiedLimit||limits[key]?{limit:qualifiedLimit||limits[key]}:{})};
   });
 }
 
@@ -376,6 +381,7 @@ exports.run = async () => {
       else if(phase==='workbench')await runCase('native-workbench-controls',()=>workbench.run(context));
       else if(phase==='testitems')await runCase('native-testitem-missing-target',()=>measureNativeTestItem(context,false));
       else if(phase==='advisor')await runCase('native-advisor-controls',()=>advisor.run(context));
+      else if(phase==='investigation-limits')await runCase('native-investigation-limits',()=>require('./native-investigation-limits.cjs').run(context));
       else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
       else if(phase==='editor'){
         await runCase('native-testitem-tag-selection-and-samples',()=>require('./native-editor-actions.cjs').runTestItems(context));
@@ -555,6 +561,7 @@ exports.run = async () => {
           await runCase('native-all-studio-controls', () => controls.run(context));
           await runCase('native-workbench-controls',()=>workbench.run(context));
           await runCase('native-investigation-controls', () => investigations.run(context));
+          await runCase('native-investigation-limits',()=>require('./native-investigation-limits.cjs').run(context));
           await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
           await runCase('native-advisor-controls', () => advisor.run(context));
           await runCase('native-mcp-controls', () => mcp.run(context));
