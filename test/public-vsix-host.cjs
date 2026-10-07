@@ -205,7 +205,7 @@ async function measureNativeTestItem(context,expectedPassed,options={}){
     assert.equal(measured.payload.runs[0].samples[0].passes,0);assert.equal(measured.payload.runs[0].samples[0].errors,1);
     await eventually(async()=>/failed|errored/i.test(await row.getAttribute('aria-label')||''),'The tree does not present missing target dependencies as passed');
     await row.click();await vscode.commands.executeCommand('testing.openOutputPeek');
-    const results=windowPage.locator('[id="workbench.panel.testResults.view"]');
+    const results=windowPage.locator('.part.panel .pane-body:visible').filter({has:windowPage.locator('.test-output-peek-tree')});
     await results.waitFor({state:'visible'});
     const failedResult=results.locator('.monaco-list-row').filter({hasText:name}).first();
     await failedResult.waitFor({state:'visible'});await failedResult.click();
