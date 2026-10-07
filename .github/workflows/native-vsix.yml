@@ -153,8 +153,8 @@ jobs:
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '4eec7f3573205519d365b4dd4553769eda5476cc' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '4fbc3c25543aa4f9b1154c227e5432f0cd62df91' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '59578c840d94d908dcd1d2f849bf41c24cd82a91' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '309e12d55896cbe5b9aed2b07e39421793c7248f' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
@@ -192,6 +192,9 @@ jobs:
           name: native-candidate-${{ github.sha }}
       - name: Add the browser protocol client (no browser installation)
         run: npm install --no-save --ignore-scripts playwright@1.62.1
+      - name: Install the disposable default-browser fixture runtime
+        if: runner.os == 'Linux' && matrix.vscode == 'stable' && (env.PERFCHECKER_NATIVE_STAGE == 'full' || env.PERFCHECKER_NATIVE_CASE_GROUP == 'mcp-pluto')
+        run: npx playwright install chromium
       - name: Install screen capture tooling in the disposable Linux stable host
         if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_VIDEO == '1'
         timeout-minutes: 15

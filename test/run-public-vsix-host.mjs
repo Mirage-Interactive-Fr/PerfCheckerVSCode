@@ -4,6 +4,7 @@ import os from 'node:os';
 import {createHash,randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -119,7 +120,7 @@ try {
     status:minimumAvailable?'native-positive-test-required':'awaiting-human-registration',candidateFunctions:coreProvenance},null,2));
 
   const launch = async phase => {
-    let recording,recorded,videoStartedAt,recordingError='';
+    let recording,recorded,videoStartedAt,recordingError='',externalBrowser;
     // Each independently launched phase has its own disposable profile. Reusing
     // the reload phase's persisted window state restores two windows and starts
     // two driver activations before either can test the next protocol.
@@ -140,6 +141,10 @@ try {
       }
     };
     try {
+      if(process.platform==='linux'&&version==='stable'&&(phase==='prepared'&&stage==='full'||phase==='mcp-pluto')){
+        const require=createRequire(import.meta.url);
+        externalBrowser=await require('./native-external-browser.cjs').create(session,{chromium:require('playwright').chromium});
+      }
       if(process.env.PERFCHECKER_NATIVE_VIDEO==='1'){
         if(process.platform!=='linux'||version!=='stable'||!process.env.DISPLAY)throw new Error('Native video recording requires the explicitly selected Linux stable Xvfb host.');
         await execute('ffmpeg',['-version']);videoStartedAt=new Date().toISOString();
@@ -150,7 +155,7 @@ try {
         recorded=new Promise(resolve=>{recording.once('close',code=>resolve(code));recording.once('error',error=>{recordingError=String(error);resolve(-1);});});
         console.log(`NATIVE_VIDEO_START ${phase} ${videoStartedAt}`);
       }
-      const environment={...process.env,PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
+      const environment={...process.env,...externalBrowser?.environment,PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
@@ -200,6 +205,7 @@ try {
       });
     } catch (error) {await retainHostLogs().catch(logError=>console.error(`NATIVE_HOST_LOGS ${logError.message}`));phaseFailures.push({phase, error: String(error)});}
     finally {
+      await externalBrowser?.close();
       if(recording){
         recording.stdin.on('error',()=>{});recording.stdin.end('q\n');
         const timeout=setTimeout(()=>recording.kill('SIGKILL'),15000);

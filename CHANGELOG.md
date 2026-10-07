@@ -13,6 +13,9 @@
 - Managed Pluto sessions preserve authenticated iframe URLs and remote port
   forwarding. Stop, Restart, view closure and Pluto's own shutdown/restart
   controls cancel owned jobs before closing their notebook workers.
+- Pluto's Recent shutdown confirmation works inside the editor sandbox.
+  Julia/HTML exports and new-context link gestures use the default browser;
+  normal notebook navigation stays in the editor with authentication preserved.
 - The Save configuration palette command now saves the visual editor's current
   unsaved state, with acknowledgement after writing and guards against stale
   replies. The native Test Explorer entry point uses its official container ID.

@@ -275,6 +275,7 @@ interface Session {
   folder: vscode.WorkspaceFolder; notebook: string; project: string; panel: vscode.WebviewPanel;
   child?: ChildProcess; cancel?: ReturnType<typeof controllerCancellation>;
   stopped?: Promise<void>; starting?: Promise<void>; disposed: boolean;
+  browserUri?: vscode.Uri; popupCapability?: string;
 }
 
 async function contained(root: string, file: string): Promise<void> {
@@ -473,7 +474,19 @@ export class PlutoNotebooks implements vscode.Disposable {
           return;
         }
         this.assertCurrent(folder, project);
-        if (message?.type === 'plutoSource') await vscode.window.showTextDocument(vscode.Uri.file(notebook));
+        if (message?.type === 'plutoPopup') {
+          if (!owned.browserUri || !owned.popupCapability || message.capability !== owned.popupCapability ||
+              !owned.child || owned.child.exitCode !== null || owned.child.signalCode !== null || typeof message.url !== 'string' || message.url.length > 8192)
+            throw new Error('The Pluto navigation request belongs to an unavailable session.');
+          const base=new URL(owned.browserUri.toString(true)),destination=new URL(message.url);
+          if (destination.origin!==base.origin || !/^https?:$/.test(destination.protocol) ||
+              !/^\/(?:edit|open|new|notebookfile|notebookexport)?$/.test(destination.pathname) ||
+              !base.searchParams.get('secret') || destination.searchParams.get('secret')!==base.searchParams.get('secret'))
+            throw new Error('The Pluto navigation request does not belong to this authenticated server.');
+          if (!await vscode.env.openExternal(vscode.Uri.parse(destination.href)))
+            await vscode.window.showWarningMessage('Pluto could not open the browser. Check your default browser, then retry the export or new-context gesture.');
+        }
+        else if (message?.type === 'plutoSource') await vscode.window.showTextDocument(vscode.Uri.file(notebook));
         else if (message?.type === 'plutoRestart' && !owned.starting) {owned.starting = (async()=>{await this.stop(owned);await this.start(owned);})(); try {await owned.starting;} finally {owned.starting = undefined;}}
       } catch (error) {if (!owned.disposed) this.render(owned,undefined,String(error));}
     }, undefined, this.context.subscriptions);
@@ -495,14 +508,16 @@ export class PlutoNotebooks implements vscode.Disposable {
     if (session.disposed) throw new Error('The Pluto view was closed.');
     this.assertCurrent(session.folder,session.project);
     const secret = randomBytes(32).toString('hex');
-    const navigation = await fs.readFile(vscode.Uri.joinPath(this.context.extensionUri,'media','pluto-navigation.js').fsPath);
+    const popupCapability=randomBytes(32).toString('hex');session.popupCapability=popupCapability;
+    const navigation = (await fs.readFile(vscode.Uri.joinPath(this.context.extensionUri,'media','pluto-navigation.js').fsPath,'utf8'))
+      .replace('__PERFCHECKER_PLUTO_POPUP_CAPABILITY__',popupCapability);
     this.assertCurrent(session.folder,session.project);
     if (session.disposed) throw new Error('The Pluto view was closed.');
     const child = spawn(vscode.workspace.getConfiguration('perfchecker',session.folder.uri).get('juliaExecutable','julia'),
       ['--startup-file=no','--history-file=no',`--project=${session.project}`,'-e',cancellableJulia(serverCode)],
       {cwd:session.folder.uri.fsPath, windowsHide:true, detached:process.platform!=='win32', stdio:['pipe','pipe','pipe'],
         env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter), PERFCHECKER_PLUTO_SECRET:secret, PERFCHECKER_PLUTO_PORT:String(port), PERFCHECKER_PLUTO_NOTEBOOK:session.notebook,
-          PERFCHECKER_PLUTO_NAVIGATION:`data:text/javascript;base64,${navigation.toString('base64')}`}});
+          PERFCHECKER_PLUTO_NAVIGATION:`data:text/javascript;base64,${Buffer.from(navigation).toString('base64')}`}});
     const redact = (line: string) => line.replaceAll(secret,'[session secret]').replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]');
     let errors = '';
     child.stderr?.on('data',data=>{
@@ -557,9 +572,12 @@ export class PlutoNotebooks implements vscode.Disposable {
     // URI.toString() encodes query delimiters, which makes Pluto's secret a query
     // key instead of its value. The HTTP URL must retain the forwarded query.
     const url=uri ? new URL(uri.toString(true)).href : undefined;
+    session.browserUri=uri;
     const nonce=randomUUID(), origin=url ? new URL(url).origin : 'http://127.0.0.1';
     const source=url ? `<iframe class="perfchecker-pluto-frame" title="Interactive Pluto notebook" src="${html(url)}" allow="clipboard-read; clipboard-write"></iframe>` : `<div class="status" role="status">${html(status)}</div>`;
-    session.panel.webview.html=`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src ${html(origin)}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';"><style nonce="${nonce}">html,body{height:100%;margin:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-font-family)}body{display:flex;flex-direction:column}header{display:flex;gap:12px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--vscode-panel-border)}header strong{margin-right:auto}button{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:0;padding:6px 10px;cursor:pointer}.perfchecker-pluto-frame{flex:1;width:100%;border:0}.status{padding:24px;line-height:1.6}</style><title>PerfChecker Pluto</title></head><body><header><strong>PerfChecker · Pluto</strong><span>Run checks explicitly · notebook saved as .jl</span><button id="pluto-source">Open source</button><button id="pluto-stop">Stop session</button><button id="pluto-restart">Restart session</button></header>${source}<script nonce="${nonce}">const api=acquireVsCodeApi();for(const [id,type]of [['pluto-source','plutoSource'],['pluto-stop','plutoStop'],['pluto-restart','plutoRestart']])document.getElementById(id).addEventListener('click',()=>api.postMessage({type}));</script></body></html>`;
+    const popupOrigin=JSON.stringify(origin).replace(/</g,'\\u003c'),capability=JSON.stringify(session.popupCapability||'');
+    const bridge=`const frame=document.querySelector('iframe.perfchecker-pluto-frame'),origin=${popupOrigin},capability=${capability},secret=new URL(frame?.src||origin).searchParams.get('secret');let retry;const handshake=()=>frame?.contentWindow?.postMessage({type:'perfcheckerPlutoHost',capability},origin);const ready=()=>{clearInterval(retry);handshake();retry=setInterval(handshake,250);};if(frame){frame.addEventListener('load',ready);ready();window.addEventListener('message',event=>{if(event.source!==frame.contentWindow||event.origin!==origin||event.data?.capability!==capability)return;if(event.data.type==='perfcheckerPlutoReady')clearInterval(retry);else if(event.data.type==='perfcheckerPlutoPopup'&&typeof event.data.url==='string'){try{const url=new URL(event.data.url);if(url.origin===origin&&secret&&url.searchParams.get('secret')===secret&&/^\\/(?:edit|open|new|notebookfile|notebookexport)?$/.test(url.pathname))api.postMessage({type:'plutoPopup',capability,url:url.href});}catch{}}});}`;
+    session.panel.webview.html=`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src ${html(origin)}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';"><style nonce="${nonce}">html,body{height:100%;margin:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-font-family)}body{display:flex;flex-direction:column}header{display:flex;gap:12px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--vscode-panel-border)}header strong{margin-right:auto}button{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:0;padding:6px 10px;cursor:pointer}.perfchecker-pluto-frame{flex:1;width:100%;border:0}.status{padding:24px;line-height:1.6}</style><title>PerfChecker Pluto</title></head><body><header><strong>PerfChecker · Pluto</strong><span>Run checks explicitly · notebook saved as .jl</span><button id="pluto-source">Open source</button><button id="pluto-stop">Stop session</button><button id="pluto-restart">Restart session</button></header>${source}<script nonce="${nonce}">const api=acquireVsCodeApi();for(const [id,type]of [['pluto-source','plutoSource'],['pluto-stop','plutoStop'],['pluto-restart','plutoRestart']])document.getElementById(id).addEventListener('click',()=>api.postMessage({type}));${bridge}</script></body></html>`;
   }
   private async stop(session: Session): Promise<void> {
     const promise=session.stopped;

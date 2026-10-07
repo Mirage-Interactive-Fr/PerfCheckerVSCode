@@ -229,8 +229,8 @@ async function investigation(context, directory) {
     'The real unfold gesture finishes and exposes the interactive CodeMirror input');
   await editor.click(); await editor.press('ControlOrMeta+A');
   context.log('native-ui-action',{surface:'Pluto investigation',action:'Edit reactive cell and evaluate'});
-  await editor.pressSequentially(`md"# ${title}"`); await editor.press('ControlOrMeta+Enter');
-  await eventually(async () => (await fs.readFile(file, 'utf8')).includes(`md"# ${title}"`), 'Reactive cell is saved as real Julia code');
+  await editor.pressSequentially(`md"# ${title}: $(4 + 5)"`); await editor.press('ControlOrMeta+Enter');
+  await eventually(async () => (await fs.readFile(file, 'utf8')).includes(`md"# ${title}: $(4 + 5)"`), 'Reactive cell is saved as real Julia code');
   await eventually(async () => (await cell.locator('pluto-output').innerText()).includes(title), 'Reactive output changes');
   await state.frame.goto(state.frame.url());
   state = await view(context);
@@ -244,6 +244,31 @@ async function investigation(context, directory) {
   const port = Number(new URL(state.frame.url()).port);
   await context.vscode.commands.executeCommand('perfchecker.openNotebook', context.vscode.Uri.file(file));
   assert.equal(Number(new URL((await view(context)).frame.url()).port), port, 'Reopening reuses the same server');
+  if(process.env.PERFCHECKER_NATIVE_BROWSER_ORACLE){
+    const endpoint=process.env.PERFCHECKER_NATIVE_BROWSER_ORACLE,token=process.env.PERFCHECKER_NATIVE_BROWSER_TOKEN;
+    const events=async()=>{const response=await fetch(`${endpoint}/events`,{headers:{authorization:`Bearer ${token}`}});assert.equal(response.status,200);return response.json();};
+    const expect=async(kind)=>eventually(async()=>{const values=await events();assert(!values.some(value=>value.failed),JSON.stringify(values));return values.find(value=>value.kind===kind);},`Real default browser completes ${kind}`);
+    const editorUrl=state.frame.url();
+    await state.frame.locator('#at_the_top button.toggle_export').click();
+    await state.frame.locator('#export a[href*="notebookfile?"]').click();
+    const julia=await expect('julia-source-browser');assert(julia.editedExpression&&julia.credentialAbsent);
+    assert.equal(state.frame.url(),editorUrl,'Julia export leaves the original VS Code editor in place');
+    if(!((await state.frame.locator('#pluto-nav').getAttribute('class'))||'').includes('show_export'))await state.frame.locator('#at_the_top button.toggle_export').click();
+    await state.frame.locator('#pluto-nav.show_export #export a[href*="notebookexport?"]').click();
+    await state.frame.locator('.export-html-dialog .ple-download a[download]').click();
+    const html=await expect('html-download');assert(html.embeddedJulia&&html.editedExpression&&html.credentialAbsent);
+    assert.equal(state.frame.url(),editorUrl,'HTML export leaves the original VS Code editor in place');
+    await state.frame.locator('img#logo-big').locator('..').click();await state.frame.locator('#recent').waitFor();
+    await state.frame.locator('#recent li.new a').click({modifiers:['Control']});
+    const modified=await expect('new-context-editor');assert.equal(modified.route,'/new');assert(modified.authenticatedWebSocket);
+    assert.equal(new URL(state.frame.url()).pathname,'/','Modified New opens a separate real browser editor');
+    const originalId=new URL(editorUrl).searchParams.get('id');
+    await state.frame.locator(`#recent a[href*="id=${originalId}"]`).click();await state.frame.locator('pluto-notebook').waitFor();
+    assert.equal(new URL(state.frame.url()).searchParams.get('id'),originalId,'Normal Recent navigation remains inside VS Code');
+    await capture(context,'pluto-browser-exports-completed');
+    context.proof('pluto-default-browser-exports',{source:'actual-installed-VSIX-env.openExternal-and-disposable-xdg-default-browser',
+      parentOrigin:new URL(state.parent.url()).protocol,ordinaryNavigationInEditor:true,Julia:julia,HTML:html,modifiedNew:modified});
+  }else context.log('pluto-default-browser-exports',{status:'skipped',reason:'Representative actual OS default-browser fixture requires disposable Linux stable; no human browser profile changes.'});
   await stop(context, state);
   const stopped = await context.findFrame('#pluto-restart');
   await stopped.locator('#pluto-restart').click();
@@ -369,25 +394,29 @@ async function ownedWorkerClose(context,directory){
     await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
     const shutdownInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Pluto homepage Shutdown test reaches its active allocation worker',360000);
     const shutdownOwned=await allocationOwned(shutdownInfo);
-    const page=state.frame.page();let confirmed=false;
-    const confirm=async dialog=>{
-      if(dialog.type()==='confirm' && /shut down|close.*notebook/i.test(dialog.message())){confirmed=true;await dialog.accept();}
-      else await dialog.dismiss();
-    };
-    page.on('dialog',confirm);
-    let shutdownElapsed;
-    try{
-      shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownOwned,false,async()=>{
+    let confirmed=false;
+    const shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownOwned,false,async()=>{
         await state.frame.locator('img#logo-big').locator('..').click();
         await eventually(()=>new URL(state.frame.url()).pathname==='/'&&state.frame.locator('#recent').isVisible(),'The real Pluto logo opens its authenticated homepage');
         const running=state.frame.locator('#recent li.running').filter({hasText:'ShutdownActiveAllocation.jl'});
         await running.locator('button').first().click();
+        const confirmation=state.frame.getByRole('dialog',{name:'Pluto confirmation'});
+        await confirmation.waitFor({state:'visible'});
+        assert.equal(await confirmation.locator('p').innerText(),'Shut down notebook process?',
+          'The real confirmation preserves Pluto 1.0.4\'s exact current translation');
+        await capture(context,'pluto-homepage-shutdown-confirmation');
+        await confirmation.getByRole('button',{name:'Cancel',exact:true}).click();
+        assert.equal(await running.count(),1,'Cancelling the actual confirmation preserves the notebook');
+        assert.doesNotThrow(()=>process.kill(Number(shutdownInfo[0]),0),'Cancelling preserves the active allocation worker');
+        assert(await fs.stat(shutdownOwned).then(stat=>stat.isDirectory()),'Cancelling preserves the active owned allocation directory');
+        await running.locator('button').first().click();await confirmation.waitFor({state:'visible'});
+        await confirmation.getByRole('button',{name:'Confirm',exact:true}).click();confirmed=true;
         await eventually(async()=>await running.count()===0,'The native Pluto homepage removes the stopped notebook');
-      });
-    }finally{page.off('dialog',confirm);}
-    assert(confirmed,'The actual browser confirmation was accepted, rather than suppressing or mocking it');
+    });
+    assert(confirmed,'The actual visible confirmation was accepted through its native button');
     assert(await portOpen(Number(new URL(state.frame.url()).port)),'The homepage shuts down its notebook without stopping the shared Pluto server');
-    context.proof('pluto-home-shutdown-active-allocation',{nativeClick:true,realConfirmation:true,cleanupMilliseconds:shutdownElapsed,pidTerminated:true,ownedFilesRemoved:true,noNewMem:true,preExistingMemPreserved:true});
+    context.proof('pluto-home-shutdown-active-allocation',{nativeClick:true,realConfirmation:true,cancelPreservedActiveWorker:true,
+      inheritedVSCodeSandboxPreserved:true,cleanupMilliseconds:shutdownElapsed,pidTerminated:true,ownedFilesRemoved:true,noNewMem:true,preExistingMemPreserved:true});
     await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));
     await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   }finally{

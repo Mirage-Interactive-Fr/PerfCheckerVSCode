@@ -42,6 +42,9 @@ Use its Launch/Cancel/Refresh controls, and **Save completed reports** in a suit
 notebook. Pluto saves edited cells to the `.jl` file; the header provides
 **Open source**, **Stop session**, and **Restart session**. Stop and closing the
 view wait for owned measurement workers and allocation cleanup.
+Pluto's Julia/HTML exports and links opened with a modifier or in a new context
+use your default browser. Normal notebook navigation stays in the editor tab.
+The Recent list asks for confirmation before shutting down a notebook.
 
 ## Measure existing Julia test items
 

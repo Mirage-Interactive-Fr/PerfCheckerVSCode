@@ -18,16 +18,20 @@ test('real Pluto 1.0.4 keeps native components and authenticates its complete em
   const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-real-pluto-'));
   const notebook=path.join(root,'Navigation.jl'),project=process.env.PERFCHECKER_PLUTO_TEST_PROJECT,originalMarker=path.join(root,'original.pid');
   await writeFile(notebook,`### A Pluto.jl notebook ###\n# v1.0.4\n\nusing Markdown\nusing InteractiveUtils\n\n# ╔═╡ 27187d83-0729-4300-b3dc-7185b06af0ed\nbegin\nimport Pkg\nPkg.activate(${JSON.stringify(project)})\nwrite(${JSON.stringify(originalMarker)},string(getpid()))\n1 + 2\nend\n\n# ╔═╡ Cell order:\n# ╠═27187d83-0729-4300-b3dc-7185b06af0ed\n`);
+  const initialNotebook=await readFile(notebook,'utf8');
   const source=await readFile(new URL('../src/plutoNotebook.ts',import.meta.url),'utf8');
   const code=source.match(/const serverCode = `([\s\S]*?)`;/)[1];
   const navigation=await readFile(new URL('../media/pluto-navigation.js',import.meta.url),'utf8');
   const eventual=async(read,description,timeout=90000)=>{const until=Date.now()+timeout;while(Date.now()<until){const result=await read();if(result)return result;await new Promise(resolve=>setTimeout(resolve,100));}throw Error(description);};
   const alive=pid=>{try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
   let browser;
-  const run=async(script,verify)=>{
+  const run=async(script,verify,sandbox=false,popupBridge=false)=>{
+    await rm(originalMarker,{force:true});
+    await writeFile(notebook,initialNotebook);
     const socket=createPortServer();await new Promise(resolve=>socket.listen(0,'127.0.0.1',resolve));
     const port=socket.address().port;await new Promise(resolve=>socket.close(resolve));
-    const secret=randomBytes(32).toString('hex');let output='',errors='';
+    const secret=randomBytes(32).toString('hex'),capability=randomBytes(32).toString('hex');let output='',errors='';
+    if(popupBridge)script=script.replace('__PERFCHECKER_PLUTO_POPUP_CAPABILITY__',capability);
     const child=spawn(process.env.PERFCHECKER_TEST_JULIA||'julia',['--startup-file=no','--history-file=no',`--project=${project}`,'-e',cancellableJulia(code)],{
       cwd:root,detached:process.platform!=='win32',stdio:['pipe','pipe','pipe'],
       env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter),JULIA_PLUTO_NEW_NOTEBOOKS_DIR:root,PERFCHECKER_PLUTO_PORT:String(port),
@@ -38,13 +42,23 @@ test('real Pluto 1.0.4 keeps native components and authenticates its complete em
       const incoming=new URL(request.url,'http://localhost');
       if(incoming.pathname==='/outside'){externalRequests.push({secret:incoming.searchParams.has('secret'),referer:request.headers.referer});response.end('Separate origin');return;}
       const target=new URL(request.url,'http://localhost').searchParams.get('target')||`edit?id=${output.match(/PERFCHECKER_PLUTO_READY \d+ ([a-f0-9-]+)/)?.[1]}`;
-      response.setHeader('content-type','text/html');response.end(`<iframe width="1100" height="800" src="http://127.0.0.1:${port}/${target}${target.includes('?')?'&':'?'}secret=${secret}"></iframe>`);
+      const bridge=popupBridge?Function('popupOrigin','capability',`return \`${source.match(/const bridge=\x60([\s\S]*?)\x60;/)[1]}\`;`)(JSON.stringify(`http://127.0.0.1:${port}`),JSON.stringify(capability)):'';
+      response.setHeader('content-type','text/html');response.end(`<iframe class="perfchecker-pluto-frame" ${sandbox?'sandbox="allow-same-origin allow-pointer-lock allow-scripts allow-downloads allow-forms"':''} width="1100" height="800" src="http://127.0.0.1:${port}/${target}${target.includes('?')?'&':'?'}secret=${secret}"></iframe>${popupBridge?`<script>const api={postMessage:message=>window.__browserLaunch(message)};${bridge}</script>`:''}`);
     });
-    let page;
+    let page,defaultBrowser;
     try{
       await eventual(()=>{if(child.exitCode!==null)throw Error(`Actual Pluto startup failed: ${errors.replaceAll(secret,'[session secret]')}`);return /PERFCHECKER_PLUTO_READY/.test(output);},'Actual Pluto server readiness');
       await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
-      page=await browser.newPage({viewport:{width:1400,height:1100}});await page.goto(`http://localhost:${server.address().port}/`);
+      page=await browser.newPage({viewport:{width:1400,height:1100},locale:'fr-FR'});
+      if(popupBridge){
+        defaultBrowser=await require('./native-external-browser.cjs').create(root,{chromium,executablePath:process.env.PERFCHECKER_BROWSER});
+        await page.exposeFunction('__browserLaunch',async message=>{
+          assert.equal(message.type,'plutoPopup');assert.equal(message.capability,capability);
+          const value=new URL(message.url);assert.equal(value.origin,`http://127.0.0.1:${port}`);assert.equal(value.searchParams.get('secret'),secret);
+          await new Promise((resolve,reject)=>{const launch=spawn(process.platform==='linux'?'xdg-open':defaultBrowser.environment.BROWSER,[message.url],{env:{...process.env,...defaultBrowser.environment},stdio:'pipe'});launch.once('error',reject);launch.once('exit',code=>code===0?resolve():reject(Error('Owned actual browser launch failed')));});
+        });
+      }
+      await page.goto(`http://localhost:${server.address().port}/`);
       let frame=page.frames().find(item=>item.parentFrame());
       await frame.locator('[data-perfchecker-navigation="ready"]').waitFor({state:'attached',timeout:90000});
       const homepage=async()=>{await frame.locator('img#logo-big').locator('..').click();await frame.locator('[data-perfchecker-navigation="ready"]').waitFor({state:'attached'});await frame.locator('#recent').waitFor();};
@@ -55,11 +69,12 @@ test('real Pluto 1.0.4 keeps native components and authenticates its complete em
         assert.match(errors,/cancelled after controller cleanup/);
         await assert.rejects(fetch(`http://127.0.0.1:${port}/?secret=${secret}`));
       };
-      await verify({page,frame,homepage,port,secret,externalRequests,closeOwned,host:`http://localhost:${server.address().port}`});
+      const browserEvents=defaultBrowser?async()=>{const result=await fetch(`${defaultBrowser.environment.PERFCHECKER_NATIVE_BROWSER_ORACLE}/events`,{headers:{authorization:`Bearer ${defaultBrowser.environment.PERFCHECKER_NATIVE_BROWSER_TOKEN}`}});return result.json();}:undefined;
+      await verify({page,frame,homepage,port,secret,capability,externalRequests,closeOwned,browserEvents,host:`http://localhost:${server.address().port}`});
     }catch(error){
       throw new Error(`${error.message}\n${errors.replaceAll(secret,'[session secret]')}`,{cause:error});
     }finally{
-      await page?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
+      await page?.close();await defaultBrowser?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
       if(child.exitCode===null&&child.signalCode===null){
         if(process.platform==='win32'){const killer=spawn('taskkill',['/pid',String(child.pid),'/t','/f'],{stdio:'ignore'});await once(killer,'exit');}
         else try{process.kill(-child.pid,'SIGTERM');}catch{}
@@ -78,6 +93,77 @@ test('real Pluto 1.0.4 keeps native components and authenticates its complete em
       await frame.locator('[data-perfchecker-navigation="ready"]').waitFor({state:'attached'});
       await eventual(async()=>await frame.locator('#recent').count()===0,'The prior hook removes the real Recent list',5000);
     });
+    const unadapted='export default function(){document.documentElement.setAttribute("data-perfchecker-navigation","ready");return {};}';
+    await run(unadapted,async({page,frame,homepage,closeOwned})=>{
+      const pid=await eventual(async()=>{const value=await readFile(originalMarker,'utf8').catch(()=>undefined);return value?Number(value):false;},'The original real notebook worker is ready');
+      let dialogs=0;const warnings=[];
+      page.on('dialog',async dialog=>{dialogs++;await dialog.accept();});page.on('console',message=>warnings.push(message.text()));
+      await frame.locator('#at_the_top button.toggle_export').click();
+      await frame.locator('#export a[href*="notebookfile?"]').click();
+      await eventual(()=>warnings.some(value=>/allow-popups/.test(value)),
+        'The actual native Julia export new-window link is blocked by the official ancestor sandbox',5000);
+      await homepage();
+      const running=frame.locator('#recent li.running').filter({hasText:'Navigation.jl'});
+      await running.locator('button').first().click();
+      await eventual(()=>warnings.some(value=>/confirm.*sandbox|sandbox.*allow-modals/i.test(value)),
+        'Real Pluto native confirmation is suppressed by the exact VS Code ancestor sandbox',5000);
+      assert.equal(dialogs,0);assert.equal(await running.count(),1);assert(alive(pid));
+      await closeOwned();await eventual(()=>!alive(pid),'The regression fixture worker is closed before harness teardown',45000);
+    },true);
+    await run(navigation,async({frame,homepage,port,secret,closeOwned})=>{
+      const pid=await eventual(async()=>{const value=await readFile(originalMarker,'utf8').catch(()=>undefined);return value?Number(value):false;},'The sandboxed real notebook worker is ready');
+      assert(alive(pid));await homepage();
+      const running=frame.locator('#recent li.running').filter({hasText:'Navigation.jl'});
+      await frame.evaluate(()=>{window.__perfcheckerTestConfirm=window.confirm;});
+      await running.locator('button').first().click();
+      const confirmation=frame.getByRole('dialog',{name:'Pluto confirmation'});
+      await confirmation.waitFor();
+      assert.equal(await confirmation.locator('p').innerText(),'Terminer le processus du notebook ?');
+      assert(await frame.evaluate(()=>window.confirm===window.__perfcheckerTestConfirm),'Question capture restores the original native confirm immediately');
+      await confirmation.getByRole('button',{name:'Cancel',exact:true}).click();
+      assert.equal(await running.count(),1);assert(alive(pid));
+      await running.locator('button').first().click();await confirmation.waitFor();
+      await confirmation.getByRole('button',{name:'Confirm',exact:true}).click();
+      assert(await frame.evaluate(()=>window.confirm===window.__perfcheckerTestConfirm),'Approval restores the native confirm immediately');
+      await frame.evaluate(()=>{delete window.__perfcheckerTestConfirm;});
+      await running.waitFor({state:'detached'});
+      await eventual(()=>!alive(pid),'Sandboxed native Shutdown terminates its real worker before harness cleanup',45000);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/?secret=${secret}`)).status,200);
+      await closeOwned();
+    },true);
+    await run(navigation,async({page,frame,homepage,closeOwned,browserEvents,capability,secret})=>{
+      const editorUrl=frame.url();
+      for(const [cap,url]of [['wrong',editorUrl],[capability,editorUrl.replace(secret,'wrong')],[capability,'https://external.invalid/new'],[capability,new URL(`/frontend/common/Environment.js?secret=${secret}`,editorUrl).href]]){
+        await frame.evaluate(({cap,url})=>parent.postMessage({type:'perfcheckerPlutoPopup',capability:cap,url},'*'),{cap,url});
+      }
+      // A sibling/outer window cannot impersonate the exact owned child source.
+      await page.evaluate(({capability,url})=>window.postMessage({type:'perfcheckerPlutoPopup',capability,url},location.origin),{capability,url:editorUrl});
+      for(const [href,download]of [['#cell',false],['https://external.invalid/new',false],['/frontend/common/Environment.js',false],['/new?secret=wrong',false],['/new',true]]){
+        await frame.evaluate(({href,download})=>{const link=document.createElement('a');link.id='negative-popup';link.href=href;link.textContent='Negative new-context fixture';if(download)link.download='fixture';link.addEventListener('click',event=>event.preventDefault());document.body.append(link);},{href,download});
+        await frame.locator('#negative-popup').click({modifiers:['Control']});
+        assert.equal(new URL(await frame.locator('#negative-popup').getAttribute('href'),editorUrl).href,new URL(href,editorUrl).href,
+          'Negative gestures preserve their destination and never acquire the session credential');
+        await frame.locator('#negative-popup').evaluate(link=>link.remove());
+      }
+      await new Promise(resolve=>setTimeout(resolve,300));assert.deepEqual(await browserEvents(),[]);
+      const cell=frame.locator('pluto-cell').first(),editor=cell.locator('pluto-input .cm-content[contenteditable="true"]');
+      if(!await editor.isVisible())await cell.locator('.foldcode').click();
+      await editor.fill('4 + 5');await editor.press('ControlOrMeta+Enter');
+      await eventual(async()=>/^9$/.test((await cell.locator('pluto-output').innerText()).trim()),'The sandboxed editor saves the exported 4 + 5 expression');
+      await eventual(async()=>/4 \+ 5/.test(await readFile(notebook,'utf8')),'The exported source is genuinely autosaved');
+      const completed=async(kind)=>eventual(async()=>{const values=await browserEvents();assert(!values.some(value=>value.failed),JSON.stringify(values));return values.find(value=>value.kind===kind);},`Actual browser fixture completes ${kind}`);
+      await frame.locator('#at_the_top button.toggle_export').click();
+      await frame.locator('#export a[href*="notebookfile?"]').click();
+      assert((await completed('julia-source-browser')).credentialAbsent);console.log('REAL_PLUTO_SANDBOX_JULIA_EXPORT_PASS');
+      if(!((await frame.locator('#pluto-nav').getAttribute('class'))||'').includes('show_export'))await frame.locator('#at_the_top button.toggle_export').click();
+      await frame.locator('#pluto-nav.show_export #export a[href*="notebookexport?"]').click();
+      await frame.locator('.export-html-dialog .ple-download a[download]').click();
+      assert((await completed('html-download')).embeddedJulia);console.log('REAL_PLUTO_SANDBOX_HTML_DOWNLOAD_PASS');
+      await homepage();await frame.locator('#recent li.new a').click({modifiers:['Control']});
+      assert((await completed('new-context-editor')).authenticatedWebSocket);console.log('REAL_PLUTO_SANDBOX_IMMEDIATE_MODIFIED_NEW_PASS');
+      assert.equal(new URL(frame.url()).pathname,'/','Modified New does not navigate the original embedded editor');
+      await closeOwned();
+    },true,true);
     await run(navigation,async({page,frame,homepage,port,secret,externalRequests,closeOwned,host})=>{
       assert(await frame.locator('img#logo-big').isVisible());await frame.locator('#at_the_top pluto-filepicker').waitFor();await homepage();
       const authenticated=()=>assert.equal(new URL(frame.url()).searchParams.get('secret'),secret);
@@ -150,9 +236,34 @@ test('real Pluto 1.0.4 keeps native components and authenticates its complete em
       const activeNew=frame.locator(`#recent li.running a[href*="id=${mainNotebook}"]`);
       await activeNew.click();await frame.locator('pluto-notebook').waitFor();
       const mainPid=await workerPid(frame,'main.pid');assert.notEqual(mainPid,popupPid);await homepage();
-      let confirmed=false;page.on('dialog',async dialog=>{assert.equal(dialog.type(),'confirm');confirmed=true;await dialog.accept();});
+      await frame.evaluate(()=>{window.__perfcheckerTestConfirm=window.confirm;});
       const running=frame.locator('#recent li.running').filter({hasText:'Navigation.jl'});await running.locator('button').first().click();
-      await running.waitFor({state:'detached'});assert(confirmed);assert.equal((await fetch(`http://127.0.0.1:${port}/?secret=${secret}`)).status,200);
+      const confirmation=frame.getByRole('dialog',{name:'Pluto confirmation'});
+      await confirmation.waitFor();
+      assert.equal(await confirmation.locator('p').innerText(),'Terminer le processus du notebook ?');
+      await confirmation.getByRole('button',{name:'Cancel',exact:true}).click();
+      assert.equal(await running.count(),1);assert(alive(originalPid),'Cancelling the actual confirmation preserves the running worker');
+      assert(await frame.evaluate(()=>window.confirm===window.__perfcheckerTestConfirm));
+      // A real pending dialog must not authorize a row whose notebook identity
+      // changed or whose DOM node was replaced while the question was open.
+      await running.locator('button').first().click();await confirmation.waitFor();
+      const originalLink=await running.locator('a[href]').getAttribute('href');
+      await running.locator('a[href]').evaluate((link,id)=>{const url=new URL(link.href);url.searchParams.set('id',id);link.href=url.href;},mainNotebook);
+      await confirmation.getByRole('button',{name:'Confirm',exact:true}).click();
+      assert(alive(originalPid)&&alive(mainPid)&&alive(popupPid),'A changed notebook ID is never approved by the pending dialog');
+      await running.locator('a[href]').evaluate((link,href)=>link.setAttribute('href',href),originalLink);
+      await running.locator('button').first().click();await confirmation.waitFor();
+      await running.evaluate(row=>{window.__perfcheckerTestRow=row;row.replaceWith(row.cloneNode(true));});
+      await confirmation.getByRole('button',{name:'Confirm',exact:true}).click();
+      assert(alive(originalPid)&&alive(mainPid)&&alive(popupPid),'A replaced native Recent row cannot replay the detached stock handler');
+      await running.evaluate(row=>{row.replaceWith(window.__perfcheckerTestRow);delete window.__perfcheckerTestRow;});
+      await running.locator('button').first().click();await confirmation.waitFor();await confirmation.press('Escape');
+      assert(alive(originalPid),'Escape cancels the actual modal without shutting down the notebook');
+      await running.locator('button').first().click();await confirmation.waitFor();
+      await confirmation.getByRole('button',{name:'Confirm',exact:true}).click();
+      assert(await frame.evaluate(()=>window.confirm===window.__perfcheckerTestConfirm));
+      await frame.evaluate(()=>{delete window.__perfcheckerTestConfirm;});
+      await running.waitFor({state:'detached'});assert.equal((await fetch(`http://127.0.0.1:${port}/?secret=${secret}`)).status,200);
       await eventual(()=>!alive(originalPid),'Actual homepage Shutdown terminates its own Malt worker before harness cleanup',45000);
       assert(await frame.locator('#recent li.running').count()>=2,'Multiple actual notebooks still run before owned Close');
       assert(alive(mainPid)&&alive(popupPid),'Two distinct real Malt workers are alive before Close');
@@ -214,9 +325,9 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
   const uri=file=>({scheme:'file',fsPath:file,toString:()=>`file://${file}`});
   const folder={name:'fixture',uri:uri(root)},messages=[],scopes=[],values=new Map();
   const disposable=()=>({dispose(){}});
-  const vscode={workspace:{isTrusted:true,workspaceFolders:[folder],getWorkspaceFolder:source=>source.fsPath.startsWith(root+path.sep)?folder:undefined,
+  const vscode={env:{openExternal:async()=>false},workspace:{isTrusted:true,workspaceFolders:[folder],getWorkspaceFolder:source=>source.fsPath.startsWith(root+path.sep)?folder:undefined,
     getConfiguration:(_name,scope)=>{scopes.push(scope);return{get:(key,fallback)=>values.has(key)?values.get(key):fallback};},onDidChangeWorkspaceFolders:disposable},
-    Uri:{file:uri,joinPath:(base,...pieces)=>uri(path.join(base.fsPath,...pieces))},ViewColumn:{One:1},
+    Uri:{file:uri,joinPath:(base,...pieces)=>uri(path.join(base.fsPath,...pieces)),parse:value=>({toString:()=>value})},ViewColumn:{One:1},
     window:{createOutputChannel:()=>({append(){},appendLine(){},dispose(){}}),
       showWarningMessage:async message=>{messages.push(message);return undefined;}},
   };
@@ -299,6 +410,22 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
     try{
       await pluto.openFile(folder,path.join(root,'perf','existing.jl'),project);
       const oldPid=owned.child.pid;
+      const launches=[];vscode.env.openExternal=async value=>{launches.push(value.toString());return true;};
+      const base='http://127.0.0.1:12345/edit?id=owned&secret=owned-test-secret';
+      owned.popupCapability='owned-test-capability';
+      const reset=()=>pluto.render(owned,{toString:()=>base});
+      for(const message of [
+        {capability:'wrong',url:base},
+        {capability:owned.popupCapability,url:base.replace('owned-test-secret','wrong')},
+        {capability:owned.popupCapability,url:base.replace('127.0.0.1','external.invalid')},
+        {capability:owned.popupCapability,url:base.replace('/edit','/frontend/common/Environment.js')},
+        {capability:owned.popupCapability,url:base.replace('http:','https:')},
+      ]){reset();await messageHandler({type:'plutoPopup',...message});}
+      assert.equal(launches.length,0,'The actual registered host handler rejects foreign origins, credentials, routes and capabilities before the browser API');
+      for(const route of ['/notebookfile','/notebookexport','/new']){
+        reset();await messageHandler({type:'plutoPopup',capability:owned.popupCapability,url:base.replace('/edit',route)});
+      }
+      assert.equal(launches.length,3,'The owned live session delegates only its authenticated export/new-context routes');
       values.set('plutoProject','perf/another-pluto');
       await messageHandler({type:'plutoStop'});
       const cleaned=await readFile(marker,'utf8').then(JSON.parse).catch(()=>undefined);
@@ -306,6 +433,8 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
       assert.equal(cleaned.pid,oldPid);
       assert.equal(owned.child.exitCode,0,'The owned process finished before fixture cleanup');
       assert.match(panel.webview.html,/Session stopped/);
+      await messageHandler({type:'plutoPopup',capability:'owned-test-capability',url:base});
+      assert.equal(launches.length,3,'A stopped or invalidated session cannot launch a browser');
       await messageHandler({type:'plutoRestart'});
       assert.match(panel.webview.html,/environment changed/i,'Restart still validates the configured environment');
     }finally{

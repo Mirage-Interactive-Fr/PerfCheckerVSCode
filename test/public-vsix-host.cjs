@@ -86,6 +86,7 @@ function buttonCoverage(checks){
     'Pluto · Cancel active suite / repeat Cancel / owned allocation cleanup':['pluto-suite-cancel-active-allocation'],
     'Pluto · Stop / Close active workers and owned .mem cleanup':['pluto-stop-active-owned-worker','pluto-close-active-allocation-worker'],
     'Pluto · homepage Shutdown / real confirmation':['pluto-home-shutdown-active-allocation'],
+    'Pluto · Julia/HTML exports / modified New in default browser':['pluto-default-browser-exports'],
     'Pluto · failed Restart leaves no stale worker':['pluto-failed-restart-real-worker-cleanup'],
     'MCP · two advice turns / diff / Apply / oracle / Restore':['native-mcp-advice-implementation-restore'],
     'MCP · select measured evidence / exact IDs / bounded context':['native-mcp-selected-measured-evidence'],
