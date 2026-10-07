@@ -19,7 +19,11 @@ function completion(child){
   let stdout='',stderr='';
   child.stdout?.setEncoding('utf8');child.stdout?.on('data',chunk=>stdout+=chunk);
   child.stderr?.setEncoding('utf8');child.stderr?.on('data',chunk=>stderr+=chunk);
-  return new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>resolve({code,signal,stdout,stderr}));});
+  return new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>{
+    const result={code,signal,stdout,stderr};
+    if(code!==0&&signal===null)console.log(JSON.stringify({event:'owned-process-finished',...result,stdout:stdout.slice(0,4000),stderr:stderr.slice(0,12000)}));
+    resolve(result);
+  });});
 }
 async function fixture(body){
   const root=await mkdtemp(path.join(tmpdir(),'perfchecker-owned-Δ space-'));
@@ -106,7 +110,7 @@ test('Windows owner preserves Unicode argv/cwd/env, stdin EOF, simultaneous larg
     const child=spawnWindowsOwnedProcess(process.execPath,[script,...args],{cwd:root,env:{...process.env,PCW_VALUE:'ü " $ \\ value'}});
     const finished=completion(child);child.stdin.end('Prompt ü Δ\nsecond line\n');
     const result=await finished;
-    assert.equal(result.code,37,result.stderr.slice(-500));
+    assert.equal(result.code,37,result.stderr);
     assert.equal(result.stderr,'y'.repeat(1048576));
     assert.equal(result.stdout.slice(0,1048576),'x'.repeat(1048576));
     const actual=JSON.parse(result.stdout.slice(1048577));
