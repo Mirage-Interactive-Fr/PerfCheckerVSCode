@@ -366,6 +366,10 @@ byId('add-comparison').addEventListener('click', () => {
   }]});
 });
 window.addEventListener('message', event => {
+  if (event.data.type === 'requestConfiguration') {
+    vscode.postMessage({type: 'save', requestId: event.data.requestId, configuration: configuration()});
+    return;
+  }
   if (event.data.type === 'plan') {
     const previousPlan = plan;
     const sameWorkspace = previousPlan && workspace === event.data.workspace;

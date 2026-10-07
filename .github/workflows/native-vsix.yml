@@ -8,6 +8,11 @@ on:
         type: choice
         options: [public, candidate]
         default: candidate
+      stage:
+        description: First-install and Save regression, or the complete native campaign
+        type: choice
+        options: [smoke, full]
+        default: full
   pull_request:
     paths:
       - '.github/workflows/native-vsix.yml'
@@ -27,13 +32,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         vscode: ['1.96.0', stable]
+        include:
+          - os: macos-15-intel
+            vscode: stable
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       PERFCHECKER_VSCODE_VERSION: ${{ matrix.vscode }}
-      # This first diagnostic PR deliberately reproduces the published package.
-      # Switch the PR default to candidate once the before-fix evidence is captured.
-      PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'public' }}
+      PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
+      # The full campaign is enabled after the Pluto session contract is ready.
+      PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'smoke' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
       JULIA_NUM_PRECOMPILE_TASKS: '1'
@@ -63,6 +71,9 @@ jobs:
         run: xvfb-run -a node test/run-public-vsix-host.mjs
       - name: Run isolated native workflows on Windows
         if: runner.os == 'Windows'
+        run: node test/run-public-vsix-host.mjs
+      - name: Run isolated native workflows on Intel macOS
+        if: runner.os == 'macOS'
         run: node test/run-public-vsix-host.mjs
       - uses: actions/upload-artifact@v7
         if: always()

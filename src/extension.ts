@@ -363,6 +363,8 @@ class Controller {
   private readonly output = vscode.window.createOutputChannel('PerfChecker');
   private designer?: vscode.WebviewPanel;
   private designerBusy = false;
+  private designerSave?: {id: string; panel: vscode.WebviewPanel; resolve: () => void;
+    reject: (error: unknown) => void; timer: ReturnType<typeof setTimeout>};
   private resultsPanel?: vscode.WebviewPanel;
   private plan?: SuitePlan;
   private uiConfiguration?: any;
@@ -996,6 +998,7 @@ class Controller {
       <aside><section class="aside-panel"><h2>Comparison targets</h2><p class="hint">Choose a discovered branch, tag, or recent commit. You can also paste a GitHub/GitLab URL or a reference such as <code>owner/repository@branch</code>.</p><div id="target-list"></div><label>Package<select id="target-package"></select></label><label>Discovered Git reference<select id="target-reference"><option value="">Loading references…</option></select></label><div class="target-scan"><small id="target-source-status">Looking for the package repository…</small><button id="refresh-targets" title="Scan Git references again">Refresh</button><button id="cancel-targets" hidden>Cancel discovery</button></div><label>Or paste a reference<input id="target-revision" placeholder="Branch, tag, commit, or Git URL"></label><label>Display label (optional)<input id="target-label" placeholder="Filled from the selected reference"></label><details><summary>Advanced target options</summary><label>Git source override<input id="target-source" placeholder="Use the package source"></label><label>Workload compatibility<select id="target-compatibility"><option value="">Automatic</option></select></label></details><p id="target-error" class="form-error" hidden></p><button id="add-target">Add comparison target</button></section><section class="aside-panel"><h2>Comparison matrix</h2><p class="hint">One checked reference is an exact comparison. Several references form an aggregated reference group.</p><div id="comparison-list"></div><label>Package<select id="comparison-package"></select></label><label>Feature<select id="comparison-feature"></select></label><label>Reference aggregation<select id="comparison-aggregation"><option value="median">Median</option><option value="mean">Mean</option><option value="minimum">Minimum</option><option value="maximum">Maximum</option></select></label><h3>Reference targets</h3><div id="baseline-targets" class="target-options"></div><h3>Candidate targets</h3><div id="candidate-targets" class="target-options"></div><p id="comparison-error" class="form-error" role="alert" hidden></p><button id="add-comparison">Add comparison</button></section><section class="aside-panel"><h2>Documentation block</h2><label>Identifier<input id="doc-id" value="performance"></label><label>Title<input id="doc-title" value="Performance"></label><label>Interactive URL<input id="doc-url" placeholder="https://…"></label><fieldset><legend>Views</legend><label><input type="checkbox" name="view" value="summary" checked> Summary</label><label><input type="checkbox" name="view" value="comparison" checked> Comparisons</label><label><input type="checkbox" name="view" value="plots" checked> Plots</label><label><input type="checkbox" name="view" value="observations"> Observations</label><label><input type="checkbox" name="view" value="diagnostics"> Diagnostics</label><label><input type="checkbox" name="view" value="artifacts"> Artifacts</label></fieldset><p class="hint">The saved JSON is consumed by VS Code, Oxygen-compatible tooling and Documenter via <code>read_document_blocks</code>.</p></section></aside></main><script nonce="${nonce}" src="${script}"></script></body></html>`;
     const workspace = this.folder().uri.toString(), designer = this.designer;
     this.designer.onDidDispose(() => {
+      this.finishDesignerSave(designer, undefined, new Error('The suite editor was closed. Reopen it before saving.'));
       this.targetDiscovery?.abort();
       this.activeControllers.forEach(stop => stop.request());
       if (this.designer === designer) this.designer = undefined;
@@ -1004,10 +1007,12 @@ class Controller {
       let sameWorkspace = false;
       try {sameWorkspace = currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders).uri.toString() === workspace;} catch {/* selected folder was closed */}
       if (!sameWorkspace) {
+        this.finishDesignerSave(designer, message?.requestId, new Error('PerfChecker folder changed. Reopen the suite editor before saving.'));
         void designer.webview.postMessage({type: 'designerError', error: 'PerfChecker folder changed. Reopen the suite editor for the selected folder.'}); return;
       }
       const mutates = ['run', 'refresh', 'save', 'targets', 'addTarget', 'comparisons'].includes(message?.type);
       if (mutates && this.designerBusy) {
+        this.finishDesignerSave(designer, message?.requestId, new Error('Wait for the current PerfChecker action to finish.'));
         void this.designer?.webview.postMessage({type: 'designerError', error: 'Wait for the current PerfChecker action to finish.'}); return;
       }
       if (mutates) {this.workspaceOperations += 1; this.designerBusy = true; void this.designer?.webview.postMessage({type: 'designerBusy', busy: true});}
@@ -1017,7 +1022,21 @@ class Controller {
       if (message.type === 'output') await this.openOutput(message.run as PlanRun | undefined,
         message.runs as PlanRun[] | undefined);
       if (message.type === 'refresh') await this.refresh();
-      if (message.type === 'save') await this.saveConfiguration(message.configuration);
+      if (message.type === 'save') {
+        const assertCurrent = () => {
+          if (this.designer !== designer || currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders).uri.toString() !== workspace)
+            throw new Error('The suite editor changed. Reopen it before saving.');
+          if (message.requestId !== undefined && (!this.designerSave ||
+            this.designerSave.panel !== designer || this.designerSave.id !== message.requestId))
+            throw new Error('This configuration request expired. Retry Save shared UI configuration.');
+        };
+        assertCurrent();
+        // Once the editor answered, the command waits for the actual file write.
+        // The reply deadline must not reject an accepted write on a slow filesystem.
+        if (message.requestId !== undefined) clearTimeout(this.designerSave!.timer);
+        await this.saveConfiguration(message.configuration, assertCurrent);
+        this.finishDesignerSave(designer, message.requestId);
+      }
       if (message.type === 'targets') await this.updateGitTargets(message.targets as GitTarget[]);
       if (message.type === 'cancelTargets') this.targetDiscovery?.abort();
       if (message.type === 'discoverTargets') {
@@ -1038,7 +1057,10 @@ class Controller {
         catch (error) { void this.designer?.webview.postMessage({type: 'targetError', error: String(error)}); }
       }
       if (message.type === 'comparisons') await this.updateComparisonPolicies(message.comparisons as ComparisonPolicyConfig[]);
-      } catch (error) {void this.designer?.webview.postMessage({type: 'designerError', error: String(error)});}
+      } catch (error) {
+        this.finishDesignerSave(designer, message?.requestId, error);
+        void this.designer?.webview.postMessage({type: 'designerError', error: String(error)});
+      }
       finally {if (mutates) {this.workspaceOperations -= 1; this.designerBusy = false; void this.designer?.webview.postMessage({type: 'designerBusy', busy: false});}}
     });
     this.postPlan();
@@ -1101,10 +1123,37 @@ class Controller {
     await this.refresh();
   }
 
-  async saveConfiguration(configuration?: unknown): Promise<void> {
+  private finishDesignerSave(panel: vscode.WebviewPanel, id?: string, error?: unknown): void {
+    const pending = this.designerSave;
+    if (!pending || pending.panel !== panel || (id !== undefined && id !== pending.id)) return;
+    // Ordinary button saves do not acknowledge a pending palette request.
+    if (id === undefined && error === undefined) return;
+    clearTimeout(pending.timer); this.designerSave = undefined;
+    if (error !== undefined) pending.reject(error); else pending.resolve();
+  }
+
+  async saveCurrentConfiguration(): Promise<void> {
+    this.folder();
+    const panel = this.designer;
+    if (!panel) throw new Error('Open the visual suite editor first, then save its current configuration.');
+    if (this.designerBusy || this.designerSave) throw new Error('Wait for the current PerfChecker action to finish.');
+    const id = randomUUID();
+    panel.reveal();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => this.finishDesignerSave(panel, id,
+        new Error('The suite editor did not respond. Reopen it and retry Save shared UI configuration.')), 10000);
+      this.designerSave = {id, panel, resolve, reject, timer};
+      void panel.webview.postMessage({type: 'requestConfiguration', requestId: id}).then(delivered => {
+        if (!delivered) this.finishDesignerSave(panel, id, new Error('The suite editor is unavailable. Reopen it before saving.'));
+      }, error => this.finishDesignerSave(panel, id, error));
+    });
+  }
+
+  async saveConfiguration(configuration: unknown, beforeWrite?: () => void): Promise<void> {
     if (!configuration) throw new Error('Open the visual suite editor first.');
     const destination = this.absolute('uiConfiguration');
     await fs.mkdir(path.dirname(destination), {recursive: true});
+    beforeWrite?.();
     await fs.writeFile(destination, JSON.stringify(configuration, null, 2) + '\n', 'utf8');
     this.uiConfiguration = configuration;
     void vscode.window.showInformationMessage(`Saved ${vscode.workspace.asRelativePath(destination)}`);
@@ -1186,7 +1235,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return controller.openDesigner(folder);
       }),
     vscode.commands.registerCommand('perfchecker.runLandscapeLiveForWorkspace', runLandscapeLive),
-    vscode.commands.registerCommand('perfchecker.saveConfiguration', () => controller.saveConfiguration()),
+    vscode.commands.registerCommand('perfchecker.saveConfiguration', () => controller.saveCurrentConfiguration()),
     view.onDidChangeCheckboxState(event => {
       for (const [node, state] of event.items) {
         for (const run of node.runs) state === vscode.TreeItemCheckboxState.Checked ? tree.selected.add(run.id) : tree.selected.delete(run.id);

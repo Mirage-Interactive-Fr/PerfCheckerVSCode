@@ -5,6 +5,8 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const {chromium} = require('playwright');
 const controls = require('./native-studio-controls.cjs');
+const mcp = require('./native-mcp-controls.cjs');
+const investigations = require('./native-investigation-controls.cjs');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function eventually(read, description, timeout = 120000) {
@@ -45,7 +47,7 @@ exports.run = async () => {
     }, `Locate the real webview ${selector}`);
     const extension = vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');
     assert(extension, 'The product must come from the separate installed VSIX');
-    assert.equal(extension.packageJSON.version, '1.0.0');
+    assert.equal(extension.packageJSON.version, process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION);
     assert(!extension.extensionPath.includes('qualification-host'));
     await extension.activate();
     const registered = new Set(await vscode.commands.getCommands(true));
@@ -67,6 +69,10 @@ exports.run = async () => {
       });
       await runCase('missing-julia-debug', async () => {
         await assert.rejects(vscode.commands.executeCommand('perfchecker.debugFile', uri), /Install the Julia VS Code extension/i);
+      });
+      await runCase('missing-controller-initialize', async () => {
+        await assert.rejects(vscode.commands.executeCommand('perfchecker.initialize'), /controller Project\.toml not found.*perfchecker\.runnerProject/i);
+        log('bootstrap-prerequisite', {controllerAbsent: true, initializeCurrentlyBlocked: true});
       });
     } else {
       const settings = vscode.workspace.getConfiguration('perfchecker', uri);
@@ -94,7 +100,17 @@ exports.run = async () => {
       if (phase === 'configured') {
         await runCase('notebook-missing-prerequisite', async () => {
           assert(!vscode.extensions.getExtension('ms-toolsai.jupyter'));
-          await assert.rejects(vscode.commands.executeCommand('perfchecker.newNotebook', uri), /install.*jupyter|jupyter.*install|notebook.*extension/i);
+          try {
+            const notebookUri = await vscode.commands.executeCommand('perfchecker.newNotebook', uri);
+            const document = vscode.workspace.notebookDocuments.find(document => document.uri.toString() === notebookUri.toString());
+            assert(document, 'The available native serializer opens the actual notebook');
+            assert(document.getCells().some(cell => /Select the \*\*Julia\*\* kernel/.test(cell.document.getText())), 'The notebook explains the Julia kernel prerequisite');
+            await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            log('notebook-native-serializer-available', {jupyterInstalled: false, kernelExplained: true});
+          } catch (error) {
+            assert.match(String(error), /install.*jupyter|jupyter.*install|notebook.*extension/i,
+              'Unavailable notebook serialization must explain how to obtain its provider');
+          }
         });
       } else {
         await runCase('native-notebook-with-jupyter', async () => {
@@ -111,8 +127,56 @@ exports.run = async () => {
           const frame = await findFrame('#save');
           await frame.locator('#save').click();
           await eventually(() => fs.readFile(path.join(workspace, 'perf', 'perfchecker-ui.json'), 'utf8').then(JSON.parse), 'Native Save button writes the shared configuration');
+          const title = `Unsaved palette state ${Date.now()}`;
+          await frame.locator('#doc-title').fill(title);
           await vscode.commands.executeCommand('perfchecker.saveConfiguration');
+          const saved = JSON.parse(await fs.readFile(path.join(workspace, 'perf', 'perfchecker-ui.json'), 'utf8'));
+          assert.equal(saved.documentation.blocks[0].title, title, 'Palette Save persists current unsaved editor state');
         });
+        await runCase('native-testitem-measurement', async () => {
+          const create = vscode.tests.createTestController;
+          let native;
+          const passed = [], failed = [];
+          vscode.tests.createTestController = (...args) => {
+            const controller = create(...args);
+            if (args[0].startsWith('perfchecker.testitems.')) {
+              const profile = controller.createRunProfile.bind(controller);
+              controller.createRunProfile = (...profileArgs) => {
+                native = {controller, run: profileArgs[2]}; return profile(...profileArgs);
+              };
+              const createRun = controller.createTestRun.bind(controller);
+              controller.createTestRun = (...runArgs) => {
+                const run = createRun(...runArgs);
+                for (const method of ['passed', 'failed', 'errored']) {
+                  const original = run[method].bind(run);
+                  run[method] = (item, value, ...rest) => {
+                    (method === 'passed' ? passed : failed).push({id: item.id, value});
+                    return original(item, value, ...rest);
+                  };
+                }
+                return run;
+              };
+            }
+            return controller;
+          };
+          try {
+            await vscode.commands.executeCommand('perfchecker.discoverTestItems', uri);
+            assert(native, 'The actual native TestController was registered');
+            const items = []; native.controller.items.forEach(item => items.push(item));
+            assert.deepEqual(items.map(item => item.label), ['Vector reduction']);
+            const token = new vscode.CancellationTokenSource();
+            try {await native.run(new vscode.TestRunRequest([items[0]]), token.token);} finally {token.dispose();}
+            assert.deepEqual(failed, [], 'The actual General-backed worker reports no errors');
+            assert.equal(passed.length, 1); assert.equal(passed[0].id, items[0].id);
+            assert(Number.isFinite(passed[0].value) && passed[0].value >= 0, 'Measured duration reaches VS Code Testing');
+            log('testitem-current-evidence', {items: 1, durationMs: passed[0].value, core: 'General 1.0.0'});
+          } finally {vscode.tests.createTestController = create;}
+        });
+        if (process.env.PERFCHECKER_NATIVE_STAGE === 'full') {
+          await runCase('native-all-studio-controls', () => controls.run(context));
+          await runCase('native-investigation-controls', () => investigations.run(context));
+          await runCase('native-mcp-controls', () => mcp.run(context));
+        }
       }
     }
   } catch (error) {failures.push({name: 'host-bootstrap', message: String(error), stack: error.stack});}

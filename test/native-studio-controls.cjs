@@ -32,9 +32,11 @@ function assertDisposable(context) {
 }
 
 async function frame(context, selector) {
-  const result = await context.findFrame(selector);
-  await result.locator(selector).first().waitFor({state: 'visible', timeout: 60000});
-  return result;
+  return eventually(async () => {
+    const result = await context.findFrame(selector);
+    await result.locator(selector).first().waitFor({state: 'visible', timeout: 1000});
+    return result;
+  }, `Reacquire the current native webview ${selector}`);
 }
 
 async function studio(context) {
@@ -347,12 +349,22 @@ async function testAdvisorAndTools(context) {
 
 async function testSavePalette(context) {
   const view = await designer(context);
-  await view.locator('#doc-title').fill(`Palette save qualification ${Date.now()}`);
   const {destination} = await savedConfiguration(context, view);
   assert((await fs.stat(destination)).size > 0, 'Editor Save works before testing the independent palette command');
+  const title = `Unsaved palette qualification ${Date.now()}`;
+  await view.locator('#doc-title').fill(title);
+  await view.locator('#cards .card .check-option input').first().uncheck();
+  const count = await selectionCount(view);
+  await view.locator('#cards .card .label').first().evaluate(input => {
+    input.value = '#a12655'; input.dispatchEvent(new Event('input', {bubbles: true}));
+  });
   await assert.doesNotReject(context.vscode.commands.executeCommand('perfchecker.saveConfiguration'),
     'The contributed Save shared UI configuration command must save the open editor instead of rejecting a missing internal payload');
-  context.log('save-palette-command', {native: true, editorSaveFirst: true, destination});
+  const saved = JSON.parse(await fs.readFile(destination, 'utf8'));
+  assert.equal(saved.documentation.blocks[0].title, title);
+  assert.equal(saved.selection.run_ids.length, count);
+  assert(Object.values(saved.selection.labels).includes('#a12655'));
+  context.log('save-palette-command', {native: true, unsavedTitleSelectionColor: true, destination});
 }
 
 exports.runSelection = async context => {
@@ -419,13 +431,14 @@ exports.runFresh = async context => {
   assert.equal(await view.locator('.card').count(), 9);
   assert.match(await view.locator('.status').innerText(), /Install the Julia extension/);
   await clickStudioAction(context, 'suite');
-  await eventually(async () => /suite file not found.*perfchecker\.suite/i.test(await (await frame(context, '#studio-root')).locator('.status').innerText()) ||
-    /suite file not found.*perfchecker\.suite/i.test(await context.windowPage.locator('body').innerText()),
-    'Fresh install explains the missing suite file');
+  const missingSetup = /suite file not found.*perfchecker\.suite|controller Project\.toml not found.*perfchecker\.runnerProject/i;
+  await eventually(async () => missingSetup.test(await (await frame(context, '#studio-root')).locator('.status').innerText()) ||
+    missingSetup.test(await context.windowPage.locator('body').innerText()),
+    'Fresh install explains the missing controller or suite file');
   await clickStudioAction(context, 'results');
-  await eventually(async () => /suite file not found.*perfchecker\.suite/i.test(await (await frame(context, '#studio-root')).locator('.status').innerText()) ||
-    /suite file not found.*perfchecker\.suite/i.test(await context.windowPage.locator('body').innerText()),
-    'Fresh results explain the suite prerequisite');
+  await eventually(async () => missingSetup.test(await (await frame(context, '#studio-root')).locator('.status').innerText()) ||
+    missingSetup.test(await context.windowPage.locator('body').innerText()),
+    'Fresh results explain the missing controller or suite file');
   await clickStudioAction(context, 'advisor');
   const advisor = await frame(context, '#advisor-root');
   assert(await advisor.locator('#advisor-protocol').isVisible());
