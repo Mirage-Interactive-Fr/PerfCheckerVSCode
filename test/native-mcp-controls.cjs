@@ -6,8 +6,10 @@ const os = require('node:os');
 const http = require('node:http');
 const {execFile} = require('node:child_process');
 const {promisify} = require('node:util');
+const {clickStudioAction}=require('./native-studio-controls.cjs');
 const execute = promisify(execFile);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const hold = async()=>{if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(3000);};
 async function eventually(read, label, timeout = 180000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {if (await read()) return; await delay(100);}
@@ -16,7 +18,7 @@ async function eventually(read, label, timeout = 180000) {
 
 exports.run = async context => {
   assert.equal(process.env.CI, 'true');
-  const {vscode, workspace, findFrame, log} = context;
+  const {vscode, workspace, findFrame, log, proof} = context;
   const uri = vscode.Uri.file(workspace);
   const settings = () => vscode.workspace.getConfiguration('perfchecker', uri);
   const source = path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl');
@@ -90,17 +92,17 @@ exports.run = async context => {
     const configuredPath=settings().get('advisorConfig','perf/advisor.json');
     const configuredFile=path.resolve(workspace,configuredPath);
     const savedConfig=await fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
-    await vscode.commands.executeCommand('perfchecker.openChat');
+    await clickStudioAction(context,'chat');
     let view = await findFrame('#chat-root');
     await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click();
     await eventually(async () => /ENOENT|executable|could not|launch/i.test(await view.locator('[role="status"]').innerText()), 'Missing Codex explains its executable prerequisite');
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected, false);
-    log('codex-missing-native-prerequisite',{command:'perfchecker.connectCodex',status:'prerequisite',reason:'Codex executable absent from disposable CI; no human credentials are transferred.'});
+    proof('codex-missing-native-prerequisite',{command:'perfchecker.connectCodex',status:'prerequisite',reason:'Codex executable absent from disposable CI; no human credentials are transferred.'});
     assert.deepEqual(await vscode.commands.executeCommand('perfchecker.disconnectCodex'),{connected:false});
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
     assert.equal(settings().get('advisorConfig','perf/advisor.json'),configuredPath);
     assert.deepEqual(await fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;}),savedConfig,'The failed temporary CLI connection and explicit disconnect preserve the saved provider bytes');
-    log('codex-disconnected-command',{command:'perfchecker.disconnectCodex',returnValueVerified:true,alreadyDisconnected:true,savedConfigurationPreserved:true,activeAuthenticatedDisconnection:false});
+    proof('codex-disconnected-command',{command:'perfchecker.disconnectCodex',returnValueVerified:true,alreadyDisconnected:true,savedConfigurationPreserved:true,activeAuthenticatedDisconnection:false});
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
     const send = async (question, count) => {
       await view.locator('#chat-question').fill(question);
@@ -115,6 +117,7 @@ exports.run = async context => {
     assert.equal(await view.locator('.message.assistant').count(), 2);
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,
       `native-${process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION}-${process.platform}-${vscode.version}-mcp-controlled-provider.png`)});
+    await hold();
     await view.getByRole('tab', {name: '02 · Implementation', exact: true}).click();
     assert.match(await view.locator('.warning').innerText(), /Git checkpoint.*isolated copy.*diff review/);
     await view.getByText('Configure the MCP implementation tool', {exact: true}).click();
@@ -126,19 +129,23 @@ exports.run = async context => {
     await eventually(async () => {const value = await state(); return !value.busy && value.proposal?.files.includes('src/PerfCheckerNativeFixture.jl');}, 'The real implementation worker returns its Git proposal', 240000);
     assert.equal(await fs.readFile(source, 'utf8'), original);
     assert.match((await state()).backupRef, /^refs\/perfchecker\/checkpoints\//);
+    await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-${vscode.version}-mcp-reviewed-proposal.png`)});await hold();
     log('native-ui-action',{surface:'MCP implementation',action:'Open full diff'});
     await view.getByRole('button', {name: 'Open full diff', exact: true}).click();
     await eventually(() => vscode.workspace.textDocuments.some(document => document.languageId === 'diff' && document.getText().includes('init=zero')), 'The actual diff editor opens');
+    await hold();
     await vscode.commands.executeCommand('perfchecker.openChat'); view = await findFrame('#chat-root');
     log('native-ui-action',{surface:'MCP implementation',action:'Apply reviewed changes'});
     await view.getByRole('button', {name: 'Apply reviewed changes', exact: true}).click();
     await eventually(async () => !((await state()).busy) && (await fs.readFile(source, 'utf8')) === proposed, 'Apply changes the original only after the native user click');
     assert.equal(await probe(workspace), implementationBytes);
+    log('native-mcp-applied-oracle',{allocationBytes:implementationBytes,baselineBytes,originalChangedAfterReview:true});await hold();
     log('native-ui-action',{surface:'MCP implementation',action:'Restore previous code'});
     await view.getByRole('button', {name: 'Restore previous code', exact: true}).click();
     await eventually(async () => !((await state()).busy) && (await fs.readFile(source, 'utf8')) === original, 'Restore returns the exact original bytes');
     assert.deepEqual(await fs.readFile(path.join(workspace, '.git', 'index')), index);
     assert.equal(await git('rev-parse', 'HEAD'), head);
+    await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-${vscode.version}-mcp-exact-restore.png`)});await hold();
     await view.getByRole('button', {name: 'Discard proposal', exact: true}).click();
     await eventually(async () => !(await state()).proposal, 'Discard closes the recovery proposal');
     await view.getByRole('tab', {name: '01 · Advice', exact: true}).click();
@@ -150,7 +157,7 @@ exports.run = async context => {
     assert.equal(await fs.readFile(source, 'utf8'), original);
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
     await eventually(async () => (await state()).messages.length === 0, 'The native clear command removes the conversation');
-    log('native-mcp-advice-implementation-restore', {provider: 'deterministic real HTTP MCP server; no model credentials',
+    proof('native-mcp-advice-implementation-restore', {provider: 'deterministic real HTTP MCP server; no model credentials',
       adviceTurns: 2, checkpoint: true, diffEditor: true, apply: true, exactRestore: true, cancellation: true,
       allocationBaselineBytes: baselineBytes, allocationCandidateBytes: implementationBytes});
   } finally {

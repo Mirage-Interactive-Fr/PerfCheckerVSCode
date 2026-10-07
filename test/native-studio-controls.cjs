@@ -9,6 +9,7 @@ const {createHash}=require('node:crypto');
 async function capture(context, name) {
   const file=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-vscode-${context.vscode.version}-${name}.png`);
   await context.windowPage.screenshot({path:file});
+  if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await new Promise(resolve=>setTimeout(resolve,2500));
   context.log('native-interface-capture',{interface:name,file:path.basename(file),sha256:createHash('sha256').update(await fs.readFile(file)).digest('hex'),
     vscode:context.vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,core:context.core,source:'actual-isolated-Electron-workbench'});
 }
@@ -88,12 +89,12 @@ async function savedConfiguration(context, view) {
   const settings = context.vscode.workspace.getConfiguration('perfchecker',
     context.vscode.Uri.file(context.workspace));
   const destination = path.resolve(context.workspace, settings.get('uiConfiguration', 'perf/perfchecker-ui.json'));
-  const previous = await fs.readFile(destination, 'utf8').catch(() => undefined);
+  const previous = await fs.stat(destination,{bigint:true}).catch(() => undefined);
   await view.locator('#save').click();
   const config = await eventually(async () => {
-    const text = await fs.readFile(destination, 'utf8');
-    if (text === previous) return false;
-    return JSON.parse(text);
+    const stat = await fs.stat(destination,{bigint:true});
+    if (previous && stat.mtimeNs === previous.mtimeNs) return false;
+    return JSON.parse(await fs.readFile(destination, 'utf8'));
   }, 'Save configuration writes the native workspace file');
   assert.equal(config.schema_version, 'perfchecker-ui-config/1');
   return {config, destination};
@@ -112,6 +113,7 @@ async function resetDesigner(view) {
 
 async function testSuiteSelection(context) {
   let view = await designer(context);
+  await resetDesigner(view);
   const all = await selectionCount(view);
   assert(all > 1, 'The native fixture exercises more than one selectable run');
   const labels = await view.locator('#check-types label span').allTextContents();
@@ -126,7 +128,7 @@ async function testSuiteSelection(context) {
   for (const unavailable of await view.locator('.check-option.unavailable .check-status').all()) {
     assert((await unavailable.getAttribute('title'))?.trim(), 'An unavailable check explains its prerequisite');
   }
-  context.log('suite-check-types', {types: checkTypes, runs: all, unavailableReasonsChecked: true});
+  context.proof('suite-check-types', {types: checkTypes, runs: all, unavailableReasonsChecked: true});
 
   const targets = await options(view, '#target-filter');
   assert(targets.length >= 2, 'At least two real targets are needed to qualify hidden selections and versions');
@@ -201,7 +203,7 @@ async function testSuiteSelection(context) {
   await view.locator('#refresh').click();
   await eventually(async () => !(await view.locator('#refresh').isDisabled()), 'Refresh native Julia plan', 120000);
   assert.equal(await selectionCount(view), all - 1, 'Native refresh preserves the saved and current selection');
-  context.log('suite-selection-and-save', {runs: all, selected: all - 1, hiddenSelectionsPreserved: true, views: 6});
+  context.proof('suite-selection-and-save', {runs: all, selected: all - 1, hiddenSelectionsPreserved: true, views: 6});
   await view.locator('h1').first().scrollIntoViewIfNeeded();
   await capture(context,'suite-designer');
 
@@ -252,7 +254,7 @@ async function testGitTargetsAndComparisons(context) {
     assert(!settings().get('gitTargets', []).some(item => item.label === 'invalid-native-target'));
     await view.locator('#refresh-targets').click();
     await eventually(async () => !(await view.locator('#target-reference').isDisabled()), 'Refresh actual Git inventory');
-    context.log('git-reference-controls', {groups, pinnedBranch: chosen.commit, addRemove: true, invalidReferenceRejected: true});
+    context.proof('git-reference-controls', {groups, pinnedBranch: chosen.commit, addRemove: true, invalidReferenceRejected: true});
 
     await view.locator('#add-comparison').click();
     await view.locator('#comparison-error').waitFor({state: 'visible'});
@@ -276,7 +278,7 @@ async function testGitTargetsAndComparisons(context) {
     assert.equal(policy.baselines.length, 1); assert.equal(policy.candidates.length, 1);
     await view.locator('#comparison-list .target').last().getByRole('button', {name: 'Remove comparison', exact: true}).click();
     await eventually(() => settings().get('comparisonPolicies', []).length === before, 'Remove comparison via actual button');
-    context.log('comparison-controls', {invalidEmpty: true, overlapRejected: true, aggregationSelections: 4, aggregationsComputed: false, addRemove: true});
+    context.proof('comparison-controls', {invalidEmpty: true, overlapRejected: true, aggregationSelections: 4, aggregationsComputed: false, addRemove: true});
   } finally {
     await settings().update('gitTargets', previousTargets, context.vscode.ConfigurationTarget.WorkspaceFolder);
     await settings().update('comparisonPolicies', previousPolicies, context.vscode.ConfigurationTarget.WorkspaceFolder);
@@ -304,7 +306,7 @@ async function testCancelGitDiscovery(context){
     assert.match(await view.locator('#target-error').innerText(),/cancel/i);
     await view.locator('#target-source').fill('');await view.locator('#refresh-targets').click();
     await eventually(async()=>await view.locator('#target-reference optgroup[label="Branches"]').count()>0,'A fresh real local Git discovery works after cancellation');
-    context.log('git-cancel-discovery',{nativeClick:true,actualRemoteGitRequest:true,connectionClosedBeforeHarnessCleanup:true,freshScanSucceeded:true});
+    context.proof('git-cancel-discovery',{nativeClick:true,actualRemoteGitRequest:true,connectionClosedBeforeHarnessCleanup:true,freshScanSucceeded:true});
   }finally{
     if(view){await view.locator('#cancel-targets').click({timeout:1000}).catch(()=>{});await view.locator('#target-source').fill('').catch(()=>{});}
     server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
@@ -318,9 +320,10 @@ async function testResults(context) {
   const total = await view.locator('[data-result-item]').count(); assert(total > 0);
   for (const id of ['package', 'workload', 'backend', 'kind', 'status']) {
     for (const option of await options(view, `#result-${id}`)) {
+      const expected=await view.locator('[data-result-item]').evaluateAll((items,{id,value})=>items.filter(item=>item.dataset[id]===value).length,{id,value:option.value});
       await view.locator(`#result-${id}`).selectOption(option.value);
       const visible = view.locator('[data-result-item]:visible');
-      assert((await visible.count()) > 0, `Actual ${id}=${option.value} results remain inspectable`);
+      assert.equal(await visible.count(),expected,`The ${id}=${option.value} filter shows exactly the matching real results, including an empty status`);
       assert(await visible.evaluateAll((items, {id, value}) => items.every(item => item.dataset[id] === value), {id, value: option.value}));
     }
     await view.locator(`#result-${id}`).selectOption('');
@@ -337,7 +340,8 @@ async function testResults(context) {
     const target = await point.getAttribute('data-target');
     if (target) assert((await view.locator(`[id="${target}"]`).innerText()).trim(), `${name} keyboard focus shows its evidence`);
   }
-  context.log('result-controls', {items: total, filters: 7, chartFamilies});
+  assert(chartFamilies.flame>0,'The actual profile reports render nonempty, focusable flame frames');
+  context.proof('result-controls', {items: total, filters: 7, chartFamilies});
   const chart=view.locator('.normalized-chart,.distribution,.spark').first();
   if(await chart.count())await chart.scrollIntoViewIfNeeded();
   await capture(context,'measured-results');
@@ -347,7 +351,7 @@ async function testResults(context) {
     const file = path.join(context.results, report);
     const exists = await fs.access(file).then(() => true, () => false);
     if (exists) await eventually(() => context.vscode.window.tabGroups.all.some(group => group.tabs.some(tab =>
-      tab.input?.uri?.fsPath === file || (report.endsWith('.md') && tab.label.includes(report)))), `Open actual ${report}`);
+      tab.input?.uri?.fsPath === context.vscode.Uri.file(file).fsPath || (report.endsWith('.md') && tab.label.includes(report)))), `Open actual ${report}`);
     else await eventually(async () => (await context.windowPage.locator('body').innerText()).includes(`PerfChecker has not produced ${report} yet.`), `Missing ${report} explains its prerequisite`);
     context.log(`result-report-${name}`, {exists, openedOrExplained: true});
   }
@@ -400,7 +404,7 @@ async function testComputedAggregations(context){
         const expected=aggregation==='minimum'?sorted[0]:aggregation==='maximum'?sorted.at(-1):aggregation==='mean'?values.reduce((a,b)=>a+b,0)/values.length:sorted[1];
         assert(Math.abs(record.baseline_value-expected)<=Math.max(1,Math.abs(expected))*1e-12,`${aggregation} is computed from those real reference measurements`);
       }
-      context.log('computed-reference-aggregation',{aggregation,nativeAddAndRunClicks:true,baselines,candidate,measuredRuns:4,records:records.length,report:path.relative(context.workspace,path.join(reports,'version-comparison.json'))});
+      context.proof('computed-reference-aggregation',{aggregation,nativeAddAndRunClicks:true,baselines,candidate,measuredRuns:4,records:records.length,report:path.relative(context.workspace,path.join(reports,'version-comparison.json'))});
     }
   }finally{
     if(saved)await fs.writeFile(configFile,saved);else await fs.rm(configFile,{force:true});
@@ -429,7 +433,7 @@ async function testAdvisorAndTools(context) {
   assert.match(await view.locator('[role="status"]').innerText(), /structured response/);
   await view.locator('#advisor-investigates').uncheck();
   assert(await view.getByRole('button', {name: 'Cancel operation', exact: true}).isDisabled());
-  context.log('provider-controls', {modes: 5, malformedArgumentsRejected: true, textInvestigationRejected: true, noNetworkRequest: true});
+  context.proof('provider-controls', {modes: 5, malformedArgumentsRejected: true, textInvestigationRejected: true, noNetworkRequest: true});
 
   await clickStudioAction(context, 'tools');
   view = await frame(context, '#app');
@@ -445,7 +449,7 @@ async function testAdvisorAndTools(context) {
     assert.equal(await view.getByRole('button', {name: tab, exact: true}).getAttribute('aria-current'), 'page');
   }
   await view.getByRole('button', {name: 'Worker log', exact: true}).click();
-  context.log('native-tool-catalogue', {backend: context.core, filter: true, investigationTabs: 4, workerLog: true});
+  context.proof('native-tool-catalogue', {backend: context.core, filter: true, investigationTabs: 4, workerLog: true});
 }
 
 async function testSavePalette(context) {
@@ -465,7 +469,7 @@ async function testSavePalette(context) {
   assert.equal(saved.documentation.blocks[0].title, title);
   assert.equal(saved.selection.run_ids.length, count);
   assert(Object.values(saved.selection.labels).includes('#a12655'));
-  context.log('save-palette-command', {native: true, unsavedTitleSelectionColor: true, destination});
+  context.proof('save-palette-command', {native: true, unsavedTitleSelectionColor: true, destination});
 }
 
 async function testLargePlanAndOrdering(context) {
@@ -477,6 +481,7 @@ async function testLargePlanAndOrdering(context) {
   try{
     await fs.rm(configFile,{force:true});
     await settings().update('suite','perf/large-suite.jl',context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await context.vscode.commands.executeCommand('perfchecker.refresh');
     await context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
     let view=await frame(context,'#cards');
     await eventually(async()=>/Showing 120 of 125 workload groups/.test(await view.locator('#rendered-count').innerText()),'The real large plan paginates 125 workload groups',120000);
@@ -497,10 +502,11 @@ async function testLargePlanAndOrdering(context) {
     await view.locator('#search').fill('workload_125');
     assert.equal(await view.locator('#cards .card').count(),1);
     await view.locator('#clear-visible').click();assert.equal(await selectionCount(view),124);
-    context.log('large-plan-pagination-and-drag',{groups:125,initiallyRendered:120,bulkIncludesHidden:true,nativeDrag:true,executionsRequested:0});
+    context.proof('large-plan-pagination-and-drag',{groups:125,initiallyRendered:120,bulkIncludesHidden:true,nativeDrag:true,executionsRequested:0});
   }finally{
     if(saved)await fs.writeFile(configFile,saved);else await fs.rm(configFile,{force:true});
     await settings().update('suite',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await context.vscode.commands.executeCommand('perfchecker.refresh');
     await context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
     const view=await frame(context,'#cards');
     await eventually(async()=>!(await view.locator('#show-more').isVisible())&&!/workload_125/.test(await view.locator('#cards').innerText()),'Restore the real measurement suite after plan-only pagination',120000);
@@ -541,7 +547,7 @@ exports.runSelection = async context => {
   const result = await frame(context, 'button[data-report="suite-result.json"]');
   assert.equal(await result.locator('.empty').count(), 0);
   assert((await result.locator('[data-result-item]').count()) > 0);
-  context.log('native-run-selection', {runs: 1, status: report.runs[0].status, reportPath, nativeClick: true});
+  context.proof('native-run-selection', {runs: 1, status: report.runs[0].status, reportPath, nativeClick: true});
   return reports;
 };
 
@@ -554,13 +560,16 @@ exports.run = async context => {
   const environment=view.locator('details.environment');
   if(await environment.getAttribute('open')===null)await environment.locator('summary').click();
   await eventually(async()=>(await environment.locator('p').innerText()).includes(context.controller),'Studio displays the selected controller after its state arrives');
-  context.log('studio-inventory', {cards: 9, workbenchButtons: 5, controllerShown: true});
+  context.proof('studio-inventory', {cards: 9, workbenchButtons: 5, controllerShown: true});
   const failures = [];
   for (const [name, run] of [['suite-selection', testSuiteSelection], ['git-and-comparisons', testGitTargetsAndComparisons],['git-cancel-discovery',testCancelGitDiscovery],
     ['results', testResults], ['provider-and-tools', testAdvisorAndTools], ['save-palette', testSavePalette],
     ['large-plan-pagination-and-drag',testLargePlanAndOrdering],['computed-reference-aggregations',testComputedAggregations]]) {
+    const commands=await context.vscode.commands.getCommands(true);
+    if(commands.includes('notifications.clearAll'))await context.vscode.commands.executeCommand('notifications.clearAll');
     try {await run(context);}
     catch (error) {
+      await capture(context,`${name}-failure`).catch(()=>{});
       failures.push(error);
       context.log(`${name}-failure`, {message: String(error), stack: error.stack});
     }
@@ -587,5 +596,5 @@ exports.runFresh = async context => {
   assert(await advisor.locator('#advisor-protocol').isVisible());
   await advisor.locator('#advisor-protocol').selectOption('none');
   assert(await advisor.getByRole('button', {name: 'Test connection / discover', exact: true}).isDisabled());
-  context.log('fresh-studio-and-advisor', {buttonsAccessible: 14, missingSuiteExplained: true, noJuliaExplained: true, ruleBasedAvailable: true});
+  context.proof('fresh-studio-and-advisor', {visibleControls: 14, exercisedActions:['suite','results','advisor'], missingSuiteExplained: true, noJuliaExplained: true, ruleBasedAvailable: true});
 };

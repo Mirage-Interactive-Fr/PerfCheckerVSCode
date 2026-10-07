@@ -26,6 +26,13 @@ dependencies explicitly to the selected controller before measuring test items.
 Add `HTTP` there for an MCP HTTP provider or the local Codex bridge. Optional
 analyzers and Julia debugging have their own prerequisites.
 
+The official Julia extension uses `julia.executablePath`, independently of
+PerfChecker's `perfchecker.juliaExecutable`. In the native qualification,
+Julia extension 1.174.2 with Julia 1.13.1 failed to start its language server
+with `KeyError: key :_apply not found` in SymbolServer. Keep that combination
+separate from PerfChecker runner support; select Julia 1.12 for the official
+REPL/debugger while using a newer Julia for PerfChecker if needed.
+
 For notebooks, select **New Pluto notebook** and choose **Feature suite** or
 **Investigation**. The extension uses real reactive Pluto `.jl` notebooks in an
 editor tab. Stable Pluto 1.0.4 uses a separate `perf/pluto` Julia environment;

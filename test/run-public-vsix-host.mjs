@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
@@ -41,18 +41,27 @@ try {
   const runtime = JSON.parse((await execute(julia, ['--startup-file=no', '-e',
     'print("{\\\"executable\\\":", repr(joinpath(Sys.BINDIR, Base.julia_exename())), ",\\\"version\\\":", repr(string(VERSION)), "}")'])).trim());
   julia = runtime.executable;
+  const officialRuntime=JSON.parse((await execute(process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA||julia,['--startup-file=no','-e',
+    'print("{\\\"executable\\\":", repr(joinpath(Sys.BINDIR, Base.julia_exename())), ",\\\"version\\\":", repr(string(VERSION)), "}")'])).trim());
   const expectedVersion = mode === 'public' ? '1.0.0' : JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version;
   const vscode = await downloadAndUnzipVSCode({version, cachePath: path.join(session, 'vscode')});
   const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscode, {reuseMachineInstall: true});
   const extensions = path.join(session, 'extensions');
   const profile = path.join(session, 'profile');
+  // Exercise real VS Code dialogs through CDP instead of invisible OS-native modals.
+  // This application-scoped preference belongs only to the disposable CI profile.
+  await fs.mkdir(path.join(profile,'User'),{recursive:true});
+  await fs.writeFile(path.join(profile,'User','settings.json'),JSON.stringify({'window.dialogStyle':'custom','telemetry.telemetryLevel':'off'}));
   const workspace = path.join(session, 'workspace');
+  const workspaceFile = path.join(session,'qualification.code-workspace');
   const controller = path.join(session, 'controller');
   const target = path.join(workspace, 'worker-environment');
   await fs.mkdir(path.join(workspace, 'src'), {recursive: true});
   await fs.mkdir(path.join(workspace, 'test'));
   await fs.writeFile(path.join(workspace, 'Project.toml'), 'name = "PerfCheckerNativeFixture"\nuuid = "6af56806-e0b1-4f34-88bf-fde69d8a8679"\nversion = "0.1.0"\n');
-  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nsum_squares(xs) = sum(xs .^ 2)\nwait_task(x) = (sleep(0.005); x)\nend\n');
+  // Keep actual workload frames in the target package, rather than inlining them
+  // into an external perf script. Both workloads allocate inside their own source.
+  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nBase.@noinline wait_task(x) = (values=fill(x,1000); sleep(0.005); values[1])\nend\n');
   await fs.writeFile(path.join(workspace, 'test', 'performance.jl'), 'using TestItems\n@testitem "Vector reduction" tags=[:performance] begin\n data=collect(1:10_000)\n @test sum(data)==50_005_000\nend\n');
   const vsix = path.join(session, 'perfchecker.vsix');
   if (mode === 'public') {
@@ -62,9 +71,22 @@ try {
   } else await fs.copyFile(path.join(repository, 'candidate.vsix'), vsix);
   const sha = createHash('sha256').update(await fs.readFile(vsix)).digest('hex');
   if (mode === 'public' && sha !== publicSha) throw new Error('Public VSIX SHA256 differs from the published qualification.');
+  if (mode === 'candidate' && (!/^[a-f0-9]{64}$/.test(process.env.PERFCHECKER_NATIVE_CANDIDATE_SHA||'')||sha!==process.env.PERFCHECKER_NATIVE_CANDIDATE_SHA))
+    throw new Error('The installed candidate must match the canonical package shared by every qualification host.');
+  const retainedVsix=`perfchecker-vscode-${expectedVersion}.vsix`;
+  await fs.copyFile(vsix,path.join(output,retainedVsix));
+  if(createHash('sha256').update(await fs.readFile(path.join(output,retainedVsix))).digest('hex')!==sha)
+    throw new Error('The retained release artifact differs from the actual installed VSIX.');
+  let packageProvenance;
+  if(mode==='candidate'){
+    packageProvenance=JSON.parse(await fs.readFile(path.join(repository,'candidate.provenance.json'),'utf8'));
+    if(packageProvenance.sha256!==sha||packageProvenance.version!==expectedVersion)throw new Error('The candidate package provenance differs from the installed archive.');
+    await fs.writeFile(path.join(output,'candidate.provenance.json'),JSON.stringify(packageProvenance,null,2));
+  }
   const cliProfile = [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`];
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
-  await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify({mode, sha256: sha, vscodeRequested: version, core:coreProvenance}, null, 2));
+  await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify({mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
+    runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception'}}, null, 2));
   const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
   const minimumAvailable=/^\["1\.0\.1"\]$/m.test(await minimumResponse.text());
@@ -96,9 +118,10 @@ try {
         recorded=new Promise(resolve=>{recording.once('close',code=>resolve(code));recording.once('error',error=>{recordingError=String(error);resolve(-1);});});
         console.log(`NATIVE_VIDEO_START ${phase} ${videoStartedAt}`);
       }
-      const environment={...process.env,PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: profile,
+      const environment={...process.env,PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: profile,
         PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
+        PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
         PERFCHECKER_NATIVE_MODE: mode, PERFCHECKER_NATIVE_SHA: sha,
         PERFCHECKER_NATIVE_STAGE: process.env.PERFCHECKER_NATIVE_STAGE || 'smoke',
         PERFCHECKER_NATIVE_EXPECTED_VERSION: expectedVersion, PERFCHECKER_NATIVE_JULIA_VERSION: runtime.version,
@@ -109,7 +132,7 @@ try {
       await new Promise((resolve,reject)=>{
         // Actual interactive host: no --extensionTestsPath or smoke driver, and
         // no intercepted APIs. All dialogs are clicked through the real UI.
-        const child=spawn(vscode,[workspace,...cliProfile,'--new-window','--skip-welcome','--skip-release-notes',
+        const child=spawn(vscode,[phase==='prepared'?workspaceFile:workspace,...cliProfile,'--new-window','--skip-welcome','--skip-release-notes',
           '--disable-workspace-trust','--disable-gpu','--remote-debugging-port=9222',
           ...(process.platform==='linux'?['--no-sandbox']:[]),
           `--extensionDevelopmentPath=${path.join(repository,'test','qualification-host')}`],
@@ -133,7 +156,8 @@ try {
           await retainHostLogs().catch(error=>console.error(`NATIVE_STARTUP_LOGS ${error.message}`));stop();
           reject(new Error(`The ${phase} helper did not activate within 3 minutes. Retained Electron/extension-host logs distinguish startup failure from campaign duration.`));
         })();},180000);
-        const timer=setTimeout(()=>{stop();reject(new Error(`The ${phase} native phase exceeded its explicit 40-minute bound`));},40*60*1000);
+        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?70:40;
+        const timer=setTimeout(()=>{stop();reject(new Error(`The ${phase} native phase exceeded its explicit ${minutes}-minute bound`));},minutes*60*1000);
         const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
         const clean=()=>{clearTimeout(timer);clearTimeout(activationTimer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
         child.once('error',error=>{clean();reject(error);});
@@ -170,6 +194,9 @@ try {
   await fs.writeFile(path.join(workspace, 'perf', 'sum.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs) = perf_workload(xs) == 333833500.0\n');
   await fs.writeFile(path.join(workspace, 'perf', 'wait.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = 42\nperf_workload(x) = PerfCheckerNativeFixture.wait_task(x)\nperf_oracle(x) = perf_workload(x) == 42\n');
   await fs.writeFile(path.join(workspace, 'perf', 'cases.jl'), 'make_sum_case(p) = (prepare=()->collect(1.0:1000.0), operation=xs->sum(xs.^2), verify=(xs,result)->result==333833500.0)\nmake_wait_case(p) = (prepare=()->42, operation=x->(sleep(0.005);x), verify=(x,result)->result==42)\nmake_cancel_case(p) = (prepare=()->42, operation=x->(write(p["marker"],"running");sleep(30);x), verify=(x,result)->result==42)\n');
+  // A distinct bounded workload gives CPU sampling actual operation time;
+  // ordinary benchmark and diagnosis examples keep their small input.
+  await fs.appendFile(path.join(workspace,'perf','cases.jl'),'Base.@noinline native_profile_sum(xs) = sum(xs.^2)\nmake_profile_case(p) = (prepare=()->collect(1.0:1_000_000.0), operation=native_profile_sum, verify=(xs,result)->isapprox(result,1_000_000.0*1_000_001.0*2_000_001.0/6;rtol=1e-12))\n');
   await fs.appendFile(path.join(workspace,'perf','cases.jl'),'make_owned_cancel_case(p) = (prepare=()->mktempdir(cleanup=false), operation=directory->begin write(joinpath(directory,"owned.tmp"),"owned");write(p["marker"],string(getpid())*"\\n"*directory);sleep(120);42 end, verify=(directory,result)->result==42, cleanup=directory->begin rm(directory;recursive=true,force=true);write(p["cleaned"],"cleaned") end)\n');
   await fs.writeFile(path.join(workspace,'perf','owned-cancel.jl'),`perf_setup() = mktempdir(cleanup=false)
 function perf_workload(directory)
@@ -187,6 +214,7 @@ end
 `);
   await fs.writeFile(path.join(workspace,'perf','owned-suite.jl'),'using PerfChecker\nfunction build_suite()\n f=FeatureSpec(:owned_stop;backend=:alloc,entrypoint=joinpath(@__DIR__,"owned-cancel.jl"),oracle=OracleSpec())\n SoftwareSuite(:owned_stop,[PackageSuite("PerfCheckerNativeFixture";source=dirname(@__DIR__),worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=VersionNumber[],features=[f])])\nend\n');
   await fs.writeFile(path.join(workspace, 'perf', 'scenarios.toml'), 'schema_version = "perfchecker-scenario-catalog/1"\nroot = "."\n[[scenarios]]\nid = "sum_squares"\nimplementation = "allocating"\nsource = "cases.jl"\nfactory = "make_sum_case"\ncollectors = ["benchmark", "chairmark", "profile", "profile_alloc"]\n[[scenarios]]\nid = "wait_task"\nimplementation = "waiting"\nsource = "cases.jl"\nfactory = "make_wait_case"\ncollectors = ["benchmark"]\n');
+  await fs.appendFile(path.join(workspace,'perf','scenarios.toml'),'[[scenarios]]\nid = "sampled_sum_squares"\nimplementation = "sampled"\nsource = "cases.jl"\nfactory = "make_profile_case"\ncollectors = ["benchmark", "chairmark", "profile", "profile_alloc"]\n');
   await fs.writeFile(path.join(workspace, 'perf', 'example.jl'), 'using Example\nperf_setup() = "PerfChecker"\nperf_workload(name) = Example.hello(name)\nperf_oracle(name,result) = occursin(name,result)\n');
   await fs.writeFile(path.join(workspace,'perf','network.jl'), `using Sockets
 perf_setup() = collect(UInt8(0):UInt8(127))
@@ -235,7 +263,7 @@ end
 `);
   await fs.writeFile(path.join(workspace, 'perf', 'large-suite.jl'), 'using PerfChecker\nfunction build_suite()\n features=[FeatureSpec(Symbol("workload_",i);workload=Symbol("workload_",i),backend=:benchmark,entrypoint=joinpath(@__DIR__,"sum.jl")) for i in 1:125]\n SoftwareSuite(:large_native_fixture,[PackageSuite("PerfCheckerNativeFixture";source=dirname(@__DIR__),worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=VersionNumber[],features)])\nend\n');
   await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
-  await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': julia, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
+  await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': officialRuntime.executable, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
   if(mode==='candidate')await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);if !isempty(ARGS[3]);@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[3];end;println("PLUTO_CORE_MODE=",ARGS[5]," CORE=",Base.pkgversion(PerfChecker)," PLUTO=",Base.pkgversion(Pluto))`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode]);
   await launch('configured');
@@ -245,6 +273,10 @@ end
   for (const extension of mode==='public'?['julialang.language-julia','ms-toolsai.jupyter']:['julialang.language-julia']) {
     await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', extension], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   }
+  // Adding a second folder to a single-folder window converts its workspace and
+  // restarts the extension host. Start the multi-root campaign in a real saved
+  // workspace so those buttons are tested once without restarting the driver.
+  await fs.writeFile(workspaceFile,JSON.stringify({folders:[{path:workspace}],settings:{}},null,2));
   await launch('prepared');
   if (phaseFailures.length) throw new Error(JSON.stringify(phaseFailures));
 } finally {await fs.rm(session, {recursive: true, force: true, maxRetries: 12, retryDelay: 500});}

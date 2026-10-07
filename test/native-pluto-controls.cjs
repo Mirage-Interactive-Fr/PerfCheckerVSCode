@@ -32,6 +32,7 @@ async function files(directory) {
 async function capture(context, name) {
   const file=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-vscode-${context.vscode.version}-${name}.png`);
   await context.windowPage.screenshot({path:file});
+  if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await new Promise(resolve=>setTimeout(resolve,2500));
   context.log('native-interface-capture',{interface:name,file:path.basename(file),sha256:createHash('sha256').update(await fs.readFile(file)).digest('hex'),
     vscode:context.vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,core:context.core,source:'actual-isolated-Electron-workbench'});
 }
@@ -100,7 +101,7 @@ async function stop(context, state, closePanel = false) {
 
 async function create(context, file, kind) {
   const uri = await context.vscode.commands.executeCommand('perfchecker.newNotebook', context.vscode.Uri.file(file), {kind});
-  assert.equal(uri.fsPath, file);
+  assert.equal(uri.fsPath, context.vscode.Uri.file(file).fsPath);
   const source = await fs.readFile(file, 'utf8');
   assert(source.startsWith('### A Pluto.jl notebook ###'));
   assert(!source.includes('jupyter-notebook'));
@@ -134,7 +135,7 @@ async function studioNotebookButtons(context,directory){
     picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
     input=picker.locator('input[type="text"]');await input.fill(file);await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter');
     await stop(context,await view(context),true);
-    context.log('pluto-studio-file-dialog-buttons',{nativeNewClick:true,nativeOpenClick:true,realFileDialog:true,file:path.basename(file),jupyter:false});
+    context.proof('pluto-studio-file-dialog-buttons',{nativeNewClick:true,nativeOpenClick:true,realFileDialog:true,file:path.basename(file),jupyter:false});
   }finally{await settings.update('simpleDialog.enable',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);}
 }
 
@@ -155,7 +156,7 @@ async function restartFailureCleanup(context,directory){
   state=await view(context);await idle(state.frame);
   assert(await portOpen(Number(new URL(state.frame.url()).port)),'A later successful Restart remains alive');
   await stop(context,state,true);
-  context.log('pluto-failed-restart-real-worker-cleanup',{failedPids:startingPids.length,newSessionUnaffected:true,staleIframeAbsent:true,remoteForwardingNotEmulated:true});
+  context.proof('pluto-failed-restart-real-worker-cleanup',{failedPids:startingPids.length,newSessionUnaffected:true,staleIframeAbsent:true,remoteForwardingNotEmulated:true});
 }
 
 async function investigation(context, directory) {
@@ -169,7 +170,7 @@ async function investigation(context, directory) {
     assert(await state.frame.getByRole('button', {name, exact: true}).isVisible(), `Real Pluto control: ${name}`);
   }
   await state.frame.locator('bond[def="action"] select').selectOption('run');
-  await state.frame.locator('bond[def="selected"] select').selectOption('1');
+  await state.frame.locator('bond[def="selected"] select').selectOption({label:'sampled_sum_squares / sampled'});
   await idle(state.frame);
   assert.deepEqual(await fingerprint(reportRoot), before, 'Opening and selecting cannot execute measurements');
   context.log('native-ui-action',{surface:'Pluto investigation',action:'Launch selected action'});
@@ -186,6 +187,8 @@ async function investigation(context, directory) {
     assert.equal(run.qualification.availability, 'complete');
     assert.equal(run.qualification.correctness, 'passed');
     assert(run.summaries.length || run.profile.samples > 0, 'A completed collector contains actual observations');
+    if(run.collector==='profile')assert(run.profile.stacks.length>0,'Pluto CPU profiling retains actual sampled stacks');
+    if(run.collector==='profile_alloc')assert(run.profile.allocation_sites.length>0,'Pluto allocation profiling retains actual sampled allocation sites');
   }
   const snapshot = `pluto-cell[id="${cellId(state.source, 'snapshot = (refresh_click;')}"] pluto-output`;
   await refresh(state.frame, 'Refresh status and evidence', snapshot, /\bcomplete\b/);
@@ -194,7 +197,7 @@ async function investigation(context, directory) {
   await state.frame.locator('bond[def="action"] select').selectOption('tools');
   await idle(state.frame);
   assert.deepEqual(await fingerprint(reportRoot), completed, 'Changing selectors after completion cannot rerun the check');
-  context.log('pluto-investigation-real-run', {collectors: [...new Set(report.runs.map(run => run.collector))], core: context.core});
+  context.proof('pluto-investigation-real-run', {collectors: [...new Set(report.runs.map(run => run.collector))], core: context.core});
 
   // Use the real CodeMirror editor, reactive evaluation and Pluto's on-disk autosave.
   const id = cellId(state.source, '# PerfChecker investigations');
@@ -212,7 +215,7 @@ async function investigation(context, directory) {
   state = await view(context);
   await eventually(async () => (await state.frame.locator(`pluto-cell[id="${id}"] pluto-output`).innerText()).includes(title), 'Saved cell survives a real iframe reload');
   await state.parent.locator('#pluto-source').click();
-  await eventually(() => context.vscode.window.activeTextEditor?.document.uri.fsPath === file, 'Open source opens the actual generated .jl');
+  await eventually(() => context.vscode.window.activeTextEditor?.document.uri.fsPath === context.vscode.Uri.file(file).fsPath, 'Open source opens the actual generated .jl');
   const saved = await fs.readFile(file);
   await context.vscode.commands.executeCommand('perfchecker.openNotebook', context.vscode.Uri.file(file));
   state = await view(context);
@@ -227,7 +230,7 @@ async function investigation(context, directory) {
   await eventually(async () => (await state.frame.locator(`pluto-cell[id="${id}"] pluto-output`).innerText()).includes(title), 'Restart retains saved cells');
   assert.deepEqual(await fingerprint(reportRoot), completed, 'Restart is not a measurement request');
   await stop(context, state, true);
-  context.log('pluto-reactive-save-reload-close', {source: path.basename(file), workersClosed: true});
+  context.proof('pluto-reactive-save-reload-close', {source: path.basename(file), workersClosed: true});
 }
 
 async function cancellation(context, directory) {
@@ -247,7 +250,7 @@ async function cancellation(context, directory) {
     const snapshot = `pluto-cell[id="${cellId(state.source, 'snapshot = (refresh_click;')}"] pluto-output`;
     await refresh(state.frame, 'Refresh status and evidence', snapshot, /\bcancelled\b/, 90000);
     await stop(context, state, true);
-    context.log('pluto-cancel-active-worker', {workerReached: true, cancelled: true, serverClosed: true});
+    context.proof('pluto-cancel-active-worker', {workerReached: true, cancelled: true, serverClosed: true});
   } finally {
     await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession', context.vscode.Uri.file(context.workspace));
     await settings.update('scenarioCatalog', previous, context.vscode.ConfigurationTarget.WorkspaceFolder);
@@ -287,7 +290,7 @@ async function ownedWorkerClose(context,directory){
     const elapsed=await assertStopped(state,Number(info[0]),info[1],cleaned,false);
     await settings.update('plutoProject',previous.pluto,context.vscode.ConfigurationTarget.WorkspaceFolder);
     await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
-    context.log('pluto-stop-active-owned-worker',{kind:'InvestigationJob',cleanupMilliseconds:elapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,environmentChangedWhileRunning:true});
+    context.proof('pluto-stop-active-owned-worker',{kind:'InvestigationJob',cleanupMilliseconds:elapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,environmentChangedWhileRunning:true});
 
     await settings.update('suite','perf/owned-suite.jl',context.vscode.ConfigurationTarget.WorkspaceFolder);
     const suiteMarker=path.join(context.workspace,'perf','owned-suite-worker.marker'),suiteCleaned=path.join(context.workspace,'perf','owned-suite-cleaned.marker'),suiteCleaning=path.join(context.workspace,'perf','owned-suite-cleaning.marker');
@@ -306,14 +309,14 @@ async function ownedWorkerClose(context,directory){
     assert.deepEqual(await fs.readFile(preserved),sentinel);
     assert.deepEqual(new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem'))),beforeMem);
     await stop(context,state,true);
-    context.log('pluto-suite-cancel-active-allocation',{nativeClick:true,secondNativeCancelDuringCleanup:true,workerTerminated:true,ownedDirectoryRemoved:true,noNewMem:true,preExistingMemPreserved:true});
+    context.proof('pluto-suite-cancel-active-allocation',{nativeClick:true,secondNativeCancelDuringCleanup:true,workerTerminated:true,ownedDirectoryRemoved:true,noNewMem:true,preExistingMemPreserved:true});
     for(const file of [suiteMarker,suiteCleaned,suiteCleaning])await fs.rm(file,{force:true});
     state=await create(context,path.join(directory,'CloseActiveAllocation.jl'),'suite');
     await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
     await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
     const suiteInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The allocation worker reaches its real PID marker',360000);
     const suiteElapsed=await assertStopped(state,Number(suiteInfo[0]),suiteInfo[1],suiteCleaned,true);
-    context.log('pluto-close-active-allocation-worker',{kind:'SuiteJob',cleanupMilliseconds:suiteElapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,noNewMem:true});
+    context.proof('pluto-close-active-allocation-worker',{kind:'SuiteJob',cleanupMilliseconds:suiteElapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,noNewMem:true});
 
     for(const file of [suiteMarker,suiteCleaned,suiteCleaning])await fs.rm(file,{force:true});
     state=await create(context,path.join(directory,'ShutdownActiveAllocation.jl'),'suite');
@@ -329,8 +332,8 @@ async function ownedWorkerClose(context,directory){
     let shutdownElapsed;
     try{
       shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownInfo[1],suiteCleaned,false,async()=>{
-        const home=new URL(state.frame.url());home.pathname='/';home.searchParams.delete('id');
-        await state.frame.goto(home.href);
+        await state.frame.locator('img#logo-big').locator('..').click();
+        await eventually(()=>new URL(state.frame.url()).pathname==='/'&&state.frame.locator('#recent').isVisible(),'The real Pluto logo opens its authenticated homepage');
         const running=state.frame.locator('#recent li.running').filter({hasText:'ShutdownActiveAllocation.jl'});
         await running.locator('button.session').click();
         await eventually(async()=>await running.count()===0,'The native Pluto homepage removes the stopped notebook');
@@ -338,7 +341,7 @@ async function ownedWorkerClose(context,directory){
     }finally{page.off('dialog',confirm);}
     assert(confirmed,'The actual browser confirmation was accepted, rather than suppressing or mocking it');
     assert(await portOpen(Number(new URL(state.frame.url()).port)),'The homepage shuts down its notebook without stopping the shared Pluto server');
-    context.log('pluto-home-shutdown-active-allocation',{nativeClick:true,realConfirmation:true,cleanupMilliseconds:shutdownElapsed,pidTerminated:true,ownedFilesRemoved:true,noNewMem:true,preExistingMemPreserved:true});
+    context.proof('pluto-home-shutdown-active-allocation',{nativeClick:true,realConfirmation:true,cleanupMilliseconds:shutdownElapsed,pidTerminated:true,ownedFilesRemoved:true,noNewMem:true,preExistingMemPreserved:true});
     await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));
     await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   }finally{
@@ -401,7 +404,7 @@ async function suite(context, directory) {
   await idle(state.frame);
   assert.deepEqual(await fingerprint(root), completed, 'Changing a completed suite does not rerun or resave results');
   await stop(context, state, true);
-  context.log('pluto-suite-select-launch-save', {checks: saved.data.runs.length, report: path.relative(context.workspace, saved.file)});
+  context.proof('pluto-suite-select-launch-save', {checks: saved.data.runs.length, report: path.relative(context.workspace, saved.file)});
 }
 
 exports.run = async context => {

@@ -2,6 +2,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const {clickStudioAction}=require('./native-studio-controls.cjs');
 const {createHash} = require('node:crypto');
 
 const reportNames = {discover: 'discovery', run: 'run', diagnose: 'diagnosis',
@@ -143,10 +144,10 @@ async function discover(context) {
   assert(context.vscode.window.activeTextEditor.document.getText().includes('prepare'));
   const source = result.report.declared.find(item => item.id === 'sum_squares').source;
   await context.vscode.commands.executeCommand('perfchecker.openInvestigationSource', source, 1);
-  assert.equal(context.vscode.window.activeTextEditor.document.uri.fsPath, path.resolve(context.workspace, source));
+  assert.equal(context.vscode.window.activeTextEditor.document.uri.fsPath, context.vscode.Uri.file(path.resolve(context.workspace, source)).fsPath);
   const lenses = await context.vscode.commands.executeCommand('vscode.executeCodeLensProvider', context.vscode.Uri.file(path.resolve(context.workspace, source)));
   assert(lenses.some(lens => lens.command?.command === 'perfchecker.diagnoseScenarios'), 'Declared factory has a real Julia diagnosis CodeLens');
-  context.log('investigation-discovery-selection-source-draft', {declared: selected, proposals: result.report.candidates.length, preparedProposal: candidate.id, hiddenSelections: true, codeLens: true});
+  context.proof('investigation-discovery-selection-source-draft', {declared: selected, proposals: result.report.candidates.length, preparedProposal: candidate.id, hiddenSelections: true, codeLens: true});
   return result;
 }
 
@@ -168,7 +169,7 @@ async function adopt(context, id, factory, parameters = {}) {
   assert(result.report.declared.some(item => item.id === id && item.factory === factory));
   const catalog = path.resolve(context.workspace, configuration(context).get('scenarioCatalog', 'perf/scenarios.toml'));
   assert((await fs.readFile(catalog, 'utf8')).includes(`id = "${id}"`));
-  context.log('investigation-adoption', {id, factory, invalidJsonRejected: true, realCatalog: catalog});
+  context.proof('investigation-adoption', {id, factory, invalidJsonRejected: true, realCatalog: catalog});
   return result;
 }
 
@@ -194,7 +195,7 @@ async function rejectAdoption(context) {
     await eventually(async () => testCase.error.test(await current.locator('#app .status').innerText()), `Invalid or duplicate declaration ${testCase.id} is rejected`);
     assert.deepEqual(await fs.readFile(catalog), before, 'Invalid input does not alter the actual catalogue');
   }
-  context.log('investigation-adoption-types-and-duplicate-rejected', {parametersArray: true, fixturesObject: true, duplicate: true, catalogUnchanged: true});
+  context.proof('investigation-adoption-types-and-duplicate-rejected', {parametersArray: true, fixturesObject: true, duplicate: true, catalogUnchanged: true});
 }
 
 async function measure(context) {
@@ -214,7 +215,7 @@ async function measure(context) {
   assert.match(await chart.locator('circle').first().getAttribute('aria-label'), /Displayed sample/);
   await current.getByText('Qualification and measurement evidence', {exact: true}).click();
   assert.match(await current.locator('#app').innerText(), /passed/);
-  context.log('investigation-real-measurement', {scenario: run.scenario.id, collector: run.collector, correctness: run.qualification.correctness, samples: run.summaries[0]?.samples, report: result.location});
+  context.proof('investigation-real-measurement', {scenario: run.scenario.id, collector: run.collector, correctness: run.qualification.correctness, samples: run.summaries[0]?.samples, report: result.location});
   context.investigationFirstRun ||= result;
   return result;
 }
@@ -230,10 +231,11 @@ async function diagnose(context) {
     assert.equal(records.length, 1, `${tool} has one actual worker result`);
     const record = records[0];
     assert(['complete', 'unavailable'].includes(record.status), `${tool} does not hide errors, invalid evidence, timeout or cancellation as a prerequisite`);
+    if (record.status === 'complete') assert.equal(record.correctness, 'passed', `${tool} execution returns valid diagnosis evidence`);
     if (record.status === 'unavailable') assert(String(record.message || '').trim(), `${tool} unavailable status explains its prerequisite`);
     if (['latency', 'gc', 'memory'].includes(tool)) assert.equal(record.status, 'complete', `${tool} built-in worker actually executes`);
     if (['heap','locks'].includes(tool) && record.status === 'unavailable') assert.match(String(record.message), tool === 'heap' ? /snapshot|redact|unsupported|not supported|runtime/i : /counter|1\.11|not exposed|unsupported|runtime/i, `${tool} has a concrete runtime prerequisite`);
-    context.log(`investigation-analyzer-${tool}`, {status: record.status, correctness: record.correctness, version: record.tool_version, prerequisite: record.status === 'complete' ? undefined : record.message});
+    context.proof(`investigation-analyzer-${tool}`, {status: record.status, correctness: record.correctness, version: record.tool_version, prerequisite: record.status === 'complete' ? undefined : record.message});
   }
   const current = await tab(context, 'Findings & advice');
   const artifactRecord = result.report.records.find(record => record.artifacts?.length);
@@ -243,8 +245,9 @@ async function diagnose(context) {
     assert.equal(createHash('sha256').update(bytes).digest('hex'), artifact.sha256);
     const recordCard = current.locator('article.card').filter({has: current.getByRole('heading', {name: `${artifactRecord.scenario} · ${artifactRecord.implementation} · ${artifactRecord.tool}`, exact: true})});
     await recordCard.getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click();
-    await eventually(() => context.vscode.window.tabGroups.all.some(group=>group.tabs.some(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifact.path)), 'Evidence artifact opens in the actual native text or custom editor');
-    const opened=context.vscode.window.tabGroups.all.flatMap(group=>group.tabs).find(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifact.path);
+    const artifactUri=context.vscode.Uri.file(artifact.path);
+    await eventually(() => context.vscode.window.tabGroups.all.some(group=>group.tabs.some(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifactUri.fsPath)), 'Evidence artifact opens in the actual native text or custom editor');
+    const opened=context.vscode.window.tabGroups.all.flatMap(group=>group.tabs).find(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifactUri.fsPath);
     context.log('investigation-artifact-native-editor',{kind:artifact.kind,editor:opened.input.constructor.name,uri:path.basename(artifact.path)});
     await fs.writeFile(artifact.path, Buffer.concat([bytes, Buffer.from('\nchanged by isolated integrity test\n')]));
     try {
@@ -252,7 +255,7 @@ async function diagnose(context) {
       await recordCard.getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click();
       await eventually(async () => /Artifact changed/.test(await current.locator('#app .status').innerText()), 'Changed artifact is rejected by digest');
     } finally {await fs.writeFile(artifact.path, bytes);}
-    context.log('investigation-native-artifact-and-integrity', {kind: artifact.kind, sha256: artifact.sha256});
+    context.proof('investigation-native-artifact-and-integrity', {kind: artifact.kind, sha256: artifact.sha256});
   } else context.log('investigation-artifact-prerequisite-gap', {reason: 'The real analyzers returned no evidence artifacts; artifact execution is not qualified by this run.'});
   return result;
 }
@@ -268,7 +271,7 @@ async function advise(context) {
   assert(await (await view(context)).getByRole('heading', {name: 'Recommendations', exact: true}).isVisible());
   await (await view(context)).getByRole('button', {name: 'Explain with configured model', exact: true}).click();
   await eventually(async () => /Optional advisor is disabled/.test(await current.locator('#app .status').innerText()), 'Unconfigured model explains the prerequisite without making a generation request');
-  context.log('investigation-saved-advice-and-disabled-model', {recommendations: result.report.recommendations.length, modelPrerequisiteExplained: true});
+  context.proof('investigation-saved-advice-and-disabled-model', {recommendations: result.report.recommendations.length, modelPrerequisiteExplained: true});
 }
 
 async function compare(context) {
@@ -285,7 +288,7 @@ async function compare(context) {
   assert.equal(result.report.schema_version, 'perfchecker-scenario-comparison/1');
   assert(result.report.configurations.some(item => item.scenario === 'ui_adopted' && item.implementation === 'ui'));
   assert.match(await (await tab(context, 'Before / after')).locator('#app').innerText(), /ui_adopted/);
-  context.log('investigation-real-baseline-candidate', {configurations: result.report.configurations.length, report: result.location});
+  context.proof('investigation-real-baseline-candidate', {configurations: result.report.configurations.length, report: result.location});
 }
 
 async function bounded(context) {
@@ -301,7 +304,7 @@ async function bounded(context) {
   await current.getByText('Limits', {exact: true}).click();
   await current.getByText('Experiments not executed', {exact: true}).click();
   await current.getByText('Optional model decisions', {exact: true}).click();
-  context.log('investigation-real-bounded-work', {status: result.report.status, experiments: result.report.experiments.length, limits: result.report.limits});
+  context.proof('investigation-real-bounded-work', {status: result.report.status, experiments: result.report.experiments.length, limits: result.report.limits});
 }
 
 async function syncAndHistory(context) {
@@ -330,11 +333,11 @@ async function syncAndHistory(context) {
   await eventually(async () => /Saved evidence/.test(await history.locator('#app .status').innerText()), 'History reloads actual evidence without starting a worker');
   await (await view(context)).getByRole('button', {name: 'Worker log', exact: true}).click();
   await eventually(async () => /PerfChecker investigations/.test(await context.windowPage.locator('body').innerText()), 'Investigation output channel is displayed');
-  context.log('investigation-sync-tools-history-native-exports', {coverage: sync.report.coverage.length, tools: catalog.report.tools.length, formats: ['JSON', 'Markdown'], historyReload: true});
+  context.proof('investigation-sync-tools-history-native-exports', {coverage: sync.report.coverage.length, tools: catalog.report.tools.length, formats: ['JSON', 'Markdown'], historyReload: true});
 }
 
 async function profiles(context) {
-  await selectScenario(context, 'sum_squares', 'allocating');
+  await selectScenario(context, 'sampled_sum_squares', 'sampled');
   const result = await action(context, 'Measure selected', 'run');
   assert.equal(result.report.runs.length, 4);
   for (const collector of ['benchmark', 'chairmark', 'profile', 'profile_alloc']) {
@@ -345,8 +348,13 @@ async function profiles(context) {
   }
   const current = await tab(context, 'Findings & advice');
   const profiles = current.locator('details:has(> summary:text-is("Explore sampled stacks and allocations"))');
-  assert.equal(await profiles.count(), 2);
-  for (let index = 0; index < 2; index++) {
+  assert.equal(await profiles.count(), result.report.runs.filter(run=>run.profile).length, 'Every actual profile payload has its own native disclosure');
+  for(const collector of ['profile','profile_alloc']){
+    const run=result.report.runs.find(run=>run.collector===collector);
+    const sampled=collector==='profile'?run.profile.stacks:run.profile.allocation_sites;
+    assert(sampled.length>0,`${collector} has nonempty actual sampled evidence, rather than an empty disclosure`);
+  }
+  for (let index = 0; index < await profiles.count(); index++) {
     const profile = profiles.nth(index);
     await profile.locator('summary').first().click();
     const filter = profile.getByRole('searchbox', {name: 'Filter profile stacks'});
@@ -355,7 +363,7 @@ async function profiles(context) {
     await filter.fill('');
     await profile.getByText('Raw profile', {exact: true}).click();
   }
-  context.log('investigation-real-collectors-and-profile-controls', {collectors: result.report.runs.map(item => item.collector), profileFilter: true, fullRawEvidence: true});
+  context.proof('investigation-real-collectors-and-profile-controls', {collectors: result.report.runs.map(item => item.collector), profileFilter: true, fullRawEvidence: true});
 }
 
 async function cancel(context) {
@@ -372,7 +380,7 @@ async function cancel(context) {
   assert.match(await first.innerText(), /cancelled/);
   assert.equal(await first.getByRole('button', {name: 'Open evidence', exact: true}).isDisabled(), true);
   await fs.rm(marker, {force: true});
-  context.log('investigation-cancel-active-julia-worker', {workerStarted: true, cleanupCompleted: true, remainingConfigurationsQualified: false});
+  context.proof('investigation-cancel-active-julia-worker', {workerStarted: true, cleanupCompleted: true, remainingConfigurationsQualified: false});
 }
 
 exports.run = async context => {
@@ -387,6 +395,7 @@ exports.run = async context => {
   const failures = [];
   try {
     for (const key of keys) await settings.update(key, values[key], context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await clickStudioAction(context,'investigations');
     for (const [name, callback] of [
       ['discovery-selection-proposals', () => discover(context)],
       ['adopt-real-shared-factory', () => adopt(context, 'ui_adopted', 'make_sum_case')],

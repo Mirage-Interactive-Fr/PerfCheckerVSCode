@@ -6,6 +6,7 @@ import {cancellableJulia, controllerCancellation} from './controllerCancellation
 import {resolveControllerProject} from './workspace-root';
 
 const active = new Set<{cancel: ReturnType<typeof controllerCancellation>; finished: Promise<void>}>();
+class ControllerCancellationFailure extends Error {}
 export async function shutdownWorkspaceSetup(): Promise<void> {
   for(const item of active)item.cancel.request();
   await Promise.allSettled([...active].map(item=>item.finished));
@@ -27,6 +28,7 @@ export async function prepareWorkspaceController(folder: vscode.WorkspaceFolder,
   const run=async(project:string,code:string,title:string)=>{
   await vscode.window.withProgress({location:vscode.ProgressLocation.Notification,title,cancellable:true},async(_progress,token)=>{
     current();
+    if(token.isCancellationRequested)throw new vscode.CancellationError();
     await new Promise<void>((resolve,reject)=>{
       const child=spawn(settings.get('juliaExecutable','julia'),['--startup-file=no','--history-file=no',`--project=${project}`,'-e',cancellableJulia(code)],
         {cwd:folder.uri.fsPath,env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)},windowsHide:true,detached:process.platform!=='win32',stdio:['pipe','pipe','pipe']});
@@ -40,12 +42,15 @@ export async function prepareWorkspaceController(folder: vscode.WorkspaceFolder,
       child.once('error',error=>reject(new Error(`Cannot start Julia (${settings.get('juliaExecutable','julia')}). Install Julia or configure perfchecker.juliaExecutable. ${error.message}`)));
       const cleanup=()=>{clearTimeout(timer);for(const subscription of subscriptions)subscription.dispose();cancel.dispose();};
       child.once('error',cleanup);
-      child.once('close',status=>{cleanup();try{current();}catch(error){reject(error);return;}status===0?resolve():reject(new Error('Controller setup did not finish. This integration requires registered PerfChecker 1.0.1 or newer in the 1.x series. Install or upgrade it explicitly in this controller environment; inspect PerfChecker output for the Julia dependency error. No controller setting was changed.'));});
+      child.once('close',status=>{cleanup();try{current();}catch(error){reject(error);return;}
+        if(token.isCancellationRequested&&status!==0&&status!==130){reject(new ControllerCancellationFailure('Controller cancellation failed. Inspect PerfChecker output for cleanup errors; no installation wizard or settings change was performed.'));return;}
+        if(token.isCancellationRequested||status===130){reject(new vscode.CancellationError());return;}
+        status===0?resolve():reject(new Error('Controller setup did not finish. This integration requires registered PerfChecker 1.0.1 or newer in the 1.x series. Install or upgrade it explicitly in this controller environment; inspect PerfChecker output for the Julia dependency error. No controller setting was changed.'));});
     });
   });
   };
   current();
-  try{const selected=resolveControllerProject(folder.uri.fsPath,settings);await run(selected.project,verifyCode,'PerfChecker · Verify controller');return true;}catch(error){output.appendLine(`Controller prerequisite: ${error}`);current();}
+  try{const selected=resolveControllerProject(folder.uri.fsPath,settings);await run(selected.project,verifyCode,'PerfChecker · Verify controller');return true;}catch(error){if(error instanceof vscode.CancellationError)return false;if(error instanceof ControllerCancellationFailure)throw error;output.appendLine(`Controller prerequisite: ${error}`);current();}
 
   const choice=await vscode.window.showQuickPick([
     {label:'Create controller environment',description:'Install registered PerfChecker 1.0.1 and collectors in perf/controller.',action:'create'},
@@ -74,7 +79,8 @@ export async function prepareWorkspaceController(folder: vscode.WorkspaceFolder,
   const existing=choice.action==='existing';
   const code=existing ? verifyCode :
     'using Pkg; Pkg.add(PackageSpec(name="PerfChecker",version="1.0.1")); Pkg.add(["BenchmarkTools","Chairmarks","TestItemRunner"]); using PerfChecker; @assert Base.pkgversion(PerfChecker)==v"1.0.1"';
-  await run(project,code,existing?'PerfChecker · Verify controller':'PerfChecker · Install controller');
+  try{await run(project,code,existing?'PerfChecker · Verify controller':'PerfChecker · Install controller');}
+  catch(error){if(error instanceof vscode.CancellationError)return false;throw error;}
   current();
   const value=path.relative(folder.uri.fsPath,project)||'.';
   await settings.update('runnerProject',value,vscode.ConfigurationTarget.WorkspaceFolder);

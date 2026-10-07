@@ -22,24 +22,82 @@ function commandCoverage(commands,checks){
     measureScenarios:['investigation-real-measurement'],diagnoseScenarios:['investigation-analyzer-jet','investigation-analyzer-alloccheck'],
     adviseScenarios:['investigation-saved-advice-and-disabled-model'],compareScenarios:['investigation-real-baseline-candidate'],
     cancelInvestigation:['investigation-cancel-active-julia-worker'],prepareScenario:['investigation-discovery-selection-source-draft'],
-    openInvestigationSource:['investigation-discovery-selection-source-draft'],refresh:['suite-selection-and-save'],initialize:['bootstrap-first-install-and-measurement'],
+    openInvestigationSource:['investigation-discovery-selection-source-draft'],refresh:['suite-selection-and-save'],initialize:['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration'],
     runAll:['all-supported-collectors-measured'],runNode:['native-run-selection-command'],openEntrypoint:['native-workload-command'],
     openOutput:['result-controls'],showLog:['native-tool-catalogue'],openDesigner:['suite-selection-and-save'],openDesignerForWorkspace:['save-palette-command'],
     runLandscapeLiveForWorkspace:['landscape-live-prerequisite'],saveConfiguration:['save-palette-command','native-suite-save-palette'],
-    openStudio:['studio-inventory'],openStudioForWorkspace:['controller-visible-in-studio'],openChat:['native-mcp-advice-implementation-restore'],
+    openStudio:['first-open-studio'],openStudioForWorkspace:['controller-visible-in-studio'],openChat:['native-mcp-advice-implementation-restore'],
     openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save'],openNotebook:['pluto-reactive-save-reload-close'],
     debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore'],applyImplementation:['native-mcp-advice-implementation-restore'],
     restoreImplementation:['native-mcp-advice-implementation-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
     stopNotebookSession:['native-pluto-without-jupyter'],
   };
   return commands.map(command=>{
-    const name=command.replace(/^perfchecker\./,''),proof=checks.filter(check=>(effects[name]||[]).includes(check.name));
-    const prerequisite=['narrateAdvice','connectCodex','runLandscapeLiveForWorkspace'].includes(name);
-    return {command,registered:true,status:proof.length?(prerequisite?'prerequisite-verified':'effect-verified'):'unverified',evidence:proof.map(check=>check.name),
-      ...(prerequisite?{limit:name==='narrateAdvice'?'No configured narrative model; enabled model execution is not qualified.':name==='connectCodex'?'No human Codex authentication in CI; authenticated CLI/General integration is covered by the separate local opt-in test.':'No physical Étendue/GPU renderer in this disposable package; only its explicit prerequisites are verified.'}:{}),
+    const name=command.replace(/^perfchecker\./,''),proof=checks.filter(check=>check.assertionsCompleted===true&&(effects[name]||[]).includes(check.name));
+    const externalPrerequisite=['narrateAdvice','connectCodex','runLandscapeLiveForWorkspace'].includes(name);
+    const prerequisite=externalPrerequisite||(proof.length>0&&proof.every(check=>['prerequisite','unavailable'].includes(check.status)));
+    return {command,registered:true,status:proof.length?(prerequisite?'prerequisite-verified':'effect-verified'):'unverified',evidence:proof.map(check=>({name:check.name,outcome:check.status||'validated-effect',case:check.case,prerequisite:check.prerequisite})),
+      ...(prerequisite?{limit:name==='narrateAdvice'?'No configured narrative model; enabled model execution is not qualified.':name==='connectCodex'?'No human Codex authentication in CI; authenticated CLI/General integration is covered by the separate local opt-in test.':name==='runLandscapeLiveForWorkspace'?'No physical Étendue/GPU renderer in this disposable package; only its explicit prerequisites are verified.':'Only explicit prerequisites were validated; this execution was unavailable.'}:{}),
       ...(name==='disconnectCodex'?{limit:'The native test verifies the explicit disconnected return state and preserved saved configuration after a failed temporary connection. An active authenticated CLI disconnect is covered separately by the local opt-in test.'}:{}),
       route:'Evidence records actual palette/API or webview backend effects; registration alone is never execution proof.'};
   });
+}
+
+function buttonCoverage(checks){
+  const families={
+    'Studio · Feature suite':['suite-selection-and-save'],
+    'Studio · Existing Julia tests / Test Explorer':['testitem-current-evidence'],
+    'Studio · Plots & results':['result-controls'],
+    'Studio · Investigations':['investigation-discovery-selection-source-draft'],
+    'Studio · Tool catalogue':['native-tool-catalogue'],
+    'Studio · Talk to your agent':['native-mcp-advice-implementation-restore'],
+    'Studio · Connect an advisor':['advisor-native-model-management','advisor-native-provider-and-tool-discovery'],
+    'Studio · Debug Julia code':['official-julia-debug'],
+    'Studio · New/Open Pluto notebook':['pluto-studio-file-dialog-buttons'],
+    'Studio · PerfChecker terminal':['multi-root-explicit-routing'],
+    'Studio · Julia extension REPL':['official-julia-repl'],
+    'Studio · Project tasks':['project-task'],
+    'Studio · Setup workspace':['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration'],
+    'Designer · nine check types / hidden selections / filters / save':['suite-selection-and-save'],
+    'Designer · Git refs / commit pin / add / remove':['git-reference-controls'],
+    'Designer · Cancel Git discovery':['git-cancel-discovery'],
+    'Designer · comparison policy selection':['comparison-controls'],
+    'Designer · median / mean / minimum / maximum calculated':['computed-reference-aggregation'],
+    'Designer · pagination125 / drag / bulk hidden selection':['large-plan-pagination-and-drag'],
+    'Designer · Run selected and native backend':['native-run-selection'],
+    'Results · filters / reports / keyboard navigation':['result-controls'],
+    'Investigation · adoption / validation / duplicate rejection':['investigation-adoption-types-and-duplicate-rejected'],
+    'Investigation · real collectors / profile filters / raw evidence':['investigation-real-collectors-and-profile-controls'],
+    'Investigation · artifact open / digest validation':['investigation-native-artifact-and-integrity'],
+    'Investigation · before/after saved measurements':['investigation-real-baseline-candidate'],
+    'Investigation · bounded work / limits':['investigation-real-bounded-work'],
+    'Investigation · active worker cancellation':['investigation-cancel-active-julia-worker'],
+    'Pluto · reactive edit / evaluate / autosave / reload':['pluto-reactive-save-reload-close'],
+    'Pluto · Launch selected checks / Refresh / Save reports':['pluto-suite-select-launch-save'],
+    'Pluto · Launch selected investigation / Refresh':['pluto-investigation-real-run'],
+    'Pluto · Cancel investigation':['pluto-cancel-active-worker'],
+    'Pluto · Cancel suite twice during cleanup':['pluto-suite-cancel-active-allocation'],
+    'Pluto · Stop / Close active workers and owned .mem cleanup':['pluto-stop-active-owned-worker','pluto-close-active-allocation-worker'],
+    'Pluto · homepage Shutdown / real confirmation':['pluto-home-shutdown-active-allocation'],
+    'Pluto · failed Restart leaves no stale worker':['pluto-failed-restart-real-worker-cleanup'],
+    'MCP · two advice turns / diff / Apply / oracle / Restore':['native-mcp-advice-implementation-restore'],
+    'Coordination3D · physical renderer prerequisites':['landscape-live-prerequisite'],
+    ...Object.fromEntries(['jet','aqua','alloccheck','snoopcompile','latency','gc','memory','heap','locks'].map(tool=>[`Analyzer · ${tool}`,[`investigation-analyzer-${tool}`]])),
+  };
+  const rows=Object.entries(families).map(([family,names])=>{
+    const evidence=checks.filter(check=>check.assertionsCompleted===true&&names.includes(check.name));
+    const complete=names.every(name=>evidence.some(check=>check.name===name))||family==='Studio · Setup workspace'&&evidence.length>0;
+    const allAggregations=family!=='Designer · median / mean / minimum / maximum calculated'||['median','mean','minimum','maximum'].every(aggregation=>evidence.some(check=>check.aggregation===aggregation));
+    return {family,status:complete&&allAggregations?(evidence.some(check=>['unavailable','prerequisite'].includes(check.status))?'prerequisite':'passed'):'unverified',
+      evidence:evidence.map(check=>({name:check.name,case:check.case,status:check.status,aggregation:check.aggregation,prerequisite:check.prerequisite||check.reason}))};
+  });
+  const result=checks.findLast(check=>check.assertionsCompleted===true&&check.name==='result-controls');
+  for(const [name,key] of Object.entries({distribution:'distribution',allocationPie:'allocation',normalizedOverlay:'normalized',flameGraph:'flame',versionSeries:'series'})){
+    const count=result?.chartFamilies[key];
+    rows.push({family:`Results plot · ${name}`,status:count>0?'passed':result?'prerequisite':'unverified',
+      points:count,evidence:result?[{name:result.name,case:result.case,prerequisite:count>0?undefined:'This real run produced no observations for this plot family; rendering execution is unqualified.'}]:[]});
+  }
+  return rows;
 }
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -55,13 +113,16 @@ async function eventually(read, description, timeout = 120000) {
 
 async function measureNativeTestItem(context,expectedPassed){
   const {vscode,windowPage,workspace}=context;
-  await vscode.commands.executeCommand('perfchecker.discoverTestItems',vscode.Uri.file(workspace));
-  await vscode.commands.executeCommand('workbench.view.extension.test');
+  await controls.clickStudioAction(context,'items');
+  await controls.clickStudioAction(context,'testing');
   const row=windowPage.locator('.monaco-list-row[aria-label*="test/performance.jl · performance"]').filter({hasText:'Vector reduction'}).first();
-  await row.waitFor({state:'visible',timeout:30000});await row.hover();
+  await row.waitFor({state:'visible',timeout:120000});await row.hover();
   const button=row.locator('.action-label[title="Run Test"],.action-label[aria-label="Run Test"],.action-label.codicon-testing-run-icon').first();
   const storage=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','native-testitems');
   const before=new Set(await fs.readdir(storage).catch(()=>[]));
+  await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(workspace,'test','performance.jl'))),{preview:false});
+  if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(2500);
+  await row.hover();
   context.log('native-ui-action',{surface:'Test Explorer',action:'Run Test',expectedPassed});
   await button.click();
   const measured=await eventually(async()=>{
@@ -73,10 +134,14 @@ async function measureNativeTestItem(context,expectedPassed){
     }
   },'The actual Test Explorer Run button returns fresh worker evidence',180000);
   assert.equal(measured.payload.passed,expectedPassed);assert.equal(measured.payload.runs.length,1);
+  const retained=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'worker-evidence',process.env.PERFCHECKER_NATIVE_PHASE,expectedPassed?'native-testitem-passed':'native-testitem-missing-target','result.json');
+  await fs.mkdir(path.dirname(retained),{recursive:true});await fs.copyFile(measured.file,retained);
   if(expectedPassed){
     assert.equal(measured.payload.runs[0].status,'validated');
     await eventually(async()=>/passed/i.test(await row.getAttribute('aria-label')||'')||await row.locator('.codicon-testing-passed-icon').count()>0,'The actual Testing tree reports Passed');
-    context.log('testitem-current-evidence',{items:1,core:context.core,nativeClick:true,report:measured.file,samples:measured.payload.runs[0].samples});
+    context.proof('testitem-current-evidence',{items:1,core:context.core,nativeClick:true,studioDiscoverAndTestingButtons:true,report:measured.file,retainedReport:path.relative(process.env.PERFCHECKER_NATIVE_OUTPUT,retained),samples:measured.payload.runs[0].samples});
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(measured.file)),{preview:false});
+    if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(3000);
   }else{
     assert.equal(measured.payload.runs[0].samples[0].passes,0);assert.equal(measured.payload.runs[0].samples[0].errors,1);
     await eventually(async()=>/failed|errored/i.test(await row.getAttribute('aria-label')||''),'The tree does not present missing target dependencies as passed');
@@ -99,9 +164,10 @@ exports.run = async () => {
   const timing=()=>({observedAt:new Date().toISOString(),...(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT?
     {videoOffsetSeconds:(Date.now()-Date.parse(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT))/1000}:{})});
   const persist=(status='running')=>{
-    const report=JSON.stringify({status,phase,coverage:process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
+    const report=JSON.stringify({status,phase,platform:process.platform,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
+      coverage:process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1',available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
-      commands:commandCoverage(commands,checks),activeCase,checks,failures},null,2);
+      commands:commandCoverage(commands,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);
     pendingReport=pendingReport.then(()=>fs.writeFile(path.join(output,`${phase}.json`),report));
     return pendingReport;
   };
@@ -115,11 +181,16 @@ exports.run = async () => {
     }
   };
   const log = (name, detail = {}) => {const clean=JSON.parse(redact(JSON.stringify({name,...detail,...timing()})));checks.push(clean); console.log(`NATIVE_CHECK ${name} ${JSON.stringify(clean)}`);void persist();};
+  const proof=(name,detail={})=>log(name,{...detail,assertionsCompleted:true,case:activeCase});
   const runCase = async (name, run) => {
     activeCase=name;await persist();
     log('native-case-start',{action:name});
     console.log(`NATIVE_CASE_START ${phase} ${name}`);
-    try {await run(); log(name, {status: 'passed'});}
+    try {
+      if((await vscode.commands.getCommands(true)).includes('notifications.clearAll'))await vscode.commands.executeCommand('notifications.clearAll');
+      await run(); proof(name, {status: 'passed'});
+      if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(1500);
+    }
     catch (error) {
       failures.push({name, message: redact(error), stack: redact(error.stack)});
       console.error(`NATIVE_FAILURE ${name}: ${redact(error.stack || error)}`);
@@ -131,6 +202,17 @@ exports.run = async () => {
   try {
     browser = await eventually(() => chromium.connectOverCDP('http://127.0.0.1:9222'), 'Connect to the disposable Electron host');
     windowPage = await eventually(async () => browser.contexts().flatMap(context => context.pages()).find(page => page.url().includes('workbench')), 'Locate the actual VS Code workbench');
+    const allCommands=await vscode.commands.getCommands(true);
+    if(allCommands.includes('workbench.action.closeAuxiliaryBar'))await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+    if(process.env.PERFCHECKER_NATIVE_VIDEO==='1'){
+      const cdp=await windowPage.context().newCDPSession(windowPage);
+      try{
+        const {windowId}=await cdp.send('Browser.getWindowForTarget');
+        await cdp.send('Browser.setWindowBounds',{windowId,bounds:{windowState:'normal'}});
+        await cdp.send('Browser.setWindowBounds',{windowId,bounds:{left:0,top:0,width:1920,height:1080}});
+        log('native-recording-layout',{actualWindowBounds:await cdp.send('Browser.getWindowBounds',{windowId}),auxiliaryChatClosed:true});
+      }finally{await cdp.detach();}
+    }
     const findFrame = selector => eventually(async () => {
       for (const context of browser.contexts()) for (const page of context.pages()) for (const frame of page.frames()) {
         if (!await frame.locator(selector).first().isVisible().catch(() => false)) continue;
@@ -156,7 +238,7 @@ exports.run = async () => {
     const uri = vscode.Uri.file(workspace);
     const context = {vscode, browser, windowPage, workspace,
       controller: process.env.PERFCHECKER_NATIVE_CONTROLLER, target: process.env.PERFCHECKER_NATIVE_TARGET,
-      results: path.join(workspace, 'perf', 'results', 'vscode'), log, findFrame,
+      results: path.join(workspace, 'perf', 'results', 'vscode'), log, proof, findFrame,
       core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION};
     log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 
@@ -202,19 +284,19 @@ exports.run = async () => {
           },'Production bootstrap explains the registered minimum and upgrade action',180000);
           assert.equal(vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject','perf'),'perf','Failed production setup preserves the selected controller');
           assert(!await fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false));
-          log('bootstrap-awaiting-registration',{status:'prerequisite',minimum:'1.0.1',registry:'General',positiveBootstrapQualified:false,explicitConfirmation:true,nativeStudioClick:true});
+          proof('bootstrap-awaiting-registration',{status:'prerequisite',minimum:'1.0.1',registry:'General',positiveBootstrapQualified:false,explicitConfirmation:true,nativeStudioClick:true});
           return;
         }
         await eventually(()=>fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false),'Explicit first-use setup creates a real suite',600000);
         await eventually(()=>vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject')==='perf/controller','Controller setting is saved only after successful setup');
         await controls.runSelection(context);
-        log('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:'General 1.0.1',nativeStudioClick:true});
+        proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:'General 1.0.1',nativeStudioClick:true});
       });
     } else {
       const settings = vscode.workspace.getConfiguration('perfchecker', uri);
       for (const [key, value] of Object.entries({juliaExecutable: process.env.PERFCHECKER_NATIVE_JULIA,
         runnerProject: context.controller, scenarioProject: context.controller,
-        suite: 'perf/suite.jl', profile: 'quick', reports: 'perf/results/vscode', advisorEnabled: false,
+        suite: 'perf/suite.jl', profile: phase==='prepared'?'historical':'quick', reports: 'perf/results/vscode', advisorEnabled: false,
         scenarioSamples: 2, analysisTools: []})) {
         await settings.update(key, value, vscode.ConfigurationTarget.WorkspaceFolder);
       }
@@ -239,7 +321,7 @@ exports.run = async () => {
           assert(!vscode.extensions.getExtension('ms-toolsai.jupyter'));
           const file=path.join(workspace,'perf','notebooks',`${phase}-first.jl`);
           const result=await vscode.commands.executeCommand('perfchecker.newNotebook',vscode.Uri.file(file),{kind:'suite'});
-          assert.equal(result.fsPath,file);
+          assert.equal(result.fsPath,vscode.Uri.file(file).fsPath);
           const parent=await findFrame('iframe.perfchecker-pluto-frame');
           const frame=await(await parent.locator('iframe.perfchecker-pluto-frame').elementHandle()).contentFrame();
           await frame.locator('pluto-notebook').waitFor({state:'visible',timeout:180000});
@@ -292,8 +374,8 @@ exports.run = async () => {
           const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
           const run=plan.runs.find(run=>run.status==='ready'&&run.backend==='benchmark');assert(run);
           await vscode.commands.executeCommand('perfchecker.openEntrypoint',run);
-          assert.equal(vscode.window.activeTextEditor.document.uri.fsPath,run.entrypoint);
-          log('native-workload-command',{command:'perfchecker.openEntrypoint',entrypoint:run.entrypoint});
+          assert.equal(vscode.window.activeTextEditor.document.uri.fsPath,vscode.Uri.file(run.entrypoint).fsPath);
+          proof('native-workload-command',{command:'perfchecker.openEntrypoint',entrypoint:run.entrypoint});
           await vscode.commands.executeCommand('perfchecker.runNode',{runs:[run]});
           const report=JSON.parse(await fs.readFile(path.join(context.results,'suite-result.json'),'utf8'));
           assert.equal(report.runs.length,1);assert.equal(report.runs[0].status,'pass');
@@ -308,7 +390,7 @@ exports.run = async () => {
             const ready=report.runs.filter(run=>run.status==='pass');
             assert(ready.length>1);assert(report.runs.every(run=>['pass','unavailable'].includes(run.status)),'Available collectors pass correctness; only known unavailable checks may remain');
             assert.deepEqual(new Set(report.runs.filter(run=>run.package==='Example').map(run=>run.version)),new Set(['0.5.0','0.5.3','0.5.4','0.5.5']));
-            log('all-supported-collectors-measured',{collectors:[...new Set(ready.map(backend))],checks:ready.length,unavailable:report.runs.filter(run=>run.status==='unavailable').map(run=>({backend:backend(run),reason:run.message})),versions:['0.5.0','0.5.3','0.5.4','0.5.5']});
+            proof('all-supported-collectors-measured',{collectors:[...new Set(ready.map(backend))],checks:ready.length,unavailable:report.runs.filter(run=>run.status==='unavailable').map(run=>({backend:backend(run),reason:run.message})),versions:['0.5.0','0.5.3','0.5.4','0.5.5']});
           });
           await runCase('native-all-studio-controls', () => controls.run(context));
           await runCase('native-workbench-controls',()=>workbench.run(context));

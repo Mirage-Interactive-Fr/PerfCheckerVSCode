@@ -23,7 +23,7 @@ test('native item controller preserves selection, exclusions, cancellation and t
     tests:{createTestController:(id,label)=>{
       const c={id,label,items:new Items(),...disposable(),createTestItem:(id,label,uri)=>({id,label,uri}),
         createRunProfile:(name,_kind,fn)=>{c.profileName=name;c.handler=fn;},
-        createTestRun:()=>{const r={events:[],end(){this.ended=true;},appendOutput(){}};
+        createTestRun:()=>{const r={events:[],outputs:[],end(){this.ended=true;},appendOutput(text,_location,item){this.outputs.push({text,item:item?.id});}};
           for(const key of ['enqueued','started','passed','failed','errored','skipped'])r[key]=item=>r.events.push([key,item.id]);
           c.lastRun=r;return r;}};controllers.push(c);return c;
     }}};
@@ -72,6 +72,11 @@ test('native item controller preserves selection, exclusions, cancellation and t
     await c.handler({include:[c.items.values[0]]},token);
     assert.deepEqual(c.lastRun.events.filter(e=>e[0]==='passed'),[]);
     assert.deepEqual(c.lastRun.events.filter(e=>e[0]==='errored'),[['errored','a']]);
+    assert.equal(c.lastRun.outputs.length,1,'Failed items expose their diagnostic in the native Testing output');
+    assert.equal(c.lastRun.outputs[0].item,'a');
+    assert.match(c.lastRun.outputs[0].text,/package under test and its test dependencies/);
+    assert.match(c.lastRun.outputs[0].text,/Controller setup installs PerfChecker and collectors only/);
+    assert.match(c.lastRun.outputs[0].text,/\r\n/);
     const afterFailure = calls.length;
     mock.workspace.isTrusted=false;
     await assert.rejects(commands.get('perfchecker.discoverTestItems')(),/trusted workspace/);

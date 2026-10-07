@@ -41,21 +41,49 @@ permissions:
   contents: read
 
 jobs:
+  package:
+    name: Package the exact candidate once
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.digest.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run package -- --out candidate.vsix
+      - id: digest
+        name: Record the shared package digest
+        run: |
+          node -e "const fs=require('fs'),crypto=require('crypto'),cp=require('child_process');const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');fs.appendFileSync(process.env.GITHUB_OUTPUT,'sha='+sha+'\n');fs.writeFileSync('candidate.vsix.sha256',sha+'  candidate.vsix\n');fs.writeFileSync('candidate.provenance.json',JSON.stringify({sha256:sha,version:JSON.parse(fs.readFileSync('package.json')).version,commit:cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),tree:cp.execFileSync('git',['rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim(),packagedOnceOn:'Linux',run:process.env.GITHUB_RUN_ID},null,2))"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-candidate-${{ github.sha }}
+          path: |
+            candidate.vsix
+            candidate.vsix.sha256
+            candidate.provenance.json
+          compression-level: 0
+
   native-workflows:
+    needs: package
     name: Native VSIX (${{ matrix.os }}, VS Code ${{ matrix.vscode }})
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       PERFCHECKER_VSCODE_VERSION: ${{ matrix.vscode }}
       PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
+      PERFCHECKER_NATIVE_CANDIDATE_SHA: ${{ needs.package.outputs.sha }}
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '4ffac370b849f9a30b3ec48a2f482c35669ea769' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '68a00ae63a607697fc0f383fdd9b0ba54d84bb72' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '6f6155510aa209859310ab3c32787caec64176bf' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || 'd73f1140aa41492482f9208d240d282d4cfcfd7f' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
@@ -71,14 +99,26 @@ jobs:
           node-version: 22
           cache: npm
       - uses: julia-actions/setup-julia@v3
+        id: runner-julia
         with:
           version: '1'
           arch: x64
+      - uses: julia-actions/setup-julia@v3
+        id: official-julia
+        with:
+          version: '1.12'
+          arch: x64
+      - name: Preserve separate runtimes for PerfChecker and official Julia integration
+        env:
+          RUNNER_JULIA_BINDIR: ${{ steps.runner-julia.outputs.julia-bindir }}
+          OFFICIAL_JULIA_BINDIR: ${{ steps.official-julia.outputs.julia-bindir }}
+        run: node -e "const fs=require('fs'),path=require('path'),exe=process.platform==='win32'?'julia.exe':'julia';fs.appendFileSync(process.env.GITHUB_ENV,'PERFCHECKER_TEST_JULIA='+path.join(process.env.RUNNER_JULIA_BINDIR,exe)+'\nPERFCHECKER_NATIVE_OFFICIAL_JULIA='+path.join(process.env.OFFICIAL_JULIA_BINDIR,exe)+'\n');fs.appendFileSync(process.env.GITHUB_PATH,process.env.RUNNER_JULIA_BINDIR+'\n')"
       - run: npm ci
-      - run: npm run compile
-      - name: Build the candidate when selected
+      - name: Retrieve the same candidate bytes on every host
         if: env.PERFCHECKER_VSIX_MODE == 'candidate'
-        run: npm run package -- --out candidate.vsix
+        uses: actions/download-artifact@v7
+        with:
+          name: native-candidate-${{ github.sha }}
       - name: Add the browser protocol client (no browser installation)
         run: npm install --no-save --ignore-scripts playwright@1.62.1
       - name: Install screen capture tooling in the disposable Linux stable host

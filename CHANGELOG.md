@@ -14,6 +14,9 @@
 - The Save configuration palette command now saves the visual editor's current
   unsaved state, with acknowledgement after writing and guards against stale
   replies. The native Test Explorer entry point uses its official container ID.
+- Failed test-item runs expose their dependency and controller diagnostic in
+  Testing output as well as the item message. Cancelling controller verification
+  ends the setup action without reopening the installation wizard.
 - Controller setup, notebook generation and scenario adoption check workspace
   trust, folder and settings identity before writing. Owned processes also
   request cooperative cleanup when their extension-host pipe closes.

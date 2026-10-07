@@ -181,7 +181,7 @@ async function ollama(context, fixture, configFile) {
   await click(frame, 'Test connection / discover'); await finished(frame, /HTTP 503/);
   assert.equal(await frame.getByRole('button', {name: 'Test connection / discover', exact: true}).isEnabled(), true);
   assert.deepEqual(await fs.readFile(configFile), savedBytes, 'Provider errors preserve the saved configuration');
-  context.log('advisor-native-model-management', {protocolFixture: true, inferenceModelDownloaded: false,
+  context.proof('advisor-native-model-management', {protocolFixture: true, inferenceModelDownloaded: false,
     payloadBytes: fixture.payload.length, selectionSaved: true, confirmedPullDeleteUnload: true,
     cancelledConnectionClosed: true, serverPartialFileExplicitlyRetained: true, providerErrorVisible: true});
 }
@@ -223,7 +223,7 @@ async function inventories(context, fixture, configFile) {
   await click(frame, 'Save configuration'); await finished(frame, /Rule-based advice only/);
   assert.equal(context.vscode.workspace.getConfiguration('perfchecker', context.vscode.Uri.file(context.workspace)).get('advisorEnabled'), false);
   assert.deepEqual(await fs.readFile(fixture.modelFile('seed:fixture')), fixture.payload);
-  context.log('advisor-native-provider-and-tool-discovery', {chatInventory: true, mcpHandshake: true,
+  context.proof('advisor-native-provider-and-tool-discovery', {chatInventory: true, mcpHandshake: true,
     paginatedTools: 2, schemaAndArguments: true, toolCalls: 0, generationRequests: 0, ruleBasedModeSaved: true});
 }
 

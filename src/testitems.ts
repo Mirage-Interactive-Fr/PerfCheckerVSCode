@@ -80,6 +80,10 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
       if (busy) throw new Error('A native test item run is already active in this folder.');
       busy = true;
       const execution = tests.createTestRun(request);
+      const appendDiagnostic = (message: string, item?: vscode.TestItem) => {
+        execution.appendOutput(`${message.replace(/\r?\n/g, '\r\n')}\r\n`, undefined, item);
+        output.appendLine(message);
+      };
       let selected: vscode.TestItem[] = [];
       try {
         if (token.isCancellationRequested) return;
@@ -102,19 +106,23 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
           const details=rows?.[0]?.samples?.map((sample:any)=>sample.message).filter((message:any)=>typeof message==='string').join('\n')??'';
           const project=resolveControllerProject(folder.uri.fsPath,vscode.workspace.getConfiguration('perfchecker',folder.uri)).project;
           const message=`Item failed, skipped, timed out or had no passing assertions (exit ${code}). ${details}\nTestItemRunner executes in ${project}. Ensure the package under test and its test dependencies are available in that controller environment, then discover and run again. Controller setup installs PerfChecker and collectors only; it does not install your package. See https://perfchecker.mirageinteractive.fr/interfaces/vscode.html and the PerfChecker test items output.`;
-          if (code !== 0) {execution.errored(item,new vscode.TestMessage(message));output.appendLine(message);}
-          else if (rows?.length !== 1) execution.errored(item,new vscode.TestMessage(`Missing or ambiguous current item evidence (exit ${code}). Inspect the output channel.`));
+          if (code !== 0) {execution.errored(item,new vscode.TestMessage(message));appendDiagnostic(message,item);}
+          else if (rows?.length !== 1) {
+            const evidenceMessage=`Missing or ambiguous current item evidence (exit ${code}). Inspect the output channel.`;
+            execution.errored(item,new vscode.TestMessage(evidenceMessage));appendDiagnostic(evidenceMessage,item);
+          }
           else if (rows[0].status==='validated' && payload.passed === true) {
             const duration = nativeItemDuration(rows[0].samples, samples);
             execution.passed(item, duration);
             execution.appendOutput(`${item.label}: ${duration.toFixed(2)} ms measured across ${samples} sample(s), including setup and assertions. Correctness validated; performance has not been compared to a budget.\r\n`,undefined,item);
           } else {
-            execution.failed(item,new vscode.TestMessage(message));output.appendLine(message);
+            execution.failed(item,new vscode.TestMessage(message));appendDiagnostic(message,item);
           }
         }
       } catch (error) {
-        selected.forEach(item=>execution.errored(item,new vscode.TestMessage(String(error))));
-        output.appendLine(String(error)); output.show(true);
+        selected.forEach(item=>{execution.errored(item,new vscode.TestMessage(String(error)));appendDiagnostic(String(error),item);});
+        if (!selected.length) appendDiagnostic(String(error));
+        output.show(true);
       } finally {execution.end();busy=false;}
     };
     tests.resolveHandler = () => refresh();
