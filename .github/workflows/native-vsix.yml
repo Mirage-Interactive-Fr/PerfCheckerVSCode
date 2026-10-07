@@ -54,8 +54,9 @@ jobs:
       PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || 'a497aabcf1f7b49783b4445ab0591afe056a9900' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '15e18d432d1bc7ddba74ba105a8dfeffc5b47f1e' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '4ffac370b849f9a30b3ec48a2f482c35669ea769' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '68a00ae63a607697fc0f383fdd9b0ba54d84bb72' }}
+      PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
       JULIA_NUM_PRECOMPILE_TASKS: '1'
@@ -80,9 +81,12 @@ jobs:
         run: npm run package -- --out candidate.vsix
       - name: Add the browser protocol client (no browser installation)
         run: npm install --no-save --ignore-scripts playwright@1.62.1
+      - name: Install screen capture tooling in the disposable Linux stable host
+        if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_VIDEO == '1'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Run isolated native workflows on Linux
         if: runner.os == 'Linux'
-        run: xvfb-run -a node test/run-public-vsix-host.mjs
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" node test/run-public-vsix-host.mjs
       - name: Run isolated native workflows on Windows
         if: runner.os == 'Windows'
         run: node test/run-public-vsix-host.mjs

@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.1 — Pluto notebooks and first-use fixes
+
+- Explicit Studio setup for a controller and starter suite, including existing
+  package environments that do not contain PerfChecker. No package installation
+  happens without a user choice; target test dependencies remain explicit.
+- Reactive Pluto `.jl` notebooks in editor tabs replace the Jupyter notebook
+  path. Feature-suite and investigation dashboards use the official companion,
+  a separate Julia environment and explicit measurement controls.
+- Managed Pluto sessions preserve authenticated iframe URLs and remote port
+  forwarding. Stop, Restart, view closure and Pluto's own shutdown/restart
+  controls cancel owned jobs before closing their notebook workers.
+- The Save configuration palette command now saves the visual editor's current
+  unsaved state, with acknowledgement after writing and guards against stale
+  replies. The native Test Explorer entry point uses its official container ID.
+- Controller setup, notebook generation and scenario adoption check workspace
+  trust, folder and settings identity before writing. Owned processes also
+  request cooperative cleanup when their extension-host pipe closes.
+- Native qualification covers fresh installation and backend effects using
+  isolated VS Code profiles on Linux, Windows and Intel macOS. Its reports
+  distinguish executed features, unavailable prerequisites and remaining gates.
+
+Requires registered PerfChecker.jl 1.0.1 or later. Existing older controller and
+Pluto environments show an explicit upgrade action. The extension does not
+silently replace a project's benchmark engine or download a model.
+
 ## 1.0.0 — PerfChecker Studio
 
 - Full editor-tab Studio with the canonical documentation logo, a monochrome

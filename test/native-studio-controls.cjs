@@ -3,6 +3,15 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const http = require('node:http');
+const {createHash}=require('node:crypto');
+
+async function capture(context, name) {
+  const file=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-vscode-${context.vscode.version}-${name}.png`);
+  await context.windowPage.screenshot({path:file});
+  context.log('native-interface-capture',{interface:name,file:path.basename(file),sha256:createHash('sha256').update(await fs.readFile(file)).digest('hex'),
+    vscode:context.vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,core:context.core,source:'actual-isolated-Electron-workbench'});
+}
 
 const studioActions = {
   suite: 'Feature suite', items: 'Existing Julia tests', testing: 'Test Explorer',
@@ -51,6 +60,7 @@ async function clickStudioAction(context, action) {
   const selector = ['notebook', 'openNotebook', 'terminal', 'julia', 'tasks'].includes(action)
     ? view.getByRole('button', {name: studioActions[action], exact: true})
     : view.locator(`[data-action="${action}"]`);
+  context.log('native-ui-action',{surface:'Studio',action:studioActions[action]});
   await selector.click();
 }
 exports.clickStudioAction = clickStudioAction;
@@ -192,6 +202,8 @@ async function testSuiteSelection(context) {
   await eventually(async () => !(await view.locator('#refresh').isDisabled()), 'Refresh native Julia plan', 120000);
   assert.equal(await selectionCount(view), all - 1, 'Native refresh preserves the saved and current selection');
   context.log('suite-selection-and-save', {runs: all, selected: all - 1, hiddenSelectionsPreserved: true, views: 6});
+  await view.locator('h1').first().scrollIntoViewIfNeeded();
+  await capture(context,'suite-designer');
 
   // Exercise the script button and assert its real editor document, then return to the retained view.
   await view.locator('#cards .card .check-option .open').first().click();
@@ -271,6 +283,34 @@ async function testGitTargetsAndComparisons(context) {
   }
 }
 
+async function testCancelGitDiscovery(context){
+  const sockets=new Set();let requested=false;
+  const server=http.createServer((_request,_response)=>{requested=true;/* Keep a real Git HTTP request pending until Cancel. */});
+  server.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  let view;
+  try{
+    view=await designer(context);
+    await view.locator('#target-package').selectOption('PerfCheckerNativeFixture');
+    await eventually(async()=>!(await view.locator('#target-reference').isDisabled()),'Initial local Git inventory finishes');
+    const advanced=view.locator('details').filter({hasText:'Advanced target options'});
+    if(await advanced.getAttribute('open')===null)await advanced.locator('summary').click();
+    await view.locator('#target-source').fill(`http://127.0.0.1:${server.address().port}/qualification.git`);
+    await view.locator('#refresh-targets').click();
+    await eventually(()=>requested&&sockets.size>0,'The actual Git process reaches its pending HTTP discovery request',30000);
+    await view.locator('#cancel-targets').click();
+    await eventually(()=>sockets.size===0,'The native Cancel discovery button terminates Git and closes its real connection',30000);
+    await eventually(async()=>!(await view.locator('#cancel-targets').isVisible()),'The cancelled Git scan returns to idle');
+    assert.match(await view.locator('#target-error').innerText(),/cancel/i);
+    await view.locator('#target-source').fill('');await view.locator('#refresh-targets').click();
+    await eventually(async()=>await view.locator('#target-reference optgroup[label="Branches"]').count()>0,'A fresh real local Git discovery works after cancellation');
+    context.log('git-cancel-discovery',{nativeClick:true,actualRemoteGitRequest:true,connectionClosedBeforeHarnessCleanup:true,freshScanSucceeded:true});
+  }finally{
+    if(view){await view.locator('#cancel-targets').click({timeout:1000}).catch(()=>{});await view.locator('#target-source').fill('').catch(()=>{});}
+    server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
+  }
+}
+
 async function testResults(context) {
   let view = await output(context);
   assert.match(await view.locator('body').innerText(), /PERFCHECKER OUTPUT/);
@@ -298,6 +338,9 @@ async function testResults(context) {
     if (target) assert((await view.locator(`[id="${target}"]`).innerText()).trim(), `${name} keyboard focus shows its evidence`);
   }
   context.log('result-controls', {items: total, filters: 7, chartFamilies});
+  const chart=view.locator('.normalized-chart,.distribution,.spark').first();
+  if(await chart.count())await chart.scrollIntoViewIfNeeded();
+  await capture(context,'measured-results');
   for (const [name, report] of [['Summary', 'suite-report.md'], ['JSON', 'suite-result.json'], ['Comparisons', 'version-comparison.md'], ['Series JSON', 'version-series.json']]) {
     view = await output(context);
     await view.getByRole('button', {name, exact: true}).click();
@@ -307,6 +350,63 @@ async function testResults(context) {
       tab.input?.uri?.fsPath === file || (report.endsWith('.md') && tab.label.includes(report)))), `Open actual ${report}`);
     else await eventually(async () => (await context.windowPage.locator('body').innerText()).includes(`PerfChecker has not produced ${report} yet.`), `Missing ${report} explains its prerequisite`);
     context.log(`result-report-${name}`, {exists, openedOrExplained: true});
+  }
+}
+
+async function testComputedAggregations(context){
+  const uri=context.vscode.Uri.file(context.workspace);
+  const settings=()=>context.vscode.workspace.getConfiguration('perfchecker',uri);
+  const previous={reports:settings().inspect('reports')?.workspaceFolderValue,policies:settings().inspect('comparisonPolicies')?.workspaceFolderValue};
+  const configFile=path.resolve(context.workspace,settings().get('uiConfiguration','perf/perfchecker-ui.json'));
+  const saved=await fs.readFile(configFile).catch(()=>undefined);
+  const baselines=['0.5.0','0.5.3','0.5.4'],candidate='0.5.5';
+  try{
+    for(const aggregation of ['median','mean','minimum','maximum']){
+      await settings().update('comparisonPolicies',[],context.vscode.ConfigurationTarget.WorkspaceFolder);
+      const reports=path.join(context.workspace,'perf','results','aggregations',aggregation);
+      await settings().update('reports',reports,context.vscode.ConfigurationTarget.WorkspaceFolder);
+      let view=await designer(context);
+      await view.locator('#comparison-package').selectOption('Example');
+      await view.locator('#comparison-feature').selectOption('hello');
+      for(const input of await view.locator('#baseline-targets input,#candidate-targets input').all())await input.uncheck();
+      for(const version of baselines)await view.locator(`#baseline-targets input[value="${version}"]`).check();
+      await view.locator(`#candidate-targets input[value="${candidate}"]`).check();
+      await view.locator('#comparison-aggregation').selectOption(aggregation);
+      await view.locator('#add-comparison').click();
+      await eventually(()=>settings().get('comparisonPolicies',[]).length===1,`The native ${aggregation} comparison policy is persisted`);
+      await eventually(async()=>!(await view.locator('#run').isDisabled()),'The policy replan finishes',120000);
+      await view.locator('#reset-filters').click();await view.locator('#clear-all').click();
+      await view.locator('#package').selectOption('Example');await view.locator('#select-visible').click();
+      assert.equal(await selectionCount(view),4,'Three registered references and a registered candidate are really measured');
+      await view.locator('#open-after-run').uncheck();context.log('native-ui-action',{surface:'Suite designer',action:'Run comparison',aggregation});await view.locator('#run').click();
+      const comparison=await eventually(async()=>{
+        const suite=JSON.parse(await fs.readFile(path.join(reports,'suite-result.json'),'utf8'));
+        if(suite.runs.length!==4)return false;
+        assert(suite.runs.every(run=>run.status==='pass'&&run.qualification.correctness.status==='passed'));
+        return JSON.parse(await fs.readFile(path.join(reports,'version-comparison.json'),'utf8'));
+      },`Actual benchmark reports complete for ${aggregation}`,360000);
+      await eventually(async()=>!(await view.locator('#run').isDisabled()),'The measured comparison returns to idle');
+      const records=comparison.records.filter(record=>record.package==='Example'&&record.candidate_version===candidate);
+      assert(records.length>0,'The measured policy produces comparisons, rather than merely saving an option');
+      for(const record of records){
+        assert.deepEqual(record.baseline_versions,baselines);
+        const series=comparison.series.find(series=>series.series_id===record.series_id);assert(series);
+        const values=baselines.map(version=>{
+          const point=series.points.find(point=>point.version===version);assert(point);
+          return point.statistics?.[record.sample_statistic]??point.median;
+        });
+        assert(values.every(Number.isFinite));
+        const sorted=[...values].sort((a,b)=>a-b);
+        const expected=aggregation==='minimum'?sorted[0]:aggregation==='maximum'?sorted.at(-1):aggregation==='mean'?values.reduce((a,b)=>a+b,0)/values.length:sorted[1];
+        assert(Math.abs(record.baseline_value-expected)<=Math.max(1,Math.abs(expected))*1e-12,`${aggregation} is computed from those real reference measurements`);
+      }
+      context.log('computed-reference-aggregation',{aggregation,nativeAddAndRunClicks:true,baselines,candidate,measuredRuns:4,records:records.length,report:path.relative(context.workspace,path.join(reports,'version-comparison.json'))});
+    }
+  }finally{
+    if(saved)await fs.writeFile(configFile,saved);else await fs.rm(configFile,{force:true});
+    await settings().update('reports',previous.reports,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await settings().update('comparisonPolicies',previous.policies,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
   }
 }
 
@@ -426,6 +526,7 @@ exports.runSelection = async context => {
   const reports = path.resolve(context.workspace, settings.get('reports', 'perf/results/vscode'));
   const reportPath = path.join(reports, 'suite-result.json');
   const old = await fs.readFile(reportPath, 'utf8').catch(() => undefined);
+  context.log('native-ui-action',{surface:'Suite designer',action:'Run selected check'});
   await view.locator('#run').click();
   const report = await eventually(async () => {
     const text = await fs.readFile(reportPath, 'utf8');
@@ -455,9 +556,9 @@ exports.run = async context => {
   await eventually(async()=>(await environment.locator('p').innerText()).includes(context.controller),'Studio displays the selected controller after its state arrives');
   context.log('studio-inventory', {cards: 9, workbenchButtons: 5, controllerShown: true});
   const failures = [];
-  for (const [name, run] of [['suite-selection', testSuiteSelection], ['git-and-comparisons', testGitTargetsAndComparisons],
+  for (const [name, run] of [['suite-selection', testSuiteSelection], ['git-and-comparisons', testGitTargetsAndComparisons],['git-cancel-discovery',testCancelGitDiscovery],
     ['results', testResults], ['provider-and-tools', testAdvisorAndTools], ['save-palette', testSavePalette],
-    ['large-plan-pagination-and-drag',testLargePlanAndOrdering]]) {
+    ['large-plan-pagination-and-drag',testLargePlanAndOrdering],['computed-reference-aggregations',testComputedAggregations]]) {
     try {await run(context);}
     catch (error) {
       failures.push(error);

@@ -16,9 +16,9 @@ const coreCommit=process.env.PERFCHECKER_NATIVE_CORE_COMMIT || '';
 const coreTree=process.env.PERFCHECKER_NATIVE_CORE_TREE || '';
 if(!['general','candidate'].includes(coreMode))throw new Error('Choose the registered or explicitly pinned candidate Core.');
 if(coreMode==='candidate' && ![coreCommit,coreTree].every(value=>/^[a-f0-9]{40}$/.test(value)))throw new Error('Core candidate mode requires an immutable commit and expected Git tree.');
-const expectedCoreVersion=coreMode==='candidate'?'1.0.1':'1.0.0';
+const expectedCoreVersion=coreMode==='candidate'||mode==='candidate'?'1.0.1':'1.0.0';
 const coreProvenance={mode:coreMode,version:expectedCoreVersion,...(coreMode==='candidate'?{commit:coreCommit,tree:coreTree}:{registry:'General'})};
-const installCore=coreMode==='candidate'?'Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]))':'Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))';
+const installCore=coreMode==='candidate'?'Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]))':`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))`;
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const phaseFailures = [];
 const publicSha = 'c4123271e71e4c4d148fe0e613ba260f4aeea6f28445338cab11d3fb9513df09';
@@ -72,7 +72,30 @@ try {
     status:minimumAvailable?'native-positive-test-required':'awaiting-human-registration',candidateFunctions:coreProvenance},null,2));
 
   const launch = async phase => {
+    let recording,recorded,videoStartedAt,recordingError='';
+    const video=path.join(output,`native-${process.platform}-vscode-${version}-${expectedVersion}-${phase}.mp4`);
+    const retainHostLogs=async()=>{
+      const origin=path.join(profile,'logs'),destination=path.join(output,'host-startup-logs',phase);
+      for(const relative of await fs.readdir(origin,{recursive:true}).catch(()=>[])){
+        const source=path.join(origin,relative),stat=await fs.stat(source).catch(()=>undefined);
+        if(!stat?.isFile()||stat.size>2000000||!relative.endsWith('.log'))continue;
+        const target=path.join(destination,relative);await fs.mkdir(path.dirname(target),{recursive:true});
+        const text=(await fs.readFile(source,'utf8')).replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]')
+          .replace(/(secret%3D)[^%\s"'<>]*/gi,'$1[session secret]');
+        await fs.writeFile(target,text);
+      }
+    };
     try {
+      if(process.env.PERFCHECKER_NATIVE_VIDEO==='1'){
+        if(process.platform!=='linux'||version!=='stable'||!process.env.DISPLAY)throw new Error('Native video recording requires the explicitly selected Linux stable Xvfb host.');
+        await execute('ffmpeg',['-version']);videoStartedAt=new Date().toISOString();
+        recording=spawn('ffmpeg',['-hide_banner','-loglevel','error','-y','-f','x11grab','-framerate','15',
+          '-video_size','1920x1080','-draw_mouse','1','-i',process.env.DISPLAY,'-an','-c:v','libx264','-preset','ultrafast',
+          '-threads','2','-crf','23','-pix_fmt','yuv420p',video],{stdio:['pipe','ignore','pipe']});
+        recording.stderr.on('data',data=>{recordingError=(recordingError+data.toString()).slice(-5000);});
+        recorded=new Promise(resolve=>{recording.once('close',code=>resolve(code));recording.once('error',error=>{recordingError=String(error);resolve(-1);});});
+        console.log(`NATIVE_VIDEO_START ${phase} ${videoStartedAt}`);
+      }
       const environment={...process.env,PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: profile,
         PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
@@ -81,6 +104,7 @@ try {
         PERFCHECKER_NATIVE_EXPECTED_VERSION: expectedVersion, PERFCHECKER_NATIVE_JULIA_VERSION: runtime.version,
         PERFCHECKER_NATIVE_CORE_VERSION: expectedCoreVersion, PERFCHECKER_NATIVE_CORE_PROVENANCE:JSON.stringify(coreProvenance),
         PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE:String(minimumAvailable),
+        PERFCHECKER_NATIVE_VIDEO_STARTED_AT:videoStartedAt||'',
         UV_THREADPOOL_SIZE: '4'};
       await new Promise((resolve,reject)=>{
         // Actual interactive host: no --extensionTestsPath or smoke driver, and
@@ -94,7 +118,7 @@ try {
         const progress=setInterval(async()=>{
           if(reading)return;reading=true;
           try{
-            if(!activated){const boot=JSON.parse(await fs.readFile(path.join(output,`${phase}-bootstrap.json`),'utf8'));activated=true;console.log(`NATIVE_HOST_ACTIVATED ${phase} VSCode ${boot.vscode}`);}
+            if(!activated){const boot=JSON.parse(await fs.readFile(path.join(output,`${phase}-bootstrap.json`),'utf8'));activated=true;clearTimeout(activationTimer);console.log(`NATIVE_HOST_ACTIVATED ${phase} VSCode ${boot.vscode}`);}
             const report=JSON.parse(await fs.readFile(path.join(output,`${phase}.json`),'utf8'));
             if(report.activeCase&&report.activeCase!==activeCase)console.log(`NATIVE_CASE_START ${phase} ${report.activeCase}`);
             activeCase=report.activeCase;
@@ -105,16 +129,35 @@ try {
           finally{reading=false;}
         },2000);
         const stop=()=>{if(child.exitCode!==null)return;if(process.platform==='win32')spawn('taskkill',['/pid',String(child.pid),'/T','/F'],{windowsHide:true});else try{process.kill(-child.pid,'SIGTERM');}catch{}};
+        const activationTimer=setTimeout(()=>{if(activated)return;void(async()=>{
+          await retainHostLogs().catch(error=>console.error(`NATIVE_STARTUP_LOGS ${error.message}`));stop();
+          reject(new Error(`The ${phase} helper did not activate within 3 minutes. Retained Electron/extension-host logs distinguish startup failure from campaign duration.`));
+        })();},180000);
         const timer=setTimeout(()=>{stop();reject(new Error(`The ${phase} native phase exceeded its explicit 40-minute bound`));},40*60*1000);
         const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
-        const clean=()=>{clearTimeout(timer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
+        const clean=()=>{clearTimeout(timer);clearTimeout(activationTimer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
         child.once('error',error=>{clean();reject(error);});
         child.once('close',async code=>{clean();try{
           const result=JSON.parse(await fs.readFile(path.join(output,`${phase}-finished.json`),'utf8'));
           result.status==='passed'?resolve():reject(new Error(result.error||`${phase} failed`));
         }catch(error){reject(new Error(`Native host exited ${code} before writing its final qualification: ${error}`));}});
       });
-    } catch (error) {phaseFailures.push({phase, error: String(error)});}
+    } catch (error) {await retainHostLogs().catch(logError=>console.error(`NATIVE_HOST_LOGS ${logError.message}`));phaseFailures.push({phase, error: String(error)});}
+    finally {
+      if(recording){
+        recording.stdin.on('error',()=>{});recording.stdin.end('q\n');
+        const timeout=setTimeout(()=>recording.kill('SIGKILL'),15000);
+        const code=await recorded;clearTimeout(timeout);
+        if(code!==0)phaseFailures.push({phase,kind:'recording',error:`Real Xvfb recording failed (${code}): ${recordingError}`});
+        else{
+          const probe=JSON.parse(await execute('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_name,width,height,avg_frame_rate','-of','json',video]));
+          await fs.writeFile(video.replace(/\.mp4$/,'.json'),JSON.stringify({file:path.basename(video),source:'actual-Xvfb-screen',phase,
+            startedAt:videoStartedAt,timeline:`${phase}.json`,timestampPrecision:'Wall-clock offsets from recorder launch; correlate with native UI events and review frames before editing.',
+            vscodeRequested:version,extension:expectedVersion,core:coreProvenance,fixtures:'Disposable deterministic qualification data; no human model authentication',
+            sha256:createHash('sha256').update(await fs.readFile(video)).digest('hex'),probe},null,2));
+        }
+      }
+    }
   };
   // The first real launch has no PerfChecker settings, Julia or Jupyter extension.
   await launch('fresh');
@@ -136,6 +179,8 @@ function perf_workload(directory)
 end
 perf_oracle(directory,result) = result==42
 function perf_cleanup(directory)
+ write(joinpath(@__DIR__,"owned-suite-cleaning.marker"),"cleaning")
+ sleep(5)
  rm(directory;recursive=true,force=true)
  write(joinpath(@__DIR__,"owned-suite-cleaned.marker"),"cleaned")
 end
@@ -184,7 +229,7 @@ function build_suite()
    options=Dict{Symbol,Any}(:repeat=>false,:network_repetitions=>2,:network_interface=>(Sys.islinux() ? "lo" : "auto")),oracle=OracleSpec()))
  end
  package=PackageSuite("PerfCheckerNativeFixture";source=dirname(@__DIR__),worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=VersionNumber[],features,candidates=[SuiteCandidate("baseline",${JSON.stringify(baseline)};source=dirname(@__DIR__),compatibility_version=v"0.1.0")])
- example=PackageSuite("Example";worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=[v"0.5.3",v"0.5.5"],include_dev=false,features=[FeatureSpec(:hello;workload=:hello,backend=:benchmark,entrypoint=joinpath(@__DIR__,"example.jl"),options=Dict(:samples=>3,:seconds=>0.03,:evals=>1),oracle=OracleSpec())])
+ example=PackageSuite("Example";worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=[v"0.5.0",v"0.5.3",v"0.5.4",v"0.5.5"],include_dev=false,features=[FeatureSpec(:hello;workload=:hello,backend=:benchmark,entrypoint=joinpath(@__DIR__,"example.jl"),options=Dict(:samples=>3,:seconds=>0.03,:evals=>1),oracle=OracleSpec())])
  SoftwareSuite(:native_fixture,[package,example])
 end
 `);

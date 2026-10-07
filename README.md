@@ -1,6 +1,6 @@
 # PerfChecker for VS Code
 
-PerfChecker 1.0 brings a full Studio, interactive plots, Julia tools, MCP
+PerfChecker 1.0.1 brings a full Studio, interactive plots, Julia tools, MCP
 conversation, and reviewed agent implementation with Git recovery into VS Code.
 Use a controller environment containing PerfChecker.jl 1.0.1 or later.
 
@@ -10,6 +10,31 @@ The user guides are maintained with PerfChecker.jl on its existing documentation
 - [Complete extension configuration](https://perfchecker.mirageinteractive.fr/interfaces/vscode-configuration.html)
 - [Plots, notebooks and Julia tools](https://perfchecker.mirageinteractive.fr/interfaces/vscode-workflows.html)
 - [MCP advice, implementation and recovery](https://perfchecker.mirageinteractive.fr/mcp-advisor.html)
+
+## First use
+
+Open a Julia package folder, then **PerfChecker: Open Studio**. Choose
+**Set up workspace and create suite** to select or explicitly create the measurement
+environment and starter suite. The setup explains which Julia project it will
+modify and asks before downloading packages. An existing package `Project.toml`
+alone does not make a measurement controller ready.
+
+Use **Create controller environment**, **Use an existing controller**, or **Read the setup guide**
+as appropriate. A controller needs registered PerfChecker.jl 1.0.1 or later.
+The starter installs measurement dependencies; add your package and its test
+dependencies explicitly to the selected controller before measuring test items.
+Add `HTTP` there for an MCP HTTP provider or the local Codex bridge. Optional
+analyzers and Julia debugging have their own prerequisites.
+
+For notebooks, select **New Pluto notebook** and choose **Feature suite** or
+**Investigation**. The extension uses real reactive Pluto `.jl` notebooks in an
+editor tab. Stable Pluto 1.0.4 uses a separate `perf/pluto` Julia environment;
+its installation is an explicit choice and does not modify the MCP controller.
+Opening the notebook or changing selectors does not launch measurements.
+Use its Launch/Cancel/Refresh controls, and **Save completed reports** in a suite
+notebook. Pluto saves edited cells to the `.jl` file; the header provides
+**Open source**, **Stop session**, and **Restart session**. Stop and closing the
+view wait for owned measurement workers and allocation cleanup.
 
 ## Measure existing Julia test items
 
@@ -108,8 +133,8 @@ JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundar
 Set-Location C:\path\to\PerfCheckerVSCode
 npm ci
 npm test
-npm run package -- --out perfchecker-vscode-1.0.0.vsix
-code --install-extension .\perfchecker-vscode-1.0.0.vsix --force
+npm run package -- --out perfchecker-vscode-1.0.1.vsix
+code --install-extension .\perfchecker-vscode-1.0.1.vsix --force
 ```
 
 Reload VS Code, open a Julia package workspace, then select the PerfChecker icon

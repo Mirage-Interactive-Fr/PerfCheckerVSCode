@@ -104,6 +104,7 @@ exports.run = async context => {
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
     const send = async (question, count) => {
       await view.locator('#chat-question').fill(question);
+      log('native-ui-action',{surface:'MCP conversation',action:'Send question',turn:count/2});
       await view.getByRole('button', {name: 'Send question', exact: true}).click();
       await eventually(async () => {const value = await state(); return !value.busy && value.messages.length === count;}, 'Actual registered Julia MCP worker returns the conversation');
     };
@@ -120,16 +121,20 @@ exports.run = async context => {
     await view.getByRole('textbox', {name: 'Implementation tool name', exact: true}).fill('implement_perfchecker');
     await view.getByRole('button', {name: 'Save implementation tool', exact: true}).click();
     await eventually(async () => /Implementation tool saved/.test((await state()).status), 'The native tool configuration is saved');
+    log('native-ui-action',{surface:'MCP implementation',action:'Prepare implementation after review'});
     await view.getByRole('button', {name: 'I reviewed the advice · Prepare implementation', exact: true}).click();
     await eventually(async () => {const value = await state(); return !value.busy && value.proposal?.files.includes('src/PerfCheckerNativeFixture.jl');}, 'The real implementation worker returns its Git proposal', 240000);
     assert.equal(await fs.readFile(source, 'utf8'), original);
     assert.match((await state()).backupRef, /^refs\/perfchecker\/checkpoints\//);
+    log('native-ui-action',{surface:'MCP implementation',action:'Open full diff'});
     await view.getByRole('button', {name: 'Open full diff', exact: true}).click();
     await eventually(() => vscode.workspace.textDocuments.some(document => document.languageId === 'diff' && document.getText().includes('init=zero')), 'The actual diff editor opens');
     await vscode.commands.executeCommand('perfchecker.openChat'); view = await findFrame('#chat-root');
+    log('native-ui-action',{surface:'MCP implementation',action:'Apply reviewed changes'});
     await view.getByRole('button', {name: 'Apply reviewed changes', exact: true}).click();
     await eventually(async () => !((await state()).busy) && (await fs.readFile(source, 'utf8')) === proposed, 'Apply changes the original only after the native user click');
     assert.equal(await probe(workspace), implementationBytes);
+    log('native-ui-action',{surface:'MCP implementation',action:'Restore previous code'});
     await view.getByRole('button', {name: 'Restore previous code', exact: true}).click();
     await eventually(async () => !((await state()).busy) && (await fs.readFile(source, 'utf8')) === original, 'Restore returns the exact original bytes');
     assert.deepEqual(await fs.readFile(path.join(workspace, '.git', 'index')), index);

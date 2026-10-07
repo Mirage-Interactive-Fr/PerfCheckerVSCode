@@ -363,9 +363,15 @@ export class PlutoNotebooks implements vscode.Disposable {
     panel.onDidDispose(() => {owned.disposed = true; if (this.sessions.get(key) === owned) this.sessions.delete(key); void this.stop(owned);});
     panel.webview.onDidReceiveMessage(async message => {
       try {
+        // Stop belongs to the already-running session, not to the environment
+        // selected for the next launch. A settings change must never disable cleanup.
+        if (message?.type === 'plutoStop') {
+          await this.stop(owned);
+          if (!owned.disposed) this.render(owned, undefined, 'Session stopped. Notebook cells and saved reports remain on disk.');
+          return;
+        }
         this.assertCurrent(folder, project);
         if (message?.type === 'plutoSource') await vscode.window.showTextDocument(vscode.Uri.file(notebook));
-        else if (message?.type === 'plutoStop') {await this.stop(owned); if (!owned.disposed) this.render(owned, undefined, 'Session stopped. Notebook cells and saved reports remain on disk.');}
         else if (message?.type === 'plutoRestart' && !owned.starting) {owned.starting = (async()=>{await this.stop(owned);await this.start(owned);})(); try {await owned.starting;} finally {owned.starting = undefined;}}
       } catch (error) {if (!owned.disposed) this.render(owned,undefined,String(error));}
     }, undefined, this.context.subscriptions);

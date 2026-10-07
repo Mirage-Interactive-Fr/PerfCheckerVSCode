@@ -9,12 +9,13 @@ const mcp = require('./native-mcp-controls.cjs');
 const investigations = require('./native-investigation-controls.cjs');
 const pluto = require('./native-pluto-controls.cjs');
 const workbench = require('./native-workbench-controls.cjs');
+const advisor = require('./native-advisor-controls.cjs');
 const redact=value=>String(value).replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]');
 
 // Feature effects are separate from registering a command. Missing evidence stays unverified.
 function commandCoverage(commands,checks){
   const effects={
-    discoverTestItems:['testitem-current-evidence'],configureAdvisor:['provider-controls'],catalogTools:['native-tool-catalogue'],
+    discoverTestItems:['testitem-current-evidence'],configureAdvisor:['advisor-native-model-management','advisor-native-provider-and-tool-discovery'],catalogTools:['native-tool-catalogue'],
     syncScenarios:['native-discovery-and-sync-after-pluto','investigation-sync-tools-history-native-exports'],
     narrateAdvice:['investigation-saved-advice-and-disabled-model'],investigateScenarios:['investigation-real-bounded-work'],
     openInvestigations:['investigation-discovery-selection-source-draft'],discoverScenarios:['investigation-discovery-selection-source-draft'],
@@ -61,6 +62,7 @@ async function measureNativeTestItem(context,expectedPassed){
   const button=row.locator('.action-label[title="Run Test"],.action-label[aria-label="Run Test"],.action-label.codicon-testing-run-icon').first();
   const storage=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','native-testitems');
   const before=new Set(await fs.readdir(storage).catch(()=>[]));
+  context.log('native-ui-action',{surface:'Test Explorer',action:'Run Test',expectedPassed});
   await button.click();
   const measured=await eventually(async()=>{
     for(const name of await fs.readdir(storage)){
@@ -94,6 +96,8 @@ exports.run = async () => {
   const checks = [], failures = [];
   let browser, windowPage,commands=[],activeCase;
   let pendingReport=Promise.resolve();
+  const timing=()=>({observedAt:new Date().toISOString(),...(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT?
+    {videoOffsetSeconds:(Date.now()-Date.parse(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT))/1000}:{})});
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,coverage:process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1',available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
@@ -110,9 +114,10 @@ exports.run = async () => {
       }}).catch(error=>{if(error.code!=='ENOENT')console.error(`NATIVE_EVIDENCE_COPY ${error}`);});
     }
   };
-  const log = (name, detail = {}) => {const clean=JSON.parse(redact(JSON.stringify({name,...detail})));checks.push(clean); console.log(`NATIVE_CHECK ${name} ${JSON.stringify(clean)}`);void persist();};
+  const log = (name, detail = {}) => {const clean=JSON.parse(redact(JSON.stringify({name,...detail,...timing()})));checks.push(clean); console.log(`NATIVE_CHECK ${name} ${JSON.stringify(clean)}`);void persist();};
   const runCase = async (name, run) => {
     activeCase=name;await persist();
+    log('native-case-start',{action:name});
     console.log(`NATIVE_CASE_START ${phase} ${name}`);
     try {await run(); log(name, {status: 'passed'});}
     catch (error) {
@@ -216,8 +221,9 @@ exports.run = async () => {
       await runCase('controller-visible-in-studio', async () => {
         await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace', uri);
         const frame = await findFrame('#studio-root');
-        await frame.getByText('Workspace environment', {exact: true}).click();
-        assert((await frame.locator('details.environment').innerText()).includes(context.controller));
+        const environment=frame.locator('details.environment');
+        if(!await environment.evaluate(element=>element.open))await environment.locator('summary').click();
+        await eventually(async()=>(await environment.innerText()).includes(context.controller),'The expanded Studio environment shows the selected controller');
       });
       await runCase('native-julia-terminal', async () => {
         const terminal = await vscode.commands.executeCommand('perfchecker.openTerminal', uri);
@@ -301,12 +307,13 @@ exports.run = async () => {
             const backend=run=>plan.runs.find(item=>item.package===run.package && item.feature===run.feature && item.version===run.version)?.backend;
             const ready=report.runs.filter(run=>run.status==='pass');
             assert(ready.length>1);assert(report.runs.every(run=>['pass','unavailable'].includes(run.status)),'Available collectors pass correctness; only known unavailable checks may remain');
-            assert.deepEqual(new Set(report.runs.filter(run=>run.package==='Example').map(run=>run.version)),new Set(['0.5.3','0.5.5']));
-            log('all-supported-collectors-measured',{collectors:[...new Set(ready.map(backend))],checks:ready.length,unavailable:report.runs.filter(run=>run.status==='unavailable').map(run=>({backend:backend(run),reason:run.message})),versions:['0.5.3','0.5.5']});
+            assert.deepEqual(new Set(report.runs.filter(run=>run.package==='Example').map(run=>run.version)),new Set(['0.5.0','0.5.3','0.5.4','0.5.5']));
+            log('all-supported-collectors-measured',{collectors:[...new Set(ready.map(backend))],checks:ready.length,unavailable:report.runs.filter(run=>run.status==='unavailable').map(run=>({backend:backend(run),reason:run.message})),versions:['0.5.0','0.5.3','0.5.4','0.5.5']});
           });
           await runCase('native-all-studio-controls', () => controls.run(context));
           await runCase('native-workbench-controls',()=>workbench.run(context));
           await runCase('native-investigation-controls', () => investigations.run(context));
+          await runCase('native-advisor-controls', () => advisor.run(context));
           await runCase('native-mcp-controls', () => mcp.run(context));
           if(process.env.PERFCHECKER_NATIVE_MODE==='candidate')await runCase('native-pluto-controls',()=>pluto.run(context));
           await runCase('native-discovery-and-sync-after-pluto',async()=>{
