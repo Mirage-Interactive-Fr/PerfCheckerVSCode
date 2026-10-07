@@ -279,7 +279,11 @@ exports.run = async (context,options={}) => {
     const alternateStudio=await findFrame('#studio-root');
     await eventually(async()=>await alternateStudio.locator('.workspace strong').innerText()==='Chat alternate folder',
       'Studio selects the second folder while the first chat request is still active');
-    await context.windowPage.locator('.tabs-container .tab').filter({hasText:'PerfChecker · Chat'}).last().click();
+    const owningChatTab=()=>context.windowPage.locator('.tabs-container .tab').filter({
+      has:context.windowPage.locator('.label-name').filter({hasText:/^PerfChecker · Chat$/})}).filter({visible:true}).first();
+    await owningChatTab().click();
+    await eventually(async()=>await owningChatTab().getAttribute('aria-selected')==='true',
+      'The exact owning Chat tab is active, rather than the alternate Studio with a similar title');
     view=await findFrame('#chat-root');
     assert.equal((await state()).workspace,vscode.workspace.workspaceFolders.find(folder=>folder.uri.fsPath===workspace).name,
       'The displayed chat still identifies its first folder while Studio selects another');
@@ -299,7 +303,8 @@ exports.run = async (context,options={}) => {
       originalOwnedProcessesPreservedBeforeCancel:true,owningEvidenceInventoryPreserved:true,
       additionalProviderRequestsOnWorkspaceSwitch:calls.length-callsBeforeSwitch});
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',vscode.Uri.file(workspace));
-    await context.windowPage.locator('.tabs-container .tab').filter({hasText:'PerfChecker · Chat'}).last().click();
+    await owningChatTab().click();
+    await eventually(async()=>await owningChatTab().getAttribute('aria-selected')==='true','The exact Chat tab is active after restoring Studio selection');
     view=await findFrame('#chat-root');
     assert.equal(await fs.readFile(source, 'utf8'), original);
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();

@@ -6,7 +6,208 @@ import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 import path from 'node:path';
 import os from 'node:os';
-import {createServer} from 'node:http';
+import {createServer,request as httpRequest} from 'node:http';
+import {createServer as createPortServer} from 'node:net';
+import {randomBytes} from 'node:crypto';
+
+test('real Pluto 1.0.4 keeps native components and authenticates its complete embedded navigation',{
+  skip:!process.env.PERFCHECKER_PLUTO_TEST_PROJECT,timeout:360000,
+},async()=>{
+  const require=createRequire(import.meta.url),{chromium}=require(process.env.PERFCHECKER_PLAYWRIGHT||'playwright');
+  const {cancellableJulia,CANCEL_REQUEST}=require('../dist/controllerCancellation.js');
+  const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-real-pluto-'));
+  const notebook=path.join(root,'Navigation.jl'),project=process.env.PERFCHECKER_PLUTO_TEST_PROJECT,originalMarker=path.join(root,'original.pid');
+  await writeFile(notebook,`### A Pluto.jl notebook ###\n# v1.0.4\n\nusing Markdown\nusing InteractiveUtils\n\n# ╔═╡ 27187d83-0729-4300-b3dc-7185b06af0ed\nbegin\nimport Pkg\nPkg.activate(${JSON.stringify(project)})\nwrite(${JSON.stringify(originalMarker)},string(getpid()))\n1 + 2\nend\n\n# ╔═╡ Cell order:\n# ╠═27187d83-0729-4300-b3dc-7185b06af0ed\n`);
+  const source=await readFile(new URL('../src/plutoNotebook.ts',import.meta.url),'utf8');
+  const code=source.match(/const serverCode = `([\s\S]*?)`;/)[1];
+  const navigation=await readFile(new URL('../media/pluto-navigation.js',import.meta.url),'utf8');
+  const eventual=async(read,description,timeout=90000)=>{const until=Date.now()+timeout;while(Date.now()<until){const result=await read();if(result)return result;await new Promise(resolve=>setTimeout(resolve,100));}throw Error(description);};
+  const alive=pid=>{try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
+  let browser;
+  const run=async(script,verify)=>{
+    const socket=createPortServer();await new Promise(resolve=>socket.listen(0,'127.0.0.1',resolve));
+    const port=socket.address().port;await new Promise(resolve=>socket.close(resolve));
+    const secret=randomBytes(32).toString('hex');let output='',errors='';
+    const child=spawn(process.env.PERFCHECKER_TEST_JULIA||'julia',['--startup-file=no','--history-file=no',`--project=${project}`,'-e',cancellableJulia(code)],{
+      cwd:root,detached:process.platform!=='win32',stdio:['pipe','pipe','pipe'],
+      env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter),JULIA_PLUTO_NEW_NOTEBOOKS_DIR:root,PERFCHECKER_PLUTO_PORT:String(port),
+        PERFCHECKER_PLUTO_NOTEBOOK:notebook,PERFCHECKER_PLUTO_SECRET:secret,PERFCHECKER_PLUTO_NAVIGATION:`data:text/javascript;base64,${Buffer.from(script).toString('base64')}`}});
+    child.stdout.on('data',data=>output+=data);child.stderr.on('data',data=>errors=(errors+data).slice(-2000));
+    const externalRequests=[];
+    const server=createServer((request,response)=>{
+      const incoming=new URL(request.url,'http://localhost');
+      if(incoming.pathname==='/outside'){externalRequests.push({secret:incoming.searchParams.has('secret'),referer:request.headers.referer});response.end('Separate origin');return;}
+      const target=new URL(request.url,'http://localhost').searchParams.get('target')||`edit?id=${output.match(/PERFCHECKER_PLUTO_READY \d+ ([a-f0-9-]+)/)?.[1]}`;
+      response.setHeader('content-type','text/html');response.end(`<iframe width="1100" height="800" src="http://127.0.0.1:${port}/${target}${target.includes('?')?'&':'?'}secret=${secret}"></iframe>`);
+    });
+    let page;
+    try{
+      await eventual(()=>{if(child.exitCode!==null)throw Error(`Actual Pluto startup failed: ${errors.replaceAll(secret,'[session secret]')}`);return /PERFCHECKER_PLUTO_READY/.test(output);},'Actual Pluto server readiness');
+      await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+      page=await browser.newPage({viewport:{width:1400,height:1100}});await page.goto(`http://localhost:${server.address().port}/`);
+      let frame=page.frames().find(item=>item.parentFrame());
+      await frame.locator('[data-perfchecker-navigation="ready"]').waitFor({state:'attached',timeout:90000});
+      const homepage=async()=>{await frame.locator('img#logo-big').locator('..').click();await frame.locator('[data-perfchecker-navigation="ready"]').waitFor({state:'attached'});await frame.locator('#recent').waitFor();};
+      const closeOwned=async()=>{
+        child.stdin.write(`${CANCEL_REQUEST}\n`);
+        await eventual(()=>child.exitCode!==null,'Cooperative Close finishes with multiple native clients and notebooks',45000);
+        assert.equal(child.exitCode,130,errors.replaceAll(secret,'[session secret]'));
+        assert.match(errors,/cancelled after controller cleanup/);
+        await assert.rejects(fetch(`http://127.0.0.1:${port}/?secret=${secret}`));
+      };
+      await verify({page,frame,homepage,port,secret,externalRequests,closeOwned,host:`http://localhost:${server.address().port}`});
+    }catch(error){
+      throw new Error(`${error.message}\n${errors.replaceAll(secret,'[session secret]')}`,{cause:error});
+    }finally{
+      await page?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
+      if(child.exitCode===null&&child.signalCode===null){
+        if(process.platform==='win32'){const killer=spawn('taskkill',['/pid',String(child.pid),'/t','/f'],{stdio:'ignore'});await once(killer,'exit');}
+        else try{process.kill(-child.pid,'SIGTERM');}catch{}
+        if(child.exitCode===null&&child.signalCode===null)await Promise.race([once(child,'exit'),new Promise(resolve=>setTimeout(resolve,5000))]);
+        if(process.platform!=='win32'&&child.exitCode===null&&child.signalCode===null)try{process.kill(-child.pid,'SIGKILL');}catch{}
+      }
+    }
+  };
+  try{
+    browser=await chromium.launch({...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{}),headless:true,args:['--no-sandbox']});
+    const oldOverrides=navigation.replace('return {};','const noop=()=>false;return {custom_editor_header_component:noop,custom_recent:noop,custom_filepicker:noop};');
+    await run(oldOverrides,async({page,frame,host})=>{
+      await eventual(async()=>await frame.locator('pluto-filepicker').count()===0,'The prior hook removes the real native header file picker',5000);
+      await page.goto(`${host}/?target=${encodeURIComponent('')}&home=1`);
+      frame=page.frames().find(item=>item.parentFrame());await frame.goto(frame.url().replace(/\/edit\?id=[^&]+&/,'/?'));
+      await frame.locator('[data-perfchecker-navigation="ready"]').waitFor({state:'attached'});
+      await eventual(async()=>await frame.locator('#recent').count()===0,'The prior hook removes the real Recent list',5000);
+    });
+    await run(navigation,async({page,frame,homepage,port,secret,externalRequests,closeOwned,host})=>{
+      assert(await frame.locator('img#logo-big').isVisible());await frame.locator('#at_the_top pluto-filepicker').waitFor();await homepage();
+      const authenticated=()=>assert.equal(new URL(frame.url()).searchParams.get('secret'),secret);
+      authenticated();assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status,403);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/edit?id=invalid`,{headers:{Referer:`http://external.invalid/?secret=${secret}`}})).status,403);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/edit?id=invalid`,{headers:{Referer:`https://127.0.0.1:${port}/?secret=${secret}`}})).status,403);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/edit?id=invalid&secret=wrong`,{headers:{Referer:`http://127.0.0.1:${port}/?secret=${secret}`}})).status,403);
+      for(const query of ['','?secret=wrong'])await new Promise((resolve,reject)=>{
+        const request=httpRequest(`http://127.0.0.1:${port}/${query}`,{headers:{Connection:'Upgrade',Upgrade:'websocket',
+          'Sec-WebSocket-Version':'13','Sec-WebSocket-Key':randomBytes(16).toString('base64')}},response=>{
+          assert.equal(response.statusCode,403,'An unauthenticated real WebSocket handshake admits no client');
+          let body='';response.on('data',data=>body+=data);response.on('end',()=>{assert.equal(body,'Forbidden');resolve();});
+        });
+        request.on('upgrade',(_response,socket)=>{socket.destroy();reject(Error('An unauthenticated WebSocket was admitted'));});
+        request.on('error',reject);request.setTimeout(5000,()=>request.destroy(Error('The refused WebSocket response did not finish')));request.end();
+      });
+      await frame.evaluate(url=>{const link=document.createElement('a');link.id='actual-external-navigation';link.href=url;link.target='_blank';link.textContent='Separate origin';document.body.append(link);},`${host}/outside`);
+      const externalPagePromise=page.context().waitForEvent('page');await frame.locator('#actual-external-navigation').click();
+      const externalPage=await externalPagePromise;await externalPage.getByText('Separate origin',{exact:true}).waitFor();await externalPage.close();
+      assert.deepEqual(externalRequests,[{secret:false,referer:undefined}],
+        'An actual browser request to another origin has no session secret in its URL or Referer');
+      await frame.locator('#recent li.running a').filter({hasText:'Navigation.jl'}).click();await frame.locator('pluto-notebook').waitFor();authenticated();
+      const cell=frame.locator('pluto-cell[id="27187d83-0729-4300-b3dc-7185b06af0ed"]');
+      await eventual(async()=>/^3$/.test((await cell.locator('pluto-output').innerText()).trim()),'The actual initial reactive cell finishes');
+      const originalPid=Number(await readFile(originalMarker,'utf8'));assert(alive(originalPid));
+      const editor=cell.locator('pluto-input .cm-editor:not(.cm-ssr-fake) .cm-content[contenteditable="true"]');
+      const edited=`begin\nimport Pkg\nPkg.activate(${JSON.stringify(project)})\n4 + 5\nend`;
+      await editor.fill(edited);await editor.press('Escape');assert.equal((await editor.innerText()).replace(/\s+/g,''),edited.replace(/\s+/g,''));await editor.press('ControlOrMeta+Enter');
+      await eventual(async()=>{const value=(await cell.locator('pluto-output').innerText()).trim();if(await cell.locator('.errored').count())throw Error(`Actual reactive error: ${value.slice(0,500)}`);return /^9$/.test(value);},'The edited cell reevaluates over the real authenticated WebSocket');
+      await eventual(async()=>(await readFile(notebook,'utf8')).includes('4 + 5'),'The reactive editor saves actual changed Julia source');
+      const notebookId=new URL(frame.url()).searchParams.get('id');
+      for(const route of ['notebookfile','notebookexport']){
+        const target=`http://127.0.0.1:${port}/${route}?id=${notebookId}`;
+        assert.equal((await fetch(target)).status,403);
+        assert.equal((await fetch(target,{headers:{Referer:`http://external.invalid/?secret=${secret}`}})).status,403);
+        assert.equal((await fetch(`${target}&secret=wrong`,{headers:{Referer:frame.url()}})).status,403);
+      }
+      await frame.locator('#at_the_top button.toggle_export').click();
+      const sourcePagePromise=page.context().waitForEvent('page');await frame.locator('#export a[href*="notebookfile?"]').click();
+      const sourcePage=await sourcePagePromise;await sourcePage.waitForURL(url=>url.pathname==='/notebookfile'&&url.searchParams.get('secret')===secret);
+      const exportedJulia=await sourcePage.locator('body').innerText();assert.match(exportedJulia,/### A Pluto\.jl notebook ###/);assert.match(exportedJulia,/4 \+ 5/);await sourcePage.close();
+      if(!((await frame.locator('#pluto-nav').getAttribute('class'))||'').includes('show_export'))await frame.locator('#at_the_top button.toggle_export').click();
+      await frame.locator('#pluto-nav.show_export #export a[href*="notebookexport?"]').click();
+      const htmlDownloadPromise=page.waitForEvent('download',{timeout:90000});
+      await frame.locator('.export-html-dialog .ple-download a[download]').click();
+      const htmlDownload=await htmlDownloadPromise;assert.match(htmlDownload.suggestedFilename(),/Navigation\.html$/);
+      const stream=await htmlDownload.createReadStream(),chunks=[];for await(const chunk of stream)chunks.push(chunk);
+      const exportedHtml=Buffer.concat(chunks).toString('utf8');assert.match(exportedHtml,/<!doctype html/i);
+      assert(!exportedJulia.includes(secret)&&!exportedHtml.includes(secret),'Exported notebook artifacts contain no session credential');
+      const embedded=exportedHtml.match(/data:text\/julia;charset=utf-8;base64,([A-Za-z0-9+/=]+)/);assert(embedded,'The actual HTML download includes its original Julia notebook');
+      assert.match(Buffer.from(embedded[1],'base64').toString('utf8'),/4 \+ 5/);
+      await homepage();
+      // Real programmatic FilePicker navigation, both native submission paths.
+      for(const enter of [false,true]){
+        const input=frame.locator('#new .cm-content');await input.fill(notebook);
+        if(enter)await input.press('Enter');else await frame.locator('#new pluto-filepicker button').click();
+        await frame.locator('pluto-notebook').waitFor();authenticated();await homepage();
+      }
+      // Pluto's GET /new redirect and actual modified anchor navigation.
+      const link=frame.locator('#recent li.new a');
+      const popupPromise=page.context().waitForEvent('page');await link.click({modifiers:[process.platform==='darwin'?'Meta':'Control']});
+      const popup=await popupPromise;await popup.waitForURL(url=>url.pathname==='/edit'&&url.searchParams.get('secret')===secret);await popup.locator('pluto-notebook').waitFor();
+      await link.click();await frame.locator('pluto-notebook').waitFor();authenticated();const mainNotebook=new URL(frame.url()).searchParams.get('id');await homepage();
+      const workerPid=async(surface,name)=>{
+        const file=path.join(root,name),editor=surface.locator('pluto-cell pluto-input .cm-editor:not(.cm-ssr-fake) .cm-content[contenteditable="true"]').first();
+        await editor.fill(`write(${JSON.stringify(file)},string(getpid()));getpid()`);await editor.press('Escape');await editor.press('ControlOrMeta+Enter');
+        return eventual(async()=>{const value=await readFile(file,'utf8').catch(()=>undefined);return value?Number(value):false;},'A real second notebook evaluates and publishes its worker PID');
+      };
+      const popupPid=await workerPid(popup,'popup.pid');
+      const activeNew=frame.locator(`#recent li.running a[href*="id=${mainNotebook}"]`);
+      await activeNew.click();await frame.locator('pluto-notebook').waitFor();
+      const mainPid=await workerPid(frame,'main.pid');assert.notEqual(mainPid,popupPid);await homepage();
+      let confirmed=false;page.on('dialog',async dialog=>{assert.equal(dialog.type(),'confirm');confirmed=true;await dialog.accept();});
+      const running=frame.locator('#recent li.running').filter({hasText:'Navigation.jl'});await running.locator('button').first().click();
+      await running.waitFor({state:'detached'});assert(confirmed);assert.equal((await fetch(`http://127.0.0.1:${port}/?secret=${secret}`)).status,200);
+      await eventual(()=>!alive(originalPid),'Actual homepage Shutdown terminates its own Malt worker before harness cleanup',45000);
+      assert(await frame.locator('#recent li.running').count()>=2,'Multiple actual notebooks still run before owned Close');
+      assert(alive(mainPid)&&alive(popupPid),'Two distinct real Malt workers are alive before Close');
+      await closeOwned();await eventual(()=>!alive(mainPid)&&!alive(popupPid),'Both real Malt workers disappear before harness process kills',45000);await popup.close();
+    });
+  }finally{await browser?.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('embedded Pluto preserves authenticated internal links without forwarding its session secret elsewhere',{
+  skip:!process.env.PERFCHECKER_BROWSER_TESTS,
+},async()=>{
+  const require=createRequire(import.meta.url),{chromium}=require(process.env.PERFCHECKER_PLAYWRIGHT||'playwright');
+  const script=await readFile(new URL('../media/pluto-navigation.js',import.meta.url),'utf8');
+  const module=`data:text/javascript;base64,${Buffer.from(script).toString('base64')}`;
+  const secret='isolated-navigation-test',requests=[];
+  const server=createServer((request,response)=>{
+    const url=new URL(request.url,'http://127.0.0.1');requests.push({path:url.pathname,authenticated:url.searchParams.get('secret')===secret});
+    response.setHeader('content-type','text/html');
+    if(url.pathname==='/host'){response.end(`<iframe src="http://127.0.0.1:${server.address().port}/edit?id=notebook&secret=${secret}${url.searchParams.has('baseline')?'&baseline=1':''}"></iframe>`);return;}
+    if(url.searchParams.get('secret')!==secret){response.statusCode=403;response.end('Not yet authenticated');return;}
+    response.end(`<a id="logo" href="./"><span>Pluto</span></a><a id="recent" href="edit?id=notebook">Recent notebook</a>
+      <a id="external" href="https://external.invalid/edit?id=other">External</a>
+      <a id="download" href="edit?id=notebook" download>Download</a><a id="hash" href="#cell">Cell</a>
+      <a id="asset" href="asset.js">Asset</a><a id="existing" href="edit?id=other&secret=explicit">Explicit</a>
+      ${url.searchParams.has('baseline')?'':`<script type="module">import environment from '${module}';environment();environment();</script>`}`);
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  let browser;
+  try{
+    browser=await chromium.launch({...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{}),headless:true,args:['--no-sandbox']});
+    const page=await browser.newPage();
+    await page.goto(`http://localhost:${server.address().port}/host?baseline=1`);
+    let baseline=page.frames().find(item=>item.parentFrame());
+    await baseline.locator('#logo').click();
+    await baseline.getByText('Not yet authenticated',{exact:true}).waitFor();
+    assert(requests.some(item=>item.path==='/'&&!item.authenticated),'The unadapted internal link reproduces the lost authentication');
+    const positiveStart=requests.length;
+    await page.goto(`http://localhost:${server.address().port}/host`);
+    let frame=page.frames().find(item=>item.parentFrame());
+    await frame.locator('[data-perfchecker-navigation="ready"]').waitFor({state:'attached'});
+    for(const [id,expected]of [['external','https://external.invalid/edit?id=other'],['download','edit?id=notebook'],['hash','#cell'],['asset','asset.js'],['existing',`http://127.0.0.1:${server.address().port}/edit?id=other&secret=explicit`]]){
+      const href=await frame.locator(`#${id}`).evaluate(element=>{
+        element.addEventListener('click',event=>event.preventDefault(),{once:true});element.click();return element.getAttribute('href');
+      });
+      assert.equal(href,expected,`The ${id} link does not acquire or overwrite the current session secret`);
+    }
+    await frame.locator('#logo span').click();
+    await frame.waitForURL(url=>url.pathname==='/'&&url.searchParams.get('secret')===secret);
+    await frame.locator('[data-perfchecker-navigation="ready"]').waitFor({state:'attached'});
+    await frame.locator('#recent').click();
+    await frame.waitForURL(url=>url.pathname==='/edit'&&url.searchParams.get('id')==='notebook'&&url.searchParams.get('secret')===secret);
+    assert(requests.slice(positiveStart).filter(item=>item.path==='/'||item.path==='/edit').every(item=>item.authenticated),
+      'Logo and Recent perform authenticated HTTP navigation inside a cross-site iframe');
+  }finally{await browser?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
 
 test('Pluto requires explicit installation, a trusted workspace and a native notebook',async()=>{
   const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-pluto-boundaries-'));

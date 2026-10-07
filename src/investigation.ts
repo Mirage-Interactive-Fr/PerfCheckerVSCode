@@ -42,9 +42,13 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   constructor(private context: vscode.ExtensionContext) {
     this.history = [];
     context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(event => {
-      if (!event.contentChanges.length || event.document.uri.scheme !== 'file' || !this.discovery) return;
-      const relative = path.relative(this.root(), event.document.uri.fsPath).replaceAll('\\', '/');
-      if (!Object.hasOwn(this.discovery.fingerprints ?? {}, relative)) return;
+      if (!event.contentChanges.length || event.document.uri.scheme !== 'file') return;
+      let folder: vscode.WorkspaceFolder;
+      try {folder = this.folder();} catch {return;}
+      const discovery = this.discovery;
+      if (!discovery || vscode.workspace.getWorkspaceFolder(event.document.uri)?.uri.toString() !== folder.uri.toString()) return;
+      const relative = path.relative(folder.uri.fsPath, event.document.uri.fsPath).replaceAll('\\', '/');
+      if (!Object.hasOwn(discovery.fingerprints ?? {}, relative)) return;
       this.diagnostics.delete(event.document.uri);
       this.lastMessage = 'A scenario input changed. Rediscover and remeasure before applying earlier conclusions.'; this.refresh();
     }));
@@ -165,8 +169,9 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     this.refresh();
   }
 
-  async execute(action: Action, keys?: string[], tools?: string[]): Promise<InvestigationReport | undefined> {
+  async execute(action: Action, keys?: string[], tools?: string[], owner?: string): Promise<InvestigationReport | undefined> {
     const workspace = this.folder().uri.toString();
+    if (owner && owner !== workspace) throw new Error('This editor action belongs to another workspace. Rediscover the selected folder.');
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before running PerfChecker.');
     if (this.busy) throw new Error('An investigation is already running; cancel it or wait for completion.');
     if (!actions.includes(action)) throw new Error('Unknown action.');
@@ -426,7 +431,9 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     const row = Math.max(0, Math.min(document.lineCount - 1, Number.isFinite(line) ? Math.trunc(line) - 1 : 0));
     await vscode.window.showTextDocument(document, {preview: true, selection: new vscode.Range(row, 0, row, 0)});
   }
-  async prepare(id: string): Promise<void> {
+  async prepare(id: string, owner?: string): Promise<void> {
+    const workspace = this.folder().uri.toString();
+    if (owner && owner !== workspace) throw new Error('This editor action belongs to another workspace. Rediscover the selected folder.');
     const proposal = this.discovery?.candidates?.find(item => item.id === id);
     if (!proposal) throw new Error('Proposal is stale; discover again.');
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({language: 'julia', content: draftCase(proposal)}));
@@ -480,11 +487,14 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
   }
 
   private publishDiagnostics(report: InvestigationReport): void {
+    const owner = this.activeWorkspace, folder = this.folder();
+    if (folder.uri.toString() !== owner) return;
+    const root = folder.uri.fsPath;
     this.diagnostics.clear(); const grouped = new Map<string, vscode.Diagnostic[]>();
     for (const record of report.records ?? []) for (const finding of record.findings ?? []) {
       const location = finding.location;
       if (!location?.file || !Number.isInteger(location.line) || location.line < 1) continue;
-      const file = path.resolve(this.root(), String(location.file));
+      const file = path.resolve(root, String(location.file));
       const diagnostic = new vscode.Diagnostic(new vscode.Range(location.line - 1, 0, location.line - 1, 1),
         `${record.tool} · ${record.scenario}/${record.implementation}: ${finding.message}\nStatic evidence is not a measured performance regression.`,
         vscode.DiagnosticSeverity.Warning);
@@ -510,16 +520,23 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     return [];
   }
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
-    const matches = (file: string) => path.resolve(this.root(), file) === document.uri.fsPath;
-    const lenses = this.declared().filter(s => matches(s.source)).map(s => new vscode.CodeLens(new vscode.Range(0, 0, 0, 0),
-      {title: `Diagnose ${s.id} · ${s.implementation}`, command: 'perfchecker.diagnoseScenarios', arguments: [[scenarioKey(s)]]}));
-    for (const p of this.discovery?.candidates ?? []) if (matches(p.origin.file) && p.origin.line <= document.lineCount) {
+    let folder: vscode.WorkspaceFolder;
+    try {folder = this.folder();} catch {return [];}
+    if (vscode.workspace.getWorkspaceFolder(document.uri)?.uri.toString() !== folder.uri.toString()) return [];
+    const discovery = this.discovery;
+    const matches = (file: string) => path.resolve(folder.uri.fsPath, file) === document.uri.fsPath;
+    const lenses = (discovery?.declared ?? []).filter(s => matches(s.source)).map(s => new vscode.CodeLens(new vscode.Range(0, 0, 0, 0),
+      {title: `Diagnose ${s.id} · ${s.implementation}`, command: 'perfchecker.diagnoseScenarios', arguments: [[scenarioKey(s)], folder.uri.toString()]}));
+    for (const p of discovery?.candidates ?? []) if (matches(p.origin.file) && p.origin.line <= document.lineCount) {
       const row = Math.max(0, p.origin.line - 1);
-      lenses.push(new vscode.CodeLens(new vscode.Range(row, 0, row, 0), {title: 'Prepare shared performance case', command: 'perfchecker.prepareScenario', arguments: [p.id]}));
+      lenses.push(new vscode.CodeLens(new vscode.Range(row, 0, row, 0), {title: 'Prepare shared performance case', command: 'perfchecker.prepareScenario', arguments: [p.id, folder.uri.toString()]}));
     }
     return lenses;
   }
-  provideCodeActions(_document: vscode.TextDocument, _range: vscode.Range, context: vscode.CodeActionContext): vscode.CodeAction[] {
+  provideCodeActions(document: vscode.TextDocument, _range: vscode.Range, context: vscode.CodeActionContext): vscode.CodeAction[] {
+    let folder: vscode.WorkspaceFolder;
+    try {folder = this.folder();} catch {return [];}
+    if (vscode.workspace.getWorkspaceFolder(document.uri)?.uri.toString() !== folder.uri.toString()) return [];
     if (!context.diagnostics.some(item => item.source === 'PerfChecker')) return [];
     const action = new vscode.CodeAction('Read evidence and verification steps', vscode.CodeActionKind.QuickFix);
     action.command = {command: 'perfchecker.openInvestigations', title: 'Open PerfChecker advice'};
@@ -552,7 +569,7 @@ export function registerInvestigations(context: vscode.ExtensionContext): void {
     command('perfchecker.openInvestigations', () => controller.open()),
     command('perfchecker.discoverScenarios', async () => {await controller.open(); return controller.execute('discover');}),
     command('perfchecker.measureScenarios', keys => controller.execute('run', keys)),
-    command('perfchecker.diagnoseScenarios', keys => controller.execute('diagnose', keys)),
+    command('perfchecker.diagnoseScenarios', (keys, owner) => controller.execute('diagnose', keys, undefined, owner)),
     command('perfchecker.adviseScenarios', () => controller.execute('advise')),
     command('perfchecker.compareScenarios', () => controller.execute('compare')),
     command('perfchecker.catalogTools', async () => {await controller.open(); return controller.execute('tools');}),
@@ -561,6 +578,6 @@ export function registerInvestigations(context: vscode.ExtensionContext): void {
     command('perfchecker.investigateScenarios', keys => controller.execute('investigate', keys)),
     command('perfchecker.cancelInvestigation', () => controller.cancel()),
     command('perfchecker.openEvidenceArtifact', file => controller.openArtifact(file)),
-    command('perfchecker.prepareScenario', id => controller.prepare(id)),
+    command('perfchecker.prepareScenario', (id, owner) => controller.prepare(id, owner)),
     command('perfchecker.openInvestigationSource', (file, line) => controller.openSource(file, line)));
 }

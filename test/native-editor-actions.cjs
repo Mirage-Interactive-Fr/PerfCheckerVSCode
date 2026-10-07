@@ -29,11 +29,18 @@ async function view(context){
   return context.findFrame('#app');
 }
 
-async function resource(context,workspace,controller,threads){
+async function resource(context,workspace,controller,threads,previousEditorAction){
   const {vscode,windowPage}=context,uri=vscode.Uri.file(workspace);
   const settings=vscode.workspace.getConfiguration('perfchecker',uri);
   const keys=['runnerProject','scenarioProject','juliaExecutable','scenarioCatalog','analysisTools','scenarioThreads','investigationReports'];
   const previous=Object.fromEntries(keys.map(key=>[key,settings.inspect(key)?.workspaceFolderValue]));
+  assert.equal(vscode.workspace.getWorkspaceFolder(uri)?.uri.toString(),uri.toString(),
+    'Every editor setting is scoped to the actual owning workspace URI');
+  const update=async(key,value,stage)=>{
+    try{await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);}
+    catch(error){context.log('native-editor-scoped-setting-failure',{key,stage,resource:uri.toString(),
+      owner:vscode.workspace.getWorkspaceFolder(uri)?.uri.toString(),workspaceFile:vscode.workspace.workspaceFile?.toString(),message:String(error)});throw error;}
+  };
   const catalog=path.join(workspace,'perf','scenarios.toml'),factory=path.join(workspace,'perf','native-editor-actions.jl');
   const original=await fs.readFile(catalog).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
   const source='function make_editor_case(p)\n    (prepare=()->Any[identity,42], operation=x->x[1](x[2]), verify=(x,r)->r==42)\nend\n';
@@ -47,13 +54,22 @@ async function resource(context,workspace,controller,threads){
     for(const [key,value]of Object.entries({runnerProject:controller,scenarioProject:controller,
       juliaExecutable:process.env.PERFCHECKER_NATIVE_JULIA,scenarioCatalog:'perf/scenarios.toml',
       analysisTools:['jet'],scenarioThreads:threads,investigationReports:'perf/results/editor-actions'}))
-      await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
+      await update(key,value,'prepare');
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',uri);
     let frame=await view(context),root=path.join(workspace,'perf','results','editor-actions'),before=await reports(root);
     await frame.getByRole('button',{name:'Discover tests',exact:true}).click();
     const discovery=await reportAfter(root,before,'discovery');
     assert(discovery.payload.declared.some(item=>item.id==='native_editor_branch'));
     assert(discovery.payload.candidates.length,'The actual TestItem fixture exposes a proposal CodeLens');
+    if(previousEditorAction){
+      const unchanged=await reports(root);
+      await assert.rejects(vscode.commands.executeCommand(previousEditorAction.command,...previousEditorAction.arguments),
+        /another workspace/,'A real first-folder CodeLens command cannot diagnose the same scenario ID in the second folder');
+      assert.deepEqual(await reports(root),unchanged,'Rejecting a stale editor action creates no second-folder report');
+      context.proof('native-stale-codelens-workspace-owner',{realCodeLensArguments:true,
+        previousOwner:previousEditorAction.arguments[1],selectedOwner:uri.toString(),
+        identicalScenarioId:'native_editor_branch',rejectedBeforeWorker:true,noNewReport:true});
+    }
 
     const candidate=discovery.payload.candidates[0];
     await vscode.commands.executeCommand('perfchecker.openInvestigationSource',candidate.origin.file,candidate.origin.line);
@@ -67,6 +83,9 @@ async function resource(context,workspace,controller,threads){
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(sourceUri),
       {preview:false,selection:new vscode.Range(0,0,0,0)});
     const lens=windowPage.locator('.codelens-decoration a').filter({hasText:'Diagnose native_editor_branch · conditional'});
+    const actualLenses=await vscode.commands.executeCommand('vscode.executeCodeLensProvider',sourceUri);
+    const editorAction=actualLenses.find(item=>item.command?.title==='Diagnose native_editor_branch · conditional')?.command;
+    assert.equal(editorAction?.arguments[1],uri.toString(),'The registered native CodeLens contains its owning workspace URI');
     await lens.waitFor({state:'visible',timeout:60000});before=await reports(root);await lens.click();
     const diagnosis=await reportAfter(root,before,'diagnosis');
     const record=diagnosis.payload.records.find(item=>item.scenario==='native_editor_branch');
@@ -95,6 +114,7 @@ async function resource(context,workspace,controller,threads){
       proposalCodeLensNativeClick:true,diagnosisCodeLensNativeClick:true,quickFixNativeChoice:true,
       diagnosticLine:finding.location.line,rule:finding.rule_id,report:diagnosis.file,
       reportSha256:sha(await fs.readFile(diagnosis.file)),sourceUnchanged:true});
+    return editorAction;
   }finally{
     await vscode.commands.executeCommand('perfchecker.cancelInvestigation');
     {
@@ -102,7 +122,7 @@ async function resource(context,workspace,controller,threads){
       await eventually(async()=>!((await current.locator('#app .status').getAttribute('class'))||'').includes('busy'),
         'Editor-action workers finish before restoring their fixture');
     }
-    for(const key of keys)await settings.update(key,previous[key],vscode.ConfigurationTarget.WorkspaceFolder);
+    for(const key of keys)await update(key,previous[key],'restore');
     if(original)await fs.writeFile(catalog,original);else await fs.rm(catalog,{force:true});
     await fs.rm(factory,{force:true});
   }
@@ -116,15 +136,25 @@ exports.run=async context=>{
   let added=false;
   try{
     await editor.update('codeLens',true,vscode.ConfigurationTarget.Global);
-    await resource(context,workspace,controller,1);
+    const firstEditorAction=await resource(context,workspace,controller,1);
     await fs.mkdir(path.join(second,'test'),{recursive:true});
     await fs.copyFile(path.join(workspace,'test','performance.jl'),path.join(second,'test','performance.jl'));
     const secondController=path.join(second,'perf','controller');await fs.mkdir(secondController,{recursive:true});
     for(const file of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(controller,file),path.join(secondController,file));
-    added=vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length,0,{uri:secondUri,name:'Editor action second workspace'});
-    assert(added);await eventually(()=>vscode.workspace.workspaceFolders.some(folder=>folder.uri.toString()===secondUri.toString()),
-      'The second native workspace is actually present');
-    await resource(context,second,secondController,2);
+    // updateWorkspaceFolders exposes an optimistic extension-host list before
+    // the workbench acknowledges its configuration model. Await the real event
+    // rather than attempting folder-setting writes against that optimistic list.
+    let acknowledged=false;
+    const changed=vscode.workspace.onDidChangeWorkspaceFolders(event=>{
+      if(event.added.some(folder=>folder.uri.toString()===secondUri.toString()))acknowledged=true;
+    });
+    try{
+      added=vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length,0,{uri:secondUri,name:'Editor action second workspace'});
+      assert(added);await eventually(()=>acknowledged,'The workbench acknowledges the second workspace and its configuration model',30000);
+    }finally{changed.dispose();}
+    assert.equal(vscode.workspace.getWorkspaceFolder(secondUri)?.uri.toString(),secondUri.toString());
+    context.log('native-editor-second-workspace-acknowledged',{resource:secondUri.toString(),actualWorkspaceEvent:true});
+    await resource(context,second,secondController,2,firstEditorAction);
   }finally{
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',vscode.Uri.file(workspace));
     if(added){const index=vscode.workspace.workspaceFolders.findIndex(folder=>folder.uri.toString()===secondUri.toString());

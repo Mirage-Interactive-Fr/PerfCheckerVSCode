@@ -381,7 +381,7 @@ async function ownedWorkerClose(context,directory){
         await state.frame.locator('img#logo-big').locator('..').click();
         await eventually(()=>new URL(state.frame.url()).pathname==='/'&&state.frame.locator('#recent').isVisible(),'The real Pluto logo opens its authenticated homepage');
         const running=state.frame.locator('#recent li.running').filter({hasText:'ShutdownActiveAllocation.jl'});
-        await running.locator('button.session').click();
+        await running.locator('button').first().click();
         await eventually(async()=>await running.count()===0,'The native Pluto homepage removes the stopped notebook');
       });
     }finally{page.off('dialog',confirm);}

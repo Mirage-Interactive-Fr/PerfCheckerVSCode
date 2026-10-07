@@ -49,17 +49,20 @@ using PerfChecker, PerfCheckerPluto, Pluto, PlutoUI
 println("Detected PerfChecker ", Base.pkgversion(PerfChecker), "; Pluto ", Base.pkgversion(Pluto))
 v"1.0.1" <= Base.pkgversion(PerfChecker) < v"2.0.0" || error("This integration requires PerfChecker 1.0.1 or newer in the 1.x series. Explicitly upgrade the separate Pluto environment from General before continuing.")
 Base.pkgversion(Pluto) == v"1.0.4" || error("This integration currently qualifies Pluto 1.0.4. Explicitly update the separate Pluto environment to use it.")
-isdefined(Pluto, :ServerSession) && isdefined(Pluto, :run!) || error("Pluto server API is unavailable.")
+all(name -> isdefined(Pluto, name), (:ServerSession, :http_router_for, :auth_middleware,
+    :create_session_context_middleware, :process_ws_message, :unpack)) || error("Pluto server API is unavailable.")
 hasmethod(PerfChecker.write_suite_notebook, Tuple{AbstractString}) || error("PerfChecker Pluto companion is unavailable.")
 `;
 const serverCode = `
 using Logging
 Logging.global_logger(Logging.NullLogger()) # Pluto's startup URL contains the session secret.
 using Pluto
+Base.pkgversion(Pluto) == v"1.0.4" || error("The embedded navigation adapter requires Pluto 1.0.4.")
 p = parse(Int, ENV["PERFCHECKER_PLUTO_PORT"])
 options = Pluto.Configuration.from_flat_kwargs(host="127.0.0.1", port=p,
     launch_browser=false, notebook=ENV["PERFCHECKER_PLUTO_NOTEBOOK"],
     require_secret_for_access=true, require_secret_for_open_links=true,
+    injected_javascript_data_url=ENV["PERFCHECKER_PLUTO_NAVIGATION"],
     auto_reload_from_file=false, threads=1)
 session = Pluto.ServerSession(options=options, secret=ENV["PERFCHECKER_PLUTO_SECRET"])
 cleanup_lock = ReentrantLock()
@@ -135,19 +138,102 @@ for action in (:shutdown_notebook, :restart_process)
         end
     end
 end
+HTTP = Pluto.HTTP
+# Build this owned listener from Pluto 1.0.4's normal router and authentication
+# middleware. Navigation cannot depend on SameSite=Strict cookies in a webview.
+app = Pluto.http_router_for(session) |> Pluto.auth_middleware |> Pluto.create_session_context_middleware(session)
+function navigation_response(request)
+    uri = HTTP.URI(request.target)
+    query = HTTP.queryparams(uri)
+    if (uri.path in ("/", "/edit", "/open", "/new", "/notebookfile", "/notebookexport") ||
+            (request.method == "POST" && uri.path == "/notebookupload")) && !haskey(query, "secret")
+        # FilePicker uses window.location rather than an anchor. Accept only an
+        # existing credential in an authenticated, same-origin HTML referrer.
+        reference = try HTTP.URI(HTTP.header(request, "Referer", "")) catch; nothing end
+        authority = try HTTP.URI("http://" * HTTP.header(request, "Host", "")) catch; nothing end
+        if reference !== nothing && authority !== nothing &&
+                reference.scheme == authority.scheme &&
+                reference.host == authority.host && reference.port == authority.port &&
+                reference.path in ("/", "/edit", "/open", "/new") &&
+                get(HTTP.queryparams(reference), "secret", "") == session.secret
+            query["secret"] = session.secret
+            request.target = string(HTTP.URI(uri; query=query))
+            if request.method == "GET"
+                # A URL credential must also reach the browser's next WebSocket.
+                response = HTTP.Response(303, "")
+                HTTP.setheader(response, "Location" => request.target)
+                return response
+            end
+        end
+    end
+    response = app(request)
+    # Pluto's GET launch handlers redirect to edit without retaining the URL
+    # credential. Adapt relative notebook redirects only, after stock auth.
+    if response.status in (301, 302, 303, 307, 308) && Pluto.is_authenticated(session, request)
+        location = HTTP.header(response, "Location", "")
+        destination = try HTTP.URI(location) catch; nothing end
+        if destination !== nothing && isempty(destination.scheme) && isempty(destination.host) &&
+                destination.path in ("./edit", "edit", "/edit")
+            parameters = HTTP.queryparams(destination)
+            haskey(parameters, "secret") || (parameters["secret"] = session.secret)
+            HTTP.setheader(response, "Location" => string(HTTP.URI(destination; query=parameters)))
+        end
+    end
+    response
+end
+function serve_owned(http)
+    if HTTP.WebSockets.isupgrade(http.message)
+        # Keep Pluto's authenticated WebSocket protocol and message dispatcher.
+        if !Pluto.is_authenticated(session, http.message)
+            HTTP.setstatus(http, 403)
+            HTTP.setheader(http, "Content-Length" => "9")
+            HTTP.setheader(http, "Connection" => "close")
+            HTTP.startwrite(http); write(http, "Forbidden"); HTTP.closewrite(http); return
+        end
+        HTTP.WebSockets.upgrade(http) do stream
+            client = nothing
+            try
+                for message in stream
+                    try
+                        body = Pluto.unpack(message)
+                        client === nothing && (client = Symbol(body["client_id"]))
+                        Pluto.process_ws_message(session, body, stream)
+                    catch error
+                        error isa InterruptException || error isa EOFError || error isa HTTP.WebSockets.WebSocketError ||
+                            println(stderr, "PerfChecker Pluto request failed: ", sprint(showerror, error))
+                    end
+                end
+            catch error
+                error isa EOFError || error isa Base.IOError || error isa HTTP.WebSockets.WebSocketError || rethrow()
+            finally
+                client === nothing || delete!(session.connected_clients, client)
+            end
+        end
+    else
+        request = http.message
+        request.body = read(http)
+        request.response = navigation_response(request)
+        request.response.request = request
+        HTTP.setheader(http, "Content-Length" => string(length(request.response.body)))
+        HTTP.setheader(http, "Referrer-Policy" => "same-origin")
+        HTTP.startwrite(http)
+        write(http, request.response.body)
+    end
+end
 server = nothing
 try
-    server = Pluto.run!(session)
+    Pluto.SessionActions.open(session, ENV["PERFCHECKER_PLUTO_NOTEBOOK"]; run_async=true)
+    server = HTTP.listen!(serve_owned, "127.0.0.1", p; stream=true, verbose=-1)
     notebook = only(values(session.notebooks))
     println("PERFCHECKER_PLUTO_READY ", p, " ", notebook.notebook_id)
     flush(stdout)
     # Pluto.wait catches InterruptException and closes Malt immediately. Keep
     # the listener wait here so our owned-job cleanup runs before that close.
-    while isopen(server.http_server)
+    while isopen(server)
         sleep(0.1)
     end
 finally
-    if server !== nothing
+    if server !== nothing || !isempty(session.notebooks)
         # Core workers are detached from the Pluto/Malt worker. Cancel only the
         # typed jobs owned by each notebook and await their cleanup first.
         lock(cleanup_lock) do
@@ -162,7 +248,23 @@ finally
                 end
                 isempty(shutdown_errors) || throw(CompositeException(shutdown_errors))
             finally
-                close(server)
+                try
+                    for client in collect(values(session.connected_clients))
+                        try close(client.stream) catch end
+                    end
+                    empty!(session.connected_clients)
+                    notebook_errors = Any[]
+                    for notebook in collect(values(session.notebooks))
+                        try
+                            Pluto.SessionActions.shutdown(session, notebook; keep_in_session=false, async=false, verbose=false)
+                        catch error
+                            push!(notebook_errors, error)
+                        end
+                    end
+                    isempty(notebook_errors) || throw(CompositeException(notebook_errors))
+                finally
+                    server === nothing || close(server)
+                end
             end
         end
     end
@@ -393,10 +495,14 @@ export class PlutoNotebooks implements vscode.Disposable {
     if (session.disposed) throw new Error('The Pluto view was closed.');
     this.assertCurrent(session.folder,session.project);
     const secret = randomBytes(32).toString('hex');
+    const navigation = await fs.readFile(vscode.Uri.joinPath(this.context.extensionUri,'media','pluto-navigation.js').fsPath);
+    this.assertCurrent(session.folder,session.project);
+    if (session.disposed) throw new Error('The Pluto view was closed.');
     const child = spawn(vscode.workspace.getConfiguration('perfchecker',session.folder.uri).get('juliaExecutable','julia'),
       ['--startup-file=no','--history-file=no',`--project=${session.project}`,'-e',cancellableJulia(serverCode)],
       {cwd:session.folder.uri.fsPath, windowsHide:true, detached:process.platform!=='win32', stdio:['pipe','pipe','pipe'],
-        env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter), PERFCHECKER_PLUTO_SECRET:secret, PERFCHECKER_PLUTO_PORT:String(port), PERFCHECKER_PLUTO_NOTEBOOK:session.notebook}});
+        env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter), PERFCHECKER_PLUTO_SECRET:secret, PERFCHECKER_PLUTO_PORT:String(port), PERFCHECKER_PLUTO_NOTEBOOK:session.notebook,
+          PERFCHECKER_PLUTO_NAVIGATION:`data:text/javascript;base64,${navigation.toString('base64')}`}});
     const redact = (line: string) => line.replaceAll(secret,'[session secret]').replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]');
     let errors = '';
     child.stderr?.on('data',data=>{
