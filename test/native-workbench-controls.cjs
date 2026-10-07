@@ -96,7 +96,8 @@ async function multiRoot(context){
     const studio=await context.findFrame('#studio-root');
     const environment=studio.locator('details.environment');
     if(!await environment.evaluate(element=>element.open))await environment.locator('summary').click();
-    await eventually(async()=>(await environment.innerText()).includes('Second native workspace'),'The expanded Studio environment identifies the selected second folder');
+    await eventually(async()=>(await studio.locator('.workspace strong').innerText())==='Second native workspace'&&
+      (await environment.innerText()).includes(context.controller),'The Studio identifies the selected second folder and its expanded controller');
     await clickStudioAction({...context,workspace:second},'terminal');
     const terminal=await eventually(()=>vscode.window.terminals.find(item=>item.name==='PerfChecker · Second native workspace'),'Studio routes its terminal to the explicitly selected second folder');
     const marker=path.join(second,'terminal-version.txt');

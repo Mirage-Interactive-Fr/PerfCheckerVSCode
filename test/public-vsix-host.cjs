@@ -170,7 +170,7 @@ exports.run = async () => {
     {videoOffsetSeconds:(Date.now()-Date.parse(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT))/1000}:{})});
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,platform:process.platform,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
-      coverage:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
+      coverage:process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1',available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
       commands:commandCoverage(commands,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);
     pendingReport=pendingReport.then(()=>fs.writeFile(path.join(output,`${phase}.json`),report));
@@ -256,12 +256,30 @@ exports.run = async () => {
       core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION};
     log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 
-    if(phase==='narrative'){
+    if(phase==='narrative'||process.env.PERFCHECKER_NATIVE_STAGE==='focused'){
       const settings=vscode.workspace.getConfiguration('perfchecker',uri);
       for(const [key,value] of Object.entries({juliaExecutable:process.env.PERFCHECKER_NATIVE_JULIA,runnerProject:context.controller,scenarioProject:context.controller,
-        suite:'perf/suite.jl',profile:'quick',reports:'perf/results/vscode',advisorEnabled:false,scenarioSamples:2,analysisTools:[]}))
+        suite:'perf/suite.jl',profile:phase==='studio'?'historical':'quick',reports:'perf/results/vscode',advisorEnabled:false,advisorConfig:'',scenarioSamples:2,analysisTools:[],plutoProject:'perf/pluto'}))
         await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
-      await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
+      if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
+      else if(phase==='mcp-pluto'){
+        await runCase('native-mcp-controls',()=>mcp.run(context));
+        await runCase('native-pluto-controls',()=>pluto.run(context));
+        await runCase('native-discovery-and-sync-after-pluto',async()=>{
+          const discovery=await vscode.commands.executeCommand('perfchecker.discoverScenarios');
+          const sync=await vscode.commands.executeCommand('perfchecker.syncScenarios');
+          assert.equal(discovery.schema_version,'perfchecker-discovery/1');
+          assert.equal(sync.schema_version,'perfchecker-scenario-sync/1');
+          assert.equal(sync.discovery.schema_version,'perfchecker-discovery/1');
+          proof('native-discovery-after-pluto',{generatedNotebookPresent:true,core:context.core,commandsCompleted:true,returnedReportsValidated:true});
+        });
+      }else if(phase==='workbench')await runCase('native-workbench-controls',()=>workbench.run(context));
+      else if(phase==='advisor')await runCase('native-advisor-controls',()=>advisor.run(context));
+      else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
+      else if(phase==='studio'){
+        await runCase('native-suite-run-button',async()=>{context.results=await controls.runSelection(context);});
+        await runCase('native-all-studio-controls',()=>controls.run(context));
+      }else throw new Error(`Unsupported focused native control group: ${phase}`);
     }else if(phase==='reload'){
       await runCase('native-single-folder-reload',()=>require('./native-reload-host.cjs').run(context));
     }else if (phase === 'fresh') {

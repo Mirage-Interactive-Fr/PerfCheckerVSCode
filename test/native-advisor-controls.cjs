@@ -111,8 +111,14 @@ async function panel(context) {
 }
 const row = (frame, name) => frame.locator('section[aria-label="Available models and tools"] article').filter({has: frame.getByRole('heading', {name, exact: true})});
 async function finished(frame, message) {
-  await eventually(async () => await frame.locator('#advisor-root').getAttribute('aria-busy') === 'false' &&
-    message.test(await frame.getByRole('status').innerText()), `Advisor action finishes: ${message}`);
+  try{
+    await eventually(async () => await frame.locator('#advisor-root').getAttribute('aria-busy') === 'false' &&
+      message.test(await frame.getByRole('status').innerText()), `Advisor action finishes: ${message}`);
+  }catch(error){
+    const actual={busy:await frame.locator('#advisor-root').getAttribute('aria-busy'),status:await frame.getByRole('status').innerText(),
+      mode:await frame.locator('#advisor-protocol').inputValue(),model:await frame.locator('#advisor-model').inputValue()};
+    throw new Error(`${error.message}; actual declared fixture UI: ${JSON.stringify(actual)}`);
+  }
 }
 async function click(frame, label) {await frame.getByRole('button', {name: label, exact: true}).click();}
 async function confirm(frame, label) {await click(frame, label); await click(frame, 'Confirm');}
@@ -234,6 +240,11 @@ exports.run = async context => {
   const previous = Object.fromEntries(keys.map(key => [key, settings.inspect(key)?.workspaceFolderValue]));
   const relative = `perf/native-advisor-${randomUUID()}/configuration.json`, configFile = path.join(context.workspace, relative);
   try {
+    // Earlier Studio controls intentionally leave their unsaved provider form
+    // open. Close that real editor so this independently configured fixture
+    // starts from its own on-disk configuration, instead of stale draft fields.
+    await panel(context);
+    await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
     await settings.update('advisorConfig', relative, context.vscode.ConfigurationTarget.WorkspaceFolder);
     await settings.update('advisorEnabled', true, context.vscode.ConfigurationTarget.WorkspaceFolder);
     await settings.update('advisorInvestigates', false, context.vscode.ConfigurationTarget.WorkspaceFolder);
@@ -246,6 +257,12 @@ exports.run = async context => {
     await ollama(context, fixture, configFile);
     await inventories(context, fixture, configFile);
     assert.deepEqual(fixture.errors, []);
+  }catch(error){
+    context.log('advisor-native-protocol-failure',{assertionsCompleted:false,error:String(error),
+      requests:fixture.calls,fixtureErrors:fixture.errors});
+    await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,
+      `${process.env.PERFCHECKER_NATIVE_PHASE}-advisor-before-teardown.png`)}).catch(()=>{});
+    throw error;
   } finally {
     await context.vscode.commands.executeCommand('perfchecker.cancelAdvisorSetup').catch(() => {});
     const frame = await context.findFrame('#advisor-root').catch(() => undefined);

@@ -9,10 +9,20 @@ on:
         options: [public, candidate]
         default: candidate
       stage:
-        description: Smoke, full, focused reload/narrative, or Core-only external-process regression
+        description: Smoke, full, reload/narrative, selected native controls, or Core-only regression
         type: choice
-        options: [smoke, full, targeted, core-external]
+        options: [smoke, full, targeted, focused, core-external]
         default: full
+      case_group:
+        description: Native controls to exercise on a clean fixture (focused stage only)
+        type: choice
+        options: [narrative, mcp-pluto, workbench, advisor, investigation, studio]
+        default: narrative
+      backend_julia:
+        description: Core runtime for a manual qualification; automatic PR coverage remains latest
+        type: choice
+        options: ['1', '1.10']
+        default: '1'
       scope:
         description: All supported hosts, or an explicit focused platform
         type: choice
@@ -111,9 +121,10 @@ jobs:
       PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
       PERFCHECKER_NATIVE_CANDIDATE_SHA: ${{ needs.package.outputs.sha }}
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
+      PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '6f6155510aa209859310ab3c32787caec64176bf' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || 'd73f1140aa41492482f9208d240d282d4cfcfd7f' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '975d9351250ace804ce932d8710fedf7a3699739' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '7efea7f007cbdd78141fbebef63eeefcebc0f54e' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
@@ -131,7 +142,7 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         id: runner-julia
         with:
-          version: '1'
+          version: ${{ github.event_name == 'workflow_dispatch' && inputs.backend_julia || '1' }}
           arch: x64
       - uses: julia-actions/setup-julia@v3
         id: official-julia

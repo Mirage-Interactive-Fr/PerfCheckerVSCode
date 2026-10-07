@@ -243,7 +243,8 @@ async function diagnose(context) {
     const artifact = artifactRecord.artifacts[0];
     const bytes = await fs.readFile(artifact.path);
     assert.equal(createHash('sha256').update(bytes).digest('hex'), artifact.sha256);
-    const recordCard = current.locator('article.card').filter({has: current.getByRole('heading', {name: `${artifactRecord.scenario} · ${artifactRecord.implementation} · ${artifactRecord.tool}`, exact: true})});
+    const cardFor = frame => frame.locator('article.card').filter({has: frame.getByRole('heading', {name: `${artifactRecord.scenario} · ${artifactRecord.implementation} · ${artifactRecord.tool}`, exact: true})});
+    const recordCard = cardFor(current);
     await recordCard.getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click();
     const artifactUri=context.vscode.Uri.file(artifact.path);
     await eventually(() => context.vscode.window.tabGroups.all.some(group=>group.tabs.some(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifactUri.fsPath)), 'Evidence artifact opens in the actual native text or custom editor');
@@ -251,9 +252,10 @@ async function diagnose(context) {
     context.log('investigation-artifact-native-editor',{kind:artifact.kind,editor:opened.input.constructor.name,uri:path.basename(artifact.path)});
     await fs.writeFile(artifact.path, Buffer.concat([bytes, Buffer.from('\nchanged by isolated integrity test\n')]));
     try {
-      await view(context);
-      await recordCard.getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click();
-      await eventually(async () => /Artifact changed/.test(await current.locator('#app .status').innerText()), 'Changed artifact is rejected by digest');
+      // Opening a native editor hides and unloads this non-retained webview.
+      const reopened = await tab(context, 'Findings & advice');
+      await cardFor(reopened).getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click();
+      await eventually(async () => /Artifact changed/.test(await reopened.locator('#app .status').innerText()), 'Changed artifact is rejected by digest');
     } finally {await fs.writeFile(artifact.path, bytes);}
     context.proof('investigation-native-artifact-and-integrity', {kind: artifact.kind, sha256: artifact.sha256});
   } else context.log('investigation-artifact-prerequisite-gap', {reason: 'The real analyzers returned no evidence artifacts; artifact execution is not qualified by this run.'});
@@ -278,12 +280,27 @@ async function compare(context) {
   const candidate = await measure(context);
   const baseline = context.investigationFirstRun;
   assert(baseline && baseline.directory !== candidate.directory, 'Compare requires two distinct real measurements of the same scenario');
+  // History.created is captured after filesystem setup; it is not the directory ID's
+  // earlier timestamp. Read the actual picker labels and require one nearby entry.
   const timestamp = directory => path.basename(directory).slice(0, 24).replace(/T(\d{2})-(\d{2})-(\d{2})/, 'T$1:$2:$3');
+  const pickMeasurement = async (title, directory) => {
+    const widget = context.windowPage.locator('.quick-input-widget');
+    await widget.waitFor({state:'visible',timeout:30000});
+    await eventually(async()=>(await widget.innerText()).includes(title),`native quick pick ${title}`,30000);
+    const target = Date.parse(timestamp(directory));
+    const rows = widget.locator('.monaco-list-row[role="option"]');
+    const labels = await rows.allTextContents();
+    const matches = labels.map((label,index)=>({label,index,date:label.match(/run · (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z)/)?.[1]}))
+      .filter(item=>item.date&&Math.abs(Date.parse(item.date)-target)<10000);
+    assert.equal(matches.length,1,`One actual saved measurement corresponds to ${timestamp(directory)}: ${JSON.stringify(labels)}`);
+    context.log('investigation-native-measurement-picker',{title,directory:path.basename(directory),displayedTimestamp:matches[0].date});
+    await rows.nth(matches[0].index).click();
+  };
   const current = await tab(context, 'Before / after');
   const before = await directories(reportRoot(context));
   await current.getByRole('button', {name: 'Choose baseline and candidate', exact: true}).click();
-  await quickPick(context, 'Choose the baseline measurement', timestamp(baseline.directory));
-  await quickPick(context, 'Choose the candidate measurement', timestamp(candidate.directory));
+  await pickMeasurement('Choose the baseline measurement', baseline.directory);
+  await pickMeasurement('Choose the candidate measurement', candidate.directory);
   const result = await reportAfter(context, before, 'compare');
   assert.equal(result.report.schema_version, 'perfchecker-scenario-comparison/1');
   assert(result.report.configurations.some(item => item.scenario === 'ui_adopted' && item.implementation === 'ui'));
@@ -322,14 +339,14 @@ async function syncAndHistory(context) {
   await search.fill('no-native-tool-matches');
   assert.equal(await current.locator('article.card').count(), 0);
   await search.fill('');
-  const history = await tab(context, 'Saved evidence');
-  const card = history.locator('article.card').filter({has: history.getByRole('heading', {name: /^run ·/})}).first();
+  let history = await tab(context, 'Saved evidence');
+  const cardFor = frame => frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^run ·/})}).first();
   for (const format of ['JSON', 'Markdown']) {
-    await card.getByRole('button', {name: format, exact: true}).click();
+    await cardFor(history).getByRole('button', {name: format, exact: true}).click();
     await eventually(() => context.vscode.window.activeTextEditor?.document.uri.fsPath.endsWith(format === 'JSON' ? 'run.json' : 'run.md'), `Native ${format} saved evidence export`);
-    await tab(context, 'Saved evidence');
+    history = await tab(context, 'Saved evidence');
   }
-  await card.getByRole('button', {name: 'Open evidence', exact: true}).click();
+  await cardFor(history).getByRole('button', {name: 'Open evidence', exact: true}).click();
   await eventually(async () => /Saved evidence/.test(await history.locator('#app .status').innerText()), 'History reloads actual evidence without starting a worker');
   await (await view(context)).getByRole('button', {name: 'Worker log', exact: true}).click();
   await eventually(async () => /PerfChecker investigations/.test(await context.windowPage.locator('body').innerText()), 'Investigation output channel is displayed');

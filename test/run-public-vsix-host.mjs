@@ -21,7 +21,10 @@ const coreProvenance={mode:coreMode,version:expectedCoreVersion,...(coreMode==='
 const installCore=coreMode==='candidate'?'Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]))':`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))`;
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
-if(!['smoke','full','targeted','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, or the explicit Core-only external-process regression.');
+if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
+const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
+if(stage==='focused'&&!['narrative','mcp-pluto','workbench','advisor','investigation','studio'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+const completeCampaign=['smoke','full'].includes(stage);
 const phaseFailures = [];
 const publicSha = 'c4123271e71e4c4d148fe0e613ba260f4aeea6f28445338cab11d3fb9513df09';
 if (!['public', 'candidate'].includes(mode)) throw new Error('Choose public or candidate VSIX explicitly.');
@@ -77,7 +80,7 @@ try {
   await fs.writeFile(path.join(workspace, 'Project.toml'), 'name = "PerfCheckerNativeFixture"\nuuid = "6af56806-e0b1-4f34-88bf-fde69d8a8679"\nversion = "0.1.0"\n');
   // Keep actual workload frames in the target package, rather than inlining them
   // into an external perf script. Both workloads allocate inside their own source.
-  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nBase.@noinline wait_task(x) = (values=fill(x,1000); sleep(0.005); values[1])\nend\n');
+  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nBase.@noinline wait_task(x) = (values=fill(x,1_000_000); sleep(0.005); values[1])\nend\n');
   await fs.writeFile(path.join(workspace, 'test', 'performance.jl'), 'using TestItems\n@testitem "Vector reduction" tags=[:performance] begin\n data=collect(1:10_000)\n @test sum(data)==50_005_000\nend\n');
   const vsix = path.join(session, 'perfchecker.vsix');
   if (mode === 'public') {
@@ -111,9 +114,16 @@ try {
 
   const launch = async phase => {
     let recording,recorded,videoStartedAt,recordingError='';
+    // Each independently launched phase has its own disposable profile. Reusing
+    // the reload phase's persisted window state restores two windows and starts
+    // two driver activations before either can test the next protocol.
+    const phaseProfile=path.join(profile,phase);
+    await fs.mkdir(path.join(phaseProfile,'User'),{recursive:true});
+    await fs.copyFile(path.join(profile,'User','settings.json'),path.join(phaseProfile,'User','settings.json'));
+    const phaseCliProfile=[`--user-data-dir=${phaseProfile}`,`--extensions-dir=${extensions}`];
     const video=path.join(output,`native-${process.platform}-vscode-${version}-${expectedVersion}-${phase}.mp4`);
     const retainHostLogs=async()=>{
-      const origin=path.join(profile,'logs'),destination=path.join(output,'host-startup-logs',phase);
+      const origin=path.join(phaseProfile,'logs'),destination=path.join(output,'host-startup-logs',phase);
       for(const relative of await fs.readdir(origin,{recursive:true}).catch(()=>[])){
         const source=path.join(origin,relative),stat=await fs.stat(source).catch(()=>undefined);
         if(!stat?.isFile()||stat.size>2000000||!relative.endsWith('.log'))continue;
@@ -134,7 +144,7 @@ try {
         recorded=new Promise(resolve=>{recording.once('close',code=>resolve(code));recording.once('error',error=>{recordingError=String(error);resolve(-1);});});
         console.log(`NATIVE_VIDEO_START ${phase} ${videoStartedAt}`);
       }
-      const environment={...process.env,PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: profile,
+      const environment={...process.env,PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
@@ -148,7 +158,7 @@ try {
       await new Promise((resolve,reject)=>{
         // Actual interactive host: no --extensionTestsPath or smoke driver, and
         // no intercepted APIs. All dialogs are clicked through the real UI.
-        const child=spawn(vscode,[phase==='prepared'?workspaceFile:workspace,...cliProfile,'--new-window','--skip-welcome','--skip-release-notes',
+        const child=spawn(vscode,[phase==='prepared'||stage==='focused'?workspaceFile:workspace,...phaseCliProfile,'--new-window','--skip-welcome','--skip-release-notes',
           '--disable-workspace-trust','--disable-gpu','--remote-debugging-port=9222',
           ...(process.platform==='linux'?['--no-sandbox']:[]),
           `--extensionDevelopmentPath=${path.join(repository,'test','qualification-host')}`],
@@ -200,7 +210,7 @@ try {
     }
   };
   // The first real launch has no PerfChecker settings, Julia or Jupyter extension.
-  if(stage!=='targeted')await launch('fresh');
+  if(completeCampaign)await launch('fresh');
   await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]); using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; end; println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode]);
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(["BenchmarkTools","Chairmarks","TestItems"]); Pkg.activate(ARGS[2]); Pkg.add("TestItems")', target, workspace]);
   await fs.mkdir(path.join(workspace, 'perf'), {recursive: true});
@@ -208,6 +218,7 @@ try {
   await fs.rm(path.join(workspace,'perf','results'),{recursive:true,force:true});
   await fs.rm(path.join(workspace,'perf','perfchecker-ui.json'),{force:true});
   await fs.writeFile(path.join(workspace, 'perf', 'sum.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs) = perf_workload(xs) == 333833500.0\n');
+  await fs.writeFile(path.join(workspace,'perf','profile-sum.jl'),'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1_000_000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs,result) = isapprox(result,1_000_000.0*1_000_001.0*2_000_001.0/6;rtol=1e-12)\n');
   await fs.writeFile(path.join(workspace, 'perf', 'wait.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = 42\nperf_workload(x) = PerfCheckerNativeFixture.wait_task(x)\nperf_oracle(x) = perf_workload(x) == 42\n');
   await fs.writeFile(path.join(workspace, 'perf', 'cases.jl'), 'make_sum_case(p) = (prepare=()->collect(1.0:1000.0), operation=xs->sum(xs.^2), verify=(xs,result)->result==333833500.0)\nmake_wait_case(p) = (prepare=()->42, operation=x->(sleep(0.005);x), verify=(x,result)->result==42)\nmake_cancel_case(p) = (prepare=()->42, operation=x->(write(p["marker"],"running");sleep(30);x), verify=(x,result)->result==42)\n');
   // A distinct bounded workload gives CPU sampling actual operation time;
@@ -260,8 +271,9 @@ perf_oracle(payload,result) = result.bytes_sent==128 && result.bytes_received==1
 function build_suite()
  features=FeatureSpec[]
  for (workload,file) in [(:sum_squares,"sum.jl"),(:wait_task,"wait.jl")], backend in [:benchmark,:chairmark,:profile,:wall_profile,:profile_alloc,:alloc]
-  options=Dict{Symbol,Any}(:samples=>3,:seconds=>0.03,:evals=>1,:repeat=>false,:targets=>["PerfCheckerNativeFixture"],:profile_seconds=>0.15,:profile_delay=>0.0005,:profile_repetitions=>3,:sample_rate=>1.0)
-  push!(features,FeatureSpec(Symbol(workload,"_",backend);workload,backend,entrypoint=joinpath(@__DIR__,file),options,oracle=OracleSpec()))
+  options=Dict{Symbol,Any}(:samples=>3,:seconds=>0.03,:evals=>1,:repeat=>false,:targets=>["PerfCheckerNativeFixture"],:profile_seconds=>0.5,:profile_delay=>0.0005,:profile_repetitions=>3,:sample_rate=>1.0)
+  entrypoint=workload===:sum_squares && backend in (:profile,:wall_profile) ? "profile-sum.jl" : file
+  push!(features,FeatureSpec(Symbol(workload,"_",backend);workload,backend,entrypoint=joinpath(@__DIR__,entrypoint),options,oracle=OracleSpec()))
  end
  for (backend,supported,reason) in [(:network,true,""),(:network_interface,${capabilities.interface.supported},${JSON.stringify(capabilities.interface.supported ? '' : 'Native interface counters unavailable on this operating system')}),(:network_isolated,${capabilities.isolated.supported},${JSON.stringify(capabilities.isolated.reason)})]
   push!(features,FeatureSpec(Symbol("tcp_",backend);workload=:tcp_roundtrip,backend,description=reason,
@@ -277,22 +289,27 @@ end
   await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': officialRuntime.executable, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
-  if(mode==='candidate'&&stage!=='targeted')await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);if !isempty(ARGS[3]);@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[3];end;println("PLUTO_CORE_MODE=",ARGS[5]," CORE=",Base.pkgversion(PerfChecker)," PLUTO=",Base.pkgversion(Pluto))`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode]);
-  if(stage!=='targeted')await launch('configured');
+  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&caseGroup==='mcp-pluto'))await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);if !isempty(ARGS[3]);@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[3];end;println("PLUTO_CORE_MODE=",ARGS[5]," CORE=",Base.pkgversion(PerfChecker)," PLUTO=",Base.pkgversion(Pluto))`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode]);
+  if(completeCampaign)await launch('configured');
   // TestItemRunner's default imports use the chosen controller. This explicit fixture
   // preparation is separate from production bootstrap, which never develops a user's package.
   await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.develop(path=ARGS[2]);println("TESTITEM_TARGET_EXPLICITLY_PREPARED=",ARGS[2])',controller,workspace]);
-  for (const extension of stage==='targeted'?[]:mode==='public'?['julialang.language-julia','ms-toolsai.jupyter']:['julialang.language-julia']) {
+  for (const extension of completeCampaign||stage==='focused'&&caseGroup==='workbench'?(mode==='public'?['julialang.language-julia','ms-toolsai.jupyter']:['julialang.language-julia']):[]) {
     await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', extension], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   }
   // Adding a second folder to a single-folder window converts its workspace and
   // restarts the extension host. Start the multi-root campaign in a real saved
   // workspace so those buttons are tested once without restarting the driver.
-  await fs.writeFile(workspaceFile,JSON.stringify({folders:[{path:workspace}],settings:{}},null,2));
+  // Julia's executable resolver reads unscoped configuration. A saved multi-root
+  // workspace needs this setting at workspace scope, not in an individual folder.
+  await fs.writeFile(workspaceFile,JSON.stringify({folders:[{path:workspace}],settings:{'julia.executablePath':officialRuntime.executable}},null,2));
   if(stage==='targeted'){
     if(mode!=='candidate')throw new Error('The targeted lifecycle/protocol campaign requires an explicit exact candidate archive.');
     await launch('reload');
     await launch('narrative');
+  }else if(stage==='focused'){
+    if(mode!=='candidate')throw new Error('Focused native controls require an explicit exact candidate archive.');
+    await launch(caseGroup);
   }else await launch('prepared');
   if (phaseFailures.length) throw new Error(JSON.stringify(phaseFailures));
   }

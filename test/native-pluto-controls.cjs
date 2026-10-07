@@ -120,9 +120,10 @@ async function serverPids(){
 async function studioNotebookButtons(context,directory){
   const file=path.join(directory,'StudioButtons.jl');
   const settings=context.vscode.workspace.getConfiguration('files',context.vscode.Uri.file(context.workspace));
-  const previous=settings.inspect('simpleDialog.enable')?.workspaceFolderValue;
+  const previous=settings.inspect('simpleDialog.enable')?.globalValue;
   try{
-    await settings.update('simpleDialog.enable',true,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    // VS Code declares this as application scope. Only the disposable profile is changed.
+    await settings.update('simpleDialog.enable',true,context.vscode.ConfigurationTarget.Global);
     await clickStudioAction(context,'notebook');
     let picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
     let input=picker.locator('input[type="text"]');await input.fill(file);await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter');
@@ -136,7 +137,7 @@ async function studioNotebookButtons(context,directory){
     input=picker.locator('input[type="text"]');await input.fill(file);await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter');
     await stop(context,await view(context),true);
     context.proof('pluto-studio-file-dialog-buttons',{nativeNewClick:true,nativeOpenClick:true,realFileDialog:true,file:path.basename(file),jupyter:false});
-  }finally{await settings.update('simpleDialog.enable',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);}
+  }finally{await settings.update('simpleDialog.enable',previous,context.vscode.ConfigurationTarget.Global);}
 }
 
 async function restartFailureCleanup(context,directory){
@@ -148,9 +149,9 @@ async function restartFailureCleanup(context,directory){
     const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
     startingPids=await eventually(async()=>{const actual=[...await serverPids()].filter(pid=>!before.has(pid));return actual.length?actual:false;},'Restart spawns its real owned Julia server');
     await settings.update('plutoProject','perf/changed-pluto-environment',context.vscode.ConfigurationTarget.WorkspaceFolder);
-    await eventually(async()=>/environment changed|Start the action again/.test(await parent.locator('[role="status"]').innerText()),'Restart reports a changed environment after starting',240000);
+    await eventually(async()=>/environment changed|Start the action again/.test(await (await context.findFrame('#pluto-restart')).locator('[role="status"]').innerText()),'Restart reports a changed environment after starting',240000);
     await eventually(async()=>{const pids=await serverPids();return startingPids.every(pid=>!pids.has(pid));},'Every server from the failed Restart exits',90000);
-    assert.equal(await parent.locator('iframe').count(),0);
+    assert.equal(await (await context.findFrame('#pluto-restart')).locator('iframe').count(),0);
   }finally{await settings.update('plutoProject',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);}
   const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
   state=await view(context);await idle(state.frame);
@@ -164,7 +165,7 @@ async function investigation(context, directory) {
   const reportRoot = path.join(context.workspace, 'perf', 'results', 'notebook');
   const before = await fingerprint(reportRoot);
   let state = await create(context, file, 'investigation');
-  assert.equal(await state.frame.locator('pluto-cell').count(), 63, 'The actual official investigation dashboard is loaded');
+  await eventually(async()=>await state.frame.locator('pluto-cell').count()===63,'The actual official investigation dashboard is loaded');
   for (const name of ['Launch selected action', 'Cancel active investigation', 'Refresh status and evidence',
     'Execute selected setup action', 'Cancel advisor setup', 'Refresh advisor setup / model inventory', 'Compare saved measurements']) {
     assert(await state.frame.getByRole('button', {name, exact: true}).isVisible(), `Real Pluto control: ${name}`);

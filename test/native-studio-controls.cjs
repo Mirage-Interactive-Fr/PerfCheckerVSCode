@@ -495,8 +495,17 @@ async function testLargePlanAndOrdering(context) {
     await view.locator('#sort').selectOption('suite');
     const before=await savedConfiguration(context,view);
     const first=before.config.selection.run_ids[0];
-    await view.locator('#cards .card').first().dragTo(view.locator('#cards .card').nth(2));
+    // Start on the workload title rather than a checkbox/color input in the card's
+    // center. Retain observed native drag events to distinguish routing from order.
+    await view.locator('#cards').evaluate(element=>{
+      element.nativeDragEvents=[];
+      for(const type of ['dragstart','dragover','drop'])element.addEventListener(type,event=>{
+        if(element.nativeDragEvents.length<20)element.nativeDragEvents.push({type,id:event.target.closest('.card')?.dataset.id,data:event.dataTransfer?.getData('text/plain')});
+      });
+    });
+    await view.locator('#cards .card').first().locator('.feature-heading strong').dragTo(view.locator('#cards .card').nth(2).locator('.feature-heading strong'));
     const after=await savedConfiguration(context,view);
+    context.log('large-plan-native-drag-observation',{events:await view.locator('#cards').evaluate(element=>element.nativeDragEvents),before:before.config.selection.run_ids.slice(0,4),after:after.config.selection.run_ids.slice(0,4)});
     assert.notEqual(after.config.selection.run_ids[0],first,'Native drag changes the persisted execution order');
     assert.deepEqual(new Set(after.config.selection.run_ids),new Set(before.config.selection.run_ids));
     await view.locator('#search').fill('workload_125');

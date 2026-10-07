@@ -90,8 +90,9 @@ exports.run = async context => {
   try {
     for (const [key, value] of Object.entries(values)) await settings().update(key, value, vscode.ConfigurationTarget.WorkspaceFolder);
     const configuredPath=settings().get('advisorConfig','perf/advisor.json');
-    const configuredFile=path.resolve(workspace,configuredPath);
-    const savedConfig=await fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
+    const configuredFile=typeof configuredPath==='string'&&configuredPath.trim()?path.resolve(workspace,configuredPath):undefined;
+    const readSavedConfiguration=()=>configuredFile?fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;}):Promise.resolve(undefined);
+    const savedConfig=await readSavedConfiguration();
     await clickStudioAction(context,'chat');
     let view = await findFrame('#chat-root');
     await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click();
@@ -101,8 +102,8 @@ exports.run = async context => {
     assert.deepEqual(await vscode.commands.executeCommand('perfchecker.disconnectCodex'),{connected:false});
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
     assert.equal(settings().get('advisorConfig','perf/advisor.json'),configuredPath);
-    assert.deepEqual(await fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;}),savedConfig,'The failed temporary CLI connection and explicit disconnect preserve the saved provider bytes');
-    proof('codex-disconnected-command',{command:'perfchecker.disconnectCodex',returnValueVerified:true,alreadyDisconnected:true,savedConfigurationPreserved:true,activeAuthenticatedDisconnection:false});
+    assert.deepEqual(await readSavedConfiguration(),savedConfig,'The failed temporary CLI connection and explicit disconnect preserve the saved provider bytes');
+    proof('codex-disconnected-command',{command:'perfchecker.disconnectCodex',returnValueVerified:true,alreadyDisconnected:true,savedConfigurationPreserved:true,optionalConfigurationPath:configuredPath,directoryRead:false,activeAuthenticatedDisconnection:false});
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
     const send = async (question, count) => {
       await view.locator('#chat-question').fill(question);
