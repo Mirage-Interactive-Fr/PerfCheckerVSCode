@@ -81,7 +81,7 @@ function buttonCoverage(checks){
     'Pluto · Launch selected checks / Refresh / Save reports':['pluto-suite-select-launch-save'],
     'Pluto · Launch selected investigation / Refresh':['pluto-investigation-real-run'],
     'Pluto · Cancel investigation':['pluto-cancel-active-worker'],
-    'Pluto · Cancel suite twice during cleanup':['pluto-suite-cancel-active-allocation'],
+    'Pluto · Cancel active suite / repeat Cancel / owned allocation cleanup':['pluto-suite-cancel-active-allocation'],
     'Pluto · Stop / Close active workers and owned .mem cleanup':['pluto-stop-active-owned-worker','pluto-close-active-allocation-worker'],
     'Pluto · homepage Shutdown / real confirmation':['pluto-home-shutdown-active-allocation'],
     'Pluto · failed Restart leaves no stale worker':['pluto-failed-restart-real-worker-cleanup'],

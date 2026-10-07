@@ -33,7 +33,7 @@ async function execute(executable, args, options = {}) {
     child.stdout?.on('data', chunk => {text += chunk; process.stdout.write(chunk);});
     child.stderr?.on('data', chunk => {text += chunk; process.stderr.write(chunk);});
     child.once('error', reject);
-    child.once('close', code => code === 0 ? resolve(text) : reject(new Error(`${path.basename(executable)} exited ${code}\n${text.slice(-5000)}`)));
+    child.once('close', code => code === 0 ? resolve(text) : reject(Object.assign(new Error(`${path.basename(executable)} exited ${code}\n${text.slice(-5000)}`), {commandOutput: text, exitCode: code})));
   });
 }
 
@@ -42,15 +42,17 @@ try {
   assertCI();
   if(stage==='core-external'){
     if(coreMode!=='candidate')throw new Error('The focused Core regression requires an immutable candidate commit/tree.');
-    const record={stage,scope:'Core-only; no VS Code/Electron or VSIX installation',core:coreProvenance,platform:process.platform,arch:process.arch,
+    const runtime=JSON.parse((await execute(julia,['--startup-file=no','-e','print("{\\\"executable\\\":", repr(joinpath(Sys.BINDIR, Base.julia_exename())), ",\\\"version\\\":", repr(string(VERSION)), "}")'])).trim());
+    const record={stage,scope:'Core-only; no VS Code/Electron or VSIX installation',core:coreProvenance,runtime,platform:process.platform,arch:process.arch,
       testItem:'External providers stop their owned process tree before returning',startedAt:new Date().toISOString()};
     const result=path.join(output,'core-external-result.json');
     try{
       const project=path.join(session,'core-external-controller');
       const isolated={env:{...process.env,JULIA_LOAD_PATH:process.platform==='win32'?'@;@stdlib':'@:@stdlib'}};
-      await execute(julia,['--startup-file=no','-e',`using Pkg;Pkg.activate(ARGS[1]);${installCore};Pkg.add(PackageSpec(name="TestItemRunner",version="1.3.2"));using PerfChecker,TestItemRunner;@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[3];println("CORE_ONLY_PROVENANCE ",Base.pkgversion(PerfChecker)," TREE=",ARGS[3]," SOURCE=",pathof(PerfChecker));TestItemRunner.run_tests(pkgdir(PerfChecker);filter=ti->ti.name=="External providers stop their owned process tree before returning")`,project,coreCommit,coreTree,expectedCoreVersion],isolated);
+      const workerOutput=await execute(julia,['--startup-file=no','-e',`using Pkg;Pkg.activate(ARGS[1]);${installCore};Pkg.add(PackageSpec(name="TestItemRunner",version="1.3.2"));using PerfChecker,TestItemRunner;@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[3];println("CORE_ONLY_PROVENANCE ",Base.pkgversion(PerfChecker)," TREE=",ARGS[3]," SOURCE=",pathof(PerfChecker));TestItemRunner.run_tests(pkgdir(PerfChecker);filter=ti->ti.name=="External providers stop their owned process tree before returning")`,project,coreCommit,coreTree,expectedCoreVersion],isolated);
+      await fs.writeFile(path.join(output,'core-external-worker.log'),workerOutput);
       await fs.writeFile(result,JSON.stringify({...record,status:'passed',finishedAt:new Date().toISOString()},null,2));
-    }catch(error){await fs.writeFile(result,JSON.stringify({...record,status:'failed',error:String(error),finishedAt:new Date().toISOString()},null,2));throw error;}
+    }catch(error){if(error.commandOutput)await fs.writeFile(path.join(output,'core-external-worker.log'),error.commandOutput);await fs.writeFile(result,JSON.stringify({...record,status:'failed',error:String(error),finishedAt:new Date().toISOString()},null,2));throw error;}
   }else{
   const runtime = JSON.parse((await execute(julia, ['--startup-file=no', '-e',
     'print("{\\\"executable\\\":", repr(joinpath(Sys.BINDIR, Base.julia_exename())), ",\\\"version\\\":", repr(string(VERSION)), "}")'])).trim());
