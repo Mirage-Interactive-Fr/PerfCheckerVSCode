@@ -9,14 +9,14 @@ on:
         options: [public, candidate]
         default: candidate
       stage:
-        description: First-install and Save regression, or the complete native campaign
+        description: Smoke, full, focused reload/narrative, or Core-only external-process regression
         type: choice
-        options: [smoke, full]
+        options: [smoke, full, targeted, core-external]
         default: full
       scope:
-        description: All supported hosts, or the two Linux hosts for a focused rerun
+        description: All supported hosts, or an explicit focused platform
         type: choice
-        options: [all, linux, linux-stable]
+        options: [all, linux, linux-stable, windows-stable]
         default: all
       core:
         description: Registered minimum, or the explicitly pinned Core fix before registration
@@ -103,7 +103,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:

@@ -268,13 +268,24 @@ async function ownedWorkerClose(context,directory){
   await fs.writeFile(preserved,sentinel);
   await fs.writeFile(catalog,'schema_version="perfchecker-scenario-catalog/1"\nroot=".."\n[[scenarios]]\nid="owned_worker"\nimplementation="stop-before-server-close"\nsource="cases.jl"\nfactory="make_owned_cancel_case"\ncollectors=["benchmark"]\n[scenarios.parameters]\nmarker='+JSON.stringify(marker)+'\ncleaned='+JSON.stringify(cleaned)+'\n');
   const beforeMem=new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem')));
+  const allocationOwned=async info=>{
+    const environment=info[1],privateCheck=path.dirname(environment),pid=Number(info[0]);
+    assert(path.basename(privateCheck).startsWith('perfchecker-check-'),'The measured allocation runs in a real Core-owned private environment');
+    assert(await fs.stat(path.join(environment,'owned.tmp')));
+    const journal=await fs.readFile(path.join(privateCheck,'allocation-artifacts'));
+    assert(journal.includes(Buffer.from(`.${pid}.mem`)),'The physical allocation journal identifies this measured worker');
+    return privateCheck;
+  };
   const assertStopped=async(state,pid,owned,cleanup,closePanel,action)=>{
     const alive=()=>{try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
     assert(alive(),'The measured process must really be alive before Stop/Close');
     const start=Date.now();if(action)await action();else await stop(context,state,closePanel);
     await eventually(()=>!alive(),'The detached measurement worker terminates before the 120-second workload could finish',45000);
     await eventually(async()=>!await fs.stat(owned).then(()=>true).catch(()=>false),'The worker cleanup removes its owned temporary directory',45000);
-    assert.equal(await fs.readFile(cleanup,'utf8'),'cleaned');
+    // ScenarioFactory cleanup callbacks are contractual. Allocation collectors
+    // instead clean their private environment and allocation journal; they do
+    // not promise to invoke a user perf_cleanup(state) callback.
+    if(cleanup)assert.equal(await fs.readFile(cleanup,'utf8'),'cleaned');
     assert(Date.now()-start<90000,'Cleanup is cooperative rather than waiting for the complete workload');
     assert.deepEqual(await fs.readFile(preserved),sentinel,'Existing .mem evidence is never removed');
     assert.deepEqual(new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem'))),beforeMem,'Only allocation files created by the session are cleaned');
@@ -293,36 +304,39 @@ async function ownedWorkerClose(context,directory){
     context.proof('pluto-stop-active-owned-worker',{kind:'InvestigationJob',cleanupMilliseconds:elapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,environmentChangedWhileRunning:true});
 
     await settings.update('suite','perf/owned-suite.jl',context.vscode.ConfigurationTarget.WorkspaceFolder);
-    const suiteMarker=path.join(context.workspace,'perf','owned-suite-worker.marker'),suiteCleaned=path.join(context.workspace,'perf','owned-suite-cleaned.marker'),suiteCleaning=path.join(context.workspace,'perf','owned-suite-cleaning.marker');
-    for(const file of [suiteMarker,suiteCleaned,suiteCleaning])await fs.rm(file,{force:true});
+    const suiteMarker=path.join(context.workspace,'perf','owned-suite-worker.marker');
+    await fs.rm(suiteMarker,{force:true});
     state=await create(context,path.join(directory,'CancelActiveAllocation.jl'),'suite');
     await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
     await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
     const cancelInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Suite Cancel test reaches its active allocation worker',360000);
+    const cancelOwned=await allocationOwned(cancelInfo);
     await state.frame.getByRole('button',{name:'Cancel active job',exact:true}).click();
-    await eventually(async()=>await fs.readFile(suiteCleaning,'utf8')==='cleaning','The first native Cancel reaches the real worker cleanup',90000);
+    let workerAliveBeforeSecondClick;
+    try{process.kill(Number(cancelInfo[0]),0);workerAliveBeforeSecondClick=true;}catch(error){if(error.code!=='ESRCH')throw error;workerAliveBeforeSecondClick=false;}
     await state.frame.getByRole('button',{name:'Cancel active job',exact:true}).click();
     await refresh(state.frame,'Refresh status','[data-suite-state]',/\bcancelled\b/,90000);
     await eventually(()=>{try{process.kill(Number(cancelInfo[0]),0);return false;}catch(error){if(error.code==='ESRCH')return true;throw error;}},'The actual Suite Cancel button terminates the detached allocation worker');
-    assert.equal(await fs.readFile(suiteCleaned,'utf8'),'cleaned');
-    assert.equal(await fs.stat(cancelInfo[1]).then(()=>true).catch(()=>false),false);
+    await eventually(()=>fs.stat(cancelOwned).then(()=>false).catch(error=>{if(error.code==='ENOENT')return true;throw error;}),'Suite Cancel cleans the actual private allocation environment and its journal',45000);
     assert.deepEqual(await fs.readFile(preserved),sentinel);
     assert.deepEqual(new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem'))),beforeMem);
     await stop(context,state,true);
-    context.proof('pluto-suite-cancel-active-allocation',{nativeClick:true,secondNativeCancelDuringCleanup:true,workerTerminated:true,ownedDirectoryRemoved:true,noNewMem:true,preExistingMemPreserved:true});
-    for(const file of [suiteMarker,suiteCleaned,suiteCleaning])await fs.rm(file,{force:true});
+    context.proof('pluto-suite-cancel-active-allocation',{nativeClick:true,nativeCancelClicks:2,workerAliveBeforeSecondClick,secondNativeCancelDuringCleanup:'not-observed; the Core regression separately forces cancellation during cleanup',workerTerminated:true,ownedDirectoryRemoved:true,noNewMem:true,preExistingMemPreserved:true});
+    await fs.rm(suiteMarker,{force:true});
     state=await create(context,path.join(directory,'CloseActiveAllocation.jl'),'suite');
     await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
     await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
     const suiteInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The allocation worker reaches its real PID marker',360000);
-    const suiteElapsed=await assertStopped(state,Number(suiteInfo[0]),suiteInfo[1],suiteCleaned,true);
+    const suiteOwned=await allocationOwned(suiteInfo);
+    const suiteElapsed=await assertStopped(state,Number(suiteInfo[0]),suiteOwned,undefined,true);
     context.proof('pluto-close-active-allocation-worker',{kind:'SuiteJob',cleanupMilliseconds:suiteElapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,noNewMem:true});
 
-    for(const file of [suiteMarker,suiteCleaned,suiteCleaning])await fs.rm(file,{force:true});
+    await fs.rm(suiteMarker,{force:true});
     state=await create(context,path.join(directory,'ShutdownActiveAllocation.jl'),'suite');
     await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
     await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
     const shutdownInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Pluto homepage Shutdown test reaches its active allocation worker',360000);
+    const shutdownOwned=await allocationOwned(shutdownInfo);
     const page=state.frame.page();let confirmed=false;
     const confirm=async dialog=>{
       if(dialog.type()==='confirm' && /shut down|close.*notebook/i.test(dialog.message())){confirmed=true;await dialog.accept();}
@@ -331,7 +345,7 @@ async function ownedWorkerClose(context,directory){
     page.on('dialog',confirm);
     let shutdownElapsed;
     try{
-      shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownInfo[1],suiteCleaned,false,async()=>{
+      shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownOwned,undefined,false,async()=>{
         await state.frame.locator('img#logo-big').locator('..').click();
         await eventually(()=>new URL(state.frame.url()).pathname==='/'&&state.frame.locator('#recent').isVisible(),'The real Pluto logo opens its authenticated homepage');
         const running=state.frame.locator('#recent li.running').filter({hasText:'ShutdownActiveAllocation.jl'});

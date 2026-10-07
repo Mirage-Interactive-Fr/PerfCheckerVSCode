@@ -17,7 +17,7 @@ function commandCoverage(commands,checks){
   const effects={
     discoverTestItems:['testitem-current-evidence'],configureAdvisor:['advisor-native-model-management','advisor-native-provider-and-tool-discovery'],catalogTools:['native-tool-catalogue'],
     syncScenarios:['native-discovery-and-sync-after-pluto','investigation-sync-tools-history-native-exports'],
-    narrateAdvice:['investigation-saved-advice-and-disabled-model'],investigateScenarios:['investigation-real-bounded-work'],
+    narrateAdvice:['investigation-saved-advice-and-disabled-model','native-narrative-controlled-response','native-narrative-cancel-active-http'],investigateScenarios:['investigation-real-bounded-work'],
     openInvestigations:['investigation-discovery-selection-source-draft'],discoverScenarios:['investigation-discovery-selection-source-draft'],
     measureScenarios:['investigation-real-measurement'],diagnoseScenarios:['investigation-analyzer-jet','investigation-analyzer-alloccheck'],
     adviseScenarios:['investigation-saved-advice-and-disabled-model'],compareScenarios:['investigation-real-baseline-candidate'],
@@ -34,11 +34,13 @@ function commandCoverage(commands,checks){
   };
   return commands.map(command=>{
     const name=command.replace(/^perfchecker\./,''),proof=checks.filter(check=>check.assertionsCompleted===true&&(effects[name]||[]).includes(check.name));
-    const externalPrerequisite=['narrateAdvice','connectCodex','runLandscapeLiveForWorkspace'].includes(name);
+    const narrativeEnabled=proof.some(check=>check.name==='native-narrative-controlled-response');
+    const externalPrerequisite=['connectCodex','runLandscapeLiveForWorkspace'].includes(name)||name==='narrateAdvice'&&!narrativeEnabled;
     const prerequisite=externalPrerequisite||(proof.length>0&&proof.every(check=>['prerequisite','unavailable'].includes(check.status)));
     return {command,registered:true,status:proof.length?(prerequisite?'prerequisite-verified':'effect-verified'):'unverified',evidence:proof.map(check=>({name:check.name,outcome:check.status||'validated-effect',case:check.case,prerequisite:check.prerequisite})),
       ...(prerequisite?{limit:name==='narrateAdvice'?'No configured narrative model; enabled model execution is not qualified.':name==='connectCodex'?'No human Codex authentication in CI; authenticated CLI/General integration is covered by the separate local opt-in test.':name==='runLandscapeLiveForWorkspace'?'No physical Étendue/GPU renderer in this disposable package; only its explicit prerequisites are verified.':'Only explicit prerequisites were validated; this execution was unavailable.'}:{}),
       ...(name==='disconnectCodex'?{limit:'The native test verifies the explicit disconnected return state and preserved saved configuration after a failed temporary connection. An active authenticated CLI disconnect is covered separately by the local opt-in test.'}:{}),
+      ...(name==='narrateAdvice'&&narrativeEnabled?{limit:'The actual native button, Core worker and request/response contract use a clearly identified local protocol fixture. This is not evidence of authenticated model inference.'}:{}),
       route:'Evidence records actual palette/API or webview backend effects; registration alone is never execution proof.'};
   });
 }
@@ -72,6 +74,9 @@ function buttonCoverage(checks){
     'Investigation · before/after saved measurements':['investigation-real-baseline-candidate'],
     'Investigation · bounded work / limits':['investigation-real-bounded-work'],
     'Investigation · active worker cancellation':['investigation-cancel-active-julia-worker'],
+    'Investigation · Explain with configured model / HTTP contract':['native-narrative-controlled-response'],
+    'Investigation · Cancel active explanation / connection cleanup':['native-narrative-cancel-active-http'],
+    'Workspace · actual extension-host reload / owned allocation cleanup':['native-reload-owned-allocation-cleanup'],
     'Pluto · reactive edit / evaluate / autosave / reload':['pluto-reactive-save-reload-close'],
     'Pluto · Launch selected checks / Refresh / Save reports':['pluto-suite-select-launch-save'],
     'Pluto · Launch selected investigation / Refresh':['pluto-investigation-real-run'],
@@ -165,7 +170,7 @@ exports.run = async () => {
     {videoOffsetSeconds:(Date.now()-Date.parse(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT))/1000}:{})});
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,platform:process.platform,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
-      coverage:process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
+      coverage:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1',available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
       commands:commandCoverage(commands,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);
     pendingReport=pendingReport.then(()=>fs.writeFile(path.join(output,`${phase}.json`),report));
@@ -251,7 +256,15 @@ exports.run = async () => {
       core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION};
     log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 
-    if (phase === 'fresh') {
+    if(phase==='narrative'){
+      const settings=vscode.workspace.getConfiguration('perfchecker',uri);
+      for(const [key,value] of Object.entries({juliaExecutable:process.env.PERFCHECKER_NATIVE_JULIA,runnerProject:context.controller,scenarioProject:context.controller,
+        suite:'perf/suite.jl',profile:'quick',reports:'perf/results/vscode',advisorEnabled:false,scenarioSamples:2,analysisTools:[]}))
+        await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
+      await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
+    }else if(phase==='reload'){
+      await runCase('native-single-folder-reload',()=>require('./native-reload-host.cjs').run(context));
+    }else if (phase === 'fresh') {
       assert(!vscode.extensions.getExtension('julialang.language-julia'));
       assert(!vscode.extensions.getExtension('ms-toolsai.jupyter'));
       await runCase('first-open-studio', () => controls.runFresh(context));
@@ -404,6 +417,7 @@ exports.run = async () => {
           await runCase('native-all-studio-controls', () => controls.run(context));
           await runCase('native-workbench-controls',()=>workbench.run(context));
           await runCase('native-investigation-controls', () => investigations.run(context));
+          await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
           await runCase('native-advisor-controls', () => advisor.run(context));
           await runCase('native-mcp-controls', () => mcp.run(context));
           if(process.env.PERFCHECKER_NATIVE_MODE==='candidate')await runCase('native-pluto-controls',()=>pluto.run(context));

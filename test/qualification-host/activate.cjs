@@ -16,7 +16,10 @@ exports.activate = async () => {
   await fs.writeFile(path.join(output,`${phase}-bootstrap.json`),JSON.stringify({phase,invocation,pid:process.pid,status:'activated',vscode:vscode.version}));
   let error;
   try {
-    if(previous.some(item=>item.invocation===invocation))throw new Error('The disposable extension host restarted during this campaign. Earlier evidence was preserved; the harness will not rerun actions against partially mutated fixtures. Inspect retained host logs.');
+    if(previous.some(item=>item.invocation===invocation)){
+      if(phase==='reload')await require('../native-reload-host.cjs').validateHandoff(previous);
+      else throw new Error('The disposable extension host restarted during this campaign. Earlier evidence was preserved; the harness will not rerun actions against partially mutated fixtures. Inspect retained host logs.');
+    }
     await require('../public-vsix-host.cjs').run();
   }
   catch (failure) {error=String(failure);console.error(`NATIVE_HOST_FAILED ${phase}: ${error}`);}
