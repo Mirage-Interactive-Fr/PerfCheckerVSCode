@@ -2,6 +2,14 @@ import {ChildProcess, spawn} from 'node:child_process';
 
 export const CANCEL_REQUEST = 'PERFCHECKER_CANCEL/1';
 export const CANCELLATION_GRACE_MS = 60_000;
+const controllers = new Map<ChildProcess, {request: () => void; finished: Promise<void>}>();
+
+/** Deactivation waits for the same cooperative cleanup used by the Cancel buttons. */
+export async function shutdownControllerProcesses(): Promise<void> {
+  const active = [...controllers.values()];
+  for (const controller of active) controller.request();
+  await Promise.allSettled(active.map(controller => controller.finished));
+}
 
 /** The stdin reader runs in the controller, so cancellation unwinds its finally blocks. */
 export function cancellableJulia(code: string): string {
@@ -57,7 +65,7 @@ export function controllerCancellation(child: ChildProcess, notice: (message: st
   child.stdin?.on('error', error => {
     if (requested && alive()) notice(`Cancellation input unavailable: ${error.message}. Waiting before forced stop.`);
   });
-  return {
+  const cancellation = {
     get forced() {return forced;}, dispose,
     request() {
       if (requested || !alive()) return;
@@ -70,4 +78,8 @@ export function controllerCancellation(child: ChildProcess, notice: (message: st
       timer = setTimeout(force, graceMs);
     },
   };
+  const finished = new Promise<void>(resolve => {child.once('close', () => resolve());child.once('error', () => resolve());});
+  controllers.set(child, {request:cancellation.request, finished});
+  void finished.then(() => controllers.delete(child));
+  return cancellation;
 }

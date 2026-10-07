@@ -29,7 +29,7 @@ test('real webviews preserve full selection, handle Git targets and render inter
   const plan={schema_version:'perfchecker-suite-plan/1',suite:'Example',description:'Performance explorer',profile:'quick',plan_revision:'fixture',runs};
   const vscode={EventEmitter:class{event=()=>disposable();fire(){}dispose(){}},Uri:{file:uri,joinPath:(value,...parts)=>uri(path.join(value.fsPath,...parts))},
     TestTag:class{constructor(id){this.id=id;}},TestRunProfileKind:{Run:1},ProgressLocation:{Window:1,Notification:2},ViewColumn:{One:1},
-    workspace:{isTrusted:true,workspaceFolders:[folder],getConfiguration:()=>({get:(key,fallback)=>({juliaExecutable:'julia',runnerProject:'perf',suite:'perf/suite.jl',
+    workspace:{onDidChangeWorkspaceFolders:()=>disposable(),isTrusted:true,workspaceFolders:[folder],getConfiguration:()=>({get:(key,fallback)=>({juliaExecutable:'julia',runnerProject:'perf',suite:'perf/suite.jl',
       factory:'build_suite',profile:'quick',reports:'perf/results/vscode',uiConfiguration:'perf/perfchecker-ui.json'})[key]??fallback,inspect:()=>undefined}),
       textDocuments:[],getWorkspaceFolder:()=>folder},
     window:{onDidCloseTerminal:()=>disposable(),onDidChangeActiveTextEditor:()=>disposable(),

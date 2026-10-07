@@ -10,8 +10,10 @@ import {registerInvestigations} from './investigation';
 import {registerNativeTestItems} from './testitems';
 import {registerStudio} from './studio';
 import {executeLiveProvider, prepareLiveProvider} from './live-provider';
-import {cancellableJulia, controllerCancellation} from './controllerCancellation';
+import {cancellableJulia, controllerCancellation, shutdownControllerProcesses} from './controllerCancellation';
 import {discoverGitReferences, resolveGitRevision} from './gitReferences';
+import {shutdownPlutoSessions} from './plutoNotebook';
+import {prepareWorkspaceController, shutdownWorkspaceSetup} from './workspaceSetup';
 import {shutdownCodexConnections} from './codexIntegration';
 import {currentWorkspaceFolder, resolveControllerProject, resolveWorkspaceFolder,
   selectWorkspaceFolder} from './workspace-root';
@@ -696,8 +698,11 @@ class Controller {
     } finally { run.end(); }
   }
 
-  async initialize(): Promise<void> {
-    const code = await this.invoke('init', [`--root=${this.root()}`]);
+  async initialize(requested?: vscode.Uri | vscode.WorkspaceFolder): Promise<void> {
+    this.selectWorkspace(requested);
+    if(!await prepareWorkspaceController(this.folder(),this.output))return;
+    const suiteExists=await fs.stat(this.absolute('suite')).then(stat=>stat.isFile()).catch(()=>false);
+    const code = suiteExists ? 0 : await this.invoke('init', [`--root=${this.root()}`]);
     if (code !== 0) throw new Error(`PerfChecker initialization failed with code ${code}.`);
     await this.refresh();
   }
@@ -1221,7 +1226,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const view = vscode.window.createTreeView('perfchecker.runs', {treeDataProvider: tree,
     dragAndDropController: tree, manageCheckboxStateManually: true, showCollapseAll: true});
   context.subscriptions.push(view, tests, vscode.commands.registerCommand('perfchecker.refresh', () => controller.refresh()),
-    vscode.commands.registerCommand('perfchecker.initialize', () => controller.initialize()),
+    vscode.commands.registerCommand('perfchecker.initialize', requested => controller.initialize(requested)),
     vscode.commands.registerCommand('perfchecker.runAll', () => controller.runAll()),
     vscode.commands.registerCommand('perfchecker.runNode', (node?: PerfNode) => controller.run(node)),
     vscode.commands.registerCommand('perfchecker.openEntrypoint', (node: PerfNode) => controller.open(node)),
@@ -1243,4 +1248,6 @@ export function activate(context: vscode.ExtensionContext): void {
     }));
 }
 
-export async function deactivate(): Promise<void> {await shutdownCodexConnections();}
+export async function deactivate(): Promise<void> {
+  await Promise.all([shutdownCodexConnections(),shutdownPlutoSessions(),shutdownWorkspaceSetup(),shutdownControllerProcesses()]);
+}

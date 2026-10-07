@@ -51,8 +51,8 @@ test('native item controller preserves selection, exclusions, cancellation and t
     await commands.get('perfchecker.discoverTestItems')();
     assert.equal(controllers.length,1);
     assert.equal(controllers[0].id,`perfchecker.testitems.${folder.uri.toString()}`);
-    assert.equal(controllers[0].label,'PerfChecker — mesures · demo');
-    assert.equal(controllers[0].profileName,'PerfChecker — mesures');
+    assert.equal(controllers[0].label,'PerfChecker — measures · demo');
+    assert.equal(controllers[0].profileName,'PerfChecker — measures');
     assert.ok(calls[0].args.includes(`--project=${path.join(root,'perf','controller')}`));
     await commands.get('perfchecker.discoverTestItems')(folder.uri);
     assert.equal(calls.length,2);

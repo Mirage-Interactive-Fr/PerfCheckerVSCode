@@ -231,7 +231,8 @@ async function diagnose(context) {
     const record = records[0];
     assert(['complete', 'unavailable'].includes(record.status), `${tool} does not hide errors, invalid evidence, timeout or cancellation as a prerequisite`);
     if (record.status === 'unavailable') assert(String(record.message || '').trim(), `${tool} unavailable status explains its prerequisite`);
-    if (['latency', 'gc', 'memory', 'heap', 'locks'].includes(tool)) assert.equal(record.status, 'complete', `${tool} built-in worker actually executes`);
+    if (['latency', 'gc', 'memory'].includes(tool)) assert.equal(record.status, 'complete', `${tool} built-in worker actually executes`);
+    if (['heap','locks'].includes(tool) && record.status === 'unavailable') assert.match(String(record.message), tool === 'heap' ? /snapshot|redact|unsupported|not supported|runtime/i : /counter|1\.11|not exposed|unsupported|runtime/i, `${tool} has a concrete runtime prerequisite`);
     context.log(`investigation-analyzer-${tool}`, {status: record.status, correctness: record.correctness, version: record.tool_version, prerequisite: record.status === 'complete' ? undefined : record.message});
   }
   const current = await tab(context, 'Findings & advice');

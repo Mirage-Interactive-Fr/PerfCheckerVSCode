@@ -8,7 +8,7 @@ const studioActions = {
   suite: 'Feature suite', items: 'Existing Julia tests', testing: 'Test Explorer',
   results: 'Plots & results', investigations: 'Investigations', tools: 'Tool catalogue',
   chat: 'Talk to your agent', advisor: 'Connect an advisor', debug: 'Debug Julia code',
-  notebook: 'New investigation notebook', openNotebook: 'Open notebook',
+  notebook: 'New Pluto notebook', openNotebook: 'Open Pluto notebook',
   terminal: 'PerfChecker terminal', julia: 'Julia extension REPL', tasks: 'Project tasks',
 };
 const checkTypes = ['BenchmarkTools', 'Chairmarks', 'Line allocations', 'Allocation profile',
@@ -209,6 +209,7 @@ async function testGitTargetsAndComparisons(context) {
   const previousTargets = settings().inspect('gitTargets')?.workspaceFolderValue;
   const previousPolicies = settings().inspect('comparisonPolicies')?.workspaceFolderValue;
   try {
+    await view.locator('#target-package').selectOption('PerfCheckerNativeFixture');
     await eventually(async () => !(await view.locator('#target-reference').isDisabled()), 'Discover real local Git references');
     const groups = await view.locator('#target-reference optgroup').evaluateAll(items => items.map(item => item.label));
     assert(groups.includes('Branches') && groups.includes('Tags') && groups.includes('Recent commits'),
@@ -263,7 +264,7 @@ async function testGitTargetsAndComparisons(context) {
     assert.equal(policy.baselines.length, 1); assert.equal(policy.candidates.length, 1);
     await view.locator('#comparison-list .target').last().getByRole('button', {name: 'Remove comparison', exact: true}).click();
     await eventually(() => settings().get('comparisonPolicies', []).length === before, 'Remove comparison via actual button');
-    context.log('comparison-controls', {invalidEmpty: true, overlapRejected: true, aggregations: 4, addRemove: true});
+    context.log('comparison-controls', {invalidEmpty: true, overlapRejected: true, aggregationSelections: 4, aggregationsComputed: false, addRemove: true});
   } finally {
     await settings().update('gitTargets', previousTargets, context.vscode.ConfigurationTarget.WorkspaceFolder);
     await settings().update('comparisonPolicies', previousPolicies, context.vscode.ConfigurationTarget.WorkspaceFolder);

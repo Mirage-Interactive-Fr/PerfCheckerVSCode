@@ -198,12 +198,12 @@
       },
       {
         "command": "perfchecker.newNotebook",
-        "title": "PerfChecker: New investigation notebook",
+        "title": "PerfChecker: New Pluto notebook",
         "icon": "$(notebook)"
       },
       {
         "command": "perfchecker.openNotebook",
-        "title": "PerfChecker: Open Julia notebook",
+        "title": "PerfChecker: Open Pluto notebook",
         "icon": "$(notebook)"
       },
       {
@@ -235,6 +235,11 @@
         "command": "perfchecker.disconnectCodex",
         "title": "PerfChecker: Disconnect local Codex",
         "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "perfchecker.stopNotebookSession",
+        "title": "PerfChecker: Stop Pluto notebook sessions",
+        "icon": "$(debug-stop)"
       }
     ],
     "viewsContainers": {
@@ -714,6 +719,12 @@
           "default": "codex",
           "scope": "resource",
           "description": "Authenticated Codex CLI executable. Connect explicitly from Chat. Requires exec support for ephemeral, ignore-user-config, ignore-rules and sandbox flags; custom Codex configuration and profiles are not inherited."
+        },
+        "perfchecker.plutoProject": {
+          "type": "string",
+          "scope": "resource",
+          "default": "perf/pluto",
+          "description": "Separate Julia environment for interactive Pluto notebooks. Installation is explicit and uses Pluto 1.0.4 and the official PerfChecker Pluto companion. Keep it separate from an HTTP 2 MCP controller."
         }
       }
     }

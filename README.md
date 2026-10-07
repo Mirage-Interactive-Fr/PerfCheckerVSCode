@@ -15,11 +15,11 @@ The user guides are maintained with PerfChecker.jl on its existing documentation
 
 Set `perfchecker.runnerProject` to a Julia environment containing PerfChecker and
 TestItemRunner 1.3.2 or later in 1.x. Run **PerfChecker: Discover existing test items**,
-then select individual items in the **PerfChecker — mesures** Test Explorer controller.
+then select individual items in the **PerfChecker — measures** Test Explorer controller.
 The measurement controller is created only for the chosen folder when discovery is
 requested. In a multi-root workspace, the command prompts for a folder; companion
 extensions may pass an open folder URI directly to `perfchecker.discoverTestItems`.
-Its **PerfChecker — mesures** run profile measures items independently of the Julia
+Its **PerfChecker — measures** run profile measures items independently of the Julia
 extension's functional test controller; it does not intercept Julia test runs.
 Untagged items are shared, `:check_only` is measurement-only,
 `:perf_only` is its supported alias, and `:test_only` is functional-only. Shared

@@ -44,7 +44,7 @@ try {
   await fs.mkdir(path.join(workspace, 'src'), {recursive: true});
   await fs.mkdir(path.join(workspace, 'test'));
   await fs.writeFile(path.join(workspace, 'Project.toml'), 'name = "PerfCheckerNativeFixture"\nuuid = "6af56806-e0b1-4f34-88bf-fde69d8a8679"\nversion = "0.1.0"\n');
-  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nsum_squares(xs) = sum(xs .^ 2)\nend\n');
+  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nsum_squares(xs) = sum(xs .^ 2)\nwait_task(x) = (sleep(0.005); x)\nend\n');
   await fs.writeFile(path.join(workspace, 'test', 'performance.jl'), 'using TestItems\n@testitem "Vector reduction" tags=[:performance] begin\n data=collect(1:10_000)\n @test sum(data)==50_005_000\nend\n');
   const vsix = path.join(session, 'perfchecker.vsix');
   if (mode === 'public') {
@@ -63,7 +63,7 @@ try {
       extensionDevelopmentPath: path.join(repository, 'test', 'qualification-host'),
       extensionTestsPath: path.join(repository, 'test', 'public-vsix-host.cjs'),
       launchArgs: [workspace, ...cliProfile, '--new-window', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', '--disable-gpu', '--remote-debugging-port=9222'],
-      extensionTestsEnv: {PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_OUTPUT: output,
+      extensionTestsEnv: {PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: profile,
         PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         PERFCHECKER_NATIVE_MODE: mode, PERFCHECKER_NATIVE_SHA: sha,
@@ -77,11 +77,33 @@ try {
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="1.0.0")); Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]); using PerfChecker; @assert Base.pkgversion(PerfChecker)==v"1.0.0"; println("REGISTERED_CORE=", Base.pkgversion(PerfChecker), " SOURCE=", pathof(PerfChecker))', controller]);
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(["BenchmarkTools","Chairmarks","TestItems"]); Pkg.activate(ARGS[2]); Pkg.add("TestItems")', target, workspace]);
   await fs.mkdir(path.join(workspace, 'perf'), {recursive: true});
+  // Fresh first-use evidence belongs to the starter; the prepared campaign uses its own reports.
+  await fs.rm(path.join(workspace,'perf','results'),{recursive:true,force:true});
+  await fs.rm(path.join(workspace,'perf','perfchecker-ui.json'),{force:true});
   await fs.writeFile(path.join(workspace, 'perf', 'sum.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs) = perf_workload(xs) == 333833500.0\n');
-  await fs.writeFile(path.join(workspace, 'perf', 'wait.jl'), 'perf_setup() = 42\nperf_workload(x) = (sleep(0.001); x)\nperf_oracle(x) = perf_workload(x) == 42\n');
+  await fs.writeFile(path.join(workspace, 'perf', 'wait.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = 42\nperf_workload(x) = PerfCheckerNativeFixture.wait_task(x)\nperf_oracle(x) = perf_workload(x) == 42\n');
   await fs.writeFile(path.join(workspace, 'perf', 'cases.jl'), 'make_sum_case(p) = (prepare=()->collect(1.0:1000.0), operation=xs->sum(xs.^2), verify=(xs,result)->result==333833500.0)\nmake_wait_case(p) = (prepare=()->42, operation=x->(sleep(0.005);x), verify=(x,result)->result==42)\nmake_cancel_case(p) = (prepare=()->42, operation=x->(write(p["marker"],"running");sleep(30);x), verify=(x,result)->result==42)\n');
   await fs.writeFile(path.join(workspace, 'perf', 'scenarios.toml'), 'schema_version = "perfchecker-scenario-catalog/1"\nroot = "."\n[[scenarios]]\nid = "sum_squares"\nimplementation = "allocating"\nsource = "cases.jl"\nfactory = "make_sum_case"\ncollectors = ["benchmark", "chairmark", "profile", "profile_alloc"]\n[[scenarios]]\nid = "wait_task"\nimplementation = "waiting"\nsource = "cases.jl"\nfactory = "make_wait_case"\ncollectors = ["benchmark"]\n');
   await fs.writeFile(path.join(workspace, 'perf', 'example.jl'), 'using Example\nperf_setup() = "PerfChecker"\nperf_workload(name) = Example.hello(name)\nperf_oracle(name,result) = occursin(name,result)\n');
+  await fs.writeFile(path.join(workspace,'perf','network.jl'), `using Sockets
+perf_setup() = collect(UInt8(0):UInt8(127))
+function perf_workload(payload)
+ server=listen(ip"127.0.0.1",0); port=getsockname(server)[2]
+ task=@async begin
+  peer=accept(server)
+  try; data=read(peer,length(payload));write(peer,data);flush(peer);finally;close(peer);end
+ end
+ client=connect(ip"127.0.0.1",port)
+ try
+  write(client,payload);flush(client);returned=read(client,length(payload));wait(task)
+  @assert returned==payload
+  (bytes_sent=length(payload),bytes_received=length(returned),operations=1)
+ finally;close(client);close(server);end
+end
+perf_oracle(payload,result) = result.bytes_sent==128 && result.bytes_received==128 && result.operations==1
+`);
+  const capabilities=JSON.parse((await execute(julia,['--startup-file=no',`--project=${controller}`,'-e','using PerfChecker; PerfChecker.JSON.print(stdout,Dict("interface"=>network_interface_capabilities(),"isolated"=>network_isolation_capabilities(probe=true)),2)'])).trim());
+  await fs.writeFile(path.join(output,'network-capabilities.json'),JSON.stringify(capabilities,null,2));
   await execute('git', ['init'], {cwd: workspace});
   await execute('git', ['config', 'user.name', 'PerfChecker native fixture'], {cwd: workspace});
   await execute('git', ['config', 'user.email', 'fixture@example.invalid'], {cwd: workspace});
@@ -91,12 +113,30 @@ try {
   await execute('git', ['tag', 'v0.1.0'], {cwd: workspace});
   await execute('git', ['branch', 'native-baseline'], {cwd: workspace});
   const baseline = (await execute('git', ['rev-parse', 'HEAD'], {cwd: workspace})).trim();
-  await fs.writeFile(path.join(workspace, 'perf', 'suite.jl'), `using PerfChecker\nfunction build_suite()\n features=FeatureSpec[]\n for (workload,file) in [(:sum_squares,"sum.jl"),(:wait_task,"wait.jl")], backend in [:benchmark,:chairmark,:profile,:wall_profile,:profile_alloc,:alloc,:network,:network_interface,:network_isolated]\n  supported = backend in [:benchmark,:chairmark,:profile,:wall_profile,:profile_alloc,:alloc]\n  options=Dict{Symbol,Any}(:samples=>3,:seconds=>0.03,:evals=>1,:repeat=>false,:targets=>["PerfCheckerNativeFixture"])\n  push!(features,FeatureSpec(Symbol(workload,"_",backend);workload,backend,entrypoint=joinpath(@__DIR__,file),until=supported ? nothing : v"0.0.0",options,oracle=OracleSpec()))\n end\n package=PackageSuite("PerfCheckerNativeFixture";source=dirname(@__DIR__),worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=VersionNumber[],features,candidates=[SuiteCandidate("baseline",${JSON.stringify(baseline)};source=dirname(@__DIR__),compatibility_version=v"0.1.0")])\n SoftwareSuite(:native_fixture,[package])\nend\n`);
+  await fs.writeFile(path.join(workspace,'perf','suite.jl'),`using PerfChecker
+function build_suite()
+ features=FeatureSpec[]
+ for (workload,file) in [(:sum_squares,"sum.jl"),(:wait_task,"wait.jl")], backend in [:benchmark,:chairmark,:profile,:wall_profile,:profile_alloc,:alloc]
+  options=Dict{Symbol,Any}(:samples=>3,:seconds=>0.03,:evals=>1,:repeat=>false,:targets=>["PerfCheckerNativeFixture"],:profile_seconds=>0.15,:profile_delay=>0.0005,:profile_repetitions=>3,:sample_rate=>1.0)
+  push!(features,FeatureSpec(Symbol(workload,"_",backend);workload,backend,entrypoint=joinpath(@__DIR__,file),options,oracle=OracleSpec()))
+ end
+ for (backend,supported,reason) in [(:network,true,""),(:network_interface,${capabilities.interface.supported},${JSON.stringify(capabilities.interface.supported ? '' : 'Native interface counters unavailable on this operating system')}),(:network_isolated,${capabilities.isolated.supported},${JSON.stringify(capabilities.isolated.reason)})]
+  push!(features,FeatureSpec(Symbol("tcp_",backend);workload=:tcp_roundtrip,backend,description=reason,
+   entrypoint=joinpath(@__DIR__,"network.jl"),until=supported ? nothing : v"0.0.0",
+   options=Dict{Symbol,Any}(:repeat=>false,:network_repetitions=>2,:network_interface=>(Sys.islinux() ? "lo" : "auto")),oracle=OracleSpec()))
+ end
+ package=PackageSuite("PerfCheckerNativeFixture";source=dirname(@__DIR__),worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=VersionNumber[],features,candidates=[SuiteCandidate("baseline",${JSON.stringify(baseline)};source=dirname(@__DIR__),compatibility_version=v"0.1.0")])
+ example=PackageSuite("Example";worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=[v"0.5.3",v"0.5.5"],include_dev=false,features=[FeatureSpec(:hello;workload=:hello,backend=:benchmark,entrypoint=joinpath(@__DIR__,"example.jl"),options=Dict(:samples=>3,:seconds=>0.03,:evals=>1),oracle=OracleSpec())])
+ SoftwareSuite(:native_fixture,[package,example])
+end
+`);
   await fs.writeFile(path.join(workspace, 'perf', 'large-suite.jl'), 'using PerfChecker\nfunction build_suite()\n features=[FeatureSpec(Symbol("workload_",i);workload=Symbol("workload_",i),backend=:benchmark,entrypoint=joinpath(@__DIR__,"sum.jl")) for i in 1:125]\n SoftwareSuite(:large_native_fixture,[PackageSuite("PerfCheckerNativeFixture";source=dirname(@__DIR__),worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=VersionNumber[],features)])\nend\n');
-  await fs.mkdir(path.join(workspace, '.vscode'));
+  await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': julia, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
+  const plutoProject=path.join(workspace,'perf','pluto');
+  if(mode==='candidate')await execute(julia,['--startup-file=no','-e','using Pkg; Pkg.activate(ARGS[1]); Pkg.add(PackageSpec(name="PerfChecker",version="1.0.0")); Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";println("REGISTERED_PLUTO_CORE=",Base.pkgversion(PerfChecker)," PLUTO=",Base.pkgversion(Pluto))',plutoProject]);
   await launch('configured');
-  for (const extension of ['julialang.language-julia', 'ms-toolsai.jupyter']) {
+  for (const extension of mode==='public'?['julialang.language-julia','ms-toolsai.jupyter']:['julialang.language-julia']) {
     await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', extension], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   }
   await launch('prepared');

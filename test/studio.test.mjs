@@ -49,6 +49,8 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await writeFile(path.join(second.uri.fsPath,'perf','controller','Project.toml'),'name="Controller"\n');
     const original=Module._load;
     Module._load=function(name,...args){return name==='vscode'?vscode:original.call(this,name,...args);};
+    const plutoCalls=[];const PlutoNotebooks=class{create(folder,options){plutoCalls.push({action:'create',folder,options});return Promise.resolve(undefined);}open(folder){plutoCalls.push({action:'open',folder});}stopWorkspace(folder){plutoCalls.push({action:'stop',folder});}dispose(){}};
+    Module._load=function(name,...args){if(name==='./plutoNotebook')return{PlutoNotebooks};return name==='vscode'?vscode:original.call(this,name,...args);};
     let register;try{({registerStudio:register}=require('../dist/studio.js'));}finally{Module._load=original;}
     const context={subscriptions:[],extensionUri:uri(path.resolve('media','..'))};register(context);
     assert.equal(panels.length,0);assert.equal(terminals.length,0);assert.equal(notebooks.length,0);assert.equal(scopes.length,0);
@@ -66,10 +68,8 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await panels[0].send({type:'studioAction',action:'__proto__'});assert.equal(invocations.length,1);
     await panels[0].send({type:'studioAction',action:'julia'});assert.match(panels[0].messages.at(-1).message,/Julia VS Code extension/);
     await commands.get('perfchecker.newNotebook')(second.uri);
-    assert.equal(notebooks[0].type,'jupyter-notebook');assert.equal(notebooks[0].data.cells.length,8);
-    const code=notebooks[0].data.cells[1].value;
-    assert.match(code,/\\\$workspace/);assert.match(code,process.platform === 'win32' ? /'quotes'/ : /\\"quotes\\"/);assert.doesNotMatch(code,/instantiate|Pkg.add/);
-    assert.equal(notebooks[0].data.metadata.metadata.language_info.name,'julia');
+    assert.deepEqual(plutoCalls,[{action:'create',folder:second.uri,options:undefined}]);
+    assert.equal(notebooks.length,0,'The primary notebook route delegates to Pluto, without a Jupyter document');
     assert.deepEqual(await readdir(second.uri.fsPath),['perf']);
     const terminal=await commands.get('perfchecker.openTerminal')(second.uri);
     assert.equal(terminal.options.cwd,second.uri);
@@ -92,7 +92,7 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await assert.rejects(commands.get('perfchecker.debugFile')(second.uri),/Save the Julia/);
     await commands.get('perfchecker.openStudioForWorkspace')(first.uri);assert.equal(panels[0].disposed,true);
     assert.equal(panels.length,2);await panels[1].send({type:'studioReady'});assert.match(panels[1].messages.at(-1).problem,/Project.toml not found/);
-    assert.equal(terminals.length,2);assert.equal(notebooks.length,1);
+    assert.equal(terminals.length,2);assert.equal(notebooks.length,0);
     assert.ok(scopes.every(scope=>[first.uri.toString(),second.uri.toString()].includes(scope)));
     context.subscriptions.forEach(item=>item.dispose());
   }finally{await rm(temporary,{recursive:true,force:true});}

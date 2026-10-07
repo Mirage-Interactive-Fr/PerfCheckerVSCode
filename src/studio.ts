@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import {promises as fs} from 'node:fs';
 import * as path from 'node:path';
+import {PlutoNotebooks} from './plutoNotebook';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject, selectWorkspaceFolder} from './workspace-root';
 
 const actions: Record<string, string> = {
+  initialize:'perfchecker.initialize',
   suite: 'perfchecker.openDesigner', results: 'perfchecker.openOutput', investigations: 'perfchecker.openInvestigations',
   items: 'perfchecker.discoverTestItems', chat: 'perfchecker.openChat', advisor: 'perfchecker.configureAdvisor',
   terminal: 'perfchecker.openTerminal', notebook: 'perfchecker.newNotebook', openNotebook: 'perfchecker.openNotebook',
@@ -12,30 +14,14 @@ const actions: Record<string, string> = {
   tools: 'perfchecker.catalogTools', testing: 'workbench.view.testing'
 };
 
-export function investigationNotebook(root: string, project: string, catalog: string, target: string): vscode.NotebookData {
-  const julia = (value: string) => JSON.stringify(value).replaceAll('$', '\\$');
-  const cells = [
-    new vscode.NotebookCellData(vscode.NotebookCellKind.Markup,
-      '# PerfChecker · Investigation\n\nDiscover → measure → diagnose → verify. Execute each step explicitly. Select the **Julia** kernel. The first cell selects this workspace’s controller environment; it installs no packages.', 'markdown'),
-    new vscode.NotebookCellData(vscode.NotebookCellKind.Code, `using Pkg\nPkg.activate(${julia(project)})\nusing PerfChecker\nroot = ${julia(root)}\ntarget_project = ${julia(target)}`, 'julia'),
-    new vscode.NotebookCellData(vscode.NotebookCellKind.Markup, '## Discover\nSource discovery reads declarations without executing the target program. Proposed cases need a factory and correctness oracle before measurement.', 'markdown'),
-    new vscode.NotebookCellData(vscode.NotebookCellKind.Code, 'discovery = discover(root)\ndisplay(investigation_view(discovery))', 'julia'),
-    new vscode.NotebookCellData(vscode.NotebookCellKind.Markup, '## Measure\nThe catalogue must contain explicit scenarios. Measurements execute the target in isolated workers; select relevant scenarios and sample counts before running.', 'markdown'),
-    new vscode.NotebookCellData(vscode.NotebookCellKind.Code, `catalog = load_scenario_catalog(${julia(catalog)})\nbundles = run_scenarios(catalog; project=target_project, samples=10)\nforeach(display, bundles)`, 'julia'),
-    new vscode.NotebookCellData(vscode.NotebookCellKind.Markup, '## Diagnose and explain\nRequires JET in the target environment. Missing analyzers are reported as unavailable. Advice is a proposal; rerun correctness and compare saved before/after measurements after making changes.', 'markdown'),
-    new vscode.NotebookCellData(vscode.NotebookCellKind.Code, 'diagnosis = diagnose(catalog; project=target_project, tools=[:jet])\nadvice = advise(diagnosis)\ndisplay(investigation_view(advice))', 'julia')
-  ];
-  const data = new vscode.NotebookData(cells);
-  data.metadata = {metadata: {kernelspec: {display_name: 'Julia', language: 'julia', name: 'julia'}, language_info: {name: 'julia'}}};
-  return data;
-}
-
 class Studio implements vscode.Disposable {
+  private pluto: PlutoNotebooks;
   private panel?: vscode.WebviewPanel;
   private panelWorkspace?: string;
   private terminals = new Map<string, vscode.Terminal>();
   private lastJuliaSource = new Map<string, vscode.Uri>();
   constructor(private context: vscode.ExtensionContext) {
+    this.pluto = new PlutoNotebooks(context);
     const remember = (editor?: vscode.TextEditor) => {
       if (editor?.document.languageId !== 'julia' || editor.document.uri.scheme !== 'file') return;
       const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
@@ -76,7 +62,7 @@ class Studio implements vscode.Disposable {
         else if (message?.type === 'studioAction' && typeof message.action === 'string' && Object.hasOwn(actions, message.action)) {
           if (message.action === 'julia' && !vscode.workspace.isTrusted) throw new Error('Trust the workspace before starting Julia.');
           if (message.action === 'julia' && !vscode.extensions.getExtension('julialang.language-julia')) throw new Error('Install the Julia VS Code extension to use its REPL and debugger.');
-          await vscode.commands.executeCommand(actions[message.action], ...(['suite', 'items', 'terminal', 'notebook', 'openNotebook', 'debug'].includes(message.action) ? [folder.uri] : []));
+          await vscode.commands.executeCommand(actions[message.action], ...(['initialize','suite', 'items', 'terminal', 'notebook', 'openNotebook', 'debug'].includes(message.action) ? [folder.uri] : []));
         }
       } catch (error) {await webview.postMessage({type: 'studioError', message: String(error)});}
     }, undefined, this.context.subscriptions);
@@ -105,21 +91,9 @@ class Studio implements vscode.Disposable {
     }
     terminal.show(); return terminal;
   }
-  async newNotebook(requested?: vscode.Uri | vscode.WorkspaceFolder) {
-    const folder = this.folder(requested), settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
-    const project = resolveControllerProject(folder.uri.fsPath, settings).project;
-    const target = resolveControllerProject(folder.uri.fsPath, settings, 'scenarioProject').project;
-    const data = investigationNotebook(folder.uri.fsPath, project, path.resolve(folder.uri.fsPath, settings.get('scenarioCatalog', 'perf/scenarios.toml')), target);
-    const notebook = await vscode.workspace.openNotebookDocument('jupyter-notebook', data);
-    await vscode.window.showNotebookDocument(notebook); return notebook.uri;
-  }
-  async openNotebook(requested?: vscode.Uri | vscode.WorkspaceFolder) {
-    const folder = this.folder(requested);
-    const chosen = await vscode.window.showOpenDialog({defaultUri: folder.uri, canSelectMany: false, filters: {'Julia notebooks': ['ipynb', 'jl']}, title: 'PerfChecker · Open a Julia notebook'});
-    if (!chosen?.length) return;
-    if (chosen[0].fsPath.endsWith('.ipynb')) await vscode.window.showNotebookDocument(await vscode.workspace.openNotebookDocument(chosen[0]));
-    else await vscode.window.showTextDocument(chosen[0]); // Pluto .jl source retains its native format.
-  }
+  async newNotebook(requested?: vscode.Uri | vscode.WorkspaceFolder, options?: {kind: 'suite' | 'investigation'}) {return await this.pluto.create(requested,options);}
+  async openNotebook(requested?: vscode.Uri | vscode.WorkspaceFolder) {return await this.pluto.open(requested);}
+  async stopNotebook(requested?: vscode.Uri | vscode.WorkspaceFolder) {return await this.pluto.stopWorkspace(requested);}
   async debugFile(requested?: vscode.Uri | vscode.WorkspaceFolder) {
     const folder = this.folder(requested);
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before debugging.');
@@ -145,7 +119,7 @@ class Studio implements vscode.Disposable {
     return await vscode.debug.startDebugging(folder, {type: 'julia', request: 'launch', name: `PerfChecker · ${path.basename(document.uri.fsPath)}`,
       program: document.uri.fsPath, cwd: folder.uri.fsPath, juliaEnv: project, stopOnEntry: true});
   }
-  dispose() {this.panel?.dispose(); for (const terminal of this.terminals.values()) terminal.dispose();}
+  dispose() {this.pluto.dispose();this.panel?.dispose(); for (const terminal of this.terminals.values()) terminal.dispose();}
 }
 
 export function registerStudio(context: vscode.ExtensionContext) {
@@ -160,7 +134,8 @@ export function registerStudio(context: vscode.ExtensionContext) {
       return studio.open(requested);
     }),
     command('perfchecker.openTerminal', requested => studio.terminal(requested)),
-    command('perfchecker.newNotebook', requested => studio.newNotebook(requested)),
+    command('perfchecker.newNotebook', (requested,options) => studio.newNotebook(requested,options)),
     command('perfchecker.openNotebook', requested => studio.openNotebook(requested)),
+    command('perfchecker.stopNotebookSession', requested => studio.stopNotebook(requested)),
     command('perfchecker.debugFile', requested => studio.debugFile(requested)));
 }

@@ -40,8 +40,7 @@ jobs:
     env:
       PERFCHECKER_VSCODE_VERSION: ${{ matrix.vscode }}
       PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
-      # The full campaign is enabled after the Pluto session contract is ready.
-      PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'smoke' }}
+      PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
       JULIA_NUM_PRECOMPILE_TASKS: '1'

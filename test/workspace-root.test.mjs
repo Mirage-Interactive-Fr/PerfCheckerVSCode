@@ -67,7 +67,7 @@ test('multi-root activation does not plan; explicit designer plans only the sele
     const configurationScopes = [];
     const vscode = {
       EventEmitter: class { event = () => undefined; fire() {} },
-      workspace: {
+      workspace: {onDidChangeWorkspaceFolders:()=>({dispose(){}}),
         workspaceFolders: [first, second],
         getConfiguration: (_section, resource) => {
           configurationScopes.push(resource?.toString());

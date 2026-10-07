@@ -17,7 +17,7 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
   const ensureController = (folder: vscode.WorkspaceFolder) => {
     const existing = controls.get(folder.uri.toString());
     if (existing) return existing;
-    const tests = vscode.tests.createTestController(`perfchecker.testitems.${folder.uri.toString()}`, `PerfChecker — mesures · ${folder.name}`);
+    const tests = vscode.tests.createTestController(`perfchecker.testitems.${folder.uri.toString()}`, `PerfChecker — measures · ${folder.name}`);
     context.subscriptions.push(tests);
     let declarations: NativeItem[] = [];
     let busy = false;
@@ -114,7 +114,7 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
     };
     tests.resolveHandler = () => refresh();
     tests.refreshHandler = () => refresh();
-    tests.createRunProfile('PerfChecker — mesures',vscode.TestRunProfileKind.Run,run,true);
+    tests.createRunProfile('PerfChecker — measures',vscode.TestRunProfileKind.Run,run,true);
     const control = {refresh,run};
     controls.set(folder.uri.toString(),control);
     return control;

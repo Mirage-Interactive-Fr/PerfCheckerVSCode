@@ -4,7 +4,21 @@ import {spawn} from 'node:child_process';
 import {mkdtemp, readFile, rm, stat} from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import {cancellableJulia, controllerCancellation} from '../dist/controllerCancellation.js';
+import {cancellableJulia, controllerCancellation, shutdownControllerProcesses} from '../dist/controllerCancellation.js';
+
+test('deactivation requests and awaits every owned controller cleanup',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-deactivate-')),children=[];
+  try{
+    for(let i=0;i<2;i++){
+      const child=spawn(process.execPath,['-e','process.stdin.setEncoding("utf8");process.stdout.write("ready\\n");process.stdin.on("data",text=>{if(text.includes("PERFCHECKER_CANCEL/1"))setTimeout(()=>{require("fs").writeFileSync(process.argv[1],"cleaned");process.exit(0);},30);});',path.join(root,String(i))],{detached:process.platform!=='win32'});
+      children.push(child);child.stderr.resume();controllerCancellation(child,()=>{},10000);
+      await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('error',reject);});
+    }
+    await shutdownControllerProcesses();
+    assert.deepEqual(await Promise.all([0,1].map(i=>readFile(path.join(root,String(i)),'utf8'))),['cleaned','cleaned']);
+    assert(children.every(child=>child.exitCode===0),'Shutdown finishes after child exit, not after sending a request');
+  }finally{for(const child of children)if(child.exitCode===null && child.signalCode===null)child.kill('SIGKILL');await rm(root,{recursive:true,force:true});}
+});
 
 const julia = process.env.PERFCHECKER_TEST_JULIA;
 test('portable stdin cancellation unwinds Julia cleanup, preserves failure and bounds forced stop', {skip: !julia}, async () => {
