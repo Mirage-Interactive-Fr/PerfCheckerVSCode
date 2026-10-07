@@ -9,3 +9,4 @@ tsconfig.json
 CONTRACT.md
 .lab/**
 validation/**
+native-qualification-results/**

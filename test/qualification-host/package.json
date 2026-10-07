@@ -1,0 +1,8 @@
+{
+  "name": "perfchecker-qualification-host",
+  "displayName": "PerfChecker native qualification host",
+  "publisher": "perfchecker-tests",
+  "version": "0.0.0",
+  "private": true,
+  "engines": {"vscode": "^1.96.0"}
+}

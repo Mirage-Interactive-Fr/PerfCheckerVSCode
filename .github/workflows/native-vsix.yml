@@ -1,0 +1,71 @@
+name: Published VSIX native workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact:
+        description: Public release for reproduction, or candidate from this commit
+        type: choice
+        options: [public, candidate]
+        default: candidate
+  pull_request:
+    paths:
+      - '.github/workflows/native-vsix.yml'
+      - 'test/**'
+      - 'src/**'
+      - 'media/**'
+      - 'package*.json'
+
+permissions:
+  contents: read
+
+jobs:
+  native-workflows:
+    name: Native VSIX (${{ matrix.os }}, VS Code ${{ matrix.vscode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        vscode: ['1.96.0', stable]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      PERFCHECKER_VSCODE_VERSION: ${{ matrix.vscode }}
+      # This first diagnostic PR deliberately reproduces the published package.
+      # Switch the PR default to candidate once the before-fix evidence is captured.
+      PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'public' }}
+      PERFCHECKER_TEST_JULIA: julia
+      JULIA_NUM_THREADS: '1'
+      JULIA_NUM_PRECOMPILE_TASKS: '1'
+      JULIA_NUM_GC_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      JULIA_PKG_PRECOMPILE_AUTO: '0'
+      PERFCHECKER_UUID: 00000000-0000-4000-8000-000000000001
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+          arch: x64
+      - run: npm ci
+      - run: npm run compile
+      - name: Build the candidate when selected
+        if: env.PERFCHECKER_VSIX_MODE == 'candidate'
+        run: npm run package -- --out candidate.vsix
+      - name: Add the browser protocol client (no browser installation)
+        run: npm install --no-save --ignore-scripts playwright@1.62.1
+      - name: Run isolated native workflows on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a node test/run-public-vsix-host.mjs
+      - name: Run isolated native workflows on Windows
+        if: runner.os == 'Windows'
+        run: node test/run-public-vsix-host.mjs
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-workflows-${{ matrix.os }}-${{ matrix.vscode }}
+          path: native-qualification-results/
