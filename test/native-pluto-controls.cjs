@@ -12,7 +12,7 @@ async function eventually(read, name, timeout = 180000) {
   const until = Date.now() + timeout;
   let last;
   while (Date.now() < until) {
-    try {const result = await read(); if (result) return result;} catch (error) {last = error;}
+    try {const result = await read(); if (result) return result;} catch (error) {if(error.name==='PlutoReactiveError')throw error;last = error;}
     await new Promise(resolve => setTimeout(resolve, 200));
   }
   throw new Error(`${name}${last ? `: ${last.message}` : ''}`);
@@ -66,6 +66,17 @@ async function idle(frame) {
     'Pluto reactive cells finish');
 }
 
+async function ready(frame, button) {
+  // Cell count precedes reactive evaluation. Wait for the real rendered control,
+  // not merely for the generator's cells to have arrived over the WebSocket.
+  await eventually(async () => {
+    const errors = await frame.locator('pluto-cell.errored pluto-output').allTextContents();
+    if (errors.length) throw Object.assign(new Error(`Pluto reactive errors: ${errors.join('\n').slice(0, 4000)}`),{name:'PlutoReactiveError'});
+    return await frame.getByRole('button', {name: button, exact: true}).isVisible() &&
+      await frame.locator('pluto-editor.loading, pluto-editor.disconnected, pluto-cell.running, pluto-cell.queued').count() === 0;
+  }, `The connected notebook finishes evaluation and renders ${button}`, 240000);
+}
+
 async function refresh(frame, button, selector, expected, timeout = 360000) {
   const until = Date.now() + timeout;
   let last = '';
@@ -105,7 +116,9 @@ async function create(context, file, kind) {
   const source = await fs.readFile(file, 'utf8');
   assert(source.startsWith('### A Pluto.jl notebook ###'));
   assert(!source.includes('jupyter-notebook'));
-  return {source, ...await view(context)};
+  const state = {source, ...await view(context)};
+  await ready(state.frame, kind === 'suite' ? 'Launch selected checks' : 'Launch selected action');
+  return state;
 }
 
 async function serverPids(){
@@ -238,7 +251,7 @@ async function cancellation(context, directory) {
   const settings = context.vscode.workspace.getConfiguration('perfchecker', context.vscode.Uri.file(context.workspace));
   const previous = settings.get('scenarioCatalog', 'perf/scenarios.toml');
   const catalog = path.join(directory, 'NativeCancellation.toml'), marker = path.join(directory, 'worker-running.marker');
-  await fs.writeFile(catalog, 'schema_version="perfchecker-scenario-catalog/1"\nroot=".."\n[[scenarios]]\nid="pluto_cancel"\nimplementation="active-worker"\nsource="cases.jl"\nfactory="make_cancel_case"\ncollectors=["benchmark"]\n[scenarios.parameters]\nmarker=' + JSON.stringify(marker) + '\n');
+  await fs.writeFile(catalog, 'schema_version="perfchecker-scenario-catalog/1"\nroot=".."\n[[scenarios]]\nid="pluto_cancel"\nimplementation="active-worker"\nsource=' + JSON.stringify(path.join(context.workspace,'perf','cases.jl')) + '\nfactory="make_cancel_case"\ncollectors=["benchmark"]\n[scenarios.parameters]\nmarker=' + JSON.stringify(marker) + '\n');
   try {
     await settings.update('scenarioCatalog', catalog, context.vscode.ConfigurationTarget.WorkspaceFolder);
     const state = await create(context, path.join(directory, 'NativeCancellation.jl'), 'investigation');
@@ -267,7 +280,7 @@ async function ownedWorkerClose(context,directory){
   const preserved=path.join(context.workspace,'perf','owned-cancel.jl.999.mem');
   const sentinel=Buffer.from('pre-existing allocation inventory retained exactly\n');
   await fs.writeFile(preserved,sentinel);
-  await fs.writeFile(catalog,'schema_version="perfchecker-scenario-catalog/1"\nroot=".."\n[[scenarios]]\nid="owned_worker"\nimplementation="stop-before-server-close"\nsource="cases.jl"\nfactory="make_owned_cancel_case"\ncollectors=["benchmark"]\n[scenarios.parameters]\nmarker='+JSON.stringify(marker)+'\ncleaned='+JSON.stringify(cleaned)+'\n');
+  await fs.writeFile(catalog,'schema_version="perfchecker-scenario-catalog/1"\nroot=".."\n[[scenarios]]\nid="owned_worker"\nimplementation="stop-before-server-close"\nsource='+JSON.stringify(path.join(context.workspace,'perf','cases.jl'))+'\nfactory="make_owned_cancel_case"\ncollectors=["benchmark"]\n[scenarios.parameters]\nmarker='+JSON.stringify(marker)+'\ncleaned='+JSON.stringify(cleaned)+'\n');
   const beforeMem=new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem')));
   const allocationOwned=async info=>{
     const environment=info[1],privateCheck=path.dirname(environment),pid=Number(info[0]);
@@ -435,6 +448,15 @@ exports.run = async context => {
       const message = error.message.replace(/([?&]secret=)[^&\s"<>]+/g, '$1[redacted]');
       failures.push(new Error(`${name}: ${message}`));
       context.log(`pluto-${name}`, {status: 'failed', message});
+      try {
+        const state = await view(context);
+        const reactive = await state.frame.locator('pluto-cell.errored pluto-output').allTextContents();
+        context.log('pluto-failure-before-stop', {case:name,reactiveErrors:reactive.map(value=>value.slice(0,3000)),
+          renderedLaunch:await state.frame.getByRole('button',{name:/Launch selected/}).count(),
+          cellCount:await state.frame.locator('pluto-cell').count(),
+          editorStatus:await state.frame.locator('pluto-editor').getAttribute('class')});
+      } catch (diagnostic) {context.log('pluto-failure-view-unavailable',{case:name,message:String(diagnostic).replace(/([?&]secret=)[^&\s"<>]+/g,'$1[redacted]')});}
+      await capture(context,`pluto-${name}-failed-before-stop`).catch(()=>{});
     }
     finally {await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession', context.vscode.Uri.file(context.workspace));}
   }

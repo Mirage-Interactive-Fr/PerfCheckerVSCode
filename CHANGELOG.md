@@ -17,6 +17,11 @@
 - Failed test-item runs expose their dependency and controller diagnostic in
   Testing output as well as the item message. Cancelling controller verification
   ends the setup action without reopening the installation wizard.
+- Julia debugging passes the official `project` launch parameter so the saved
+  source executes in the selected controller rather than the active workspace.
+- Codex cancellation also reclaims descendants after the CLI leader exits. On
+  Windows, a private process Job owns descendants before the CLI starts and
+  stops them when the extension host or connector disappears.
 - Controller setup, notebook generation and scenario adoption check workspace
   trust, folder and settings identity before writing. Owned processes also
   request cooperative cleanup when their extension-host pipe closes.

@@ -269,7 +269,9 @@ async function testGitTargetsAndComparisons(context) {
     await view.locator('#candidate-targets input').nth(1).check();
     for (const value of ['median', 'mean', 'minimum', 'maximum']) await view.locator('#comparison-aggregation').selectOption(value);
     await view.locator('#comparison-aggregation').selectOption('median');
-    await view.locator('#comparison-package').locator('..').scrollIntoViewIfNeeded();
+    await context.vscode.commands.executeCommand('workbench.action.closePanel');
+    const matrix=view.locator('.aside-panel').filter({has:view.getByRole('heading',{name:'Comparison matrix',exact:true})});
+    await matrix.scrollIntoViewIfNeeded();
     await capture(context,'comparison-matrix');
     const before = settings().get('comparisonPolicies', []).length;
     await view.locator('#add-comparison').click();
@@ -537,8 +539,9 @@ async function testLargePlanAndOrdering(context) {
     assert.notEqual(after.config.selection.run_ids[0],first,'Native drag changes the persisted execution order');
     assert.deepEqual(new Set(after.config.selection.run_ids),new Set(before.config.selection.run_ids));
     await view.locator('#search').fill('workload_125');
-    assert.equal(await view.locator('#cards .card').count(),1);
-    await view.locator('#clear-visible').click();assert.equal(await selectionCount(view),124);
+    await eventually(async()=>await view.locator('#cards .card').count()===1,'The debounced workload search has rendered the one matching group');
+    await view.locator('#clear-visible').click();
+    await eventually(async()=>await selectionCount(view)===124,'Clearing the one filtered group preserves all124hidden selections');
     context.proof('large-plan-pagination-and-drag',{groups:125,initiallyRendered:120,bulkIncludesHidden:true,nativeDrag:true,executionsRequested:0});
   }catch(error){
     const view=await frame(context,'#cards');

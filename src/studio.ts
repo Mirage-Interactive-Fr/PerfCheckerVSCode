@@ -117,7 +117,7 @@ class Studio implements vscode.Disposable {
     await extension.activate();
     const project = resolveControllerProject(folder.uri.fsPath, vscode.workspace.getConfiguration('perfchecker', folder.uri), 'scenarioProject').project;
     return await vscode.debug.startDebugging(folder, {type: 'julia', request: 'launch', name: `PerfChecker · ${path.basename(document.uri.fsPath)}`,
-      program: document.uri.fsPath, cwd: folder.uri.fsPath, juliaEnv: project, stopOnEntry: true});
+      program: document.uri.fsPath, cwd: folder.uri.fsPath, project, stopOnEntry: true});
   }
   dispose() {this.pluto.dispose();this.panel?.dispose(); for (const terminal of this.terminals.values()) terminal.dispose();}
 }

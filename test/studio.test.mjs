@@ -83,7 +83,8 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await assert.rejects(commands.get('perfchecker.debugFile')(second.uri),/Julia VS Code extension/);
     hasJulia=true;chosen=[uri(path.join(second.uri.fsPath,'case.jl'))];
     assert.equal(await commands.get('perfchecker.debugFile')(second.uri),true);
-    assert.equal(debugged[0].configuration.juliaEnv,path.join(second.uri.fsPath,'perf','controller'));
+    assert.equal(debugged[0].configuration.project,path.join(second.uri.fsPath,'perf','controller'),
+      'The official Julia debugger reads project; juliaEnv is ignored and would select the active workspace instead');
     assert.equal(debugged[0].configuration.program,chosen[0].fsPath);
     assert.equal(debugged[0].configuration.stopOnEntry,true);
     changeEditor({document:{uri:chosen[0],languageId:'julia'}});chosen=undefined;

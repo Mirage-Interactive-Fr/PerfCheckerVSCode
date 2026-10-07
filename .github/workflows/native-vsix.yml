@@ -54,6 +54,7 @@ on:
       - 'test/**'
       - 'src/**'
       - 'media/**'
+      - 'resources/**'
       - 'package*.json'
 
 permissions:
@@ -152,8 +153,8 @@ jobs:
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '975d9351250ace804ce932d8710fedf7a3699739' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '7efea7f007cbdd78141fbebef63eeefcebc0f54e' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '4eec7f3573205519d365b4dd4553769eda5476cc' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '4fbc3c25543aa4f9b1154c227e5432f0cd62df91' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'

@@ -6,6 +6,7 @@ const os = require('node:os');
 const http = require('node:http');
 const {execFile} = require('node:child_process');
 const {promisify} = require('node:util');
+const {createHash} = require('node:crypto');
 const {clickStudioAction}=require('./native-studio-controls.cjs');
 const execute = promisify(execFile);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -14,6 +15,50 @@ async function eventually(read, label, timeout = 180000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {if (await read()) return; await delay(100);}
   throw new Error(label);
+}
+const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?
+  Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
+
+async function measuredEvidence(context) {
+  const root=path.resolve(context.workspace,context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace)).get('investigationReports','perf/results/investigations'));
+  const entries=()=>fs.readdir(root).catch(error=>{if(error.code==='ENOENT')return [];throw error;});
+  await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
+  let frame=await context.findFrame('#app nav[aria-label="Investigation views"]');
+  await frame.getByRole('button',{name:'Discover tests',exact:true}).click();
+  await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class')).includes('busy')&&
+    await frame.locator('.scenario-title strong').filter({hasText:'sum_squares'}).count()>0,'Actual Core discovers the declared allocation scenario',240000);
+  await frame.getByRole('button',{name:'Scenarios',exact:true}).click();
+  await frame.getByRole('button',{name:'Clear selection',exact:true}).click();
+  await frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:'sum_squares'})})
+    .filter({has:frame.locator('.implementation',{hasText:'allocating'})}).first().locator('.scenario-title input').check();
+  const before=new Set(await entries());
+  await frame.getByRole('button',{name:'Measure selected',exact:true}).click();
+  let measured;
+  await eventually(async()=>{
+    for(const id of await entries()){
+      if(before.has(id))continue;
+      const directory=path.join(root,id),file=path.join(directory,'run.json');
+      const data=await fs.readFile(file).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
+      if(!data)continue;
+      let report;
+      try{report=JSON.parse(data);}catch(error){if(error instanceof SyntaxError)continue;throw error;}
+      if(report.schema_version!=='perfchecker-scenario-run/1')continue;
+      assert(report.runs.length>0);
+      assert(report.runs.every(run=>run.scenario.id==='sum_squares'&&run.qualification.availability==='complete'&&run.qualification.correctness==='passed'));
+      const adviceBytes=await fs.readFile(path.join(directory,'advice','advice.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
+      if(!adviceBytes)continue;
+      let advice;
+      try{advice=JSON.parse(adviceBytes);}catch(error){if(error instanceof SyntaxError)continue;throw error;}
+      assert(advice.recommendations.some(row=>row.rule_id==='evidence.samples'),'Two actual samples retain deterministic advice');
+      const evidence=advice.recommendations.map(row=>({id:row.id,rule:row.rule_id,observation:row.hypothesis,experiment:row.action,verification:row.validation,
+        limits:['Evidence is limited to the recorded configuration; no unmeasured gain is established.']}));
+      measured={id,file,adviceFile:path.join(directory,'advice','advice.json'),evidence,runSha256:hash(data),adviceSha256:hash(adviceBytes)};
+      return !(await frame.locator('#app .status').getAttribute('class')).includes('busy');
+    }
+    return false;
+  },'Real Julia measurements and their saved deterministic advice complete',360000);
+  return measured;
 }
 
 exports.run = async context => {
@@ -37,7 +82,7 @@ exports.run = async context => {
   };
   const baselineBytes = await probe(workspace);
   const calls = [], pending = new Set();
-  let implementationBytes;
+  let implementationBytes,attached;
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'DELETE') {res.writeHead(204); res.end(); return;}
@@ -58,7 +103,10 @@ exports.run = async context => {
         assert.equal(req.headers['mcp-protocol-version'], '2026-07-28');
         const {name, arguments: args} = body.params;
         assert.equal(typeof args.prompt, 'string');
-        calls.push({name, prompt: args.prompt});
+        const projection=JSON.parse(args.prompt.split('\n\nPerfChecker evidence:\n').at(-1));
+        assert(Array.isArray(projection.evidence));
+        if(attached)assert.deepEqual(projection.evidence,attached.evidence,'The actual selected advice IDs and content reach tools/call');
+        calls.push({name, prompt: args.prompt, evidenceIds:projection.evidence.map(row=>row.id),projectionSha256:hash(JSON.stringify(canonical(projection.evidence)))});
         let answer = 'Consider a generator to remove the intermediate squared array. Verify empty inputs and signed floating-point values, then measure allocations; speed is not yet qualified.';
         if (args.prompt.includes('native cancellation probe')) {
           pending.add(res); res.on('close', () => pending.delete(res)); return;
@@ -85,6 +133,7 @@ exports.run = async context => {
     advisorMcpTool: 'ask_perfchecker', advisorMcpResponse: 'text', advisorMcpVersion: '2026-07-28',
     advisorImplementationMcpTool: 'implement_perfchecker', advisorTimeout: 180,
     codexExecutable: path.join(workspace, 'not-installed-codex')};
+  values.scenarioSamples=2;
   const previous = Object.fromEntries(Object.keys(values).map(key => [key, settings().inspect(key)?.workspaceFolderValue]));
   const state = () => vscode.commands.executeCommand('perfchecker.chatState');
   try {
@@ -112,9 +161,23 @@ exports.run = async context => {
       await eventually(async () => {const value = await state(); return !value.busy && value.messages.length === count;}, 'Actual registered Julia MCP worker returns the conversation');
     };
     await send('Inspect the intermediate allocation in sum_squares without editing. What should I verify?', 2);
+    assert.deepEqual(calls[0].evidenceIds,[],'The configuration-only path remains valid without saved measurements');
+    proof('native-mcp-configuration-only-conversation',{adviceTurns:1,noSavedEvidence:true,sourceUnchanged:await fs.readFile(source,'utf8')===original});
+    attached=await measuredEvidence(context);
+    await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#chat-root');
+    await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(attached.id);
+    await eventually(async()=>{const value=await state();return value.evidenceId===attached.id&&value.messages.length===0;},'The real evidence selector starts a conversation with the selected measured bundle');
+    await send('Inspect the intermediate allocation in sum_squares using this measured evidence without editing. What should I verify?',2);
     await send('Continue this conversation: how should empty inputs and signed Float64 values be checked?', 4);
     assert.equal(await fs.readFile(source, 'utf8'), original);
-    assert(calls[1].prompt.includes('Inspect the intermediate allocation') && calls[1].prompt.includes('signed Float64'), 'The second real MCP call contains the bounded conversation');
+    assert(calls[2].prompt.includes('Inspect the intermediate allocation') && calls[2].prompt.includes('signed Float64'), 'The second attached-evidence MCP call contains the bounded conversation');
+    assert.deepEqual(calls[1].evidenceIds,attached.evidence.map(row=>row.id));
+    assert.equal(calls[1].projectionSha256,calls[2].projectionSha256,'Follow-up sends the same bounded measured evidence');
+    assert.equal(hash(await fs.readFile(attached.file)),attached.runSha256);
+    assert.equal(hash(await fs.readFile(attached.adviceFile)),attached.adviceSha256);
+    proof('native-mcp-selected-measured-evidence',{nativeSelector:true,historyId:attached.id,evidenceIds:calls[1].evidenceIds,
+      runSha256:attached.runSha256,adviceSha256:attached.adviceSha256,projectionSha256:calls[1].projectionSha256,
+      contextualTurns:2,provider:'Controlled real HTTP MCP service; no inference or credentials',sourceUnchanged:true});
     assert.equal(await view.locator('.message.assistant').count(), 2);
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,
       `native-${process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION}-${process.platform}-${vscode.version}-mcp-controlled-provider.png`)});

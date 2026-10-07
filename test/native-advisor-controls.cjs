@@ -209,6 +209,8 @@ async function inventories(context, fixture, configFile) {
   assert.equal(await frame.locator('#advisor-root b').count(), 0, 'Tool descriptions remain literal text');
   await row(frame, 'ask_fixture').getByText('Required arguments and tool schema', {exact: true}).click();
   assert.match(await row(frame, 'ask_fixture').locator('pre').innerText(), /"context"/);
+  await row(frame,'ask_fixture').scrollIntoViewIfNeeded();
+  if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await new Promise(resolve=>setTimeout(resolve,2500));
   await row(frame, 'ask_fixture').getByRole('button', {name: 'Use', exact: true}).click();
   assert.equal(await frame.locator('#advisor-mcp_tool').inputValue(), 'ask_fixture');
   assert.equal(await frame.locator('#advisor-mcp_prompt_argument').inputValue(), 'question');

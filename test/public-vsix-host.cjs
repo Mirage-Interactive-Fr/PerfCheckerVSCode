@@ -22,7 +22,7 @@ function commandCoverage(commands,checks){
     measureScenarios:['investigation-real-measurement'],diagnoseScenarios:['investigation-analyzer-jet','investigation-analyzer-alloccheck'],
     adviseScenarios:['investigation-saved-advice-and-disabled-model'],compareScenarios:['investigation-real-baseline-candidate'],
     cancelInvestigation:['investigation-cancel-active-julia-worker'],prepareScenario:['investigation-discovery-selection-source-draft'],
-    openInvestigationSource:['investigation-discovery-selection-source-draft'],refresh:['suite-selection-and-save'],initialize:['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration'],
+    openInvestigationSource:['investigation-discovery-selection-source-draft'],refresh:['suite-selection-and-save'],initialize:['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration','bootstrap-existing-controller'],
     runAll:['all-supported-collectors-measured'],runNode:['native-run-selection-command'],openEntrypoint:['native-workload-command'],
     openOutput:['result-controls'],showLog:['native-tool-catalogue'],openDesigner:['suite-selection-and-save'],openDesignerForWorkspace:['save-palette-command'],
     runLandscapeLiveForWorkspace:['landscape-live-prerequisite'],saveConfiguration:['save-palette-command','native-suite-save-palette'],
@@ -30,7 +30,7 @@ function commandCoverage(commands,checks){
     openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save'],openNotebook:['pluto-reactive-save-reload-close'],
     debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore'],applyImplementation:['native-mcp-advice-implementation-restore'],
     restoreImplementation:['native-mcp-advice-implementation-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
-    stopNotebookSession:['native-pluto-without-jupyter'],
+    stopNotebookSession:['native-pluto-without-jupyter','pluto-stop-active-owned-worker'],
   };
   return commands.map(command=>{
     const name=command.replace(/^perfchecker\./,''),proof=checks.filter(check=>check.assertionsCompleted===true&&(effects[name]||[]).includes(check.name));
@@ -59,7 +59,7 @@ function buttonCoverage(checks){
     'Studio · PerfChecker terminal':['multi-root-explicit-routing'],
     'Studio · Julia extension REPL':['official-julia-repl'],
     'Studio · Project tasks':['project-task'],
-    'Studio · Setup workspace':['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration'],
+    'Studio · Setup workspace':['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration','bootstrap-existing-controller'],
     'Designer · nine check types / hidden selections / filters / save':['suite-selection-and-save'],
     'Designer · Git refs / commit pin / add / remove':['git-reference-controls'],
     'Designer · Cancel Git discovery':['git-cancel-discovery'],
@@ -86,6 +86,8 @@ function buttonCoverage(checks){
     'Pluto · homepage Shutdown / real confirmation':['pluto-home-shutdown-active-allocation'],
     'Pluto · failed Restart leaves no stale worker':['pluto-failed-restart-real-worker-cleanup'],
     'MCP · two advice turns / diff / Apply / oracle / Restore':['native-mcp-advice-implementation-restore'],
+    'MCP · select measured evidence / exact IDs / bounded context':['native-mcp-selected-measured-evidence'],
+    'MCP · configuration-only conversation':['native-mcp-configuration-only-conversation'],
     'Coordination3D · physical renderer prerequisites':['landscape-live-prerequisite'],
     ...Object.fromEntries(['jet','aqua','alloccheck','snoopcompile','latency','gc','memory','heap','locks'].map(tool=>[`Analyzer · ${tool}`,[`investigation-analyzer-${tool}`]])),
   };
@@ -178,10 +180,10 @@ exports.run = async () => {
   };
   const retainEvidence=async name=>{
     const directory=path.join(output,'worker-evidence',phase,name);
-    for(const relative of ['perf/results']){
+    for(const relative of ['perf/results','perf/notebooks']){
       const origin=path.join(workspace,relative);
       await fs.cp(origin,path.join(directory,relative),{recursive:true,filter:async(file)=>{
-        const stat=await fs.stat(file);return stat.isDirectory()||(/\.(json|jsonl|md|csv|xml)$/.test(file)&&stat.size<5000000);
+        const stat=await fs.stat(file);return stat.isDirectory()||(/\.(json|jsonl|md|csv|xml|jl|toml)$/.test(file)&&stat.size<5000000);
       }}).catch(error=>{if(error.code!=='ENOENT')console.error(`NATIVE_EVIDENCE_COPY ${error}`);});
     }
   };
@@ -224,6 +226,8 @@ exports.run = async () => {
         if(allCommands.includes('workbench.action.toggleFullScreen')){
           await vscode.commands.executeCommand('workbench.action.toggleFullScreen').catch(error=>log('native-recording-layout-warning',{fallback:String(error)}));
         }
+        await eventually(async()=>await windowPage.evaluate(()=>innerWidth>=1800),'The asynchronous native fullscreen action reaches the recording width',5000)
+          .catch(error=>log('native-recording-layout-warning',{fallback:String(error),functionalTestsContinue:true}));
         log('native-recording-viewport',{dimensions:await windowPage.evaluate(()=>({width:innerWidth,height:innerHeight})),fallback:'actual-workbench-fullscreen-command'});
       }finally{await target?.detach().catch(()=>{});await cdp?.detach().catch(()=>{});}
     }

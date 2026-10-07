@@ -400,7 +400,8 @@ Authenticate your CLI using `codex login` in your own terminal. Set
 choose **Connect Codex CLI**. Version, supported flags and login status are checked
 without starting a model turn. This requires `--no-daemon`, `--ignore-user-config`
 and `--ignore-rules`, in addition to the standard `exec` sandbox/ephemeral/output
-flags; Codex CLI 0.159.2 was qualified. Unsupported executables fail explicitly.
+flags; Codex CLI 0.162.0-alpha.2 was qualified with a real authenticated local
+Julia implementation test. Unsupported executables fail explicitly.
 Windows requires the native `.exe`; npm `.cmd`/`.bat` launchers are unsupported.
 
 The connector uses the existing account and default CLI model. Custom user
@@ -429,6 +430,14 @@ This sends real model requests and verifies advice, isolated editing, Node
 semantics, diff, apply, byte-identical restoration and cancellation after a turn
 starts. It removes its temporary files. The default tests use a sacrificial CLI
 to verify errors, limits, process-tree termination and authentication separately.
+
+The separate `PERFCHECKER_TEST_CODEX_JULIA=1` opt-in test also requires
+`PERFCHECKER_TEST_JULIA` and `PERFCHECKER_TEST_JULIA_PROJECT`. It checks two advice
+turns and an actual Julia allocation change, empty and signed input oracles,
+reviewed Apply, exact source/index/HEAD restoration, cancellation and disconnect.
+Its final JSON identifies the Core source tree and whether that environment came
+from the registry. `PERFCHECKER_TEST_CORE_TREE` explicitly identifies an immutable
+candidate source when qualifying a Core fix before registration.
 
 The complete opt-in editor/controller qualification uses a prepared controller:
 
