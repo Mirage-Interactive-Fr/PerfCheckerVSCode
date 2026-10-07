@@ -161,7 +161,9 @@ public static class PerfCheckerOwnedProcess {
     }
 }
 '@
-    $arguments = [string[]]@(ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ArgumentsBase64))))
+    # Convert the JSON array directly. PowerShell 5.1 writes that array as one
+    # pipeline object; wrapping it in @() before a string[] cast joins argv.
+    $arguments = [string[]](ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ArgumentsBase64))))
     $exitCode = [PerfCheckerOwnedProcess]::Run($Executable, $arguments, $WorkingDirectory, $ParentPid)
     exit $exitCode
 } catch {
