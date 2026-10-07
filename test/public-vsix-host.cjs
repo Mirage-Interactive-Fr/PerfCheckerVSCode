@@ -164,7 +164,10 @@ exports.run = async () => {
   const workspace = process.env.PERFCHECKER_NATIVE_WORKSPACE;
   const output = process.env.PERFCHECKER_NATIVE_OUTPUT;
   assert(path.isAbsolute(workspace));
-  assert(path.basename(path.dirname(workspace)).startsWith('perfchecker-public-vsix-'));
+  const session=process.env.PERFCHECKER_NATIVE_SESSION;
+  assert(session&&path.isAbsolute(session),'The runner must provide its owned temporary session');
+  assert.equal(await fs.realpath(workspace),path.join(await fs.realpath(session),'workspace'),
+    'The native host must operate only on the exact workspace created by its runner');
   const checks = [], failures = [];
   let browser, windowPage,commands=[],activeCase;
   let pendingReport=Promise.resolve();
