@@ -28,7 +28,7 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp','mcp-pluto','workbench','advisor','investigation','studio','studio-ordering','editor'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['narrative','mcp','mcp-pluto','workbench','advisor','investigation','studio','studio-ordering','editor','testitems'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 const completeCampaign=['smoke','full'].includes(stage);
 const phaseFailures = [];
 const publicSha = 'c4123271e71e4c4d148fe0e613ba260f4aeea6f28445338cab11d3fb9513df09';
@@ -311,7 +311,9 @@ end
   if(completeCampaign)await launch('configured');
   // TestItemRunner's default imports use the chosen controller. This explicit fixture
   // preparation is separate from production bootstrap, which never develops a user's package.
-  await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.develop(path=ARGS[2]);println("TESTITEM_TARGET_EXPLICITLY_PREPARED=",ARGS[2])',controller,workspace]);
+  // The focused missing-target check keeps this controller unprepared.
+  if(!(stage==='focused'&&caseGroup==='testitems'))
+    await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.develop(path=ARGS[2]);println("TESTITEM_TARGET_EXPLICITLY_PREPARED=",ARGS[2])',controller,workspace]);
   for (const extension of completeCampaign||stage==='focused'&&caseGroup==='workbench'?(mode==='public'?['julialang.language-julia','ms-toolsai.jupyter']:['julialang.language-julia']):[]) {
     await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', extension], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   }

@@ -374,6 +374,7 @@ exports.run = async () => {
         });
       }else if(phase==='studio-ordering')await runCase('native-plan-pagination-and-ordering',()=>controls.runOrdering(context));
       else if(phase==='workbench')await runCase('native-workbench-controls',()=>workbench.run(context));
+      else if(phase==='testitems')await runCase('native-testitem-missing-target',()=>measureNativeTestItem(context,false));
       else if(phase==='advisor')await runCase('native-advisor-controls',()=>advisor.run(context));
       else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
       else if(phase==='editor'){
