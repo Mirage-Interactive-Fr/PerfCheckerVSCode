@@ -108,6 +108,11 @@ async function stop(context, state, closePanel = false) {
   if (closePanel) await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   else await state.parent.locator('#pluto-stop').click();
   await eventually(async () => !await portOpen(port), 'Closing Pluto also closes its server and workers', 45000);
+  if(!closePanel)await eventually(async()=>{
+    const parent=await context.findFrame('#pluto-restart');
+    return await parent.locator('iframe.perfchecker-pluto-frame').count()===0&&
+      /session stopped/i.test(await parent.locator('[role="status"]').innerText());
+  },'The explicit Stop transition finishes before another session action');
 }
 
 async function create(context, file, kind) {
@@ -218,8 +223,10 @@ async function investigation(context, directory) {
   const cell = state.frame.locator(`pluto-cell[id="${id}"]`);
   await cell.scrollIntoViewIfNeeded();
   const title = 'PerfChecker native reactive qualification';
-  const editor = cell.locator('.cm-content[contenteditable="true"]');
+  const editor = cell.locator('pluto-input .cm-editor:not(.cm-ssr-fake) .cm-content[contenteditable="true"]');
   if (!await editor.isVisible()) await cell.locator('.foldcode').click();
+  await eventually(async()=>!((await cell.getAttribute('class'))||'').split(/\s+/).includes('code_folded')&&await editor.isVisible(),
+    'The real unfold gesture finishes and exposes the interactive CodeMirror input');
   await editor.click(); await editor.press('ControlOrMeta+A');
   context.log('native-ui-action',{surface:'Pluto investigation',action:'Edit reactive cell and evaluate'});
   await editor.pressSequentially(`md"# ${title}"`); await editor.press('ControlOrMeta+Enter');
@@ -282,6 +289,7 @@ async function ownedWorkerClose(context,directory){
   await fs.writeFile(preserved,sentinel);
   await fs.writeFile(catalog,'schema_version="perfchecker-scenario-catalog/1"\nroot=".."\n[[scenarios]]\nid="owned_worker"\nimplementation="stop-before-server-close"\nsource='+JSON.stringify(path.join(context.workspace,'perf','cases.jl'))+'\nfactory="make_owned_cancel_case"\ncollectors=["benchmark"]\n[scenarios.parameters]\nmarker='+JSON.stringify(marker)+'\ncleaned='+JSON.stringify(cleaned)+'\n');
   const beforeMem=new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem')));
+  let fixtureUserDirectory,fixtureWorkerPid;
   const allocationOwned=async info=>{
     const environment=info[1],privateCheck=path.dirname(environment),pid=Number(info[0]);
     assert(path.basename(privateCheck).startsWith('perfchecker-check-'),'The measured allocation runs in a real Core-owned private environment');
@@ -290,16 +298,12 @@ async function ownedWorkerClose(context,directory){
     assert(journal.includes(Buffer.from(`.${pid}.mem`)),'The physical allocation journal identifies this measured worker');
     return privateCheck;
   };
-  const assertStopped=async(state,pid,owned,cleanup,closePanel,action)=>{
+  const assertStopped=async(state,pid,owned,closePanel,action)=>{
     const alive=()=>{try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
     assert(alive(),'The measured process must really be alive before Stop/Close');
     const start=Date.now();if(action)await action();else await stop(context,state,closePanel);
     await eventually(()=>!alive(),'The detached measurement worker terminates before the 120-second workload could finish',45000);
     await eventually(async()=>!await fs.stat(owned).then(()=>true).catch(()=>false),'The worker cleanup removes its owned temporary directory',45000);
-    // ScenarioFactory cleanup callbacks are contractual. Allocation collectors
-    // instead clean their private environment and allocation journal; they do
-    // not promise to invoke a user perf_cleanup(state) callback.
-    if(cleanup)assert.equal(await fs.readFile(cleanup,'utf8'),'cleaned');
     assert(Date.now()-start<90000,'Cleanup is cooperative rather than waiting for the complete workload');
     assert.deepEqual(await fs.readFile(preserved),sentinel,'Existing .mem evidence is never removed');
     assert.deepEqual(new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem'))),beforeMem,'Only allocation files created by the session are cleaned');
@@ -310,12 +314,26 @@ async function ownedWorkerClose(context,directory){
     let state=await create(context,path.join(directory,'StopActiveInvestigation.jl'),'investigation');
     await state.frame.locator('bond[def="action"] select').selectOption('run');await idle(state.frame);
     await state.frame.getByRole('button',{name:'Launch selected action',exact:true}).click();
-    const info=await eventually(async()=>{const lines=(await fs.readFile(marker,'utf8')).split('\n');return lines.length===2?lines:false;},'The detached investigation reaches its real PID marker',360000);
+    const info=await eventually(async()=>{const lines=(await fs.readFile(marker,'utf8')).split('\n');return lines.length===3?lines:false;},'The detached investigation reaches its real PID and private controller-directory marker',360000);
+    const [pid,userDirectory,controllerDirectory]=info;
+    fixtureWorkerPid=Number(pid);fixtureUserDirectory=userDirectory;
+    for(const name of ['request.toml','worker.log'])assert(await fs.stat(path.join(controllerDirectory,name)).then(stat=>stat.isFile()),
+      `The active investigation has its own physical ${name}`);
     await settings.update('plutoProject','perf/changed-after-launch',context.vscode.ConfigurationTarget.WorkspaceFolder);
-    const elapsed=await assertStopped(state,Number(info[0]),info[1],cleaned,false);
+    const elapsed=await assertStopped(state,Number(pid),controllerDirectory,false);
+    const callbackCompleted=await fs.readFile(cleaned,'utf8').then(value=>value==='cleaned').catch(error=>{if(error.code==='ENOENT')return false;throw error;});
+    context.log('pluto-forced-scenario-callback-limitation',{callbackCompleted,
+      contract:'Forced worker termination does not guarantee arbitrary Julia cleanup callbacks. The fixture-owned directory is removed only after PID death.'});
+    // This directory was created by this fixture's user callback, not inventoried
+    // by Core. Its removal belongs to the test after the strong worker oracle.
+    assert(path.basename(userDirectory).startsWith('jl_'));
+    await fs.rm(userDirectory,{recursive:true,force:true});
+    fixtureUserDirectory=undefined;
     await settings.update('plutoProject',previous.pluto,context.vscode.ConfigurationTarget.WorkspaceFolder);
     await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
-    context.proof('pluto-stop-active-owned-worker',{kind:'InvestigationJob',cleanupMilliseconds:elapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,environmentChangedWhileRunning:true});
+    context.proof('pluto-stop-active-owned-worker',{kind:'InvestigationJob',cleanupMilliseconds:elapsed,pidTerminated:true,ownedFilesRemoved:true,
+      coreRequestAndWorkerLogRemoved:true,arbitraryUserCleanupCallbackGuaranteed:false,callbackCompleted,
+      fixtureDirectoryRemovedAfterWorkerDeath:true,preExistingMemPreserved:true,environmentChangedWhileRunning:true});
 
     await settings.update('suite','perf/owned-suite.jl',context.vscode.ConfigurationTarget.WorkspaceFolder);
     const suiteMarker=path.join(context.workspace,'perf','owned-suite-worker.marker');
@@ -342,7 +360,7 @@ async function ownedWorkerClose(context,directory){
     await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
     const suiteInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The allocation worker reaches its real PID marker',360000);
     const suiteOwned=await allocationOwned(suiteInfo);
-    const suiteElapsed=await assertStopped(state,Number(suiteInfo[0]),suiteOwned,undefined,true);
+    const suiteElapsed=await assertStopped(state,Number(suiteInfo[0]),suiteOwned,true);
     context.proof('pluto-close-active-allocation-worker',{kind:'SuiteJob',cleanupMilliseconds:suiteElapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,noNewMem:true});
 
     await fs.rm(suiteMarker,{force:true});
@@ -359,7 +377,7 @@ async function ownedWorkerClose(context,directory){
     page.on('dialog',confirm);
     let shutdownElapsed;
     try{
-      shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownOwned,undefined,false,async()=>{
+      shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownOwned,false,async()=>{
         await state.frame.locator('img#logo-big').locator('..').click();
         await eventually(()=>new URL(state.frame.url()).pathname==='/'&&state.frame.locator('#recent').isVisible(),'The real Pluto logo opens its authenticated homepage');
         const running=state.frame.locator('#recent li.running').filter({hasText:'ShutdownActiveAllocation.jl'});
@@ -374,6 +392,13 @@ async function ownedWorkerClose(context,directory){
     await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   }finally{
     await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));
+    if(fixtureUserDirectory){
+      let running;try{process.kill(fixtureWorkerPid,0);running=true;}catch(error){if(error.code!=='ESRCH')throw error;running=false;}
+      if(!running){assert(path.basename(fixtureUserDirectory).startsWith('jl_'));
+        await fs.rm(fixtureUserDirectory,{recursive:true,force:true});}
+      else context.log('pluto-failure-fixture-cleanup-pending',{worker:fixtureWorkerPid,
+        reason:'The fixture callback directory is retained while its measured process still owns it.'});
+    }
     await settings.update('suite',previous.suite,context.vscode.ConfigurationTarget.WorkspaceFolder);
     await settings.update('scenarioCatalog',previous.catalog,context.vscode.ConfigurationTarget.WorkspaceFolder);
     await settings.update('plutoProject',previous.pluto,context.vscode.ConfigurationTarget.WorkspaceFolder);
@@ -411,6 +436,12 @@ async function suite(context, directory) {
       return {file: name, data: JSON.parse(await fs.readFile(name, 'utf8'))};
     }
   }, 'Save completed reports writes an actual measured bundle');
+  const savedOutput=state.frame.locator(`pluto-cell[id="${cellId(state.source,'saved_reports = begin')}"] pluto-output`);
+  await eventually(async()=>/Last saved reports:/.test(await savedOutput.innerText()),
+    'The Save cell finishes writing every report format');
+  await idle(state.frame);
+  for(const name of ['version-series.json','version-comparison.json','version-comparison.md'])
+    assert(await fs.stat(path.join(path.dirname(saved.file),name)).then(stat=>stat.isFile()),`The completed Save includes ${name}`);
   assert.equal(saved.data.schema_version, 'perfchecker-suite-result/1');
   assert.equal(saved.data.runs.length, 1, 'Package/workload/collector/target filters determine the measured plan');
   assert.equal(saved.data.runs[0].status, 'pass');

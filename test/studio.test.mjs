@@ -15,13 +15,14 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
   const first={name:'first',uri:uri(path.join(temporary,'first'))};
   const second={name:'second',uri:uri(path.join(temporary,process.platform === 'win32' ? "second $workspace 'quotes'" : 'second $workspace "quotes"'))};
   const commands=new Map(),panels=[],terminals=[],notebooks=[],debugged=[],invocations=[],scopes=[];
-  let closeTerminal,changeEditor,chosen,hasJulia=false;
+  let closeTerminal,changeEditor,chosen,hasJulia=false,initializeAction,changeConfiguration;
   const vscode={
     Uri:{joinPath:(root,...pieces)=>uri(path.join(root.fsPath,...pieces))},ThemeIcon:class{constructor(id){this.id=id;}},
     ViewColumn:{One:1},NotebookCellKind:{Markup:1,Code:2},
     NotebookCellData:class{constructor(kind,value,languageId){Object.assign(this,{kind,value,languageId});}},
     NotebookData:class{constructor(cells){this.cells=cells;}},
     workspace:{isTrusted:true,workspaceFolders:[first,second],getWorkspaceFolder:source=>source.fsPath.startsWith(second.uri.fsPath)?second:first,
+      onDidChangeConfiguration:callback=>{changeConfiguration=callback;return disposable();},
       getConfiguration:(_name,resource)=>{scopes.push(resource.toString());return{get:(_key,fallback)=>fallback,inspect:()=>undefined};},
       openNotebookDocument:async(type,data)=>{notebooks.push({type,data});return{uri:{scheme:'untitled'},getCells:()=>data.cells};},
       openTextDocument:async source=>({uri:source,languageId:'julia',isDirty:false}),
@@ -40,7 +41,7 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
       },
       createTerminal:options=>{const terminal={options,show(){this.visible=true;},dispose(){this.disposed=true;}};terminals.push(terminal);return terminal;},
     },
-    commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async(...args)=>invocations.push(args)},
+    commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async(...args)=>{invocations.push(args);if(args[0]==='perfchecker.initialize')await initializeAction?.();}},
     extensions:{getExtension:()=>hasJulia?{activate:async()=>undefined}:undefined},
     debug:{startDebugging:async(folder,configuration)=>{debugged.push({folder,configuration});return true;}},
   };
@@ -95,6 +96,25 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await assert.rejects(commands.get('perfchecker.debugFile')(second.uri),/Save the Julia/);
     await commands.get('perfchecker.openStudioForWorkspace')(first.uri);assert.equal(panels[0].disposed,true);
     assert.equal(panels.length,2);await panels[1].send({type:'studioReady'});assert.match(panels[1].messages.at(-1).problem,/Project.toml not found/);
+    initializeAction=async()=>{
+      await mkdir(path.join(first.uri.fsPath,'perf','controller'),{recursive:true});
+      await writeFile(path.join(first.uri.fsPath,'perf','controller','Project.toml'),'name="Controller"\n');
+    };
+    await panels[1].send({type:'studioAction',action:'initialize'});
+    assert.equal(panels[1].messages.at(-1).project,path.join(first.uri.fsPath,'perf','controller'),
+      'The same Studio refreshes its controller state after the explicit setup action finishes');
+    assert.equal(panels[1].messages.at(-1).problem,'');
+    let started,finish;
+    const initialized=new Promise(resolve=>{started=resolve;});
+    initializeAction=()=>new Promise(resolve=>{finish=resolve;started();});
+    const previousPanel=panels[1],beforeRefresh=previousPanel.messages.length;
+    const pending=previousPanel.send({type:'studioAction',action:'initialize'});await initialized;
+    await commands.get('perfchecker.openStudioForWorkspace')(second.uri);await panels[2].send({type:'studioReady'});
+    finish();await pending;
+    assert.equal(previousPanel.messages.length,beforeRefresh,'An action finishing in a replaced panel cannot publish stale state');
+    assert.equal(panels[2].messages.at(-1).workspace,'second','A completed setup must not replace another folder’s displayed context');
+    await changeConfiguration({affectsConfiguration:(_section,resource)=>resource.toString()===second.uri.toString()});
+    assert.equal(panels[2].messages.at(-1).project,path.join(second.uri.fsPath,'perf','controller'));
     assert.equal(terminals.length,2);assert.equal(notebooks.length,0);
     assert.ok(scopes.every(scope=>[first.uri.toString(),second.uri.toString()].includes(scope)));
     context.subscriptions.forEach(item=>item.dispose());

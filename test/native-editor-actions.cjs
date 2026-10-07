@@ -71,7 +71,7 @@ async function resource(context,workspace,controller,threads){
     const diagnosis=await reportAfter(root,before,'diagnosis');
     const record=diagnosis.payload.records.find(item=>item.scenario==='native_editor_branch');
     assert(record,'The clicked CodeLens diagnoses its own selected scenario');
-    assert.equal(record.tool,'jet');assert.equal(record.status,'complete');assert.equal(record.correctness.status,'passed');
+    assert.equal(record.tool,'jet');assert.equal(record.status,'complete');assert.equal(record.correctness,'passed');
     assert.equal(vscode.Uri.file(record.configuration.project).fsPath,vscode.Uri.file(controller).fsPath);
     assert.equal(record.runtime.threads,threads);
     const finding=record.findings.find(item=>item.location?.file&&

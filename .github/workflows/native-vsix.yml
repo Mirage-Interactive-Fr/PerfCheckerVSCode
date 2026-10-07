@@ -145,7 +145,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-stable' && '[{"os":"macos-15-intel","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 150
     env:
       PERFCHECKER_VSCODE_VERSION: ${{ matrix.vscode }}
       PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}

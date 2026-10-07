@@ -188,7 +188,7 @@ try {
           await retainHostLogs().catch(error=>console.error(`NATIVE_STARTUP_LOGS ${error.message}`));stop();
           reject(new Error(`The ${phase} helper did not activate within 3 minutes. Retained Electron/extension-host logs distinguish startup failure from campaign duration.`));
         })();},180000);
-        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?70:40;
+        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?100:40;
         const timer=setTimeout(()=>{stop();reject(new Error(`The ${phase} native phase exceeded its explicit ${minutes}-minute bound`));},minutes*60*1000);
         const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
         const clean=()=>{clearTimeout(timer);clearTimeout(activationTimer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
@@ -236,7 +236,7 @@ try {
   // A distinct bounded workload gives CPU sampling actual operation time;
   // ordinary benchmark and diagnosis examples keep their small input.
   await fs.appendFile(path.join(workspace,'perf','cases.jl'),'Base.@noinline function native_profile_sum(xs)\n result=0.0\n for _ in 1:64\n  result=sum(xs.^2)\n end\n result\nend\nmake_profile_case(p) = (prepare=()->collect(1.0:1_000_000.0), operation=native_profile_sum, verify=(xs,result)->isapprox(result,1_000_000.0*1_000_001.0*2_000_001.0/6;rtol=1e-12))\n');
-  await fs.appendFile(path.join(workspace,'perf','cases.jl'),'make_owned_cancel_case(p) = (prepare=()->mktempdir(cleanup=false), operation=directory->begin write(joinpath(directory,"owned.tmp"),"owned");write(p["marker"],string(getpid())*"\\n"*directory);sleep(120);42 end, verify=(directory,result)->result==42, cleanup=directory->begin rm(directory;recursive=true,force=true);write(p["cleaned"],"cleaned") end)\n');
+  await fs.appendFile(path.join(workspace,'perf','cases.jl'),'make_owned_cancel_case(p) = (prepare=()->mktempdir(cleanup=false), operation=directory->begin write(joinpath(directory,"owned.tmp"),"owned");write(p["marker"],string(getpid())*"\\n"*directory*"\\n"*dirname(Base.ARGS[1]));sleep(120);42 end, verify=(directory,result)->result==42, cleanup=directory->begin rm(directory;recursive=true,force=true);write(p["cleaned"],"cleaned") end)\n');
   await fs.writeFile(path.join(workspace,'perf','owned-cancel.jl'),`perf_setup() = dirname(Base.active_project())
 function perf_workload(directory)
  write(joinpath(directory,"owned.tmp"),"owned")

@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const http = require('node:http');
-const {execFile} = require('node:child_process');
+const {execFile,spawn} = require('node:child_process');
 const {promisify} = require('node:util');
 const {createHash} = require('node:crypto');
 const {clickStudioAction}=require('./native-studio-controls.cjs');
@@ -19,6 +19,21 @@ async function eventually(read, label, timeout = 180000) {
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?
   Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
+const processAlive=pid=>{try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
+async function ownedChatProcesses(){
+  let rows;
+  if(process.platform==='win32'){
+    const {stdout}=await execute('powershell.exe',['-NoProfile','-Command',
+      '@(Get-CimInstance Win32_Process | Where-Object { $_.Name -like "julia*" } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;command=$_.CommandLine} }) | ConvertTo-Json -Compress']);
+    const value=stdout.trim()?JSON.parse(stdout):[];rows=Array.isArray(value)?value:[value];
+  }else{
+    const {stdout}=await execute('ps',['-eo','pid=,ppid=,args=']);
+    rows=stdout.split('\n').map(line=>{const match=line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);return match?{pid:Number(match[1]),parent:Number(match[2]),command:match[3]}:undefined;}).filter(Boolean);
+  }
+  const cli=rows.find(row=>row.parent===process.pid&&/perfchecker-chat-/.test(row.command||'')&&/--source=/.test(row.command||''));
+  const worker=cli&&rows.find(row=>row.parent===cli.pid&&/advisor_worker\.jl/.test(row.command||''));
+  return cli&&worker?{cli:Number(cli.pid),worker:Number(worker.pid)}:undefined;
+}
 
 async function measuredEvidence(context) {
   const root=path.resolve(context.workspace,context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace)).get('investigationReports','perf/results/investigations'));
@@ -85,7 +100,6 @@ exports.run = async (context,options={}) => {
   const git = async (...args) => (await execute('git', args, {cwd: workspace,
     env: {...process.env, GIT_OPTIONAL_LOCKS: '0'}, windowsHide: true})).stdout;
   const head = await git('rev-parse', 'HEAD');
-  const index = await fs.readFile(path.join(workspace, '.git', 'index'));
   const probe = async root => {
     const code = 'include("src/PerfCheckerNativeFixture.jl"); score=PerfCheckerNativeFixture.sum_squares; @assert score(Float64[]) == 0.0; @assert score([1.0,-2.0,3.0]) == 14.0; xs=collect(1.0:1000.0); score(xs); @assert score(xs)==333833500.0; println(@allocated score(xs))';
     return Number((await execute(process.env.PERFCHECKER_NATIVE_JULIA,
@@ -94,6 +108,9 @@ exports.run = async (context,options={}) => {
   };
   const baselineBytes = await probe(workspace);
   const calls = [], pending = new Set(), providerErrors=[];
+  let alternateFolder;
+  const foreign=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+  const foreignFinished=new Promise(resolve=>foreign.once('close',resolve));
   const custom=options.customArguments===true;
   const adviceArgument=custom?'question':'prompt',implementationArgument=custom?'change_request':'prompt',workspaceArgument=custom?'checkout_path':'workspace';
   const additional=custom?{native_contract:{label:'real-native-request',enabled:true}}:{};
@@ -212,6 +229,9 @@ exports.run = async (context,options={}) => {
     await view.getByRole('textbox', {name: 'Implementation tool name', exact: true}).fill('implement_perfchecker');
     await view.getByRole('button', {name: 'Save implementation tool', exact: true}).click();
     await eventually(async () => /Implementation tool saved/.test((await state()).status), 'The native tool configuration is saved');
+    // Snapshot immediately before the checkpoint, after measurement and native
+    // editor activity; earlier stat-cache changes are not part of this action.
+    const index = await fs.readFile(path.join(workspace, '.git', 'index'));
     log('native-ui-action',{surface:'MCP implementation',action:'Prepare implementation after review'});
     await view.getByRole('button', {name: 'I reviewed the advice · Prepare implementation', exact: true}).click();
     await eventually(async () => {const value = await state(); return !value.busy && value.proposal?.files.includes('src/PerfCheckerNativeFixture.jl');}, 'The real implementation worker returns its Git proposal', 240000);
@@ -234,15 +254,53 @@ exports.run = async (context,options={}) => {
     assert.deepEqual(await fs.readFile(path.join(workspace, '.git', 'index')), index);
     assert.equal(await git('rev-parse', 'HEAD'), head);
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-${vscode.version}-mcp-exact-restore.png`)});await hold();
+    proof('native-mcp-reviewed-apply-exact-restore',{provider:'Controlled real HTTP MCP service; no inference or credentials',checkpoint:true,diffEditor:true,apply:true,exactSourceIndexHead:true,
+      allocationBaselineBytes:baselineBytes,allocationCandidateBytes:implementationBytes,indexSha256:hash(index)});
+    if(custom)proof('native-mcp-custom-arguments',{adviceArgument,implementationArgument,workspaceArgument,additionalArgumentsVerified:true,
+      actualHttpCalls:calls.length,measuredEvidenceIds:attached.evidence.map(row=>row.id),configurationRestoredInFinally:true});
     await view.getByRole('button', {name: 'Discard proposal', exact: true}).click();
     await eventually(async () => !(await state()).proposal, 'Discard closes the recovery proposal');
     await view.getByRole('tab', {name: '01 · Advice', exact: true}).click();
     await view.locator('#chat-question').fill('native cancellation probe');
     await view.getByRole('button', {name: 'Send question', exact: true}).click();
     await eventually(() => pending.size > 0, 'The actual MCP request reached the provider');
+    const owned=await ownedChatProcesses();
+    assert(owned&&processAlive(owned.cli)&&processAlive(owned.worker),'The active native chat owns a real CLI and detached advisor worker');
+    const callsBeforeSwitch=calls.length;
+    const owningEvidence=(await state()).evidence;
+    assert(vscode.workspace.workspaceFile,'This regression uses a saved disposable multi-root workspace');
+    const alternate=path.join(path.dirname(workspace),'chat-alternate-workspace');
+    await fs.mkdir(alternate,{recursive:true});await fs.writeFile(path.join(alternate,'Project.toml'),'name="AlternateChatFixture"\n');
+    alternateFolder=vscode.Uri.file(alternate);
+    assert(vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length,0,{uri:alternateFolder,name:'Chat alternate folder'}));
+    await eventually(()=>vscode.workspace.workspaceFolders.some(folder=>folder.uri.toString()===alternateFolder.toString()),
+      'The real workspace has added the independent alternate folder');
+    await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',alternateFolder);
+    const alternateStudio=await findFrame('#studio-root');
+    await eventually(async()=>await alternateStudio.locator('.workspace strong').innerText()==='Chat alternate folder',
+      'Studio selects the second folder while the first chat request is still active');
+    await context.windowPage.locator('.tabs-container .tab').filter({hasText:'PerfChecker · Chat'}).last().click();
+    view=await findFrame('#chat-root');
+    assert.equal((await state()).workspace,vscode.workspace.workspaceFolders.find(folder=>folder.uri.fsPath===workspace).name,
+      'The displayed chat still identifies its first folder while Studio selects another');
+    assert.deepEqual((await state()).evidence,owningEvidence,'Publishing A retains A’s evidence inventory instead of reading the selected folder B');
+    assert.equal((await state()).evidenceId,attached.id);
+    assert(processAlive(owned.cli)&&processAlive(owned.worker),'Selecting the alternate Studio preserves the original active request');
+    assert.equal(calls.length,callsBeforeSwitch,'Selecting another Studio must not send another provider request');
+    log('native-mcp-cancel-before',{...owned,foreign:foreign.pid,heldResponses:pending.size,uiBusy:(await state()).busy});
     await view.getByRole('button', {name: 'Cancel request', exact: true}).click();
     await eventually(async () => !(await state()).busy, 'Cancel stops the real local Julia worker', 60000);
     await eventually(()=>pending.size===0,'The cancelled provider connection closes before the harness destroys any socket',15000);
+    assert.equal(processAlive(owned.cli),false,'The CLI is gone before harness teardown');
+    assert.equal(processAlive(owned.worker),false,'The detached advisor worker is gone before harness teardown');
+    assert(processAlive(foreign.pid),'Cancellation preserves an unrelated process');
+    proof('native-mcp-cancel-owned-processes',{...owned,foreignPreserved:true,heldResponseClosed:true,uiIdleAfterCleanup:true,
+      observedBeforeHarnessCleanup:true,nativeOwningPanelCancelAfterAlternateStudioSelected:true,
+      originalOwnedProcessesPreservedBeforeCancel:true,owningEvidenceInventoryPreserved:true,
+      additionalProviderRequestsOnWorkspaceSwitch:calls.length-callsBeforeSwitch});
+    await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',vscode.Uri.file(workspace));
+    await context.windowPage.locator('.tabs-container .tab').filter({hasText:'PerfChecker · Chat'}).last().click();
+    view=await findFrame('#chat-root');
     assert.equal(await fs.readFile(source, 'utf8'), original);
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
     await eventually(async () => (await state()).messages.length === 0, 'The native clear command removes the conversation');
@@ -254,8 +312,14 @@ exports.run = async (context,options={}) => {
       proof('native-mcp-custom-arguments',{adviceArgument,implementationArgument,workspaceArgument,additionalArgumentsVerified:true,
         actualHttpCalls:calls.length,measuredEvidenceIds:attached.evidence.map(row=>row.id),configurationRestoredInFinally:true});}
   } finally {
+    if(alternateFolder){
+      await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',vscode.Uri.file(workspace));
+      const index=vscode.workspace.workspaceFolders.findIndex(folder=>folder.uri.toString()===alternateFolder.toString());
+      if(index>=0)assert(vscode.workspace.updateWorkspaceFolders(index,1));
+    }
     for (const response of pending) response.destroy();
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     for (const [key, value] of Object.entries(previous)) await settings().update(key, value, vscode.ConfigurationTarget.WorkspaceFolder);
+    foreign.kill();await foreignFinished;
   }
 };

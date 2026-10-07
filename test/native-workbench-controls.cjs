@@ -59,10 +59,11 @@ async function repl(context){
 async function debug(context){
   const {vscode,workspace,windowPage}=context;
   const marker=path.join(workspace,'native-debug-version.txt');
+  await fs.rm(marker,{force:true});
   const program=path.join(workspace,'perf','native-debug.jl');
-  await fs.writeFile(program,`include(${JSON.stringify(path.join(workspace,'src','PerfCheckerNativeFixture.jl'))})\nusing .PerfCheckerNativeFixture\nvalue=PerfCheckerNativeFixture.sum_squares(collect(1.0:1000.0))\nwrite(${JSON.stringify(marker)},string(VERSION)*"\\n"*Base.active_project()*"\\n"*string(value))\n`);
+  await fs.writeFile(program,`include(${JSON.stringify(path.join(workspace,'src','PerfCheckerNativeFixture.jl'))})\nusing .PerfCheckerNativeFixture\nvalue=PerfCheckerNativeFixture.sum_squares(collect(1.0:1000.0))\nwrite(${JSON.stringify(marker+'.pending')},string(VERSION)*"\\n"*Base.active_project()*"\\n"*string(value))\nmv(${JSON.stringify(marker+'.pending')},${JSON.stringify(marker)};force=true)\n`);
   await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(program)));
-  let stopped=false,terminated=false,session;
+  let stopped=false,terminated=false,session,primaryError;
   const protocol=[];
   const tracker=vscode.debug.registerDebugAdapterTrackerFactory('julia',{createDebugAdapterTracker(current){
     if(typeof current.configuration.program!=='string'||vscode.Uri.file(current.configuration.program).fsPath!==vscode.Uri.file(program).fsPath)return undefined;session=current;
@@ -91,8 +92,17 @@ async function debug(context){
     },'The actual Continue button executes the saved Julia file in the selected controller',240000);
     await eventually(()=>terminated||!vscode.debug.activeDebugSession,'The Julia debug session terminates after execution');
     context.proof('official-julia-debug',{nativeStudioClick:true,nativeContinueClick:true,stopOnEntry:true,controller:context.controller,workspace:path.basename(workspace),julia:process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION,targetSourceExecuted:true,activeProjectVerified:true,coreImportUnderInterpreter:false});
-  }catch(error){context.log('julia-debug-protocol',{events:protocol,error:String(error)});throw error;}
-  finally{tracker.dispose();if(session&&!terminated)await vscode.debug.stopDebugging(session);}
+  }catch(error){primaryError=error;context.log('julia-debug-protocol',{events:protocol,error:String(error)});throw error;}
+  finally{
+    tracker.dispose();
+    if(session&&!terminated&&vscode.debug.activeDebugSession?.id===session.id){
+      try{await vscode.debug.stopDebugging(session);}catch(error){
+        if(primaryError)throw new AggregateError([primaryError,error],'Debug validation failed and its teardown also reported an error');
+        throw error;
+      }
+    }
+    await fs.rm(marker+'.pending',{force:true});
+  }
 }
 async function tasks(context){
   const {vscode,workspace,windowPage}=context;

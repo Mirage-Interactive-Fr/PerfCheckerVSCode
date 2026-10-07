@@ -18,6 +18,7 @@ class Studio implements vscode.Disposable {
   private pluto: PlutoNotebooks;
   private panel?: vscode.WebviewPanel;
   private panelWorkspace?: string;
+  private stateRevision = 0;
   private terminals = new Map<string, vscode.Terminal>();
   private lastJuliaSource = new Map<string, vscode.Uri>();
   constructor(private context: vscode.ExtensionContext) {
@@ -31,6 +32,15 @@ class Studio implements vscode.Disposable {
     context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(remember));
     context.subscriptions.push(vscode.window.onDidCloseTerminal(terminal => {
       for (const [key, existing] of this.terminals) if (terminal === existing) this.terminals.delete(key);
+    }));
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
+      const panel=this.panel, workspace=this.panelWorkspace;
+      const folder=vscode.workspace.workspaceFolders?.find(item=>item.uri.toString()===workspace);
+      if (!panel || !workspace || !folder || !event.affectsConfiguration('perfchecker',folder.uri)) return;
+      return this.publish(panel,workspace).catch(error => {
+        if (this.panel===panel && this.panelWorkspace===workspace)
+          void panel.webview.postMessage({type:'studioError',message:String(error)});
+      });
     }));
   }
   private folder(requested?: vscode.Uri | vscode.WorkspaceFolder) {
@@ -63,17 +73,24 @@ class Studio implements vscode.Disposable {
           if (message.action === 'julia' && !vscode.workspace.isTrusted) throw new Error('Trust the workspace before starting Julia.');
           if (message.action === 'julia' && !vscode.extensions.getExtension('julialang.language-julia')) throw new Error('Install the Julia VS Code extension to use its REPL and debugger.');
           await vscode.commands.executeCommand(actions[message.action], ...(['initialize','suite', 'items', 'terminal', 'notebook', 'openNotebook', 'debug'].includes(message.action) ? [folder.uri] : []));
+          if (message.action==='initialize') await this.publish(panel,workspace);
         }
       } catch (error) {await webview.postMessage({type: 'studioError', message: String(error)});}
     }, undefined, this.context.subscriptions);
   }
-  private async publish() {
-    const folder = this.folder(), settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
+  private async publish(panel=this.panel, workspace=this.panelWorkspace) {
+    if (!panel || !workspace || this.panel!==panel || this.panelWorkspace!==workspace) return;
+    const folder=vscode.workspace.workspaceFolders?.find(item=>item.uri.toString()===workspace);
+    if (!folder) return;
+    const revision=++this.stateRevision;
+    const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
     let project = '', problem = '';
     try {project = resolveControllerProject(folder.uri.fsPath, settings).project;} catch (error) {problem = String(error);}
     const suite = path.resolve(folder.uri.fsPath, settings.get('suite', 'perf/suite.jl'));
-    await this.panel?.webview.postMessage({type: 'studioState', workspace: folder.name, project, problem,
-      suiteAvailable: await fs.stat(suite).then(stat => stat.isFile()).catch(() => false),
+    const suiteAvailable=await fs.stat(suite).then(stat=>stat.isFile()).catch(()=>false);
+    if (this.panel!==panel || this.panelWorkspace!==workspace || revision!==this.stateRevision) return;
+    await panel.webview.postMessage({type: 'studioState', workspace: folder.name, project, problem,
+      suiteAvailable,
       juliaAvailable: Boolean(vscode.extensions.getExtension('julialang.language-julia')), trusted: vscode.workspace.isTrusted});
   }
   async terminal(requested?: vscode.Uri | vscode.WorkspaceFolder) {

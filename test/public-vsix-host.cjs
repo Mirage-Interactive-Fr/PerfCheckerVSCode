@@ -10,7 +10,8 @@ const investigations = require('./native-investigation-controls.cjs');
 const pluto = require('./native-pluto-controls.cjs');
 const workbench = require('./native-workbench-controls.cjs');
 const advisor = require('./native-advisor-controls.cjs');
-const redact=value=>String(value).replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]');
+const redact=value=>String(value).replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]')
+  .replace(/(secret%3D)[^%\s"'<>]*/gi,'$1[session secret]');
 
 // Feature effects are separate from registering a command. Missing evidence stays unverified.
 function commandCoverage(commands,checks){
@@ -26,10 +27,10 @@ function commandCoverage(commands,checks){
     runAll:['all-supported-collectors-measured'],runNode:['native-run-selection-command'],openEntrypoint:['native-workload-command'],
     openOutput:['result-controls'],showLog:['native-tool-catalogue'],openDesigner:['suite-selection-and-save'],openDesignerForWorkspace:['save-palette-command'],
     runLandscapeLiveForWorkspace:['landscape-live-prerequisite'],saveConfiguration:['save-palette-command','native-suite-save-palette'],
-    openStudio:['first-open-studio'],openStudioForWorkspace:['controller-visible-in-studio'],openChat:['native-mcp-advice-implementation-restore'],
-    openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save'],openNotebook:['pluto-reactive-save-reload-close'],
-    debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore'],applyImplementation:['native-mcp-advice-implementation-restore'],
-    restoreImplementation:['native-mcp-advice-implementation-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
+    openStudio:['native-open-studio-command'],openStudioForWorkspace:['controller-visible-in-studio','studio-inventory','bootstrap-existing-controller'],openChat:['native-mcp-advice-implementation-restore','native-mcp-configuration-only-conversation'],
+    openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save','pluto-studio-file-dialog-buttons'],openNotebook:['pluto-reactive-save-reload-close','pluto-studio-file-dialog-buttons'],
+    debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],applyImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],
+    restoreImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
     stopNotebookSession:['native-pluto-without-jupyter','pluto-stop-active-owned-worker'],
   };
   return commands.map(command=>{
@@ -257,6 +258,30 @@ exports.run = async () => {
     catch (error) {
       failures.push({name, message: redact(error), stack: redact(error.stack)});
       console.error(`NATIVE_FAILURE ${name}: ${redact(error.stack || error)}`);
+      // Keep a short terminal witness even if GitHub cannot upload the larger
+      // evidence archive. This only observes the real panel and owned log files.
+      const diagnostic={case:name,visibleDesigner:[],outputTails:[]};
+      try{
+        for(const context of browser?.contexts()||[])for(const page of context.pages())for(const frame of page.frames()){
+          if(!await frame.locator('#run').isVisible().catch(()=>false))continue;
+          diagnostic.visibleDesigner.push(await frame.evaluate(()=>({
+            busy:document.getElementById('run')?.disabled,
+            progress:document.getElementById('progress')?.innerText?.slice(-1000),
+            error:document.getElementById('designer-error')?.innerText?.slice(-2000),
+            selection:document.getElementById('count')?.innerText,
+          })).catch(value=>({readError:String(value)})));
+        }
+        const logs=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'logs');
+        const names=(await fs.readdir(logs,{recursive:true}).catch(()=>[])).filter(file=>/(?:\d+-)?PerfChecker(?: investigations| test items| Pluto)?\.log$/.test(path.basename(file)));
+        for(const file of names.slice(-4)){
+          const handle=await fs.open(path.join(logs,file),'r');
+          try{const stat=await handle.stat(),bytes=Buffer.alloc(Math.min(stat.size,2000));
+            await handle.read(bytes,0,bytes.length,Math.max(0,stat.size-bytes.length));
+            diagnostic.outputTails.push({channel:path.basename(file),tail:bytes.toString('utf8')});
+          }finally{await handle.close();}
+        }
+      }catch(value){diagnostic.readError=String(value);}
+      log('native-failure-diagnostic',diagnostic);
       await windowPage?.screenshot({path: path.join(output, `${phase}-${name}.png`)}).catch(() => {});
       await persist();await retainEvidence(name);
     }

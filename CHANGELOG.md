@@ -5,6 +5,8 @@
 - Explicit Studio setup for a controller and starter suite, including existing
   package environments that do not contain PerfChecker. No package installation
   happens without a user choice; target test dependencies remain explicit.
+- Studio refreshes its displayed controller after setup or folder-scoped
+  configuration changes, without publishing another workspace's state.
 - Reactive Pluto `.jl` notebooks in editor tabs replace the Jupyter notebook
   path. Feature-suite and investigation dashboards use the official companion,
   a separate Julia environment and explicit measurement controls.
@@ -22,6 +24,8 @@
 - Codex cancellation also reclaims descendants after the CLI leader exits. On
   Windows, a private process Job owns descendants before the CLI starts and
   stops them when the extension host or connector disappears.
+- MCP chat cancellation and editor closure wait for the controller to stop its
+  detached HTTP advisor worker; extension shutdown uses the same cleanup path.
 - Controller setup, notebook generation and scenario adoption check workspace
   trust, folder and settings identity before writing. Owned processes also
   request cooperative cleanup when their extension-host pipe closes.

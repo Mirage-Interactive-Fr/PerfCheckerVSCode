@@ -52,6 +52,13 @@ async function frame(context, selector) {
 async function studio(context) {
   await context.vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',
     context.vscode.Uri.file(context.workspace));
+  if(!context.openStudioCommandVerified){
+    await context.vscode.commands.executeCommand('perfchecker.openStudio',context.vscode.Uri.file(context.workspace));
+    const opened=await frame(context,'#studio-root');
+    await eventually(async()=>(await opened.locator('.workspace strong').innerText())===context.vscode.workspace.getWorkspaceFolder(context.vscode.Uri.file(context.workspace)).name,'The generic Studio command displays the explicit workspace');
+    context.proof('native-open-studio-command',{command:'perfchecker.openStudio',explicitWorkspace:true,currentPanelVisible:true});
+    context.openStudioCommandVerified=true;
+  }
   return frame(context, '#studio-root');
 }
 
@@ -80,6 +87,7 @@ async function options(view, selector) {
 async function designer(context) {
   await clickStudioAction(context, 'suite');
   const view = await frame(context, '#cards');
+  await view.locator('#reset-filters').click();
   await eventually(async () => (await view.locator('#cards .card').count()) > 0,
     'General-backed suite plan renders workload cards', 120000);
   return view;
@@ -182,8 +190,10 @@ async function testSuiteSelection(context) {
   await group.locator('.pick').check();
   await group.locator('.check-option input').first().uncheck();
   assert.equal(await view.locator('.card.partial').count(), 1);
-  await view.locator('#selection-summary').click();
-  assert.equal(await view.locator('#selection-preview li').count(), Math.min(all - 1, 80));
+  if(await view.locator('#selection-preview').locator('..').getAttribute('open')===null)
+    await view.locator('#selection-summary').click();
+  await eventually(async()=>await view.locator('#selection-preview li').count()===Math.min(all-1,80),
+    'The native details toggle renders the exact selected runs before their count is read');
   await view.locator('#open-after-run').uncheck();
   await group.locator('.label').evaluate(input => {
     input.value = '#1266aa'; input.dispatchEvent(new Event('input', {bubbles: true}));

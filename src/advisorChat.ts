@@ -11,6 +11,7 @@ import {localAdvisorConnection} from './advisorConnection';
 import {ChatMessage, prepareChatMessages, completeChatMessages, chatReply} from './advisorChatModel';
 import {InvestigationReport} from './investigationModel';
 import {createImplementationCheckout, applyImplementation, recoverImplementationProposal, recoverActiveImplementationProposal, saveActiveImplementationProposal, ImplementationProposal} from './implementation';
+import {cancellableJulia, controllerCancellation} from './controllerCancellation';
 
 export interface ChatEvidence {id: string; label: string}
 export class AdvisorChat implements vscode.Disposable {
@@ -18,7 +19,9 @@ export class AdvisorChat implements vscode.Disposable {
   private workspace?: string;
   private messages: ChatMessage[] = [];
   private evidenceId = '';
+  private displayedEvidence: ChatEvidence[] = [];
   private child?: ChildProcess;
+  private cancellation?: ReturnType<typeof controllerCancellation>;
   private busy = false;
   private cancelled = false;
   private status = 'Configure an MCP advice tool, then send a question.';
@@ -39,6 +42,7 @@ export class AdvisorChat implements vscode.Disposable {
       if (this.busy) throw new Error('Wait for the active conversation before changing PerfChecker folders.');
       this.panel?.dispose(); this.panel = undefined;
       this.messages = []; this.evidenceId = ''; this.pending = '';
+      this.displayedEvidence = [];
       this.proposal = undefined; this.implementationSummary = ''; this.backupRef = '';
       this.recoveredWorkspace = undefined;
       this.workspace = key;
@@ -46,10 +50,19 @@ export class AdvisorChat implements vscode.Disposable {
     return folder;
   }
   state() {
-    const folder = this.folder();
+    // A displayed conversation retains its folder even when another Studio
+    // changes the window's selected workspace. Its owned Cancel stays usable.
+    const folder = this.panel ? vscode.workspace.workspaceFolders?.find(folder=>folder.uri.toString()===this.workspace) : this.folder();
+    if (!folder) throw new Error('The conversation workspace was closed.');
+    let selectedHere=false;
+    try{selectedHere=currentWorkspaceFolder(vscode.workspace.workspaceFolders).uri.toString()===folder.uri.toString();}
+    catch{/* A different selected folder may have closed while this request finishes. */}
+    // The evidence provider is selected-folder scoped. Retain A's last inventory
+    // while B is selected instead of invoking B's history provider for A's panel.
+    if(selectedHere)this.displayedEvidence=this.evidenceOptions().map(item=>({...item}));
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
     return {type: 'chatState', workspace: folder.name, messages: this.messages, evidenceId: this.evidenceId,
-      evidence: this.evidenceOptions(), busy: this.busy, status: this.status, pending: this.pending,
+      evidence: this.displayedEvidence, busy: this.busy, status: this.status, pending: this.pending,
       connection: localAdvisorConnection(folder.uri.toString())?.label,
       implementation: localAdvisorConnection(folder.uri.toString())?.implementation ?? {tool: settings.get('advisorImplementationMcpTool', ''),
         promptArgument: settings.get('advisorImplementationMcpPromptArgument', 'prompt'),
@@ -69,18 +82,19 @@ export class AdvisorChat implements vscode.Disposable {
     if (this.panel) {this.panel.reveal(); this.publish(); return;}
     this.panel = vscode.window.createWebviewPanel('perfchecker.advisorChat', 'PerfChecker · Chat', vscode.ViewColumn.One,
       {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
-    const webview = this.panel.webview, nonce = randomUUID();
+    const panel = this.panel, webview = panel.webview, nonce = randomUUID();
     const resource = (name: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
     this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
     webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('advisor-chat.css')}"><title>PerfChecker chat</title></head><body><main id="chat-root"></main><script nonce="${nonce}" src="${resource('advisor-chat.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorChat(document.getElementById('chat-root'),m=>api.postMessage(m),${JSON.stringify(String(resource('perfchecker.png')))});window.addEventListener('message',e=>panel.receive(e.data));api.postMessage({type:'chatReady'});</script></body></html>`;
-    this.panel.onDidDispose(() => {this.cancel(); this.panel = undefined;});
+    panel.onDidDispose(() => {if (this.panel===panel) {this.cancel();this.panel=undefined;}});
     webview.onDidReceiveMessage(async message => {
       try {
+        if (this.panel!==panel || this.workspace!==workspace) return;
+        if (message?.type==='chatCancel') {this.cancel();return;}
         if (this.folder().uri.toString() !== workspace) throw new Error('PerfChecker folder changed. Reopen the conversation.');
         if (message?.type === 'chatReady') this.publish();
         else if (message?.type === 'chatSend') await this.send(message.question, message.evidenceId);
         else if (message?.type === 'chatClear') this.clear(message.evidenceId);
-        else if (message?.type === 'chatCancel') this.cancel();
         else if (message?.type === 'chatSettings') await vscode.commands.executeCommand('perfchecker.configureAdvisor');
         else if (message?.type === 'chatConnectCodex') await vscode.commands.executeCommand('perfchecker.connectCodex');
         else if (message?.type === 'chatDisconnectCodex') await vscode.commands.executeCommand('perfchecker.disconnectCodex');
@@ -94,7 +108,7 @@ export class AdvisorChat implements vscode.Disposable {
         }
         else if (message?.type === 'chatVerify') await vscode.commands.executeCommand('perfchecker.openInvestigations');
         else if (message?.type === 'chatDiscard') {if (this.busy) throw new Error('Wait for the current request.'); this.proposal = undefined; this.implementationSummary = ''; await this.persistProposal(); this.publish();}
-      } catch (error) {this.status = String(error); this.publish();}
+      } catch (error) {if (this.panel===panel && this.workspace===workspace) {this.status=String(error);this.publish();}}
     }, undefined, this.context.subscriptions);
   }
   clear(evidenceId: unknown = '') {
@@ -249,10 +263,13 @@ export class AdvisorChat implements vscode.Disposable {
       if (this.cancelled) throw new Error('Request cancelled.');
       return await new Promise((resolve, reject) => {
         const child = spawn(settings.get('juliaExecutable', 'julia'), ['--startup-file=no', `--project=${project}`,
-          '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', command, `--source=${source}`,
+          '-e', cancellableJulia('using PerfChecker; exit(perfchecker_main(ARGS))'), '--', command, `--source=${source}`,
           `--advisor-config=${configuration}`, `--project=${target}`],
-        {cwd: folder.uri.fsPath, windowsHide: true, detached: process.platform !== 'win32'});
+        {cwd: folder.uri.fsPath, windowsHide: true, detached: process.platform !== 'win32',
+          env: {...process.env, JULIA_LOAD_PATH: process.env.PERFCHECKER_LOAD_PATH || `@${path.delimiter}@stdlib`}});
         this.child = child;
+        const cancellation = controllerCancellation(child, message => {this.status = message; this.publish();});
+        this.cancellation = cancellation;
         const output: Buffer[] = [], errorDecoder = new StringDecoder('utf8');
         let error = '', size = 0, exceeded = false, timedOut = false;
         const duration = Number(config.timeout ?? 90);
@@ -263,13 +280,19 @@ export class AdvisorChat implements vscode.Disposable {
           if (size > 2_000_000) {exceeded = true; this.cancel();} else output.push(Buffer.from(data));
         });
         child.stderr?.on('data', data => {error = (error + errorDecoder.write(data)).slice(-4000);});
-        child.on('error', value => {clearTimeout(timeout); reject(value);});
+        const release = () => {
+          clearTimeout(timeout); cancellation.dispose();
+          if (this.child === child) {this.child = undefined; this.cancellation = undefined;}
+        };
+        child.on('error', value => {release(); reject(value);});
         child.on('close', code => {
-          clearTimeout(timeout);
+          release();
           error = (error + errorDecoder.end()).slice(-4000);
+          if (cancellation.forced) return reject(new Error(`${exceeded?'Advisor output exceeded 2 MB. ':''}Forced stop: advisor controller cleanup did not finish. Allocation traces or private inventories may remain; inspect the PerfChecker output.`));
           if (exceeded) return reject(new Error('Advisor output exceeded 2 MB.'));
-          if (timedOut) return reject(new Error('Advisor request timed out.'));
-          if (this.cancelled) return reject(new Error('Request cancelled. The remote server may still finish its work.'));
+          if (timedOut) return reject(new Error(`Advisor request timed out.${code && code !== 130 && error ? ` ${error}` : ''}`));
+          if (this.cancelled) return reject(new Error(code && code !== 130 && error ? error :
+            'Request cancelled after local worker cleanup. The remote server may still finish its work.'));
           try {resolve(JSON.parse(Buffer.concat(output).toString('utf8')));} catch {reject(new Error(code ? error || 'Julia chat worker failed. Update the PerfChecker controller if chat is unavailable.' : 'Invalid advisor response.'));}
         });
       });
@@ -278,11 +301,7 @@ export class AdvisorChat implements vscode.Disposable {
   cancel() {
     if (!this.busy) return;
     this.cancelled = true; this.status = 'Cancelling advisor request…';
-    const child = this.child;
-    if (child?.pid && child.exitCode === null && child.signalCode === null) {
-      if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {windowsHide: true}).on('error', () => child.kill());
-      else {try {process.kill(-child.pid, 'SIGKILL');} catch {child.kill('SIGKILL');}}
-    }
+    this.cancellation?.request();
     this.publish();
   }
   dispose() {this.disposed = true; this.cancel(); this.panel?.dispose();}
