@@ -233,12 +233,15 @@ export class PlutoNotebooks implements vscode.Disposable {
   private project(folder: vscode.WorkspaceFolder) {
     return path.resolve(folder.uri.fsPath, vscode.workspace.getConfiguration('perfchecker', folder.uri).get('plutoProject', 'perf/pluto'));
   }
+  private configuration(folder:vscode.WorkspaceFolder,keys:readonly string[]) {
+    return JSON.stringify(keys.map(key=>vscode.workspace.getConfiguration('perfchecker',folder.uri).get(key)));
+  }
   private async command(folder: vscode.WorkspaceFolder, project: string, code: string, title: string,
-      environment: Record<string, string> = {}, capture = false): Promise<string> {
+      environment: Record<string, string> = {}, capture = false, snapshot?:{keys:readonly string[];expected:string}): Promise<string> {
+    const keys=snapshot?.keys ?? ['plutoProject','runnerProject','scenarioProject','juliaExecutable'];
+    const expected=snapshot?.expected ?? this.configuration(folder,keys);
     return await vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title, cancellable: true}, async (_progress, token) => {
-      const configuration=()=>JSON.stringify(['plutoProject','runnerProject','scenarioProject','juliaExecutable'].map(key=>vscode.workspace.getConfiguration('perfchecker',folder.uri).get(key)));
-      const expected=configuration();
-      const current=()=>{this.assertCurrent(folder, project);if(configuration()!==expected)throw new Error('The Julia or PerfChecker environment settings changed during Pluto setup. Start the action again.');};
+      const current=()=>{this.assertCurrent(folder, project);if(this.configuration(folder,keys)!==expected)throw new Error('The Julia or PerfChecker environment settings changed during Pluto setup. Start the action again.');};
       current();
       const executable = vscode.workspace.getConfiguration('perfchecker', folder.uri).get('juliaExecutable', 'julia');
       let text = '';
@@ -250,7 +253,7 @@ export class PlutoNotebooks implements vscode.Disposable {
         this.setups.set(child,{cancel,finished});closing.add(finished);
         void finished.then(()=>{this.setups.delete(child);closing.delete(finished);});
         const subscriptions=[token.onCancellationRequested(() => cancel.request()),vscode.workspace.onDidChangeWorkspaceFolders(()=>{try{current();}catch{cancel.request();}}),
-          vscode.workspace.onDidChangeConfiguration(event=>{if(['plutoProject','runnerProject','scenarioProject','juliaExecutable'].some(key=>event.affectsConfiguration(`perfchecker.${key}`,folder.uri))){try{current();}catch{cancel.request();}}})];
+          vscode.workspace.onDidChangeConfiguration(event=>{if(keys.some(key=>event.affectsConfiguration(`perfchecker.${key}`,folder.uri))){try{current();}catch{cancel.request();}}})];
         const timeout = setTimeout(() => cancel.request(), 600000);
         child.stdout?.on('data', data => {if(capture){text += data.toString();if(text.length>2000000){cancel.request();reject(new Error('Generated Pluto notebook exceeded 2 MB.'));}}
           else this.output.append(data.toString());});
@@ -308,20 +311,31 @@ export class PlutoNotebooks implements vscode.Disposable {
       {label:'Investigation', description:'Discover scenarios, diagnose and compare measurements.', notebookKind:'investigation'}], {title:'PerfChecker · Pluto dashboard'});
     if (!kind) return;
     const project = await this.ensureEnvironment(folder); if (!project) return;
+    const keys=['plutoProject','runnerProject','scenarioProject','juliaExecutable','suite','reports','scenarioCatalog','factory','profile'];
+    const expected=this.configuration(folder,keys);
+    const current=()=>{
+      this.assertCurrent(folder,project);
+      if(this.configuration(folder,keys)!==expected)throw new Error('The Pluto notebook configuration changed. Start generation again.');
+    };
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
     const suite = path.resolve(folder.uri.fsPath, settings.get('suite', 'perf/suite.jl'));
-    const suiteExists = await fs.stat(suite).then(stat => stat.isFile()).catch(() => false);
     const reports = path.resolve(folder.uri.fsPath, settings.get('reports', 'perf/results/vscode'));
     const target = kind.notebookKind === 'investigation' ? resolveControllerProject(folder.uri.fsPath,settings,'scenarioProject').project : project;
+    const argumentsJson={kind:kind.notebookKind,notebook:notebook.fsPath,root:folder.uri.fsPath,
+      catalog:path.resolve(folder.uri.fsPath,settings.get('scenarioCatalog','perf/scenarios.toml')),
+      factory:settings.get('factory','build_suite'),profile:settings.get('profile','quick'),
+      reports,result:path.join(reports,'suite-result.json'),project,target};
+    const suiteExists = await fs.stat(suite).then(stat => stat.isFile()).catch(() => false);
+    current();
     await fs.mkdir(path.dirname(notebook.fsPath), {recursive: true});
-    const generated = await this.command(folder, project, generateCode, 'PerfChecker · Write Pluto dashboard', {PERFCHECKER_PLUTO_ARGUMENTS: JSON.stringify({
-      kind: kind.notebookKind, notebook: notebook.fsPath, root: folder.uri.fsPath, catalog: path.resolve(folder.uri.fsPath, settings.get('scenarioCatalog','perf/scenarios.toml')),
-      suite: suiteExists ? suite : null, factory: settings.get('factory','build_suite'), profile: settings.get('profile','quick'),
-      reports, result: path.join(reports,'suite-result.json'), project,target})},true);
+    current();
+    const generated = await this.command(folder, project, generateCode, 'PerfChecker · Write Pluto dashboard',
+      {PERFCHECKER_PLUTO_ARGUMENTS:JSON.stringify({...argumentsJson,suite:suiteExists?suite:null})},true,{keys,expected});
     const encoded = /^PERFCHECKER_PLUTO_NOTEBOOK ([A-Za-z0-9+/=]+)$/m.exec(generated)?.[1];
     if(!encoded)throw new Error('The Pluto generator did not return a native notebook. Inspect the PerfChecker Pluto output.');
-    this.assertCurrent(folder,project);
+    current();
     await contained(folder.uri.fsPath,notebook.fsPath);
+    current();
     await fs.writeFile(notebook.fsPath,Buffer.from(encoded,'base64'),{flag:'wx'});
     return await this.openFile(folder, notebook.fsPath, project);
   }

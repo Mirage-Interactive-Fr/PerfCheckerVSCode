@@ -87,12 +87,27 @@ try {
         // no intercepted APIs. All dialogs are clicked through the real UI.
         const child=spawn(vscode,[workspace,...cliProfile,'--new-window','--skip-welcome','--skip-release-notes',
           '--disable-workspace-trust','--disable-gpu','--remote-debugging-port=9222',
+          ...(process.platform==='linux'?['--no-sandbox']:[]),
           `--extensionDevelopmentPath=${path.join(repository,'test','qualification-host')}`],
           {env:environment,windowsHide:false,detached:process.platform!=='win32',stdio:'inherit'});
+        let activated=false,seenChecks=0,seenFailures=0,reading=false,activeCase;
+        const progress=setInterval(async()=>{
+          if(reading)return;reading=true;
+          try{
+            if(!activated){const boot=JSON.parse(await fs.readFile(path.join(output,`${phase}-bootstrap.json`),'utf8'));activated=true;console.log(`NATIVE_HOST_ACTIVATED ${phase} VSCode ${boot.vscode}`);}
+            const report=JSON.parse(await fs.readFile(path.join(output,`${phase}.json`),'utf8'));
+            if(report.activeCase&&report.activeCase!==activeCase)console.log(`NATIVE_CASE_START ${phase} ${report.activeCase}`);
+            activeCase=report.activeCase;
+            for(const check of report.checks.slice(seenChecks))console.log(`NATIVE_CHECK ${phase} ${check.name} ${check.status??'observed'}`);
+            for(const failure of report.failures.slice(seenFailures))console.log(`NATIVE_FAILURE ${phase} ${failure.name}: ${failure.message}`);
+            seenChecks=report.checks.length;seenFailures=report.failures.length;
+          }catch(error){if(!['ENOENT'].includes(error.code)&&!(error instanceof SyntaxError))console.log(`NATIVE_PROGRESS ${phase}: ${error.message}`);}
+          finally{reading=false;}
+        },2000);
         const stop=()=>{if(child.exitCode!==null)return;if(process.platform==='win32')spawn('taskkill',['/pid',String(child.pid),'/T','/F'],{windowsHide:true});else try{process.kill(-child.pid,'SIGTERM');}catch{}};
         const timer=setTimeout(()=>{stop();reject(new Error(`The ${phase} native phase exceeded its explicit 40-minute bound`));},40*60*1000);
         const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
-        const clean=()=>{clearTimeout(timer);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
+        const clean=()=>{clearTimeout(timer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
         child.once('error',error=>{clean();reject(error);});
         child.once('close',async code=>{clean();try{
           const result=JSON.parse(await fs.readFile(path.join(output,`${phase}-finished.json`),'utf8'));

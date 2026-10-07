@@ -13,6 +13,11 @@ on:
         type: choice
         options: [smoke, full]
         default: full
+      scope:
+        description: All supported hosts, or the two Linux hosts for a focused rerun
+        type: choice
+        options: [all, linux]
+        default: all
       core:
         description: Registered minimum, or the explicitly pinned Core fix before registration
         type: choice
@@ -41,11 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        vscode: ['1.96.0', stable]
-        include:
-          - os: macos-15-intel
-            vscode: stable
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:

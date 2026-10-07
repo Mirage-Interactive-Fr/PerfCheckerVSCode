@@ -9,10 +9,10 @@ import {createServer} from 'node:http';
 test('Pluto requires explicit installation, a trusted workspace and a native notebook',async()=>{
   const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-pluto-boundaries-'));
   const uri=file=>({scheme:'file',fsPath:file,toString:()=>`file://${file}`});
-  const folder={name:'fixture',uri:uri(root)},messages=[],scopes=[];
+  const folder={name:'fixture',uri:uri(root)},messages=[],scopes=[],values=new Map();
   const disposable=()=>({dispose(){}});
   const vscode={workspace:{isTrusted:true,workspaceFolders:[folder],getWorkspaceFolder:source=>source.fsPath.startsWith(root+path.sep)?folder:undefined,
-    getConfiguration:(_name,scope)=>{scopes.push(scope);return{get:(_key,fallback)=>fallback};},onDidChangeWorkspaceFolders:disposable},
+    getConfiguration:(_name,scope)=>{scopes.push(scope);return{get:(key,fallback)=>values.has(key)?values.get(key):fallback};},onDidChangeWorkspaceFolders:disposable},
     Uri:{file:uri,joinPath:(base,...pieces)=>uri(path.join(base.fsPath,...pieces))},
     window:{createOutputChannel:()=>({append(){},appendLine(){},dispose(){}}),
       showWarningMessage:async message=>{messages.push(message);return undefined;}},
@@ -57,5 +57,26 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
       assert.equal((await fetch(source)).status,200,'The rendered iframe carries the original authentication parameters');
       assert.equal(new URL(source).searchParams.get('id'),'test-notebook');
     }finally{await new Promise(resolve=>server.close(resolve));}
+
+    const project=path.join(root,'perf','pluto'),suite=path.join(root,'perf','suite.jl');
+    await writeFile(suite,'using PerfChecker\n');
+    const originalEnsure=pluto.ensureEnvironment,originalCommand=pluto.command,originalOpen=pluto.openFile;
+    // Isolate the asynchronous file/settings boundary; the native campaign tests
+    // the real generator/server separately rather than claiming that here.
+    pluto.ensureEnvironment=async()=>project;
+    pluto.command=async()=>`PERFCHECKER_PLUTO_NOTEBOOK ${Buffer.from('### A Pluto.jl notebook ###\n').toString('base64')}\n`;
+    pluto.openFile=async(_folder,file)=>uri(file);
+    const nativeFs=createRequire(import.meta.url)('node:fs').promises,originalStat=nativeFs.stat;
+    let changed=false;
+    nativeFs.stat=async(file,...args)=>{
+      const result=await originalStat(file,...args);
+      if(file===suite&&!changed){changed=true;values.set('profile','changed-during-generation');}
+      return result;
+    };
+    const stale=path.join(root,'perf','notebooks','stale.jl');
+    try{
+      await assert.rejects(pluto.create(uri(stale),{kind:'suite'}),/settings changed|configuration changed/i);
+      assert.equal(await originalStat(stale).then(()=>true).catch(()=>false),false,'Stale generation cannot leave a notebook on disk');
+    }finally{nativeFs.stat=originalStat;pluto.ensureEnvironment=originalEnsure;pluto.command=originalCommand;pluto.openFile=originalOpen;}
   }finally{pluto.dispose();context.subscriptions.forEach(item=>item.dispose());await rm(root,{recursive:true,force:true});}
 });

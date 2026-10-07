@@ -28,7 +28,7 @@ function commandCoverage(commands,checks){
     openStudio:['studio-inventory'],openStudioForWorkspace:['controller-visible-in-studio'],openChat:['native-mcp-advice-implementation-restore'],
     openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save'],openNotebook:['pluto-reactive-save-reload-close'],
     debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore'],applyImplementation:['native-mcp-advice-implementation-restore'],
-    restoreImplementation:['native-mcp-advice-implementation-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:[],
+    restoreImplementation:['native-mcp-advice-implementation-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
     stopNotebookSession:['native-pluto-without-jupyter'],
   };
   return commands.map(command=>{
@@ -36,6 +36,7 @@ function commandCoverage(commands,checks){
     const prerequisite=['narrateAdvice','connectCodex','runLandscapeLiveForWorkspace'].includes(name);
     return {command,registered:true,status:proof.length?(prerequisite?'prerequisite-verified':'effect-verified'):'unverified',evidence:proof.map(check=>check.name),
       ...(prerequisite?{limit:name==='narrateAdvice'?'No configured narrative model; enabled model execution is not qualified.':name==='connectCodex'?'No human Codex authentication in CI; authenticated CLI/General integration is covered by the separate local opt-in test.':'No physical Étendue/GPU renderer in this disposable package; only its explicit prerequisites are verified.'}:{}),
+      ...(name==='disconnectCodex'?{limit:'The native test verifies the explicit disconnected return state and preserved saved configuration after a failed temporary connection. An active authenticated CLI disconnect is covered separately by the local opt-in test.'}:{}),
       route:'Evidence records actual palette/API or webview backend effects; registration alone is never execution proof.'};
   });
 }
@@ -91,12 +92,12 @@ exports.run = async () => {
   assert(path.isAbsolute(workspace));
   assert(path.basename(path.dirname(workspace)).startsWith('perfchecker-public-vsix-'));
   const checks = [], failures = [];
-  let browser, windowPage,commands=[];
+  let browser, windowPage,commands=[],activeCase;
   let pendingReport=Promise.resolve();
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,coverage:process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1',available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
-      commands:commandCoverage(commands,checks),checks,failures},null,2);
+      commands:commandCoverage(commands,checks),activeCase,checks,failures},null,2);
     pendingReport=pendingReport.then(()=>fs.writeFile(path.join(output,`${phase}.json`),report));
     return pendingReport;
   };
@@ -111,6 +112,7 @@ exports.run = async () => {
   };
   const log = (name, detail = {}) => {const clean=JSON.parse(redact(JSON.stringify({name,...detail})));checks.push(clean); console.log(`NATIVE_CHECK ${name} ${JSON.stringify(clean)}`);void persist();};
   const runCase = async (name, run) => {
+    activeCase=name;await persist();
     console.log(`NATIVE_CASE_START ${phase} ${name}`);
     try {await run(); log(name, {status: 'passed'});}
     catch (error) {
@@ -119,6 +121,7 @@ exports.run = async () => {
       await windowPage?.screenshot({path: path.join(output, `${phase}-${name}.png`)}).catch(() => {});
       await persist();await retainEvidence(name);
     }
+    finally{activeCase=undefined;await persist();}
   };
   try {
     browser = await eventually(() => chromium.connectOverCDP('http://127.0.0.1:9222'), 'Connect to the disposable Electron host');

@@ -87,15 +87,20 @@ exports.run = async context => {
   const state = () => vscode.commands.executeCommand('perfchecker.chatState');
   try {
     for (const [key, value] of Object.entries(values)) await settings().update(key, value, vscode.ConfigurationTarget.WorkspaceFolder);
+    const configuredPath=settings().get('advisorConfig','perf/advisor.json');
+    const configuredFile=path.resolve(workspace,configuredPath);
+    const savedConfig=await fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
     await vscode.commands.executeCommand('perfchecker.openChat');
     let view = await findFrame('#chat-root');
     await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click();
     await eventually(async () => /ENOENT|executable|could not|launch/i.test(await view.locator('[role="status"]').innerText()), 'Missing Codex explains its executable prerequisite');
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected, false);
     log('codex-missing-native-prerequisite',{command:'perfchecker.connectCodex',status:'prerequisite',reason:'Codex executable absent from disposable CI; no human credentials are transferred.'});
-    await vscode.commands.executeCommand('perfchecker.disconnectCodex');
+    assert.deepEqual(await vscode.commands.executeCommand('perfchecker.disconnectCodex'),{connected:false});
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
-    log('codex-disconnected-command',{command:'perfchecker.disconnectCodex',alreadyDisconnected:true,activeAuthenticatedDisconnection:false});
+    assert.equal(settings().get('advisorConfig','perf/advisor.json'),configuredPath);
+    assert.deepEqual(await fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;}),savedConfig,'The failed temporary CLI connection and explicit disconnect preserve the saved provider bytes');
+    log('codex-disconnected-command',{command:'perfchecker.disconnectCodex',returnValueVerified:true,alreadyDisconnected:true,savedConfigurationPreserved:true,activeAuthenticatedDisconnection:false});
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
     const send = async (question, count) => {
       await view.locator('#chat-question').fill(question);
