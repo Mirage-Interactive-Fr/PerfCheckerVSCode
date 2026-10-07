@@ -155,6 +155,7 @@ exports.run = async context => {
     await eventually(() => pending.size > 0, 'The actual MCP request reached the provider');
     await view.getByRole('button', {name: 'Cancel request', exact: true}).click();
     await eventually(async () => !(await state()).busy, 'Cancel stops the real local Julia worker', 60000);
+    await eventually(()=>pending.size===0,'The cancelled provider connection closes before the harness destroys any socket',15000);
     assert.equal(await fs.readFile(source, 'utf8'), original);
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
     await eventually(async () => (await state()).messages.length === 0, 'The native clear command removes the conversation');

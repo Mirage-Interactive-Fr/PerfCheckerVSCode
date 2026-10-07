@@ -121,14 +121,15 @@ async function exportAndVerify(context, result) {
   const original = await fs.readFile(result.location);
   const markdown = await fs.readFile(result.location.replace(/\.json$/, '.md'), 'utf8');
   assert(markdown.includes(marker));
-  const frame = await tab(context, 'Saved evidence');
-  const card = frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^narrate ·/})}).first();
   for (const [label, extension] of [['JSON', 'json'], ['Markdown', 'md']]) {
-    await card.getByRole('button', {name: label, exact: true}).click();
+    // Opening an export hides and destroys this non-retained webview. Reacquire
+    // its real frame and current card for each click, including the next export.
+    const frame = await tab(context, 'Saved evidence');
+    const card = frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^narrate ·/})}).first();
+    await card.getByRole('button', {name: label, exact: true}).click({timeout: 30000});
     const expected = result.location.replace(/\.json$/, `.${extension}`);
     await eventually(() => context.vscode.window.activeTextEditor?.document.uri.fsPath === context.vscode.Uri.file(expected).fsPath, `${label} export opens in the actual native editor`);
     assert(context.vscode.window.activeTextEditor.document.getText().includes(marker));
-    await view(context);
   }
   assert.deepEqual(await fs.readFile(result.location), original, 'Export does not rewrite evidence');
 }
@@ -186,6 +187,9 @@ exports.run = async context => {
     await frame.getByRole('heading', {name: 'Optional model explanation', exact: true}).waitFor();
     assert((await frame.locator('#app').innerText()).includes(marker));
     assert((await frame.locator('#app').innerText()).includes('Generated prose needs review'));
+    context.proof('native-narrative-controlled-response-visible', {provider: 'local controlled HTTP protocol fixture; no inference or human authentication',
+      protocol: settings.advisorProtocol, requests: fixture.requests.length, scenario: 'sum_squares', evidenceIds: request.ids,
+      samples: 2, status: narrative.report.status, authority: narrative.report.authority, visible: true, exportsStillRequired: true});
     await exportAndVerify(context, narrative);
     assert.deepEqual(await fs.readFile(measured.location), runBytes, 'Explanation does not replace measured results');
     context.proof('native-narrative-controlled-response', {provider: 'local controlled HTTP protocol fixture; no inference or human authentication',

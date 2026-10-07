@@ -278,6 +278,19 @@ exports.run = async () => {
       else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
       else if(phase==='studio'){
         await runCase('native-suite-run-button',async()=>{context.results=await controls.runSelection(context);});
+        await runCase('native-focused-result-measurements',async()=>{
+          const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
+          const examples=plan.runs.filter(run=>run.status==='ready'&&run.package==='Example');
+          const sampled=['profile','wall_profile','profile_alloc','alloc'].map(backend=>{
+            const run=plan.runs.find(run=>run.status==='ready'&&run.package==='PerfCheckerNativeFixture'&&run.feature===`sum_squares_${backend}`);
+            assert(run,`A real ${backend} workload is available for the focused Results controls`);return run;
+          });
+          assert.equal(examples.length,4,'Four registered Example versions supply real series and distributions');
+          await vscode.commands.executeCommand('perfchecker.runNode',{runs:[...sampled,...examples]});
+          const report=JSON.parse(await fs.readFile(path.join(context.results,'suite-result.json'),'utf8'));
+          assert.equal(report.runs.length,8);assert(report.runs.every(run=>run.status==='pass'));
+          proof('native-focused-result-measurements',{checks:8,collectors:['profile','wall_profile','profile_alloc','alloc','benchmark'],versions:examples.map(run=>run.version),source:'Actual Julia workers; no synthetic reports'});
+        });
         await runCase('native-all-studio-controls',()=>controls.run(context));
       }else throw new Error(`Unsupported focused native control group: ${phase}`);
     }else if(phase==='reload'){

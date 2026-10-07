@@ -231,11 +231,20 @@ async function diagnose(context) {
     assert.equal(records.length, 1, `${tool} has one actual worker result`);
     const record = records[0];
     assert(['complete', 'unavailable'].includes(record.status), `${tool} does not hide errors, invalid evidence, timeout or cancellation as a prerequisite`);
-    if (record.status === 'complete') assert.equal(record.correctness, 'passed', `${tool} execution returns valid diagnosis evidence`);
+    if (record.status === 'complete') {
+      // Aqua assesses package quality; it does not run the scenario's oracle.
+      // Its real adapter separates that assessment from runtime correctness.
+      if (tool === 'aqua') {
+        assert.equal(record.correctness, 'not_checked');
+        assert(['passed', 'failed'].includes(record.quality), 'Aqua returns a real package-quality assessment');
+      } else assert.equal(record.correctness, 'passed', `${tool} execution returns valid diagnosis evidence`);
+    }
     if (record.status === 'unavailable') assert(String(record.message || '').trim(), `${tool} unavailable status explains its prerequisite`);
     if (['latency', 'gc', 'memory'].includes(tool)) assert.equal(record.status, 'complete', `${tool} built-in worker actually executes`);
+    if (process.env.PERFCHECKER_NATIVE_PHASE === 'investigation' && ['aqua', 'snoopcompile'].includes(tool))
+      assert.equal(record.status, 'complete', `${tool} is explicitly installed for this positive optional-analyzer campaign`);
     if (['heap','locks'].includes(tool) && record.status === 'unavailable') assert.match(String(record.message), tool === 'heap' ? /snapshot|redact|unsupported|not supported|runtime/i : /counter|1\.11|not exposed|unsupported|runtime/i, `${tool} has a concrete runtime prerequisite`);
-    context.proof(`investigation-analyzer-${tool}`, {status: record.status, correctness: record.correctness, version: record.tool_version, prerequisite: record.status === 'complete' ? undefined : record.message});
+    context.proof(`investigation-analyzer-${tool}`, {status: record.status, correctness: record.correctness, quality: record.quality, version: record.tool_version, prerequisite: record.status === 'complete' ? undefined : record.message});
   }
   const current = await tab(context, 'Findings & advice');
   const artifactRecord = result.report.records.find(record => record.artifacts?.length);

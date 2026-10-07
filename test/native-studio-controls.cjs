@@ -269,6 +269,8 @@ async function testGitTargetsAndComparisons(context) {
     await view.locator('#candidate-targets input').nth(1).check();
     for (const value of ['median', 'mean', 'minimum', 'maximum']) await view.locator('#comparison-aggregation').selectOption(value);
     await view.locator('#comparison-aggregation').selectOption('median');
+    await view.locator('#comparison-package').locator('..').scrollIntoViewIfNeeded();
+    await capture(context,'comparison-matrix');
     const before = settings().get('comparisonPolicies', []).length;
     await view.locator('#add-comparison').click();
     await eventually(() => settings().get('comparisonPolicies', []).length === before + 1, 'Persist comparison from actual button');
@@ -314,6 +316,8 @@ async function testCancelGitDiscovery(context){
 }
 
 async function testResults(context) {
+  const commands=await context.vscode.commands.getCommands(true);
+  if(commands.includes('workbench.action.closePanel'))await context.vscode.commands.executeCommand('workbench.action.closePanel');
   let view = await output(context);
   assert.match(await view.locator('body').innerText(), /PERFCHECKER OUTPUT/);
   assert.equal(await view.locator('.empty').count(), 0, 'Real suite measurements were supplied to the installed VSIX');

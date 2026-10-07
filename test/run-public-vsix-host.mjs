@@ -212,6 +212,7 @@ try {
   // The first real launch has no PerfChecker settings, Julia or Jupyter extension.
   if(completeCampaign)await launch('fresh');
   await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]); using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; end; println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode]);
+  if(stage==='focused'&&caseGroup==='investigation')await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.add(["Aqua","SnoopCompile"]);using Aqua,SnoopCompile;println("OPTIONAL_ANALYZER_INSTALL Aqua=",Base.pkgversion(Aqua)," SnoopCompile=",Base.pkgversion(SnoopCompile))',controller]);
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(["BenchmarkTools","Chairmarks","TestItems"]); Pkg.activate(ARGS[2]); Pkg.add("TestItems")', target, workspace]);
   await fs.mkdir(path.join(workspace, 'perf'), {recursive: true});
   // Fresh first-use evidence belongs to the starter; the prepared campaign uses its own reports.
@@ -238,6 +239,12 @@ perf_oracle(directory) = isdir(directory)
   await fs.writeFile(path.join(workspace,'perf','owned-suite.jl'),'using PerfChecker\nfunction build_suite()\n f=FeatureSpec(:owned_stop;backend=:alloc,entrypoint=joinpath(@__DIR__,"owned-cancel.jl"),oracle=OracleSpec())\n SoftwareSuite(:owned_stop,[PackageSuite("PerfCheckerNativeFixture";source=dirname(@__DIR__),worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=VersionNumber[],features=[f])])\nend\n');
   await fs.writeFile(path.join(workspace, 'perf', 'scenarios.toml'), 'schema_version = "perfchecker-scenario-catalog/1"\nroot = "."\n[[scenarios]]\nid = "sum_squares"\nimplementation = "allocating"\nsource = "cases.jl"\nfactory = "make_sum_case"\ncollectors = ["benchmark", "chairmark", "profile", "profile_alloc"]\n[[scenarios]]\nid = "wait_task"\nimplementation = "waiting"\nsource = "cases.jl"\nfactory = "make_wait_case"\ncollectors = ["benchmark"]\n');
   await fs.appendFile(path.join(workspace,'perf','scenarios.toml'),'[[scenarios]]\nid = "sampled_sum_squares"\nimplementation = "sampled"\nsource = "cases.jl"\nfactory = "make_profile_case"\ncollectors = ["benchmark", "chairmark", "profile", "profile_alloc"]\n');
+  if(stage==='focused'&&caseGroup==='investigation'){
+    const catalog=path.join(workspace,'perf','scenarios.toml');
+    // Aqua needs the actual target package, rather than the perf script folder.
+    // Declared source paths remain relative to the catalog's own directory.
+    await fs.writeFile(catalog,(await fs.readFile(catalog,'utf8')).replace('root = "."','root = ".."'));
+  }
   await fs.writeFile(path.join(workspace, 'perf', 'example.jl'), 'using Example\nperf_setup() = "PerfChecker"\nperf_workload(name) = Example.hello(name)\nperf_oracle(name,result) = occursin(name,result)\n');
   await fs.writeFile(path.join(workspace,'perf','network.jl'), `using Sockets
 perf_setup() = collect(UInt8(0):UInt8(127))
