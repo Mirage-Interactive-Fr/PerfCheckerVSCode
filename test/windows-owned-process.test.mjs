@@ -49,9 +49,9 @@ else if(role==='child'){
   const code='[IO.File]::WriteAllText('+literal(root+'/child.pid')+', [string]$PID);'+
    '$start=New-Object Diagnostics.ProcessStartInfo;$start.FileName='+literal(process.execPath)+';'+
    '$start.Arguments='+literal('"'+__filename+'" grandchild intermediate')+';$start.UseShellExecute=$false;'+
-   '$process=[Diagnostics.Process]::Start($start);while(-not [IO.File]::Exists('+literal(root+'/ready')+')){Start-Sleep -Milliseconds20};exit0';
+   '$process=[Diagnostics.Process]::Start($start);while(-not [IO.File]::Exists('+literal(root+'/ready')+')){Start-Sleep -Milliseconds 20};exit 0';
   cp.spawn(process.env.SystemRoot+'/System32/WindowsPowerShell/v1.0/powershell.exe',
-   ['-NoProfile','-EncodedCommand',Buffer.from(code.replace(/-Milliseconds20/g,'-Milliseconds 20').replace(/exit0/g,'exit 0'),'utf16le').toString('base64')],{stdio:['ignore',1,2],env:process.env});
+   ['-NoProfile','-EncodedCommand',Buffer.from(code,'utf16le').toString('base64')],{stdio:['ignore',1,2],env:process.env});
  }else cp.spawn(process.execPath,[__filename,'child',mode],{stdio:['ignore',1,2],env:process.env});
  const timer=setInterval(()=>{if(fs.existsSync(root+'/ready')){
   fs.writeFileSync(root+'/leader-ready','ready');
@@ -96,12 +96,15 @@ test('Windows Job owner stops if its Node parent disappears',{skip:!windows,time
   const host=path.join(root,'owner host.js');
   const module=require.resolve('../dist/windowsOwnedProcess.js');
   await writeFile(host,`const fs=require('node:fs');const {spawnWindowsOwnedProcess}=require(${JSON.stringify(module)});const child=spawnWindowsOwnedProcess(process.execPath,[${JSON.stringify(script)},'leader','active'],{cwd:${JSON.stringify(root)},env:{...process.env,PCW_TEST_ROOT:${JSON.stringify(root)}});fs.writeFileSync(${JSON.stringify(path.join(root,'wrapper.pid'))},String(child.pid));let stderr='';child.stdout.resume();child.stderr.on('data',chunk=>stderr+=chunk);child.on('close',(code,signal)=>fs.writeFileSync(${JSON.stringify(path.join(root,'wrapper-result.json'))},JSON.stringify({code,signal,stderr})));child.stdin.end('complete prompt');setInterval(()=>{},1000);`);
-  const parent=spawn(process.execPath,[host],{stdio:'ignore',windowsHide:true});
+  const parent=spawn(process.execPath,[host],{stdio:['ignore','pipe','pipe'],windowsHide:true});
+  const parentFinished=completion(parent);let parentResult;
+  void parentFinished.then(result=>{parentResult=result;});
   let pids=[];
   try{
     await until(async()=>{try{await readFile(path.join(root,'leader-ready'));return true;}catch(error){if(error.code!=='ENOENT')throw error;}
       const result=await readFile(path.join(root,'wrapper-result.json'),'utf8').catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
-      if(result)throw new Error(`Owner-loss fixture failed before readiness: ${result}`);return false;
+      if(result)throw new Error(`Owner-loss fixture failed before readiness: ${result}`);
+      if(parentResult)throw new Error(`Owner-loss Node host failed before readiness: ${JSON.stringify(parentResult)}`);return false;
     },'real child/grandchild before owner loss');
     pids=await Promise.all(['wrapper','leader','child','grandchild'].map(async role=>Number(await readFile(path.join(root,role+'.pid'),'utf8'))));
     assert.equal(alive(pids[3]),true,'grandchild is running before its Node owner is stopped');
