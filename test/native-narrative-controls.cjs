@@ -3,9 +3,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const http = require('node:http');
-const {createHash} = require('node:crypto');
+const {createHash, randomUUID} = require('node:crypto');
 
 const marker = 'Controlled protocol fixture: collect more comparable samples before drawing a performance conclusion.';
+const customInstructions = 'Native qualification instruction: distinguish measured allocation evidence from hypotheses.';
 const names = {discover: 'discovery', run: 'run', narrate: 'narrative'};
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -67,13 +68,13 @@ async function action(context, root, label, name) {
   return reportAfter(context, root, before, name);
 }
 
-async function fixtureServer() {
+async function fixtureServer(token) {
   const state = {mode: 'respond', requests: [], errors: [], sockets: new Set(), blocked: undefined};
   const server = http.createServer(async (request, response) => {
     try {
       assert.equal(request.method, 'POST');
       assert.equal(request.url, '/v1/chat/completions');
-      assert.equal(request.headers.authorization, undefined, 'The fixture does not request or receive human authentication');
+      assert.equal(request.headers.authorization, `Bearer ${token}`, 'Only the sacrificial environment token reaches the owned fixture');
       const chunks = [];
       let size = 0;
       for await (const chunk of request) {size += chunk.length; assert(size < 1_000_000); chunks.push(chunk);}
@@ -81,6 +82,8 @@ async function fixtureServer() {
       assert.equal(body.model, 'perfchecker-native-narrative-fixture');
       assert.equal(body.stream, false);
       assert.equal(body.response_format.type, 'json_schema');
+      assert(body.messages.find(message => message.role === 'system')?.content.startsWith(customInstructions + '\n\n'),
+        'The actual Julia HTTP request prepends the configured nonempty instruction');
       const user = body.messages.find(message => message.role === 'user');
       assert(user && typeof user.content === 'string');
       const projection = JSON.parse(user.content);
@@ -117,6 +120,58 @@ async function fixtureServer() {
   return state;
 }
 
+async function remoteConfiguration(context, fixture, settings, keyEnvironment, token) {
+  const relative = `perf/native-narrative-settings-${randomUUID()}/configuration.json`;
+  const file = path.join(context.workspace, relative);
+  await fs.mkdir(path.dirname(file), {recursive: true});
+  await fs.writeFile(file, JSON.stringify({protocol: 'chat_completions_schema', endpoint: fixture.endpoint,
+    model: 'perfchecker-native-narrative-fixture', timeout: 180, instructions: customInstructions,
+    api_key_env: keyEnvironment, allow_remote: false}));
+  try {
+    await settings.update('advisorConfig', relative, context.vscode.ConfigurationTarget.WorkspaceFolder);
+    // Discard any earlier unsaved provider editor, then load the owned draft.
+    await context.vscode.commands.executeCommand('perfchecker.configureAdvisor');
+    await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+    await context.vscode.commands.executeCommand('perfchecker.configureAdvisor');
+    let frame = await context.findFrame('#advisor-root');
+    assert.equal(await frame.locator('#advisor-allow_remote').isChecked(), false);
+    assert.equal(await frame.locator('#advisor-instructions').inputValue(), customInstructions);
+    assert.equal(await frame.locator('#advisor-api_key_env').inputValue(), keyEnvironment);
+    const original = await fs.readFile(file), calls = fixture.requests.length;
+    const save = async expression => {
+      await frame.getByRole('button', {name: 'Save configuration', exact: true}).click();
+      await eventually(async () => await frame.locator('#advisor-root').getAttribute('aria-busy') === 'false' &&
+        expression.test(await frame.getByRole('status').innerText()), 'The native remote configuration action finishes');
+    };
+    await frame.locator('#advisor-endpoint').fill('https://perfchecker-native-fixture.invalid/v1/chat/completions');
+    await save(/remote evidence transmission requires allow_remote=true and HTTPS/);
+    assert.deepEqual(await fs.readFile(file), original, 'Refused remote configuration preserves the saved local provider');
+    await frame.locator('#advisor-allow_remote').check();
+    await frame.locator('#advisor-endpoint').fill('http://perfchecker-native-fixture.invalid/v1/chat/completions');
+    await save(/remote evidence transmission requires allow_remote=true and HTTPS/);
+    assert.deepEqual(await fs.readFile(file), original, 'Opt-in still refuses unencrypted remote HTTP');
+    await frame.locator('#advisor-endpoint').fill('https://perfchecker-native-fixture.invalid/v1/chat/completions');
+    await save(/Configuration saved/);
+    const saved = await fs.readFile(file, 'utf8'), config = JSON.parse(saved);
+    assert.equal(config.allow_remote, true); assert.equal(config.instructions, customInstructions);
+    assert.equal(config.api_key_env, keyEnvironment); assert(!saved.includes(token));
+    assert.equal(config.endpoint, 'https://perfchecker-native-fixture.invalid/v1/chat/completions');
+    await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+    await context.vscode.commands.executeCommand('perfchecker.configureAdvisor');
+    frame = await context.findFrame('#advisor-root');
+    assert.equal(await frame.locator('#advisor-allow_remote').isChecked(), true);
+    assert.equal(await frame.locator('#advisor-endpoint').inputValue(), config.endpoint);
+    assert.equal(fixture.requests.length, calls, 'Validation and saving make no generation request');
+    context.proof('native-advisor-remote-opt-in-contract', {nativeUncheckedRefusal: true, nativeHttpOptInRefusal: true,
+      explicitHttpsOptInSavedAndReopened: true, noGenerationRequests: true, credentialValueNotPersisted: true,
+      scope: 'Actual native UI and Julia validation; no external remote connection or credentials'});
+  } finally {
+    await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+    await settings.update('advisorConfig', '', context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await fs.rm(path.dirname(file), {recursive: true, force: true});
+  }
+}
+
 async function exportAndVerify(context, result) {
   const original = await fs.readFile(result.location);
   const markdown = await fs.readFile(result.location.replace(/\.json$/, '.md'), 'utf8');
@@ -137,17 +192,20 @@ async function exportAndVerify(context, result) {
 exports.run = async context => {
   const cfg = configuration(context);
   const root = path.resolve(context.workspace, cfg.get('investigationReports', 'perf/results/investigations'));
-  const fixture = await fixtureServer();
+  const token = `synthetic-native-only-${randomUUID()}`, keyEnvironment = `PERFCHECKER_NATIVE_FIXTURE_${randomUUID().replaceAll('-', '').toUpperCase()}`;
+  const previousToken = process.env[keyEnvironment]; process.env[keyEnvironment] = token;
+  const fixture = await fixtureServer(token);
   const settings = {scenarioSamples: 2, analysisTimeout: 180, advisorEnabled: true, advisorConfig: '',
     advisorProtocol: 'chat_completions_schema', advisorEndpoint: fixture.endpoint,
-    advisorModel: 'perfchecker-native-narrative-fixture', advisorKeyEnvironment: '', advisorAllowRemote: false,
-    advisorTimeout: 180, advisorInstructions: ''};
+    advisorModel: 'perfchecker-native-narrative-fixture', advisorKeyEnvironment: keyEnvironment, advisorAllowRemote: false,
+    advisorTimeout: 180, advisorInstructions: customInstructions};
   const previous = new Map(Object.keys(settings).map(key => [key, cfg.inspect(key)?.workspaceFolderValue]));
   const catalog = path.resolve(context.workspace, cfg.get('scenarioCatalog', 'perf/scenarios.toml'));
   const catalogBytes = await fs.readFile(catalog);
   const sourceBytes = await fs.readFile(path.join(context.workspace, 'perf', 'cases.jl'));
   try {
     for (const [key, value] of Object.entries(settings)) await cfg.update(key, value, context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await remoteConfiguration(context, fixture, cfg, keyEnvironment, token);
     const discovery = await action(context, root, 'Discover tests', 'discover');
     assert.equal(discovery.report.schema_version, 'perfchecker-discovery/1');
     assert(discovery.report.declared.some(item => item.id === 'sum_squares' && item.implementation === 'allocating'));
@@ -183,6 +241,12 @@ exports.run = async context => {
     assert.deepEqual(narrative.report.cards, [{evidence_id: request.ids[0], explanation: marker}]);
     assert.equal(narrative.report.response_sha256, createHash('sha256').update(request.content).digest('hex'));
     assert.equal(narrative.report.usage.total_tokens, 42);
+    assert(!JSON.stringify(narrative.report).includes(token), 'The synthetic credential is never copied into narrative evidence');
+    const actualConfig = await fs.readFile(path.join(narrative.directory, 'advisor-config.json'), 'utf8');
+    assert.equal(JSON.parse(actualConfig).api_key_env, keyEnvironment); assert(!actualConfig.includes(token));
+    context.proof('native-narrative-custom-instruction-and-environment-key', {outboundSystemInstructionExact: true,
+      outboundSyntheticBearerExact: true, realJuliaWorkerEnvironment: true, credentialValueNotPersisted: true,
+      scope: 'Owned loopback fixture only; synthetic token, no human authentication or inference'});
     frame = await tab(context, 'Findings & advice');
     await frame.getByRole('heading', {name: 'Optional model explanation', exact: true}).waitFor();
     assert((await frame.locator('#app').innerText()).includes(marker));
@@ -226,6 +290,27 @@ exports.run = async context => {
     assert.deepEqual(await fs.readFile(measured.location), runBytes);
     context.proof('native-narrative-cancel-active-http', {activeRequestReceived: true, socketClosedBeforeFixtureCleanup: true,
       controllerCleanupComplete: true, configurationPreserved: true, sourceAndMeasurementUnchanged: true, retainedLog: true});
+
+    await configuration(context).update('advisorTimeout', 45, context.vscode.ConfigurationTarget.WorkspaceFolder);
+    fixture.blocked = undefined;
+    const timeoutBefore = await directories(root);
+    frame = await tab(context, 'Saved evidence');
+    await frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^run ·/})}).first()
+      .getByRole('button', {name: 'Open evidence', exact: true}).click();
+    frame = await tab(context, 'Findings & advice');
+    await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).click();
+    await eventually(() => fixture.blocked, 'The real third HTTP request reaches the deadline fixture', 180000);
+    const held = fixture.blocked; assert.equal(held.closed, false);
+    const expired = await reportAfter(context, root, timeoutBefore, 'narrate');
+    assert.equal(expired.report.status, 'timeout', 'The Core request deadline expires without a Cancel click');
+    await eventually(() => held.closed, 'The expired model socket closes before fixture teardown');
+    assert.equal(configuration(context).get('advisorTimeout'), 45);
+    frame = await tab(context, 'Findings & advice');
+    assert.match(await frame.locator('#app').innerText(), /timeout|timed out|isolated worker stopped/i);
+    assert.deepEqual(await fs.readFile(measured.location), runBytes);
+    context.proof('native-narrative-configured-deadline', {configuredSeconds: 45, requestReachedOwnedFixture: true,
+      noCancelClick: true, coreStatus: expired.report.status, socketClosedBeforeFixtureCleanup: true,
+      nativeOutcomeVisible: true, measuredEvidencePreserved: true});
   } finally {
     // Only the sacrificial workspace-folder settings are restored; global/user configuration is never written.
     try {
@@ -236,6 +321,7 @@ exports.run = async context => {
       }
     } finally {
       await fixture.close();
+      if (previousToken === undefined) delete process.env[keyEnvironment]; else process.env[keyEnvironment] = previousToken;
       for (const [key, value] of previous) await cfg.update(key, value, context.vscode.ConfigurationTarget.WorkspaceFolder);
       for (const [key, value] of previous) assert.deepEqual(configuration(context).inspect(key)?.workspaceFolderValue, value);
     }

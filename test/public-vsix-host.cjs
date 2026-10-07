@@ -118,10 +118,10 @@ function configurationCoverage(properties,checks){
     advisorConfig:['advisor-native-model-management','advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],
     advisorEndpoint:['advisor-native-model-management','native-mcp-advice-implementation-restore','native-narrative-controlled-response'],
     advisorModel:['advisor-native-model-management','native-narrative-controlled-response'],advisorProtocol:['provider-controls','advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore','native-narrative-controlled-response'],
-    advisorInstructions:[],advisorMcpTool:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],
+    advisorInstructions:['native-narrative-custom-instruction-and-environment-key'],advisorMcpTool:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],
     advisorMcpPromptArgument:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],
     advisorMcpArguments:['advisor-native-provider-and-tool-discovery','native-mcp-custom-arguments'],advisorMcpResponse:['provider-controls','native-mcp-advice-implementation-restore'],
-    advisorMcpVersion:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],advisorAllowRemote:[],advisorKeyEnvironment:[],advisorTimeout:['native-mcp-advice-implementation-restore'],
+    advisorMcpVersion:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],advisorAllowRemote:['native-advisor-remote-opt-in-contract'],advisorKeyEnvironment:['native-narrative-custom-instruction-and-environment-key'],advisorTimeout:['native-mcp-advice-implementation-restore','native-narrative-configured-deadline'],
     advisorInvestigates:['investigation-real-bounded-work'],investigationMaxExperiments:['investigation-real-bounded-work'],investigationBudgetSeconds:['investigation-real-bounded-work'],
     scenarioCatalog:['investigation-adoption','native-codelens-and-quickfix'],scenarioProject:['native-codelens-and-quickfix','native-active-controller-runtime-settings'],
     investigationReports:['investigation-real-measurement','native-codelens-and-quickfix'],analysisTools:['investigation-analyzer-jet','investigation-analyzer-alloccheck','native-codelens-and-quickfix'],
@@ -135,9 +135,8 @@ function configurationCoverage(properties,checks){
   };
   const pathOnly=new Set(['advisorTimeout','advisorInvestigates','investigationBudgetSeconds','analysisTimeout','suite','factory','profile']);
   const limits={
-    advisorInstructions:'A nonempty custom instruction has not been asserted in a native outbound request.',
-    advisorAllowRemote:'Loopback fixtures exercise the allowed local path; remote opt-in/refusal is not native-qualified here.',
-    advisorKeyEnvironment:'No human credentials are sent to CI; a nonempty credential environment variable is not native-qualified here.',
+    advisorAllowRemote:'The native checkbox and Julia HTTPS opt-in/refusal contract are validated without external remote connection.',
+    advisorKeyEnvironment:'The asserted bearer is synthetic and sent only to the owned loopback fixture; no human credentials or authenticated external model are qualified.',
     advisorTimeout:'Active cancellation is qualified separately; expiry of every configured deadline is not implied.',
     advisorInvestigates:'The deterministic disabled-model path is exercised; enabled model decisions inside bounded investigations are not qualified.',
     investigationBudgetSeconds:'The actual bounded report is inspected, but elapsed-time exhaustion is not independently forced.',
@@ -149,7 +148,8 @@ function configurationCoverage(properties,checks){
   };
   return Object.keys(properties).map(option=>{
     const key=option.replace(/^perfchecker\./,''),evidence=checks.filter(check=>check.assertionsCompleted===true&&(paths[key]||[]).includes(check.name));
-    const status=!evidence.length?'unverified':key==='codexExecutable'?'prerequisite-verified':pathOnly.has(key)?'path-exercised':'effect-verified';
+    const deadlineVerified=key==='advisorTimeout'&&evidence.some(check=>check.name==='native-narrative-configured-deadline');
+    const status=!evidence.length?'unverified':key==='codexExecutable'?'prerequisite-verified':pathOnly.has(key)&&!deadlineVerified?'path-exercised':'effect-verified';
     return {option,status,evidence:evidence.map(check=>({name:check.name,case:check.case,status:check.status||'validated-effect'})),
       scope:'Actual values asserted by the cited case only; API-written test settings and native UI changes are not interchangeable.',
       ...(limits[key]?{limit:limits[key]}:{})};
