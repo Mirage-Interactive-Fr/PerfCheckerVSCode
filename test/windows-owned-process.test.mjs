@@ -92,7 +92,7 @@ for(const mode of ['exit','active','intermediate'])test(`Windows private Job: ${
   }
 });
 
-test('Windows Job owner stops if its Node parent disappears',{skip:!windows,timeout:45000},async()=>{
+test('Windows Job owner stops if its Node parent disappears',{skip:!windows,timeout:45000},async t=>{
   const {root,script}=await fixture(treeSource);
   const host=path.join(root,'owner host.js');
   const module=require.resolve('../dist/windowsOwnedProcess.js');
@@ -102,7 +102,7 @@ test('Windows Job owner stops if its Node parent disappears',{skip:!windows,time
   const parent=spawn(process.execPath,[host],{stdio:['ignore','pipe','pipe'],windowsHide:true});
   const parentFinished=completion(parent);let parentResult;
   void parentFinished.then(result=>{parentResult=result;});
-  let pids=[];
+  let pids=[],primaryFailure;
   try{
     await until(async()=>{try{await readFile(path.join(root,'leader-ready'));return true;}catch(error){if(error.code!=='ENOENT')throw error;}
       const result=await readFile(path.join(root,'wrapper-result.json'),'utf8').catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
@@ -114,11 +114,23 @@ test('Windows Job owner stops if its Node parent disappears',{skip:!windows,time
     parent.kill('SIGKILL');
     await new Promise(resolve=>parent.exitCode!==null||parent.signalCode!==null?resolve():parent.once('close',resolve));
     await until(()=>pids.every(pid=>!alive(pid)),'private Job and owner completion after Node owner loss',10000);
+    t.diagnostic(JSON.stringify({event:'owned-parent-loss-before-teardown',parent:parent.pid,
+      parentAlive:alive(parent.pid),owned:pids.map(pid=>({pid,alive:alive(pid)}))}));
     for(const pid of pids)assert.equal(alive(pid),false,'owned processes are stopped before fixture teardown');
-  }finally{
-    if(parent.pid&&alive(parent.pid))parent.kill('SIGKILL');
-    for(const pid of pids)if(alive(pid))process.kill(pid,'SIGKILL');
-    await rm(root,{recursive:true,force:true});
+  }catch(error){primaryFailure=error;throw error;}
+  finally{
+    try{
+      if(parent.pid&&alive(parent.pid))parent.kill('SIGKILL');
+      for(const pid of pids)if(alive(pid))process.kill(pid,'SIGKILL');
+      await parentFinished;
+      // Process/pipe completion is required above; Windows may still briefly
+      // retain a filesystem lock while releasing a completed process's cwd.
+      await rm(root,{recursive:true,force:true,maxRetries:10,retryDelay:100});
+    }catch(cleanupFailure){
+      if(primaryFailure)throw new AggregateError([primaryFailure,cleanupFailure],
+        'Owner-loss verification and fixture cleanup both failed');
+      throw cleanupFailure;
+    }
   }
 });
 
