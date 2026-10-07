@@ -16,7 +16,7 @@ on:
       case_group:
         description: Native controls to exercise on a clean fixture (focused stage only)
         type: choice
-        options: [narrative, mcp-pluto, workbench, advisor, investigation, studio]
+        options: [narrative, mcp-pluto, workbench, advisor, investigation, studio, studio-ordering]
         default: narrative
       backend_julia:
         description: Core runtime for a manual qualification; automatic PR coverage remains latest
@@ -164,7 +164,13 @@ jobs:
         run: npm install --no-save --ignore-scripts playwright@1.62.1
       - name: Install screen capture tooling in the disposable Linux stable host
         if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_VIDEO == '1'
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        timeout-minutes: 5
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version
       - name: Run isolated native workflows on Linux
         if: runner.os == 'Linux'
         run: xvfb-run -a --server-args="-screen 0 1920x1080x24" node test/run-public-vsix-host.mjs

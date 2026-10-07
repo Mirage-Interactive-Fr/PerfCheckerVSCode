@@ -23,7 +23,7 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp-pluto','workbench','advisor','investigation','studio'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['narrative','mcp-pluto','workbench','advisor','investigation','studio','studio-ordering'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 const completeCampaign=['smoke','full'].includes(stage);
 const phaseFailures = [];
 const publicSha = 'c4123271e71e4c4d148fe0e613ba260f4aeea6f28445338cab11d3fb9513df09';
@@ -224,7 +224,7 @@ try {
   await fs.writeFile(path.join(workspace, 'perf', 'cases.jl'), 'make_sum_case(p) = (prepare=()->collect(1.0:1000.0), operation=xs->sum(xs.^2), verify=(xs,result)->result==333833500.0)\nmake_wait_case(p) = (prepare=()->42, operation=x->(sleep(0.005);x), verify=(x,result)->result==42)\nmake_cancel_case(p) = (prepare=()->42, operation=x->(write(p["marker"],"running");sleep(30);x), verify=(x,result)->result==42)\n');
   // A distinct bounded workload gives CPU sampling actual operation time;
   // ordinary benchmark and diagnosis examples keep their small input.
-  await fs.appendFile(path.join(workspace,'perf','cases.jl'),'Base.@noinline native_profile_sum(xs) = sum(xs.^2)\nmake_profile_case(p) = (prepare=()->collect(1.0:1_000_000.0), operation=native_profile_sum, verify=(xs,result)->isapprox(result,1_000_000.0*1_000_001.0*2_000_001.0/6;rtol=1e-12))\n');
+  await fs.appendFile(path.join(workspace,'perf','cases.jl'),'Base.@noinline function native_profile_sum(xs)\n result=0.0\n for _ in 1:64\n  result=sum(xs.^2)\n end\n result\nend\nmake_profile_case(p) = (prepare=()->collect(1.0:1_000_000.0), operation=native_profile_sum, verify=(xs,result)->isapprox(result,1_000_000.0*1_000_001.0*2_000_001.0/6;rtol=1e-12))\n');
   await fs.appendFile(path.join(workspace,'perf','cases.jl'),'make_owned_cancel_case(p) = (prepare=()->mktempdir(cleanup=false), operation=directory->begin write(joinpath(directory,"owned.tmp"),"owned");write(p["marker"],string(getpid())*"\\n"*directory);sleep(120);42 end, verify=(directory,result)->result==42, cleanup=directory->begin rm(directory;recursive=true,force=true);write(p["cleaned"],"cleaned") end)\n');
   await fs.writeFile(path.join(workspace,'perf','owned-cancel.jl'),`perf_setup() = dirname(Base.active_project())
 function perf_workload(directory)

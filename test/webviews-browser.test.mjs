@@ -154,6 +154,20 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await send({type:'plan',workspace:'new-workspace',plan:large});await page.locator('#reset-filters').click();
     assert.equal(await page.locator('#cards .card').count(),120);await page.locator('#clear-all').click();assert.equal(await page.locator('#run').isDisabled(),true);
     await page.locator('#select-visible').click();assert.match(await page.locator('#count').innerText(),/1000 selected/);await page.locator('#show-more').click();assert.equal(await page.locator('#cards .card').count(),240);
+    await page.locator('#sort').selectOption('suite');
+    const dragIds=await page.locator('#cards .card').evaluateAll(cards=>cards.slice(0,3).map(card=>card.dataset.id));
+    await page.locator('#cards').evaluate(element=>{
+      element.nativeDragEvents=[];
+      for(const type of ['dragstart','dragover','drop'])element.addEventListener(type,event=>element.nativeDragEvents.push({type,id:event.target.closest('.card')?.dataset.id}));
+    });
+    await page.locator('#cards .card').first().locator('.feature-heading strong').dragTo(page.locator('#cards .card').nth(2).locator('.feature-heading strong'));
+    const nativeDragEvents=await page.locator('#cards').evaluate(element=>element.nativeDragEvents);
+    assert(nativeDragEvents.some(event=>event.type==='dragstart'),'A real pointer gesture starts the draggable card');
+    assert(nativeDragEvents.some(event=>event.type==='drop'),'The browser delivers a real drop to the destination card');
+    await page.locator('#save').click();
+    const dragConfiguration=await page.evaluate(()=>window.messages.findLast(message=>message.type==='save').configuration);
+    assert.deepEqual(dragConfiguration.selection.run_ids.slice(0,3),[dragIds[1],dragIds[0],dragIds[2]],'The saved order reflects the real browser drop');
+    assert.equal(dragConfiguration.selection.run_ids.length,1000);
     await page.setViewportSize({width:420,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     await load('perfchecker.output');assert.equal(await page.locator('.distribution .sample').count(),4);assert.equal(await page.locator('.pie-slice').count(),1);
     assert.equal(await page.locator('.pie-slice').getAttribute('fill'),'#4f8cff');assert.match(await page.locator('.pie-slice').getAttribute('d'),/A82 82 0 1 1 100 182/);

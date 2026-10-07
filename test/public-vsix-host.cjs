@@ -273,7 +273,8 @@ exports.run = async () => {
           assert.equal(sync.discovery.schema_version,'perfchecker-discovery/1');
           proof('native-discovery-after-pluto',{generatedNotebookPresent:true,core:context.core,commandsCompleted:true,returnedReportsValidated:true});
         });
-      }else if(phase==='workbench')await runCase('native-workbench-controls',()=>workbench.run(context));
+      }else if(phase==='studio-ordering')await runCase('native-plan-pagination-and-ordering',()=>controls.runOrdering(context));
+      else if(phase==='workbench')await runCase('native-workbench-controls',()=>workbench.run(context));
       else if(phase==='advisor')await runCase('native-advisor-controls',()=>advisor.run(context));
       else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
       else if(phase==='studio'){

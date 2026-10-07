@@ -503,19 +503,49 @@ async function testLargePlanAndOrdering(context) {
     // center. Retain observed native drag events to distinguish routing from order.
     await view.locator('#cards').evaluate(element=>{
       element.nativeDragEvents=[];
-      for(const type of ['dragstart','dragover','drop'])element.addEventListener(type,event=>{
-        if(element.nativeDragEvents.length<20)element.nativeDragEvents.push({type,id:event.target.closest('.card')?.dataset.id,data:event.dataTransfer?.getData('text/plain')});
+      for(const type of ['pointerdown','mousedown','dragstart','dragover','drop','dragend'])element.addEventListener(type,event=>{
+        if(element.nativeDragEvents.length<40)element.nativeDragEvents.push({type,id:event.target.closest('.card')?.dataset.id,target:event.target.tagName,
+          x:event.clientX,y:event.clientY,data:event.dataTransfer?.getData('text/plain')});
       });
     });
     await view.locator('#cards .card').first().locator('.feature-heading strong').dragTo(view.locator('#cards .card').nth(2).locator('.feature-heading strong'));
+    const initialEvents=await view.locator('#cards').evaluate(element=>element.nativeDragEvents);
+    context.log('large-plan-title-drag-events',{events:initialEvents});
+    if(!initialEvents.some(event=>event.type==='drop')){
+      // Electron's nested webview may not deliver Playwright's dragTo gesture.
+      // Move the real workbench mouse across visible draggable card borders;
+      // never synthesize DragEvents, DataTransfer, configuration or postMessage.
+      const source=view.locator('#cards .card').first(),target=view.locator('#cards .card').nth(2);
+      await source.evaluate(element=>element.scrollIntoView({block:'start'}));
+      const from=await source.boundingBox(),to=await target.boundingBox();
+      assert(from&&to,'Both native draggable cards have real screen coordinates');
+      context.log('large-plan-pointer-drag-coordinates',{from,to,viewport:context.windowPage.viewportSize(),
+        dom:await view.locator('#cards .card').evaluateAll(cards=>cards.slice(0,3).map(card=>({id:card.dataset.id,draggable:card.draggable,
+          title:card.querySelector('strong')?.textContent,rect:card.getBoundingClientRect().toJSON()})))});
+      await context.windowPage.mouse.move(from.x+4,from.y+8);
+      await context.windowPage.mouse.down();
+      try{
+        await context.windowPage.mouse.move(from.x+20,from.y+12,{steps:5});
+        await context.windowPage.mouse.move(to.x+16,to.y+20,{steps:20});
+        await context.windowPage.mouse.move(to.x+20,to.y+24,{steps:3});
+      }finally{await context.windowPage.mouse.up();}
+    }
     const after=await savedConfiguration(context,view);
-    context.log('large-plan-native-drag-observation',{events:await view.locator('#cards').evaluate(element=>element.nativeDragEvents),before:before.config.selection.run_ids.slice(0,4),after:after.config.selection.run_ids.slice(0,4)});
+    const events=await view.locator('#cards').evaluate(element=>element.nativeDragEvents);
+    context.log('large-plan-native-drag-observation',{events,before:before.config.selection.run_ids.slice(0,4),after:after.config.selection.run_ids.slice(0,4)});
+    assert(events.some(event=>event.type==='dragstart')&&events.some(event=>event.type==='drop'),'The real webview receives native dragstart and drop before checking order');
     assert.notEqual(after.config.selection.run_ids[0],first,'Native drag changes the persisted execution order');
     assert.deepEqual(new Set(after.config.selection.run_ids),new Set(before.config.selection.run_ids));
     await view.locator('#search').fill('workload_125');
     assert.equal(await view.locator('#cards .card').count(),1);
     await view.locator('#clear-visible').click();assert.equal(await selectionCount(view),124);
     context.proof('large-plan-pagination-and-drag',{groups:125,initiallyRendered:120,bulkIncludesHidden:true,nativeDrag:true,executionsRequested:0});
+  }catch(error){
+    const view=await frame(context,'#cards');
+    context.log('large-plan-before-restore-failure',{message:String(error),rendered:await view.locator('#cards .card').count(),
+      state:await view.locator('#cards').evaluate(element=>({events:element.nativeDragEvents,cards:[...element.children].slice(0,4).map(card=>({id:card.dataset.id,draggable:card.draggable,text:card.querySelector('strong')?.textContent}))}))});
+    await capture(context,'large-plan-before-restore-failure');
+    throw error;
   }finally{
     if(saved)await fs.writeFile(configFile,saved);else await fs.rm(configFile,{force:true});
     await settings().update('suite',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);
@@ -525,6 +555,12 @@ async function testLargePlanAndOrdering(context) {
     await eventually(async()=>!(await view.locator('#show-more').isVisible())&&!/workload_125/.test(await view.locator('#cards').innerText()),'Restore the real measurement suite after plan-only pagination',120000);
   }
 }
+
+exports.runOrdering = async context => {
+  assertDisposable(context);
+  await designer(context);
+  await testLargePlanAndOrdering(context);
+};
 
 exports.runSelection = async context => {
   assertDisposable(context);
