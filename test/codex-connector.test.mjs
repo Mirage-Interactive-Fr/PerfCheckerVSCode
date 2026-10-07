@@ -122,7 +122,10 @@ test('timeout, HTTP cancellation and disposal reclaim the owned CLI descendants 
   const failures=[];
   const alive=async pid=>{
     try{process.kill(pid,0);}catch{return false;}
-    if(process.platform==='linux')return !/\) Z /.test(await readFile(`/proc/${pid}/stat`,'utf8').catch(()=>''));
+    if(process.platform==='linux'){
+      try{return !/\) Z /.test(await readFile(`/proc/${pid}/stat`,'utf8'));}
+      catch(error){if(error.code==='ENOENT'||error.code==='ESRCH')return false;throw error;}
+    }
     return true;
   };
   for(const mode of ['timeout','cancel','dispose']){
@@ -157,7 +160,10 @@ test('timeout, HTTP cancellation and disposal reclaim the owned CLI descendants 
     }catch(error){failures.push(error);}
     finally{
       // Only the PID reported by this disposable fixture is eligible for teardown.
-      if(owned&&await alive(owned.descendant))process.kill(owned.descendant,'SIGKILL');
+      if(owned&&await alive(owned.descendant)){
+        try{process.kill(owned.descendant,'SIGKILL');}
+        catch(error){if(error.code!=='ESRCH')throw error;}
+      }
       await connector.dispose();await request;
     }
   }
