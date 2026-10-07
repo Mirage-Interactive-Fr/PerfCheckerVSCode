@@ -26,7 +26,7 @@ on:
       scope:
         description: All supported hosts, or an explicit focused platform
         type: choice
-        options: [all, linux, linux-stable, windows-stable]
+        options: [all, linux, linux-stable, windows-stable, macos-stable]
         default: all
       core:
         description: Registered minimum, or the explicitly pinned Core fix before registration
@@ -143,7 +143,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-stable' && '[{"os":"macos-15-intel","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:

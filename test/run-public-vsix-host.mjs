@@ -8,7 +8,10 @@ import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@v
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
-const session = await fs.mkdtemp(path.join(os.tmpdir(), 'perfchecker-public-vsix-'));
+// Darwin's TMPDIR is long; per-phase profiles otherwise exceed its 103-byte
+// Unix-domain socket limit before VS Code can start. This remains a disposable
+// OS temporary directory, independent of any real VS Code profile.
+const session = await fs.mkdtemp(path.join(process.platform==='darwin'?'/tmp':os.tmpdir(), 'pc-vsix-'));
 let julia = process.env.PERFCHECKER_TEST_JULIA || 'julia';
 const mode = process.env.PERFCHECKER_VSIX_MODE || 'public';
 const coreMode=process.env.PERFCHECKER_NATIVE_CORE || 'general';
