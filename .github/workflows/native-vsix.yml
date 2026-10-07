@@ -194,7 +194,7 @@ jobs:
         run: npm install --no-save --ignore-scripts playwright@1.62.1
       - name: Install screen capture tooling in the disposable Linux stable host
         if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_VIDEO == '1'
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update
