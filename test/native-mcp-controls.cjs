@@ -51,9 +51,21 @@ async function measuredEvidence(context) {
       let advice;
       try{advice=JSON.parse(adviceBytes);}catch(error){if(error instanceof SyntaxError)continue;throw error;}
       assert(advice.recommendations.some(row=>row.rule_id==='evidence.samples'),'Two actual samples retain deterministic advice');
-      const evidence=advice.recommendations.map(row=>({id:row.id,rule:row.rule_id,observation:row.hypothesis,experiment:row.action,verification:row.validation,
+      const rawEvidence=advice.recommendations.map(row=>({id:row.id,rule:row.rule_id,observation:row.hypothesis,experiment:row.action,verification:row.validation,
         limits:['Evidence is limited to the recorded configuration; no unmeasured gain is established.']}));
-      measured={id,file,adviceFile:path.join(directory,'advice','advice.json'),evidence,runSha256:hash(data),adviceSha256:hash(adviceBytes)};
+      const adviceFile=path.join(directory,'advice','advice.json');
+      // Ask the installed Core for its real bounded projection. It intentionally
+      // deduplicates IDs before sending recommendations; transport must preserve
+      // those exact rows rather than all raw recommendation records.
+      const projected=await execute(process.env.PERFCHECKER_NATIVE_JULIA,
+        ['--startup-file=no',`--project=${context.controller}`,'-e',
+          'using PerfChecker; advice=PerfChecker.read_advice(ARGS[1]); config=PerfChecker.AdvisorConfig(protocol=:mcp_http,mcp_tool="ask_perfchecker",mcp_response=:text); print(PerfChecker.JSON.json(PerfChecker._advisor_evidence(advice,config)))',adviceFile],
+        {windowsHide:true,env:{...process.env,JULIA_LOAD_PATH:process.env.PERFCHECKER_LOAD_PATH||'@'+path.delimiter+'@stdlib'}});
+      const evidence=JSON.parse(projected.stdout);
+      assert.equal(new Set(evidence.map(row=>row.id)).size,evidence.length,'The Core projection has unique evidence IDs');
+      assert([...JSON.stringify(evidence)].length<=12000,'The actual projection respects the default character limit');
+      for(const row of evidence)assert(rawEvidence.some(raw=>JSON.stringify(canonical(raw))===JSON.stringify(canonical(row))),'Every transmitted row retains exact recorded content');
+      measured={id,file,adviceFile,evidence,rawEvidence,runSha256:hash(data),adviceSha256:hash(adviceBytes)};
       return !(await frame.locator('#app .status').getAttribute('class')).includes('busy');
     }
     return false;
@@ -61,7 +73,7 @@ async function measuredEvidence(context) {
   return measured;
 }
 
-exports.run = async context => {
+exports.run = async (context,options={}) => {
   assert.equal(process.env.CI, 'true');
   const {vscode, workspace, findFrame, log, proof} = context;
   const uri = vscode.Uri.file(workspace);
@@ -81,7 +93,10 @@ exports.run = async context => {
         env: {...process.env, UV_THREADPOOL_SIZE: '1'}})).stdout.trim());
   };
   const baselineBytes = await probe(workspace);
-  const calls = [], pending = new Set();
+  const calls = [], pending = new Set(), providerErrors=[];
+  const custom=options.customArguments===true;
+  const adviceArgument=custom?'question':'prompt',implementationArgument=custom?'change_request':'prompt',workspaceArgument=custom?'checkout_path':'workspace';
+  const additional=custom?{native_contract:{label:'real-native-request',enabled:true}}:{};
   let implementationBytes,attached;
   const server = http.createServer(async (req, res) => {
     try {
@@ -96,23 +111,29 @@ exports.run = async context => {
         result = {protocolVersion: body.params.protocolVersion, capabilities: {tools: {}},
           serverInfo: {name: 'Deterministic native qualification provider', version: '1'}};
       }
-      if (body.method === 'tools/list') result = {tools: ['ask_perfchecker', 'implement_perfchecker'].map(name => ({name,
-        inputSchema: {type: 'object', properties: {prompt: {type: 'string'}, workspace: {type: 'string'}},
-          required: name.startsWith('implement') ? ['prompt', 'workspace'] : ['prompt']}}))};
+      if (body.method === 'tools/list') result = {tools: ['ask_perfchecker', 'implement_perfchecker'].map(name => {
+        const promptArgument=name.startsWith('implement')?implementationArgument:adviceArgument;
+        return {name,inputSchema:{type:'object',properties:{[promptArgument]:{type:'string'},[workspaceArgument]:{type:'string'},
+          ...(custom?{native_contract:{type:'object'}}:{})},required:name.startsWith('implement')?[promptArgument,workspaceArgument]:[promptArgument]}};
+      })};
       if (body.method === 'tools/call') {
         assert.equal(req.headers['mcp-protocol-version'], '2026-07-28');
         const {name, arguments: args} = body.params;
-        assert.equal(typeof args.prompt, 'string');
-        const projection=JSON.parse(args.prompt.split('\n\nPerfChecker evidence:\n').at(-1));
+        const promptArgument=name==='implement_perfchecker'?implementationArgument:adviceArgument,prompt=args[promptArgument];
+        assert.equal(typeof prompt, 'string');
+        if(custom){assert.deepEqual(args.native_contract,additional.native_contract);assert.equal(Object.hasOwn(args,'prompt'),false);
+          assert.deepEqual(Object.keys(args).sort(),[promptArgument,...(name==='implement_perfchecker'?[workspaceArgument]:[]),'native_contract'].sort());}
+        const projection=JSON.parse(prompt.split('\n\nPerfChecker evidence:\n').at(-1));
         assert(Array.isArray(projection.evidence));
         if(attached)assert.deepEqual(projection.evidence,attached.evidence,'The actual selected advice IDs and content reach tools/call');
-        calls.push({name, prompt: args.prompt, evidenceIds:projection.evidence.map(row=>row.id),projectionSha256:hash(JSON.stringify(canonical(projection.evidence)))});
+        calls.push({name,prompt,promptArgument,workspaceArgument:name==='implement_perfchecker'?workspaceArgument:undefined,additionalArgumentsVerified:custom,
+          evidenceIds:projection.evidence.map(row=>row.id),projectionSha256:hash(JSON.stringify(canonical(projection.evidence)))});
         let answer = 'Consider a generator to remove the intermediate squared array. Verify empty inputs and signed floating-point values, then measure allocations; speed is not yet qualified.';
-        if (args.prompt.includes('native cancellation probe')) {
+        if (prompt.includes('native cancellation probe')) {
           pending.add(res); res.on('close', () => pending.delete(res)); return;
         }
         if (name === 'implement_perfchecker') {
-          const root = await fs.realpath(args.workspace);
+          const root = await fs.realpath(args[workspaceArgument]);
           assert.notEqual(root, await fs.realpath(workspace));
           assert(path.relative(os.tmpdir(), root).split(path.sep)[0] !== '..', 'Only the supplied disposable checkout is edited');
           const file = path.join(root, 'src', 'PerfCheckerNativeFixture.jl');
@@ -125,13 +146,15 @@ exports.run = async context => {
         result = {content: [{type: 'text', text: answer}]};
       }
       res.end(JSON.stringify({jsonrpc: '2.0', id: body.id, result}));
-    } catch (error) {res.writeHead(500); res.end(JSON.stringify({error: String(error)}));}
+    } catch (error) {providerErrors.push(String(error));log('native-controlled-provider-error',{error:String(error)});res.writeHead(500); res.end(JSON.stringify({error: String(error)}));}
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const values = {advisorEnabled: true, advisorProtocol: 'mcp_http',
     advisorEndpoint: `http://127.0.0.1:${server.address().port}/mcp`, advisorModel: 'native-fixture',
     advisorMcpTool: 'ask_perfchecker', advisorMcpResponse: 'text', advisorMcpVersion: '2026-07-28',
     advisorImplementationMcpTool: 'implement_perfchecker', advisorTimeout: 180,
+    advisorMcpPromptArgument:adviceArgument,advisorMcpArguments:additional,
+    advisorImplementationMcpPromptArgument:implementationArgument,advisorImplementationMcpWorkspaceArgument:workspaceArgument,
     codexExecutable: path.join(workspace, 'not-installed-codex')};
   values.scenarioSamples=2;
   const previous = Object.fromEntries(Object.keys(values).map(key => [key, settings().inspect(key)?.workspaceFolderValue]));
@@ -158,7 +181,7 @@ exports.run = async context => {
       await view.locator('#chat-question').fill(question);
       log('native-ui-action',{surface:'MCP conversation',action:'Send question',turn:count/2});
       await view.getByRole('button', {name: 'Send question', exact: true}).click();
-      await eventually(async () => {const value = await state(); return !value.busy && value.messages.length === count;}, 'Actual registered Julia MCP worker returns the conversation');
+      await eventually(async () => {assert.deepEqual(providerErrors,[],'The real provider must accept the exact Core request');const value = await state(); return !value.busy && value.messages.length === count;}, 'Actual Julia MCP worker returns the conversation');
     };
     await send('Inspect the intermediate allocation in sum_squares without editing. What should I verify?', 2);
     assert.deepEqual(calls[0].evidenceIds,[],'The configuration-only path remains valid without saved measurements');
@@ -177,6 +200,7 @@ exports.run = async context => {
     assert.equal(hash(await fs.readFile(attached.adviceFile)),attached.adviceSha256);
     proof('native-mcp-selected-measured-evidence',{nativeSelector:true,historyId:attached.id,evidenceIds:calls[1].evidenceIds,
       runSha256:attached.runSha256,adviceSha256:attached.adviceSha256,projectionSha256:calls[1].projectionSha256,
+      rawRecommendations:attached.rawEvidence,boundedCoreProjection:attached.evidence,uniqueEvidenceIds:true,maxEvidenceCharacters:12000,
       contextualTurns:2,provider:'Controlled real HTTP MCP service; no inference or credentials',sourceUnchanged:true});
     assert.equal(await view.locator('.message.assistant').count(), 2);
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,
@@ -225,6 +249,10 @@ exports.run = async context => {
     proof('native-mcp-advice-implementation-restore', {provider: 'deterministic real HTTP MCP server; no model credentials',
       adviceTurns: 2, checkpoint: true, diffEditor: true, apply: true, exactRestore: true, cancellation: true,
       allocationBaselineBytes: baselineBytes, allocationCandidateBytes: implementationBytes});
+    if(custom){assert(calls.some(call=>call.name==='ask_perfchecker'&&call.promptArgument===adviceArgument));
+      assert(calls.some(call=>call.name==='implement_perfchecker'&&call.promptArgument===implementationArgument&&call.workspaceArgument===workspaceArgument));
+      proof('native-mcp-custom-arguments',{adviceArgument,implementationArgument,workspaceArgument,additionalArgumentsVerified:true,
+        actualHttpCalls:calls.length,measuredEvidenceIds:attached.evidence.map(row=>row.id),configurationRestoredInFinally:true});}
   } finally {
     for (const response of pending) response.destroy();
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));

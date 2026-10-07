@@ -437,7 +437,10 @@ async function suite(context, directory) {
 
 exports.run = async context => {
   assert.equal(process.env.CI, 'true', 'Never use a human VS Code installation');
-  assert(path.basename(path.dirname(context.workspace)).startsWith('perfchecker-public-vsix-'));
+  const session=process.env.PERFCHECKER_NATIVE_SESSION;
+  assert(session&&path.isAbsolute(session),'The runner identifies the disposable session');
+  assert.equal(await fs.realpath(context.workspace),path.join(await fs.realpath(session),'workspace'),
+    'Only the exact workspace created by this qualification runner may be changed');
   const directory = path.join(context.workspace, 'perf', 'notebooks');
   await fs.mkdir(directory, {recursive: true});
   const failures = [];

@@ -18,8 +18,8 @@ function commandCoverage(commands,checks){
     discoverTestItems:['testitem-current-evidence'],configureAdvisor:['advisor-native-model-management','advisor-native-provider-and-tool-discovery'],catalogTools:['native-tool-catalogue'],
     syncScenarios:['native-discovery-and-sync-after-pluto','investigation-sync-tools-history-native-exports'],
     narrateAdvice:['investigation-saved-advice-and-disabled-model','native-narrative-controlled-response','native-narrative-cancel-active-http'],investigateScenarios:['investigation-real-bounded-work'],
-    openInvestigations:['investigation-discovery-selection-source-draft'],discoverScenarios:['investigation-discovery-selection-source-draft'],
-    measureScenarios:['investigation-real-measurement'],diagnoseScenarios:['investigation-analyzer-jet','investigation-analyzer-alloccheck'],
+    openInvestigations:['investigation-discovery-selection-source-draft','native-codelens-and-quickfix'],discoverScenarios:['investigation-discovery-selection-source-draft'],
+    measureScenarios:['investigation-real-measurement'],diagnoseScenarios:['investigation-analyzer-jet','investigation-analyzer-alloccheck','native-codelens-and-quickfix'],
     adviseScenarios:['investigation-saved-advice-and-disabled-model'],compareScenarios:['investigation-real-baseline-candidate'],
     cancelInvestigation:['investigation-cancel-active-julia-worker'],prepareScenario:['investigation-discovery-selection-source-draft'],
     openInvestigationSource:['investigation-discovery-selection-source-draft'],refresh:['suite-selection-and-save'],initialize:['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration','bootstrap-existing-controller'],
@@ -69,6 +69,7 @@ function buttonCoverage(checks){
     'Designer · Run selected and native backend':['native-run-selection'],
     'Results · filters / reports / keyboard navigation':['result-controls'],
     'Investigation · adoption / validation / duplicate rejection':['investigation-adoption-types-and-duplicate-rejected'],
+    'Editor · real proposal and diagnosis CodeLens / quick fix':['native-codelens-and-quickfix'],
     'Investigation · real collectors / profile filters / raw evidence':['investigation-real-collectors-and-profile-controls'],
     'Investigation · artifact open / digest validation':['investigation-native-artifact-and-integrity'],
     'Investigation · before/after saved measurements':['investigation-real-baseline-candidate'],
@@ -107,6 +108,53 @@ function buttonCoverage(checks){
   return rows;
 }
 
+// Native evidence does not imply every alternate value or external service was tested.
+// Preserve a row for every contributed option, including remaining unqualified paths.
+function configurationCoverage(properties,checks){
+  const paths={
+    testItemTags:['native-testitems-tags-exclusions-samples'],testItemExcludeTags:['native-testitems-tags-exclusions-samples'],testItemSamples:['testitem-current-evidence','native-testitems-tags-exclusions-samples'],
+    advisorEnabled:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],
+    advisorConfig:['advisor-native-model-management','advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],
+    advisorEndpoint:['advisor-native-model-management','native-mcp-advice-implementation-restore','native-narrative-controlled-response'],
+    advisorModel:['advisor-native-model-management','native-narrative-controlled-response'],advisorProtocol:['provider-controls','advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore','native-narrative-controlled-response'],
+    advisorInstructions:[],advisorMcpTool:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],
+    advisorMcpPromptArgument:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],
+    advisorMcpArguments:['advisor-native-provider-and-tool-discovery','native-mcp-custom-arguments'],advisorMcpResponse:['provider-controls','native-mcp-advice-implementation-restore'],
+    advisorMcpVersion:['advisor-native-provider-and-tool-discovery','native-mcp-advice-implementation-restore'],advisorAllowRemote:[],advisorKeyEnvironment:[],advisorTimeout:['native-mcp-advice-implementation-restore'],
+    advisorInvestigates:['investigation-real-bounded-work'],investigationMaxExperiments:['investigation-real-bounded-work'],investigationBudgetSeconds:['investigation-real-bounded-work'],
+    scenarioCatalog:['investigation-adoption','native-codelens-and-quickfix'],scenarioProject:['native-codelens-and-quickfix','native-active-controller-runtime-settings'],
+    investigationReports:['investigation-real-measurement','native-codelens-and-quickfix'],analysisTools:['investigation-analyzer-jet','investigation-analyzer-alloccheck','native-codelens-and-quickfix'],
+    analysisTimeout:['investigation-real-measurement'],scenarioThreads:['native-codelens-and-quickfix'],scenarioSamples:['investigation-real-measurement','native-mcp-selected-measured-evidence'],
+    juliaExecutable:['native-julia-terminal','official-julia-debug','native-active-controller-runtime-settings'],runnerProject:['multi-root-explicit-routing','official-julia-debug','native-active-controller-runtime-settings'],
+    suite:['suite-selection-and-save'],factory:['suite-selection-and-save'],profile:['all-supported-collectors-measured'],reports:['result-controls','computed-reference-aggregation'],
+    uiConfiguration:['save-palette-command','native-suite-save-palette'],gitTargets:['git-reference-controls'],comparisonPolicies:['computed-reference-aggregation'],
+    advisorImplementationMcpTool:['native-mcp-advice-implementation-restore'],advisorImplementationMcpPromptArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],
+    advisorImplementationMcpWorkspaceArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],codexExecutable:['codex-missing-native-prerequisite'],
+    plutoProject:['native-pluto-without-jupyter','pluto-investigation-real-run','pluto-stop-active-owned-worker'],
+  };
+  const pathOnly=new Set(['advisorTimeout','advisorInvestigates','investigationBudgetSeconds','analysisTimeout','suite','factory','profile']);
+  const limits={
+    advisorInstructions:'A nonempty custom instruction has not been asserted in a native outbound request.',
+    advisorAllowRemote:'Loopback fixtures exercise the allowed local path; remote opt-in/refusal is not native-qualified here.',
+    advisorKeyEnvironment:'No human credentials are sent to CI; a nonempty credential environment variable is not native-qualified here.',
+    advisorTimeout:'Active cancellation is qualified separately; expiry of every configured deadline is not implied.',
+    advisorInvestigates:'The deterministic disabled-model path is exercised; enabled model decisions inside bounded investigations are not qualified.',
+    investigationBudgetSeconds:'The actual bounded report is inspected, but elapsed-time exhaustion is not independently forced.',
+    analysisTimeout:'Successful worker execution uses the configured limit; timeout expiry is not independently forced by this path.',
+    suite:'The actual configured suite is planned and run; every alternate filename is not qualified.',
+    factory:'The actual build_suite factory is used; alternate factory names are not native-qualified.',
+    profile:'The actual quick profile is run; every alternate profile is not native-qualified.',
+    codexExecutable:'The unavailable executable diagnostic is native-tested; authenticated Codex is a separate local opt-in proof.',
+  };
+  return Object.keys(properties).map(option=>{
+    const key=option.replace(/^perfchecker\./,''),evidence=checks.filter(check=>check.assertionsCompleted===true&&(paths[key]||[]).includes(check.name));
+    const status=!evidence.length?'unverified':key==='codexExecutable'?'prerequisite-verified':pathOnly.has(key)?'path-exercised':'effect-verified';
+    return {option,status,evidence:evidence.map(check=>({name:check.name,case:check.case,status:check.status||'validated-effect'})),
+      scope:'Actual values asserted by the cited case only; API-written test settings and native UI changes are not interchangeable.',
+      ...(limits[key]?{limit:limits[key]}:{})};
+  });
+}
+
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function eventually(read, description, timeout = 120000) {
   const deadline = Date.now() + timeout;
@@ -118,16 +166,17 @@ async function eventually(read, description, timeout = 120000) {
   throw new Error(`${description}${last ? `: ${last.message}` : ''}`);
 }
 
-async function measureNativeTestItem(context,expectedPassed){
+async function measureNativeTestItem(context,expectedPassed,options={}){
   const {vscode,windowPage,workspace}=context;
   await controls.clickStudioAction(context,'items');
   await controls.clickStudioAction(context,'testing');
-  const row=windowPage.locator('.monaco-list-row[aria-label*="test/performance.jl · performance"]').filter({hasText:'Vector reduction'}).first();
+  const filename=options.file||'test/performance.jl',name=options.name||'Vector reduction';
+  const row=windowPage.locator(`.monaco-list-row[aria-label*="${filename}"]`).filter({hasText:name}).first();
   await row.waitFor({state:'visible',timeout:120000});await row.hover();
   const button=row.locator('.action-label[title="Run Test"],.action-label[aria-label="Run Test"],.action-label.codicon-testing-run-icon').first();
   const storage=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','native-testitems');
   const before=new Set(await fs.readdir(storage).catch(()=>[]));
-  await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(workspace,'test','performance.jl'))),{preview:false});
+  await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(workspace,filename))),{preview:false});
   if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(2500);
   await row.hover();
   context.log('native-ui-action',{surface:'Test Explorer',action:'Run Test',expectedPassed});
@@ -141,12 +190,14 @@ async function measureNativeTestItem(context,expectedPassed){
     }
   },'The actual Test Explorer Run button returns fresh worker evidence',180000);
   assert.equal(measured.payload.passed,expectedPassed);assert.equal(measured.payload.runs.length,1);
-  const retained=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'worker-evidence',process.env.PERFCHECKER_NATIVE_PHASE,expectedPassed?'native-testitem-passed':'native-testitem-missing-target','result.json');
+  if(options.samples!==undefined)assert.equal(measured.payload.runs[0].samples.length,options.samples);
+  const retained=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'worker-evidence',process.env.PERFCHECKER_NATIVE_PHASE,
+    options.retainName||(expectedPassed?'native-testitem-passed':'native-testitem-missing-target'),'result.json');
   await fs.mkdir(path.dirname(retained),{recursive:true});await fs.copyFile(measured.file,retained);
   if(expectedPassed){
     assert.equal(measured.payload.runs[0].status,'validated');
     await eventually(async()=>/passed/i.test(await row.getAttribute('aria-label')||'')||await row.locator('.codicon-testing-passed-icon').count()>0,'The actual Testing tree reports Passed');
-    context.proof('testitem-current-evidence',{items:1,core:context.core,nativeClick:true,studioDiscoverAndTestingButtons:true,report:measured.file,retainedReport:path.relative(process.env.PERFCHECKER_NATIVE_OUTPUT,retained),samples:measured.payload.runs[0].samples});
+    context.proof(options.proofName||'testitem-current-evidence',{items:1,core:context.core,nativeClick:true,studioDiscoverAndTestingButtons:true,report:measured.file,retainedReport:path.relative(process.env.PERFCHECKER_NATIVE_OUTPUT,retained),samples:measured.payload.runs[0].samples});
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(measured.file)),{preview:false});
     if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(3000);
   }else{
@@ -156,6 +207,7 @@ async function measureNativeTestItem(context,expectedPassed){
     await eventually(async()=>/package under test and its test dependencies/.test(await windowPage.locator('body').innerText()),'The real Test Results surface explains how to prepare the chosen controller');
     context.log('testitem-missing-target-prerequisite',{core:context.core,nativeClick:true,errors:1,assertions:0,diagnosticExplained:true});
   }
+  return measured;
 }
 
 exports.run = async () => {
@@ -171,13 +223,14 @@ exports.run = async () => {
   const checks = [], failures = [];
   let browser, windowPage,commands=[],activeCase;
   let pendingReport=Promise.resolve();
+  let configurationProperties={};
   const timing=()=>({observedAt:new Date().toISOString(),...(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT?
     {videoOffsetSeconds:(Date.now()-Date.parse(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT))/1000}:{})});
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,platform:process.platform,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
       coverage:process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1',available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
-      commands:commandCoverage(commands,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);
+      commands:commandCoverage(commands,checks),configuration:configurationCoverage(configurationProperties,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);
     pendingReport=pendingReport.then(()=>fs.writeFile(path.join(output,`${phase}.json`),report));
     return pendingReport;
   };
@@ -253,6 +306,7 @@ exports.run = async () => {
     await extension.activate();
     const registered = new Set(await vscode.commands.getCommands(true));
     commands = extension.packageJSON.contributes.commands.map(command => command.command);
+    configurationProperties=extension.packageJSON.contributes.configuration.properties;
     for (const command of commands) assert(registered.has(command), `Contributed command is registered: ${command}`);
     log('installed-extension', {version: extension.packageJSON.version, vscode: vscode.version, commands: commands.length,
       settings: Object.keys(extension.packageJSON.contributes.configuration.properties).length, vsixSha256: process.env.PERFCHECKER_NATIVE_SHA});
@@ -261,6 +315,7 @@ exports.run = async () => {
       controller: process.env.PERFCHECKER_NATIVE_CONTROLLER, target: process.env.PERFCHECKER_NATIVE_TARGET,
       results: path.join(workspace, 'perf', 'results', 'vscode'), log, proof, findFrame,
       core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION};
+    context.measureTestItem=options=>measureNativeTestItem(context,true,options);
     log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 
     if(phase==='narrative'||process.env.PERFCHECKER_NATIVE_STAGE==='focused'){
@@ -269,6 +324,7 @@ exports.run = async () => {
         suite:'perf/suite.jl',profile:phase==='studio'?'historical':'quick',reports:'perf/results/vscode',advisorEnabled:false,advisorConfig:'',scenarioSamples:2,analysisTools:[],plutoProject:'perf/pluto'}))
         await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
       if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
+      else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
       else if(phase==='mcp-pluto'){
         await runCase('native-mcp-controls',()=>mcp.run(context));
         await runCase('native-pluto-controls',()=>pluto.run(context));
@@ -284,6 +340,12 @@ exports.run = async () => {
       else if(phase==='workbench')await runCase('native-workbench-controls',()=>workbench.run(context));
       else if(phase==='advisor')await runCase('native-advisor-controls',()=>advisor.run(context));
       else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
+      else if(phase==='editor'){
+        await runCase('native-testitem-tag-selection-and-samples',()=>require('./native-editor-actions.cjs').runTestItems(context));
+        await runCase('native-codelens-and-quickfix',()=>require('./native-editor-actions.cjs').run(context));
+        await runCase('native-active-controller-runtime-settings',()=>require('./native-editor-actions.cjs').runActiveSettings(context));
+        await runCase('native-mcp-custom-arguments',()=>mcp.run(context,{customArguments:true}));
+      }
       else if(phase==='studio'){
         await runCase('native-suite-run-button',async()=>{context.results=await controls.runSelection(context);});
         await runCase('native-focused-result-measurements',async()=>{
