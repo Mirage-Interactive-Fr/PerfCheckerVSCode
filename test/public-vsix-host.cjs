@@ -205,8 +205,19 @@ async function measureNativeTestItem(context,expectedPassed,options={}){
     assert.equal(measured.payload.runs[0].samples[0].passes,0);assert.equal(measured.payload.runs[0].samples[0].errors,1);
     await eventually(async()=>/failed|errored/i.test(await row.getAttribute('aria-label')||''),'The tree does not present missing target dependencies as passed');
     await row.click();await vscode.commands.executeCommand('testing.openOutputPeek');
-    await eventually(async()=>/package under test and its test dependencies/.test(await windowPage.locator('body').innerText()),'The real Test Results surface explains how to prepare the chosen controller');
-    context.log('testitem-missing-target-prerequisite',{core:context.core,nativeClick:true,errors:1,assertions:0,diagnosticExplained:true});
+    const results=windowPage.locator('[id="workbench.panel.testResults.view"]');
+    await results.waitFor({state:'visible'});
+    const failedResult=results.locator('.monaco-list-row').filter({hasText:name}).first();
+    await failedResult.waitFor({state:'visible'});await failedResult.click();
+    await eventually(async()=>{
+      // Monaco soft-wraps even within words. Read only the visible result editor,
+      // retaining the actual UI oracle while removing those rendering breaks.
+      const text=(await results.locator('.monaco-editor:visible .view-lines').allInnerTexts()).join('').replace(/\s+/g,'');
+      return text.includes(`TestItemRunnerexecutesin${context.controller.replace(/\s+/g,'')}.`)
+        &&text.includes('Ensurethepackageundertestanditstestdependenciesareavailableinthatcontrollerenvironment');
+    },'The selected real Test Results surface explains how to prepare the chosen controller');
+    context.proof('testitem-missing-target-prerequisite',{core:context.core,nativeClick:true,selectedResult:name,errors:1,assertions:0,
+      visibleSurface:'Test Results',selectedController:context.controller,diagnosticExplained:true});
   }
   return measured;
 }
