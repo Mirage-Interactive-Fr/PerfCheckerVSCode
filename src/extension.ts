@@ -489,13 +489,16 @@ class Controller {
         this.output.appendLine(`> ${executable} --startup-file=no --project=${JSON.stringify(project)} -e "using Pkg; Pkg.instantiate()"`);
         const code = await new Promise<number>((resolve, reject) => {
           const child = spawn(executable, ['--startup-file=no', `--project=${project}`,
-            '-e', 'using Pkg; Pkg.instantiate()'], {cwd: project, windowsHide: true,
+            '-e', cancellableJulia('using Pkg; Pkg.instantiate()')], {cwd: project, windowsHide: true, detached:process.platform!=='win32',
             env: {...process.env, JULIA_LOAD_PATH: ['@', '@stdlib'].join(path.delimiter),
               JULIA_PKG_PRECOMPILE_AUTO: '0'}});
+          const stop=controllerCancellation(child,message=>this.output.appendLine(message));
+          this.activeControllers.add(stop);
           child.stdout.on('data', value => this.output.append(String(value)));
           child.stderr.on('data', value => this.output.append(String(value)));
-          child.on('error', reject);
-          child.on('close', value => resolve(value ?? 2));
+          const finished=()=>{stop.dispose();this.activeControllers.delete(stop);};
+          child.on('error', error=>{finished();reject(error);});
+          child.on('close', value=>{finished();resolve(value ?? 2);});
         });
         if (code !== 0) throw new Error(`PerfChecker controller preparation failed (exit ${code}). Check PerfChecker output and the dependencies/sources in ${path.join(project, 'Project.toml')}, then retry.`);
         this.readyControllers.add(project);
@@ -700,11 +703,15 @@ class Controller {
 
   async initialize(requested?: vscode.Uri | vscode.WorkspaceFolder): Promise<void> {
     this.selectWorkspace(requested);
-    if(!await prepareWorkspaceController(this.folder(),this.output))return;
-    const suiteExists=await fs.stat(this.absolute('suite')).then(stat=>stat.isFile()).catch(()=>false);
-    const code = suiteExists ? 0 : await this.invoke('init', [`--root=${this.root()}`]);
-    if (code !== 0) throw new Error(`PerfChecker initialization failed with code ${code}.`);
-    await this.refresh();
+    await this.inWorkspace(async()=>{
+      const folder=this.folder(),identity=folder.uri.toString();
+      if(!await prepareWorkspaceController(folder,this.output))return;
+      if(this.folder().uri.toString()!==identity)throw new Error('The PerfChecker folder changed during setup. Choose it again before creating the suite.');
+      const suiteExists=await fs.stat(this.absolute('suite')).then(stat=>stat.isFile()).catch(()=>false);
+      const code = suiteExists ? 0 : await this.invoke('init', [`--root=${this.root()}`]);
+      if (code !== 0) throw new Error(`PerfChecker initialization failed with code ${code}.`);
+      await this.refresh();
+    });
   }
 
   private ids(node?: PerfNode): string[] {

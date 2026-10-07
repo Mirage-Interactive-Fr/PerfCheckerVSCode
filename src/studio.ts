@@ -11,7 +11,7 @@ const actions: Record<string, string> = {
   items: 'perfchecker.discoverTestItems', chat: 'perfchecker.openChat', advisor: 'perfchecker.configureAdvisor',
   terminal: 'perfchecker.openTerminal', notebook: 'perfchecker.newNotebook', openNotebook: 'perfchecker.openNotebook',
   debug: 'perfchecker.debugFile', tasks: 'workbench.action.tasks.runTask', julia: 'language-julia.startREPL',
-  tools: 'perfchecker.catalogTools', testing: 'workbench.view.testing'
+  tools: 'perfchecker.catalogTools', testing: 'workbench.view.extension.test'
 };
 
 class Studio implements vscode.Disposable {

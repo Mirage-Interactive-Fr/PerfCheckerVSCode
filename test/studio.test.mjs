@@ -66,6 +66,8 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await panels[0].send({type:'studioAction',action:'notebook'});
     assert.equal(invocations.at(-1)[0],'perfchecker.newNotebook');assert.equal(invocations.at(-1)[1],second.uri);
     await panels[0].send({type:'studioAction',action:'__proto__'});assert.equal(invocations.length,1);
+    await panels[0].send({type:'studioAction',action:'testing'});
+    assert.equal(invocations.at(-1)[0],'workbench.view.extension.test','Testing opens its supported view container command');
     await panels[0].send({type:'studioAction',action:'julia'});assert.match(panels[0].messages.at(-1).message,/Julia VS Code extension/);
     await commands.get('perfchecker.newNotebook')(second.uri);
     assert.deepEqual(plutoCalls,[{action:'create',folder:second.uri,options:undefined}]);

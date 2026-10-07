@@ -306,7 +306,8 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
       '-e', cancellableJulia('using PerfChecker; exit(perfchecker_main(ARGS))'), '--', command, ...args];
     this.output.appendLine(`PerfChecker ${command}`);
     return await new Promise((resolve, reject) => {
-      const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true, detached: process.platform !== 'win32'});
+      const child = spawn(executable, juliaArgs, {cwd: this.root(), windowsHide: true, detached: process.platform !== 'win32',
+        env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)}});
       this.child = child;
       const stop = controllerCancellation(child, (message, forced) => {
         this.output.appendLine(message); this.lastMessage = message; this.refresh();
@@ -431,11 +432,22 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({language: 'julia', content: draftCase(proposal)}));
   }
   async adopt(input: Partial<Scenario>): Promise<void> {
+    if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before editing the PerfChecker catalogue.');
     if (this.busy) throw new Error('Wait for the current investigation before editing the catalogue.');
+    const folder=this.folder(), root=folder.uri.fsPath;
     if (!this.discovery) throw new Error('Discover the package first.');
-    const source = workspacePath(this.root(), String(input.source ?? ''));
+    const discovery=this.discovery;
+    const catalogSetting=this.setting('scenarioCatalog','perf/scenarios.toml');
+    const current=()=>{
+      if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before editing the PerfChecker catalogue.');
+      const selected=currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);
+      if(selected.uri.toString()!==folder.uri.toString() || this.discovery!==discovery ||
+          vscode.workspace.getConfiguration('perfchecker',folder.uri).get('scenarioCatalog','perf/scenarios.toml')!==catalogSetting)
+        throw new Error('The workspace or catalogue changed. Discover again before adding a declaration.');
+    };
+    const source = workspacePath(root, String(input.source ?? ''));
     if (!(await fs.stat(source)).isFile()) throw new Error('Choose an existing Julia source file.');
-    workspacePath(await fs.realpath(this.root()), await fs.realpath(source));
+    workspacePath(await fs.realpath(root), await fs.realpath(source));
     const scenario: Scenario = {id: String(input.id ?? '').trim(), implementation: String(input.implementation ?? 'default').trim(),
       factory: String(input.factory ?? '').trim(), source, collectors: input.collectors ?? ['benchmark'],
       parameters: input.parameters ?? {}, fixtures: input.fixtures ?? [], requirements: input.requirements ?? []};
@@ -443,24 +455,27 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     if (!scenario.parameters || Array.isArray(scenario.parameters) || typeof scenario.parameters !== 'object') throw new Error('Parameters must be a JSON object.');
     if (!Array.isArray(scenario.fixtures) || scenario.fixtures.length > 128) throw new Error('Provide an array of at most 128 fixture paths.');
     scenario.fixtures = await Promise.all(scenario.fixtures.map(async file => {
-      const resolved = workspacePath(this.root(), file);
-      workspacePath(await fs.realpath(this.root()), await fs.realpath(resolved));
+      const resolved = workspacePath(root, file);
+      workspacePath(await fs.realpath(root), await fs.realpath(resolved));
       if (!(await fs.stat(resolved)).isFile()) throw new Error('Fixture paths must refer to files.'); return resolved;
     }));
     if (this.declared().some(item => scenarioKey(item) === scenarioKey(scenario))) throw new Error('This scenario/implementation is already declared.');
-    const catalog = workspacePath(this.root(), this.absolute('scenarioCatalog', 'perf/scenarios.toml'));
+    const catalog = workspacePath(root, path.resolve(root,catalogSetting));
+    current();
     await fs.mkdir(path.dirname(catalog), {recursive: true});
-    workspacePath(await fs.realpath(this.root()), await fs.realpath(path.dirname(catalog)));
+    workspacePath(await fs.realpath(root), await fs.realpath(path.dirname(catalog)));
     const previous = await fs.readFile(catalog, 'utf8').catch((error: NodeJS.ErrnoException) => {if (error.code === 'ENOENT') return undefined; throw error;});
-    const relative = path.relative(this.root(), catalog).replaceAll('\\', '/');
-    if (previous !== undefined && createHash('sha256').update(previous).digest('hex') !== this.discovery.fingerprints?.[relative]) {
+    const relative = path.relative(root, catalog).replaceAll('\\', '/');
+    if (previous !== undefined && createHash('sha256').update(previous).digest('hex') !== discovery.fingerprints?.[relative]) {
       throw new Error('The catalogue changed since discovery. Refresh before adoption.');
     }
     const entry = scenarioToml(scenario, path.dirname(catalog));
+    current();
     if (previous === undefined) {
-      const root = JSON.stringify(path.relative(path.dirname(catalog), this.root()).replaceAll('\\', '/') || '.');
-      await fs.writeFile(catalog, `schema_version = "perfchecker-scenario-catalog/1"\nroot = ${root}\n${entry}`, {flag: 'wx'});
+      const relativeRoot = JSON.stringify(path.relative(path.dirname(catalog), root).replaceAll('\\', '/') || '.');
+      await fs.writeFile(catalog, `schema_version = "perfchecker-scenario-catalog/1"\nroot = ${relativeRoot}\n${entry}`, {flag: 'wx'});
     } else await fs.appendFile(catalog, entry, 'utf8');
+    current();
     await this.openSource(catalog); await this.execute('discover');
   }
 

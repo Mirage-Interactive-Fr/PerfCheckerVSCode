@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {readFile, realpath, stat} from 'node:fs/promises';
 import * as path from 'node:path';
+import {cancellableJulia,controllerCancellation} from './controllerCancellation';
 
 const qualityName = /^[a-z][a-z0-9-]*$/;
 const bundleLine = /^PERFCHECKER_LIVE_BUNDLE (.+)$/m;
@@ -109,7 +110,7 @@ println("PERFCHECKER_LIVE_BUNDLE " * destination)
 `;
 
 export function liveJuliaArguments(input: LiveProviderInput): string[] {
-  return ['--startup-file=no', `--project=${input.controller}`, '-e', LIVE_JULIA,
+  return ['--startup-file=no', `--project=${input.controller}`, '-e', cancellableJulia(LIVE_JULIA),
     '--', input.root, input.provider, input.quality, input.reports, input.qualityDigest, input.julia];
 }
 
@@ -128,12 +129,10 @@ export async function executeLiveProvider(input: LiveProviderInput, token: Cance
       env: {...process.env, JULIA_LOAD_PATH: ['@', '@stdlib'].join(path.delimiter)},
     });
     let stdout = '', stderr = '', cancelled = false;
+    const controller=controllerCancellation(child,message=>output(`${message}\n`));
     const stop = () => {
       cancelled = true;
-      if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-      if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'],
-        {windowsHide: true}).on('error', () => child.kill());
-      else { try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); } }
+      controller.request();
     };
     const subscription = token.onCancellationRequested(stop);
     child.stdout.on('data', data => {
@@ -146,9 +145,10 @@ export async function executeLiveProvider(input: LiveProviderInput, token: Cance
       if (stderr.length > 131072) stderr = stderr.slice(-131072);
       output(String(data));
     });
-    child.on('error', error => { subscription.dispose(); reject(error); });
+    child.on('error', error => {subscription.dispose();controller.dispose();reject(error);});
     child.on('close', async code => {
       subscription.dispose();
+      controller.dispose();
       if (cancelled || token.isCancellationRequested) { reject(new Error('Live measurement cancelled.')); return; }
       if (code !== 0) { reject(new Error(`Live measurement failed (exit ${code}): ${stderr.slice(-2048)}`)); return; }
       const match = stdout.match(bundleLine);

@@ -13,6 +13,17 @@ on:
         type: choice
         options: [smoke, full]
         default: full
+      core:
+        description: Registered minimum, or the explicitly pinned Core fix before registration
+        type: choice
+        options: [general, candidate]
+        default: general
+      core_commit:
+        description: Immutable Core candidate commit (candidate mode only)
+        type: string
+      core_tree:
+        description: Expected Git tree for that Core candidate (candidate mode only)
+        type: string
   pull_request:
     paths:
       - '.github/workflows/native-vsix.yml'
@@ -41,6 +52,9 @@ jobs:
       PERFCHECKER_VSCODE_VERSION: ${{ matrix.vscode }}
       PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
+      PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || 'a497aabcf1f7b49783b4445ab0591afe056a9900' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '15e18d432d1bc7ddba74ba105a8dfeffc5b47f1e' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
       JULIA_NUM_PRECOMPILE_TASKS: '1'

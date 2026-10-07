@@ -92,6 +92,10 @@ exports.run = async context => {
     await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click();
     await eventually(async () => /ENOENT|executable|could not|launch/i.test(await view.locator('[role="status"]').innerText()), 'Missing Codex explains its executable prerequisite');
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected, false);
+    log('codex-missing-native-prerequisite',{command:'perfchecker.connectCodex',status:'prerequisite',reason:'Codex executable absent from disposable CI; no human credentials are transferred.'});
+    await vscode.commands.executeCommand('perfchecker.disconnectCodex');
+    assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
+    log('codex-disconnected-command',{command:'perfchecker.disconnectCodex',alreadyDisconnected:true,activeAuthenticatedDisconnection:false});
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
     const send = async (question, count) => {
       await view.locator('#chat-question').fill(question);
@@ -103,6 +107,8 @@ exports.run = async context => {
     assert.equal(await fs.readFile(source, 'utf8'), original);
     assert(calls[1].prompt.includes('Inspect the intermediate allocation') && calls[1].prompt.includes('signed Float64'), 'The second real MCP call contains the bounded conversation');
     assert.equal(await view.locator('.message.assistant').count(), 2);
+    await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,
+      `native-${process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION}-${process.platform}-${vscode.version}-mcp-controlled-provider.png`)});
     await view.getByRole('tab', {name: '02 · Implementation', exact: true}).click();
     assert.match(await view.locator('.warning').innerText(), /Git checkpoint.*isolated copy.*diff review/);
     await view.getByText('Configure the MCP implementation tool', {exact: true}).click();

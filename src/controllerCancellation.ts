@@ -16,9 +16,11 @@ export function cancellableJulia(code: string): string {
   return `
 const perfchecker_controller_task = current_task()
 @async begin
+    requested = false
     try
         for line in eachline(stdin)
             if line == "${CANCEL_REQUEST}"
+                requested = true
                 istaskdone(perfchecker_controller_task) ||
                     schedule(perfchecker_controller_task, InterruptException(); error=true)
                 break
@@ -26,6 +28,12 @@ const perfchecker_controller_task = current_task()
         end
     catch error
         error isa EOFError || println(stderr, "PerfChecker cancellation input: ", sprint(showerror, error))
+    finally
+        # This dedicated pipe belongs to the extension host. EOF means its
+        # owner disappeared; request the same cleanup once, without interrupting
+        # cleanup again after an explicit cancellation message.
+        requested || istaskdone(perfchecker_controller_task) ||
+            schedule(perfchecker_controller_task, InterruptException(); error=true)
     end
 end
 try
@@ -71,7 +79,7 @@ export function controllerCancellation(child: ChildProcess, notice: (message: st
       if (requested || !alive()) return;
       requested = true;
       notice('Cancelling… waiting for workers and allocation cleanup.');
-      // Keep the pipe open until exit; EOF is not a cancellation request.
+      // Keep the pipe open through cleanup. EOF also signals a lost owner.
       child.stdin?.write(`${CANCEL_REQUEST}\n`, error => {
         if (error && alive()) notice(`Cancellation input unavailable: ${error.message}. Waiting before forced stop.`);
       });

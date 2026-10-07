@@ -4,6 +4,9 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const net = require('node:net');
 const {createHash} = require('node:crypto');
+const {execFile}=require('node:child_process');
+const execute=require('node:util').promisify(execFile);
+const {clickStudioAction}=require('./native-studio-controls.cjs');
 
 async function eventually(read, name, timeout = 180000) {
   const until = Date.now() + timeout;
@@ -96,6 +99,57 @@ async function create(context, file, kind) {
   return {source, ...await view(context)};
 }
 
+async function serverPids(){
+  if(process.platform==='win32'){
+    const {stdout}=await execute('powershell.exe',['-NoProfile','-Command','@(Get-CimInstance Win32_Process | Where-Object { $_.Name -like "julia*" -and $_.CommandLine -match "PERFCHECKER_PLUTO_READY" } | ForEach-Object { $_.ProcessId }) | ConvertTo-Json -Compress']);
+    const value=stdout.trim()?JSON.parse(stdout):[];return new Set((Array.isArray(value)?value:[value]).map(Number));
+  }
+  const {stdout}=await execute('ps',['-eo','pid=,args=']);
+  return new Set(stdout.split('\n').filter(line=>line.includes('PERFCHECKER_PLUTO_READY')&&/julia/i.test(line)).map(line=>Number(line.trim().split(/\s+/,1)[0])));
+}
+
+async function studioNotebookButtons(context,directory){
+  const file=path.join(directory,'StudioButtons.jl');
+  const settings=context.vscode.workspace.getConfiguration('files',context.vscode.Uri.file(context.workspace));
+  const previous=settings.inspect('simpleDialog.enable')?.workspaceFolderValue;
+  try{
+    await settings.update('simpleDialog.enable',true,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await clickStudioAction(context,'notebook');
+    let picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
+    let input=picker.locator('input[type="text"]');await input.fill(file);await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter');
+    await picker.locator('.monaco-list-row').filter({hasText:'Investigation'}).first().waitFor();
+    await picker.locator('.monaco-list-row').filter({hasText:'Investigation'}).first().click();
+    const state=await view(context);await idle(state.frame);
+    assert((await fs.readFile(file,'utf8')).startsWith('### A Pluto.jl notebook ###'));
+    await stop(context,state,true);
+    await clickStudioAction(context,'openNotebook');
+    picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
+    input=picker.locator('input[type="text"]');await input.fill(file);await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter');
+    await stop(context,await view(context),true);
+    context.log('pluto-studio-file-dialog-buttons',{nativeNewClick:true,nativeOpenClick:true,realFileDialog:true,file:path.basename(file),jupyter:false});
+  }finally{await settings.update('simpleDialog.enable',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);}
+}
+
+async function restartFailureCleanup(context,directory){
+  const file=path.join(directory,'RestartCleanup.jl');
+  let state=await create(context,file,'investigation');await idle(state.frame);await stop(context,state);
+  const settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
+  const previous=settings.get('plutoProject','perf/pluto'),before=await serverPids();let startingPids=[];
+  try{
+    const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
+    startingPids=await eventually(async()=>{const actual=[...await serverPids()].filter(pid=>!before.has(pid));return actual.length?actual:false;},'Restart spawns its real owned Julia server');
+    await settings.update('plutoProject','perf/changed-pluto-environment',context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await eventually(async()=>/environment changed|Start the action again/.test(await parent.locator('[role="status"]').innerText()),'Restart reports a changed environment after starting',240000);
+    await eventually(async()=>{const pids=await serverPids();return startingPids.every(pid=>!pids.has(pid));},'Every server from the failed Restart exits',90000);
+    assert.equal(await parent.locator('iframe').count(),0);
+  }finally{await settings.update('plutoProject',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);}
+  const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
+  state=await view(context);await idle(state.frame);
+  assert(await portOpen(Number(new URL(state.frame.url()).port)),'A later successful Restart remains alive');
+  await stop(context,state,true);
+  context.log('pluto-failed-restart-real-worker-cleanup',{failedPids:startingPids.length,newSessionUnaffected:true,staleIframeAbsent:true,remoteForwardingNotEmulated:true});
+}
+
 async function investigation(context, directory) {
   const file = path.join(directory, 'NativeInvestigation.jl');
   const reportRoot = path.join(context.workspace, 'perf', 'results', 'notebook');
@@ -130,7 +184,7 @@ async function investigation(context, directory) {
   await state.frame.locator('bond[def="action"] select').selectOption('tools');
   await idle(state.frame);
   assert.deepEqual(await fingerprint(reportRoot), completed, 'Changing selectors after completion cannot rerun the check');
-  context.log('pluto-investigation-real-run', {collectors: [...new Set(report.runs.map(run => run.collector))], core: 'General 1.0.0'});
+  context.log('pluto-investigation-real-run', {collectors: [...new Set(report.runs.map(run => run.collector))], core: context.core});
 
   // Use the real CodeMirror editor, reactive evaluation and Pluto's on-disk autosave.
   const id = cellId(state.source, '# PerfChecker investigations');
@@ -187,6 +241,96 @@ async function cancellation(context, directory) {
     await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession', context.vscode.Uri.file(context.workspace));
     await settings.update('scenarioCatalog', previous, context.vscode.ConfigurationTarget.WorkspaceFolder);
     await fs.unlink(marker).catch(error => {if (error.code !== 'ENOENT') throw error;});
+  }
+}
+
+async function ownedWorkerClose(context,directory){
+  const settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
+  const previous={suite:settings.get('suite','perf/suite.jl'),catalog:settings.get('scenarioCatalog','perf/scenarios.toml')};
+  const marker=path.join(directory,'owned-worker.marker'),cleaned=path.join(directory,'owned-worker-cleaned.marker');
+  const catalog=path.join(directory,'OwnedWorker.toml');
+  const preserved=path.join(context.workspace,'perf','owned-cancel.jl.999.mem');
+  const sentinel=Buffer.from('pre-existing allocation inventory retained exactly\n');
+  await fs.writeFile(preserved,sentinel);
+  await fs.writeFile(catalog,'schema_version="perfchecker-scenario-catalog/1"\nroot=".."\n[[scenarios]]\nid="owned_worker"\nimplementation="stop-before-server-close"\nsource="cases.jl"\nfactory="make_owned_cancel_case"\ncollectors=["benchmark"]\n[scenarios.parameters]\nmarker='+JSON.stringify(marker)+'\ncleaned='+JSON.stringify(cleaned)+'\n');
+  const beforeMem=new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem')));
+  const assertStopped=async(state,pid,owned,cleanup,closePanel,action)=>{
+    const alive=()=>{try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
+    assert(alive(),'The measured process must really be alive before Stop/Close');
+    const start=Date.now();if(action)await action();else await stop(context,state,closePanel);
+    await eventually(()=>!alive(),'The detached measurement worker terminates before the 120-second workload could finish',45000);
+    await eventually(async()=>!await fs.stat(owned).then(()=>true).catch(()=>false),'The worker cleanup removes its owned temporary directory',45000);
+    assert.equal(await fs.readFile(cleanup,'utf8'),'cleaned');
+    assert(Date.now()-start<90000,'Cleanup is cooperative rather than waiting for the complete workload');
+    assert.deepEqual(await fs.readFile(preserved),sentinel,'Existing .mem evidence is never removed');
+    assert.deepEqual(new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem'))),beforeMem,'Only allocation files created by the session are cleaned');
+    return Date.now()-start;
+  };
+  try{
+    await settings.update('scenarioCatalog',catalog,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    let state=await create(context,path.join(directory,'StopActiveInvestigation.jl'),'investigation');
+    await state.frame.locator('bond[def="action"] select').selectOption('run');await idle(state.frame);
+    await state.frame.getByRole('button',{name:'Launch selected action',exact:true}).click();
+    const info=await eventually(async()=>{const lines=(await fs.readFile(marker,'utf8')).split('\n');return lines.length===2?lines:false;},'The detached investigation reaches its real PID marker',360000);
+    const elapsed=await assertStopped(state,Number(info[0]),info[1],cleaned,false);
+    await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+    context.log('pluto-stop-active-owned-worker',{kind:'InvestigationJob',cleanupMilliseconds:elapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true});
+
+    await settings.update('suite','perf/owned-suite.jl',context.vscode.ConfigurationTarget.WorkspaceFolder);
+    const suiteMarker=path.join(context.workspace,'perf','owned-suite-worker.marker'),suiteCleaned=path.join(context.workspace,'perf','owned-suite-cleaned.marker');
+    for(const file of [suiteMarker,suiteCleaned])await fs.rm(file,{force:true});
+    state=await create(context,path.join(directory,'CancelActiveAllocation.jl'),'suite');
+    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
+    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
+    const cancelInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Suite Cancel test reaches its active allocation worker',360000);
+    await state.frame.getByRole('button',{name:'Cancel active job',exact:true}).click();
+    await refresh(state.frame,'Refresh status','[data-suite-state]',/\bcancelled\b/,90000);
+    await eventually(()=>{try{process.kill(Number(cancelInfo[0]),0);return false;}catch(error){if(error.code==='ESRCH')return true;throw error;}},'The actual Suite Cancel button terminates the detached allocation worker');
+    assert.equal(await fs.readFile(suiteCleaned,'utf8'),'cleaned');
+    assert.equal(await fs.stat(cancelInfo[1]).then(()=>true).catch(()=>false),false);
+    assert.deepEqual(await fs.readFile(preserved),sentinel);
+    assert.deepEqual(new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem'))),beforeMem);
+    await stop(context,state,true);
+    context.log('pluto-suite-cancel-active-allocation',{nativeClick:true,workerTerminated:true,ownedDirectoryRemoved:true,noNewMem:true,preExistingMemPreserved:true});
+    for(const file of [suiteMarker,suiteCleaned])await fs.rm(file,{force:true});
+    state=await create(context,path.join(directory,'CloseActiveAllocation.jl'),'suite');
+    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
+    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
+    const suiteInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The allocation worker reaches its real PID marker',360000);
+    const suiteElapsed=await assertStopped(state,Number(suiteInfo[0]),suiteInfo[1],suiteCleaned,true);
+    context.log('pluto-close-active-allocation-worker',{kind:'SuiteJob',cleanupMilliseconds:suiteElapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,noNewMem:true});
+
+    for(const file of [suiteMarker,suiteCleaned])await fs.rm(file,{force:true});
+    state=await create(context,path.join(directory,'ShutdownActiveAllocation.jl'),'suite');
+    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
+    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
+    const shutdownInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Pluto homepage Shutdown test reaches its active allocation worker',360000);
+    const page=state.frame.page();let confirmed=false;
+    const confirm=async dialog=>{
+      if(dialog.type()==='confirm' && /shut down|close.*notebook/i.test(dialog.message())){confirmed=true;await dialog.accept();}
+      else await dialog.dismiss();
+    };
+    page.on('dialog',confirm);
+    let shutdownElapsed;
+    try{
+      shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownInfo[1],suiteCleaned,false,async()=>{
+        const home=new URL(state.frame.url());home.pathname='/';home.searchParams.delete('id');
+        await state.frame.goto(home.href);
+        const running=state.frame.locator('#recent li.running').filter({hasText:'ShutdownActiveAllocation.jl'});
+        await running.locator('button.session').click();
+        await eventually(async()=>await running.count()===0,'The native Pluto homepage removes the stopped notebook');
+      });
+    }finally{page.off('dialog',confirm);}
+    assert(confirmed,'The actual browser confirmation was accepted, rather than suppressing or mocking it');
+    assert(await portOpen(Number(new URL(state.frame.url()).port)),'The homepage shuts down its notebook without stopping the shared Pluto server');
+    context.log('pluto-home-shutdown-active-allocation',{nativeClick:true,realConfirmation:true,cleanupMilliseconds:shutdownElapsed,pidTerminated:true,ownedFilesRemoved:true,noNewMem:true,preExistingMemPreserved:true});
+    await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));
+    await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  }finally{
+    await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));
+    await settings.update('suite',previous.suite,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await settings.update('scenarioCatalog',previous.catalog,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    for(const file of [marker,cleaned,preserved])await fs.rm(file,{force:true});
   }
 }
 
@@ -247,7 +391,8 @@ exports.run = async context => {
   const directory = path.join(context.workspace, 'perf', 'notebooks');
   await fs.mkdir(directory, {recursive: true});
   const failures = [];
-  for (const [name, test] of [['investigation', investigation], ['cancellation', cancellation], ['suite', suite]]) {
+  for (const [name, test] of [['studio-file-dialogs',studioNotebookButtons],['failed-restart-cleanup',restartFailureCleanup],
+    ['investigation', investigation], ['cancellation', cancellation], ['suite', suite],['stop-close-active-worker',ownedWorkerClose]]) {
     try {await test(context, directory);}
     catch (error) {
       const message = error.message.replace(/([?&]secret=)[^&\s"<>]+/g, '$1[redacted]');

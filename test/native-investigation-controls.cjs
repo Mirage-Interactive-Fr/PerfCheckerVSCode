@@ -243,7 +243,9 @@ async function diagnose(context) {
     assert.equal(createHash('sha256').update(bytes).digest('hex'), artifact.sha256);
     const recordCard = current.locator('article.card').filter({has: current.getByRole('heading', {name: `${artifactRecord.scenario} · ${artifactRecord.implementation} · ${artifactRecord.tool}`, exact: true})});
     await recordCard.getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click();
-    await eventually(() => context.vscode.window.activeTextEditor?.document.uri.fsPath === artifact.path, 'Evidence artifact opens through the real native command');
+    await eventually(() => context.vscode.window.tabGroups.all.some(group=>group.tabs.some(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifact.path)), 'Evidence artifact opens in the actual native text or custom editor');
+    const opened=context.vscode.window.tabGroups.all.flatMap(group=>group.tabs).find(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifact.path);
+    context.log('investigation-artifact-native-editor',{kind:artifact.kind,editor:opened.input.constructor.name,uri:path.basename(artifact.path)});
     await fs.writeFile(artifact.path, Buffer.concat([bytes, Buffer.from('\nchanged by isolated integrity test\n')]));
     try {
       await view(context);
@@ -342,7 +344,7 @@ async function profiles(context) {
     assert.equal(runs[0].qualification.correctness, 'passed');
   }
   const current = await tab(context, 'Findings & advice');
-  const profiles = current.locator('details').filter({has: current.getByText('Explore sampled stacks and allocations', {exact: true})});
+  const profiles = current.locator('details:has(> summary:text-is("Explore sampled stacks and allocations"))');
   assert.equal(await profiles.count(), 2);
   for (let index = 0; index < 2; index++) {
     const profile = profiles.nth(index);

@@ -4,13 +4,21 @@ import os from 'node:os';
 import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath, runTests} from '@vscode/test-electron';
+import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
 const session = await fs.mkdtemp(path.join(os.tmpdir(), 'perfchecker-public-vsix-'));
 let julia = process.env.PERFCHECKER_TEST_JULIA || 'julia';
 const mode = process.env.PERFCHECKER_VSIX_MODE || 'public';
+const coreMode=process.env.PERFCHECKER_NATIVE_CORE || 'general';
+const coreCommit=process.env.PERFCHECKER_NATIVE_CORE_COMMIT || '';
+const coreTree=process.env.PERFCHECKER_NATIVE_CORE_TREE || '';
+if(!['general','candidate'].includes(coreMode))throw new Error('Choose the registered or explicitly pinned candidate Core.');
+if(coreMode==='candidate' && ![coreCommit,coreTree].every(value=>/^[a-f0-9]{40}$/.test(value)))throw new Error('Core candidate mode requires an immutable commit and expected Git tree.');
+const expectedCoreVersion=coreMode==='candidate'?'1.0.1':'1.0.0';
+const coreProvenance={mode:coreMode,version:expectedCoreVersion,...(coreMode==='candidate'?{commit:coreCommit,tree:coreTree}:{registry:'General'})};
+const installCore=coreMode==='candidate'?'Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]))':'Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))';
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const phaseFailures = [];
 const publicSha = 'c4123271e71e4c4d148fe0e613ba260f4aeea6f28445338cab11d3fb9513df09';
@@ -56,25 +64,46 @@ try {
   if (mode === 'public' && sha !== publicSha) throw new Error('Public VSIX SHA256 differs from the published qualification.');
   const cliProfile = [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`];
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
-  await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify({mode, sha256: sha, vscodeRequested: version}, null, 2));
+  await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify({mode, sha256: sha, vscodeRequested: version, core:coreProvenance}, null, 2));
+  const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
+  if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
+  const minimumAvailable=/^\["1\.0\.1"\]$/m.test(await minimumResponse.text());
+  await fs.writeFile(path.join(output,'production-bootstrap-gate.json'),JSON.stringify({minimum:'1.0.1',registry:'General',available:minimumAvailable,
+    status:minimumAvailable?'native-positive-test-required':'awaiting-human-registration',candidateFunctions:coreProvenance},null,2));
 
   const launch = async phase => {
-    try {await runTests({vscodeExecutablePath: vscode,
-      extensionDevelopmentPath: path.join(repository, 'test', 'qualification-host'),
-      extensionTestsPath: path.join(repository, 'test', 'public-vsix-host.cjs'),
-      launchArgs: [workspace, ...cliProfile, '--new-window', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', '--disable-gpu', '--remote-debugging-port=9222'],
-      extensionTestsEnv: {PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: profile,
+    try {
+      const environment={...process.env,PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: profile,
         PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         PERFCHECKER_NATIVE_MODE: mode, PERFCHECKER_NATIVE_SHA: sha,
         PERFCHECKER_NATIVE_STAGE: process.env.PERFCHECKER_NATIVE_STAGE || 'smoke',
         PERFCHECKER_NATIVE_EXPECTED_VERSION: expectedVersion, PERFCHECKER_NATIVE_JULIA_VERSION: runtime.version,
-        UV_THREADPOOL_SIZE: '1'},
-    });} catch (error) {phaseFailures.push({phase, error: String(error)});}
+        PERFCHECKER_NATIVE_CORE_VERSION: expectedCoreVersion, PERFCHECKER_NATIVE_CORE_PROVENANCE:JSON.stringify(coreProvenance),
+        PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE:String(minimumAvailable),
+        UV_THREADPOOL_SIZE: '4'};
+      await new Promise((resolve,reject)=>{
+        // Actual interactive host: no --extensionTestsPath or smoke driver, and
+        // no intercepted APIs. All dialogs are clicked through the real UI.
+        const child=spawn(vscode,[workspace,...cliProfile,'--new-window','--skip-welcome','--skip-release-notes',
+          '--disable-workspace-trust','--disable-gpu','--remote-debugging-port=9222',
+          `--extensionDevelopmentPath=${path.join(repository,'test','qualification-host')}`],
+          {env:environment,windowsHide:false,detached:process.platform!=='win32',stdio:'inherit'});
+        const stop=()=>{if(child.exitCode!==null)return;if(process.platform==='win32')spawn('taskkill',['/pid',String(child.pid),'/T','/F'],{windowsHide:true});else try{process.kill(-child.pid,'SIGTERM');}catch{}};
+        const timer=setTimeout(()=>{stop();reject(new Error(`The ${phase} native phase exceeded its explicit 40-minute bound`));},40*60*1000);
+        const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
+        const clean=()=>{clearTimeout(timer);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
+        child.once('error',error=>{clean();reject(error);});
+        child.once('close',async code=>{clean();try{
+          const result=JSON.parse(await fs.readFile(path.join(output,`${phase}-finished.json`),'utf8'));
+          result.status==='passed'?resolve():reject(new Error(result.error||`${phase} failed`));
+        }catch(error){reject(new Error(`Native host exited ${code} before writing its final qualification: ${error}`));}});
+      });
+    } catch (error) {phaseFailures.push({phase, error: String(error)});}
   };
   // The first real launch has no PerfChecker settings, Julia or Jupyter extension.
   await launch('fresh');
-  await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="1.0.0")); Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]); using PerfChecker; @assert Base.pkgversion(PerfChecker)==v"1.0.0"; println("REGISTERED_CORE=", Base.pkgversion(PerfChecker), " SOURCE=", pathof(PerfChecker))', controller]);
+  await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]); using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; end; println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode]);
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(["BenchmarkTools","Chairmarks","TestItems"]); Pkg.activate(ARGS[2]); Pkg.add("TestItems")', target, workspace]);
   await fs.mkdir(path.join(workspace, 'perf'), {recursive: true});
   // Fresh first-use evidence belongs to the starter; the prepared campaign uses its own reports.
@@ -83,6 +112,20 @@ try {
   await fs.writeFile(path.join(workspace, 'perf', 'sum.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs) = perf_workload(xs) == 333833500.0\n');
   await fs.writeFile(path.join(workspace, 'perf', 'wait.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = 42\nperf_workload(x) = PerfCheckerNativeFixture.wait_task(x)\nperf_oracle(x) = perf_workload(x) == 42\n');
   await fs.writeFile(path.join(workspace, 'perf', 'cases.jl'), 'make_sum_case(p) = (prepare=()->collect(1.0:1000.0), operation=xs->sum(xs.^2), verify=(xs,result)->result==333833500.0)\nmake_wait_case(p) = (prepare=()->42, operation=x->(sleep(0.005);x), verify=(x,result)->result==42)\nmake_cancel_case(p) = (prepare=()->42, operation=x->(write(p["marker"],"running");sleep(30);x), verify=(x,result)->result==42)\n');
+  await fs.appendFile(path.join(workspace,'perf','cases.jl'),'make_owned_cancel_case(p) = (prepare=()->mktempdir(cleanup=false), operation=directory->begin write(joinpath(directory,"owned.tmp"),"owned");write(p["marker"],string(getpid())*"\\n"*directory);sleep(120);42 end, verify=(directory,result)->result==42, cleanup=directory->begin rm(directory;recursive=true,force=true);write(p["cleaned"],"cleaned") end)\n');
+  await fs.writeFile(path.join(workspace,'perf','owned-cancel.jl'),`perf_setup() = mktempdir(cleanup=false)
+function perf_workload(directory)
+ write(joinpath(directory,"owned.tmp"),"owned")
+ write(joinpath(@__DIR__,"owned-suite-worker.marker"),string(getpid())*"\\n"*directory)
+ sleep(120);42
+end
+perf_oracle(directory,result) = result==42
+function perf_cleanup(directory)
+ rm(directory;recursive=true,force=true)
+ write(joinpath(@__DIR__,"owned-suite-cleaned.marker"),"cleaned")
+end
+`);
+  await fs.writeFile(path.join(workspace,'perf','owned-suite.jl'),'using PerfChecker\nfunction build_suite()\n f=FeatureSpec(:owned_stop;backend=:alloc,entrypoint=joinpath(@__DIR__,"owned-cancel.jl"),oracle=OracleSpec())\n SoftwareSuite(:owned_stop,[PackageSuite("PerfCheckerNativeFixture";source=dirname(@__DIR__),worker_environment=joinpath(dirname(@__DIR__),"worker-environment"),versions=VersionNumber[],features=[f])])\nend\n');
   await fs.writeFile(path.join(workspace, 'perf', 'scenarios.toml'), 'schema_version = "perfchecker-scenario-catalog/1"\nroot = "."\n[[scenarios]]\nid = "sum_squares"\nimplementation = "allocating"\nsource = "cases.jl"\nfactory = "make_sum_case"\ncollectors = ["benchmark", "chairmark", "profile", "profile_alloc"]\n[[scenarios]]\nid = "wait_task"\nimplementation = "waiting"\nsource = "cases.jl"\nfactory = "make_wait_case"\ncollectors = ["benchmark"]\n');
   await fs.writeFile(path.join(workspace, 'perf', 'example.jl'), 'using Example\nperf_setup() = "PerfChecker"\nperf_workload(name) = Example.hello(name)\nperf_oracle(name,result) = occursin(name,result)\n');
   await fs.writeFile(path.join(workspace,'perf','network.jl'), `using Sockets
@@ -134,8 +177,11 @@ end
   await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': julia, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
-  if(mode==='candidate')await execute(julia,['--startup-file=no','-e','using Pkg; Pkg.activate(ARGS[1]); Pkg.add(PackageSpec(name="PerfChecker",version="1.0.0")); Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";println("REGISTERED_PLUTO_CORE=",Base.pkgversion(PerfChecker)," PLUTO=",Base.pkgversion(Pluto))',plutoProject]);
+  if(mode==='candidate')await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);if !isempty(ARGS[3]);@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[3];end;println("PLUTO_CORE_MODE=",ARGS[5]," CORE=",Base.pkgversion(PerfChecker)," PLUTO=",Base.pkgversion(Pluto))`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode]);
   await launch('configured');
+  // TestItemRunner's default imports use the chosen controller. This explicit fixture
+  // preparation is separate from production bootstrap, which never develops a user's package.
+  await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.develop(path=ARGS[2]);println("TESTITEM_TARGET_EXPLICITLY_PREPARED=",ARGS[2])',controller,workspace]);
   for (const extension of mode==='public'?['julialang.language-julia','ms-toolsai.jupyter']:['julialang.language-julia']) {
     await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', extension], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   }

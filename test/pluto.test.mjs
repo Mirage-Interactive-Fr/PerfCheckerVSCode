@@ -4,6 +4,7 @@ import Module, {createRequire} from 'node:module';
 import {mkdtemp,mkdir,writeFile,readdir,rm} from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import {createServer} from 'node:http';
 
 test('Pluto requires explicit installation, a trusted workspace and a native notebook',async()=>{
   const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-pluto-boundaries-'));
@@ -39,5 +40,22 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
     await assert.rejects(pluto.create(uri(path.join(root,'perf','existing.jl')),{kind:'suite'}),/already exists/);
     assert.equal(messages.length,1,'Invalid files never start environment setup');
     assert(scopes.every(scope=>scope.toString()===folder.uri.toString()));
+    const server=createServer((request,response)=>{
+      const query=new URL(request.url,'http://localhost').searchParams;
+      response.statusCode=query.get('secret')==='isolated-test-secret' ? 200 : 403;
+      response.end();
+    });
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    try {
+      const address=server.address(),url=`http://127.0.0.1:${address.port}/edit?id=test-notebook&secret=isolated-test-secret`;
+      // This is VS Code URI's documented serialization of a query component.
+      const forwarded={toString:skipEncoding=>skipEncoding?url:`http://127.0.0.1:${address.port}/edit?${encodeURIComponent('id=test-notebook&secret=isolated-test-secret')}`};
+      assert.equal((await fetch(forwarded.toString())).status,403,'The previous URI encoding loses authenticated query parameters');
+      const panel={webview:{}};
+      pluto.render({panel},forwarded);
+      const source=/src="([^"]+)"/.exec(panel.webview.html)[1].replaceAll('&amp;','&');
+      assert.equal((await fetch(source)).status,200,'The rendered iframe carries the original authentication parameters');
+      assert.equal(new URL(source).searchParams.get('id'),'test-notebook');
+    }finally{await new Promise(resolve=>server.close(resolve));}
   }finally{pluto.dispose();context.subscriptions.forEach(item=>item.dispose());await rm(root,{recursive:true,force:true});}
 });

@@ -24,11 +24,11 @@ const julia = process.env.PERFCHECKER_TEST_JULIA;
 test('portable stdin cancellation unwinds Julia cleanup, preserves failure and bounds forced stop', {skip: !julia}, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'perfchecker-stdin-cancel-'));
   try {
-    for (const mode of ['clean', 'failure', 'forced']) {
+    for (const mode of ['clean', 'failure', 'forced','eof-clean','eof-failure','normal']) {
       const ready = path.join(root, `${mode}-ready`), cleaned = path.join(root, `${mode}-cleaned`);
       const quote = value => JSON.stringify(value).replaceAll('$', '\\$');
-      const operation = mode === 'forced' ? 'while true; nothing; end' : 'sleep(120)';
-      const code = `write(${quote(ready)}, "ready"); try; ${operation}; finally; write(${quote(cleaned)}, "cleanup"); ${mode === 'failure' ? 'error("real cleanup failure")' : ''}; end`;
+      const operation = mode === 'forced' ? 'while true; nothing; end' : mode==='normal'?'sleep(0.1)':'sleep(120)';
+      const code = `write(${quote(ready)}, "ready"); try; ${operation}; finally; write(${quote(cleaned)}, "cleanup"); ${mode.endsWith('failure') ? 'error("real cleanup failure")' : ''}; end`;
       const child = spawn(julia, ['--startup-file=no', '-e', cancellableJulia(code)], {detached: process.platform !== 'win32'});
       let stderr = ''; child.stderr.on('data', bytes => {stderr += bytes;});
       child.stdout.resume();
@@ -40,16 +40,17 @@ test('portable stdin cancellation unwinds Julia cleanup, preserves failure and b
           if (Date.now() > deadline) throw new Error(`Julia did not start: ${stderr}`);
           await new Promise(resolve => setTimeout(resolve, 20));
         }
-        stop.request(); stop.request();
-        const result = await closed;
+        if(mode.startsWith('eof-'))child.stdin.end();
+        else if(mode!=='normal'){stop.request();stop.request();}
+        const result = await Promise.race([closed,new Promise((_,reject)=>{const timeout=setTimeout(()=>reject(new Error(`${mode}: owned Julia did not stop after its control input`)),20000);closed.then(()=>clearTimeout(timeout));})]);
         if (mode === 'forced') {assert.equal(stop.forced, true); assert.ok(notices.some(item => item.forced));}
         else {
           assert.equal(stop.forced, false);
           assert.equal(await readFile(cleaned, 'utf8'), 'cleanup');
-          assert.equal(result.code, mode === 'clean' ? 130 : 1);
-          if (mode === 'failure') assert.match(stderr, /real cleanup failure/);
+          assert.equal(result.code,mode==='normal'?0:mode.endsWith('failure')?1:130);
+          if (mode.endsWith('failure')) assert.match(stderr, /real cleanup failure/);
         }
-        assert.equal(notices.filter(item => item.message.startsWith('Cancelling')).length, 1);
+        assert.equal(notices.filter(item => item.message.startsWith('Cancelling')).length,mode.startsWith('eof-')||mode==='normal'?0:1);
       } finally {stop.dispose(); if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await closed;}
     }
   } finally {await rm(root, {recursive: true, force: true});}

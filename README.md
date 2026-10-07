@@ -2,7 +2,7 @@
 
 PerfChecker 1.0 brings a full Studio, interactive plots, Julia tools, MCP
 conversation, and reviewed agent implementation with Git recovery into VS Code.
-Use a controller environment containing PerfChecker.jl 1.0.0 or later.
+Use a controller environment containing PerfChecker.jl 1.0.1 or later.
 
 The user guides are maintained with PerfChecker.jl on its existing documentation host:
 
@@ -74,9 +74,10 @@ the Julia package or enter measured workers.
 - Connect an already authenticated Codex CLI from Chat for the same advice and
   reviewed implementation workflow. The temporary local connection preserves
   your saved provider configuration and ends when disconnected or the editor closes.
-- Open a folder-scoped Julia terminal, create an unsaved Julia investigation
-  notebook, open native notebooks, and debug saved Julia source using the Julia
-  extension. Select an installed notebook kernel explicitly.
+- Open a folder-scoped Julia terminal and interactive Pluto notebooks inside VS Code.
+  Create a feature-suite or investigation notebook with the official PerfCheckerPluto
+  interface, then explicitly launch checks. Pluto has a separate Julia environment;
+  installation requires your confirmation. Debug saved Julia source with the Julia extension.
 - Browse `package → business feature → check type → target` in the activity bar
   and native Test Explorer.
 - Select BenchmarkTools, Chairmarks, allocations, CPU/wall-time profiles and
@@ -96,7 +97,7 @@ the Julia package or enter measured workers.
 - Julia available as `julia`, or configured through
   `perfchecker.juliaExecutable`.
 - A controller environment in the opened package workspace, normally `perf`,
-  containing PerfChecker.jl 1.0.0 or later and a `suite.jl` with `build_suite()`.
+  containing PerfChecker.jl 1.0.1 or later and a `suite.jl` with `build_suite()`.
 
 The extension invokes the public PerfChecker CLI and reads only versioned JSON,
 JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundary.
@@ -162,7 +163,7 @@ the quality contract and `perf/live_provider.jl` before launch. The provider mus
 write `perfchecker-provider-result/1` JSON to `PERFCHECKER_OUTPUT`, using the
 explicit `--quality=<slug>` argument. It runs in the game project; PerfChecker runs
 in the folder's configured controller project. The controller must already contain
-PerfChecker.jl 1.0.0 or later. No package installation or suite factory runs automatically.
+PerfChecker.jl 1.0.1 or later. No package installation or suite factory runs automatically.
 
 The provider's `suite` is `etendu-beautiful-landscape-live`. Its `environment`
 contains `quality_profile`, effective `width` and `height`, `resolution_source`,
@@ -223,7 +224,7 @@ separate extension development profile before choosing a deployment.
 
 ### Extension host integration test (opt-in)
 
-Prepare a controller containing PerfChecker.jl 1.0.0 or later, SharedScenarioDemo,
+Prepare a controller containing PerfChecker.jl 1.0.1 or later, SharedScenarioDemo,
 BenchmarkTools, Chairmarks and JET. Then create a **new** scratch workspace:
 
 ```text
@@ -259,7 +260,7 @@ workspace named `/tmp/perfchecker-chat-host-*`, with an initial HEAD,
 `PRIVATE_NOT_ATTACHED` and stage a version of `source.jl` before changing its
 on-disk content. In `.vscode/settings.json`, set absolute `juliaExecutable`,
 `runnerProject` and `scenarioProject` paths. The prepared controller must contain
-PerfChecker.jl 1.0.0 or later and HTTP; no package installation occurs in
+PerfChecker.jl 1.0.1 or later and HTTP; no package installation occurs in
 these tests. Use new profile/extensions directories and keep their paths for the
 second process. Workspace-trust disabling below belongs only to these fixtures.
 
@@ -314,7 +315,7 @@ npm run package -- --out perfchecker-vscode.vsix
 
 ## Marketplace publication
 
-Publish the stable extension only after PerfChecker.jl 1.0.0 is available in
+Publish the stable extension only after PerfChecker.jl 1.0.1 is available in
 Julia's General registry. Build and test the exact VSIX before publishing it.
 
 The immutable Marketplace identity is
@@ -350,7 +351,7 @@ Implementation requires a separate explicit tool configuration in the chat's
 use a trusted agent that respects the path and can access the local filesystem.
 Preparation creates a checkpoint; application requires a separate reviewed action.
 The extension uses the controller's public `chat` and `implement` commands, which
-are supplied by PerfChecker.jl 1.0.0 or later; an older controller fails
+are supplied by PerfChecker.jl 1.0.1 or later; an older controller fails
 visibly instead of providing an implementation fallback. The extension does not
 install an agent backend. Its explicit **Connect Codex CLI** action starts an
 authenticated installed CLI on demand through a temporary local MCP endpoint;

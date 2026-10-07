@@ -99,13 +99,18 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
             `--samples=${samples}`,`--timeout=${setting('analysisTimeout',120)}`],token);
           if (token.isCancellationRequested) {execution.skipped(item);continue;}
           const rows = payload?.schema_version==='perfchecker-testitem-run/1' ? payload.runs?.filter((r:any)=>r.item?.id===item.id) : undefined;
-          if (code !== 0) execution.errored(item,new vscode.TestMessage(`Test item process exited with code ${code}. Inspect the output channel.`));
-          else if (rows?.length !== 1) execution.errored(item,new vscode.TestMessage('Missing or ambiguous current item evidence.'));
+          const details=rows?.[0]?.samples?.map((sample:any)=>sample.message).filter((message:any)=>typeof message==='string').join('\n')??'';
+          const project=resolveControllerProject(folder.uri.fsPath,vscode.workspace.getConfiguration('perfchecker',folder.uri)).project;
+          const message=`Item failed, skipped, timed out or had no passing assertions (exit ${code}). ${details}\nTestItemRunner executes in ${project}. Ensure the package under test and its test dependencies are available in that controller environment, then discover and run again. Controller setup installs PerfChecker and collectors only; it does not install your package. See https://perfchecker.mirageinteractive.fr/interfaces/vscode.html and the PerfChecker test items output.`;
+          if (code !== 0) {execution.errored(item,new vscode.TestMessage(message));output.appendLine(message);}
+          else if (rows?.length !== 1) execution.errored(item,new vscode.TestMessage(`Missing or ambiguous current item evidence (exit ${code}). Inspect the output channel.`));
           else if (rows[0].status==='validated' && payload.passed === true) {
             const duration = nativeItemDuration(rows[0].samples, samples);
             execution.passed(item, duration);
             execution.appendOutput(`${item.label}: ${duration.toFixed(2)} ms measured across ${samples} sample(s), including setup and assertions. Correctness validated; performance has not been compared to a budget.\r\n`,undefined,item);
-          } else execution.failed(item,new vscode.TestMessage('Item failed, skipped, timed out or had no passing assertions. Inspect PerfChecker test items output.'));
+          } else {
+            execution.failed(item,new vscode.TestMessage(message));output.appendLine(message);
+          }
         }
       } catch (error) {
         selected.forEach(item=>execution.errored(item,new vscode.TestMessage(String(error))));

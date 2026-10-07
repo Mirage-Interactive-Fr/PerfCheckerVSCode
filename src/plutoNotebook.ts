@@ -16,7 +16,7 @@ export async function shutdownPlutoSessions(): Promise<void> {
 
 const installCode = `
 using Pkg
-Pkg.add(PackageSpec(name="PerfChecker", version="1.0.0"))
+Pkg.add(PackageSpec(name="PerfChecker", version="1.0.1"))
 Pkg.add([PackageSpec(name="Pluto", version="1.0.4"), PackageSpec(name="PlutoUI"),
     PackageSpec(name="BenchmarkTools"), PackageSpec(name="Chairmarks")])
 Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",
@@ -47,7 +47,7 @@ end
 const environmentCode = `
 using PerfChecker, PerfCheckerPluto, Pluto, PlutoUI
 println("Detected PerfChecker ", Base.pkgversion(PerfChecker), "; Pluto ", Base.pkgversion(Pluto))
-v"1.0.0" <= Base.pkgversion(PerfChecker) < v"2.0.0" || error("This integration requires PerfChecker 1.x.")
+v"1.0.1" <= Base.pkgversion(PerfChecker) < v"2.0.0" || error("This integration requires PerfChecker 1.0.1 or newer in the 1.x series. Explicitly upgrade the separate Pluto environment from General before continuing.")
 Base.pkgversion(Pluto) == v"1.0.4" || error("This integration currently qualifies Pluto 1.0.4. Explicitly update the separate Pluto environment to use it.")
 isdefined(Pluto, :ServerSession) && isdefined(Pluto, :run!) || error("Pluto server API is unavailable.")
 hasmethod(PerfChecker.write_suite_notebook, Tuple{AbstractString}) || error("PerfChecker Pluto companion is unavailable.")
@@ -62,15 +62,110 @@ options = Pluto.Configuration.from_flat_kwargs(host="127.0.0.1", port=p,
     require_secret_for_access=true, require_secret_for_open_links=true,
     auto_reload_from_file=false, threads=1)
 session = Pluto.ServerSession(options=options, secret=ENV["PERFCHECKER_PLUTO_SECRET"])
+cleanup_lock = ReentrantLock()
+function cleanup_owned(notebook)
+    lock(cleanup_lock) do
+        workspace = try
+            Pluto.WorkspaceManager.get_workspace((session, notebook); allow_creation=false)
+        catch error
+            error isa Pluto.WorkspaceManager.DiscardedWorkspaceException || rethrow()
+            nothing
+        end
+        workspace === nothing && return
+        Pluto.WorkspaceManager.eval_in_workspace(workspace, quote
+            if isdefined(@__MODULE__, :PerfChecker)
+                owned_jobs = Any[]
+                cleanup_errors = Any[]
+                for name in (:active_job, :setup_job)
+                    isdefined(@__MODULE__, name) || continue
+                    ref = getfield(@__MODULE__, name)
+                    ref isa Ref || continue
+                    job = ref[]
+                    (job isa PerfChecker.SuiteJob || job isa PerfChecker.InvestigationJob) || continue
+                    any(other -> other === job, owned_jobs) || push!(owned_jobs, job)
+                end
+                for job in owned_jobs
+                    try
+                        if job isa PerfChecker.SuiteJob
+                            # A second interrupt while cancelling can interrupt cleanup itself.
+                            PerfChecker.suite_job_status(job) == :running && PerfChecker.cancel_suite!(job)
+                        else
+                            PerfChecker.cancel!(job)
+                        end
+                    catch error
+                        push!(cleanup_errors, error)
+                    end
+                end
+                for job in owned_jobs
+                    try
+                        if job isa PerfChecker.SuiteJob
+                            try
+                                PerfChecker.wait_suite(job; strict=false)
+                            catch error
+                                error isa InterruptException && PerfChecker.suite_job_status(job) == :cancelled || rethrow()
+                            end
+                        else
+                            PerfChecker.wait_investigation(job)
+                        end
+                    catch error
+                        push!(cleanup_errors, error)
+                    end
+                end
+                isempty(cleanup_errors) || throw(CompositeException(cleanup_errors))
+            end
+        end)
+    end
+end
+# Pluto's public shutdown event happens after Malt has already stopped. Intercept
+# only these two requests in this owned server, preserving their normal handlers.
+for action in (:shutdown_notebook, :restart_process)
+    original = Pluto.responses[action]
+    Pluto.responses[action] = function(request; kwargs...)
+        request.session === session || return original(request; kwargs...)
+        lock(cleanup_lock) do
+            try
+                request.notebook === nothing || cleanup_owned(request.notebook)
+            catch error
+                # The server logger hides startup secrets; keep cleanup failures
+                # visible in the extension output rather than losing them there.
+                println(stderr, "PerfChecker Pluto cleanup failed: ", sprint(showerror, error))
+                rethrow()
+            end
+            original(request; kwargs...)
+        end
+    end
+end
 server = nothing
 try
     server = Pluto.run!(session)
     notebook = only(values(session.notebooks))
     println("PERFCHECKER_PLUTO_READY ", p, " ", notebook.notebook_id)
     flush(stdout)
-    wait(server)
+    # Pluto.wait catches InterruptException and closes Malt immediately. Keep
+    # the listener wait here so our owned-job cleanup runs before that close.
+    while isopen(server.http_server)
+        sleep(0.1)
+    end
 finally
-    server === nothing || close(server)
+    if server !== nothing
+        # Core workers are detached from the Pluto/Malt worker. Cancel only the
+        # typed jobs owned by each notebook and await their cleanup first.
+        lock(cleanup_lock) do
+            try
+                shutdown_errors = Any[]
+                for notebook in values(session.notebooks)
+                    try
+                        cleanup_owned(notebook)
+                    catch error
+                        push!(shutdown_errors, error)
+                    end
+                end
+                isempty(shutdown_errors) || throw(CompositeException(shutdown_errors))
+            finally
+                close(server)
+            end
+        end
+    end
 end
 `;
 
@@ -141,27 +236,32 @@ export class PlutoNotebooks implements vscode.Disposable {
   private async command(folder: vscode.WorkspaceFolder, project: string, code: string, title: string,
       environment: Record<string, string> = {}, capture = false): Promise<string> {
     return await vscode.window.withProgress({location: vscode.ProgressLocation.Notification, title, cancellable: true}, async (_progress, token) => {
-      this.assertCurrent(folder, project);
+      const configuration=()=>JSON.stringify(['plutoProject','runnerProject','scenarioProject','juliaExecutable'].map(key=>vscode.workspace.getConfiguration('perfchecker',folder.uri).get(key)));
+      const expected=configuration();
+      const current=()=>{this.assertCurrent(folder, project);if(configuration()!==expected)throw new Error('The Julia or PerfChecker environment settings changed during Pluto setup. Start the action again.');};
+      current();
       const executable = vscode.workspace.getConfiguration('perfchecker', folder.uri).get('juliaExecutable', 'julia');
       let text = '';
       await new Promise<void>((resolve, reject) => {
         const child = spawn(executable, ['--startup-file=no', '--history-file=no', `--project=${project}`, '-e', cancellableJulia(code)],
-          {cwd: folder.uri.fsPath, env: {...process.env, ...environment}, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe','pipe','pipe']});
+          {cwd: folder.uri.fsPath, env: {...process.env, ...environment,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)}, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe','pipe','pipe']});
         const cancel = controllerCancellation(child, message => this.output.appendLine(message));
         const finished = new Promise<void>(done => {child.once('close',done);child.once('error',()=>done());});
         this.setups.set(child,{cancel,finished});closing.add(finished);
         void finished.then(()=>{this.setups.delete(child);closing.delete(finished);});
-        const subscription = token.onCancellationRequested(() => cancel.request());
+        const subscriptions=[token.onCancellationRequested(() => cancel.request()),vscode.workspace.onDidChangeWorkspaceFolders(()=>{try{current();}catch{cancel.request();}}),
+          vscode.workspace.onDidChangeConfiguration(event=>{if(['plutoProject','runnerProject','scenarioProject','juliaExecutable'].some(key=>event.affectsConfiguration(`perfchecker.${key}`,folder.uri))){try{current();}catch{cancel.request();}}})];
         const timeout = setTimeout(() => cancel.request(), 600000);
         child.stdout?.on('data', data => {if(capture){text += data.toString();if(text.length>2000000){cancel.request();reject(new Error('Generated Pluto notebook exceeded 2 MB.'));}}
           else this.output.append(data.toString());});
         child.stderr?.on('data', data => this.output.append(data.toString()));
         child.once('error', reject);
-        child.once('close', code => code === 0 ? resolve() : reject(new Error(token.isCancellationRequested ?
-          'Pluto setup cancelled after worker cleanup.' : 'Pluto setup failed. Inspect the PerfChecker Pluto output for the missing dependency or Julia error.')));
-        child.once('close', () => {clearTimeout(timeout); subscription.dispose(); cancel.dispose();});
+        child.once('close', code => {try{current();}catch(error){reject(error);return;}code === 0 ? resolve() : reject(new Error(token.isCancellationRequested ?
+          'Pluto setup cancelled after worker cleanup.' : 'Pluto setup failed. Inspect the PerfChecker Pluto output for the missing dependency or Julia error.'));});
+        const cleanup=()=>{clearTimeout(timeout);for(const subscription of subscriptions)subscription.dispose();cancel.dispose();};
+        child.once('close', cleanup);child.once('error',cleanup);
       });
-      this.assertCurrent(folder, project);
+      current();
       return text;
     });
   }
@@ -173,11 +273,11 @@ export class PlutoNotebooks implements vscode.Disposable {
         await this.command(folder, project, environmentCode, 'PerfChecker · Check Pluto environment');
         return project;
       } catch (error) {
-        if (String(error).includes('cancelled')) throw error;
+        if (/cancelled|settings changed|workspace was closed|environment changed/.test(String(error))) throw error;
       }
     }
     const choice = await vscode.window.showWarningMessage(
-      `Pluto needs its own Julia environment at ${project}. Install PerfChecker 1.0.0, Pluto 1.0.4, PlutoUI and the official Pluto companion there? This downloads packages and updates that environment. Your MCP controller stays separate.`,
+      `Pluto needs its own Julia environment at ${project}. Install registered PerfChecker 1.0.1, Pluto 1.0.4, PlutoUI and the official Pluto companion there? This downloads packages and updates that environment. Your MCP controller stays separate.`,
       {modal: true}, 'Install Pluto environment', 'Open setup guide');
     if (choice === 'Open setup guide') {
       await vscode.env.openExternal(vscode.Uri.parse('https://perfchecker.mirageinteractive.fr/interfaces/repl-pluto.html')); return;
@@ -276,7 +376,7 @@ export class PlutoNotebooks implements vscode.Disposable {
     const child = spawn(vscode.workspace.getConfiguration('perfchecker',session.folder.uri).get('juliaExecutable','julia'),
       ['--startup-file=no','--history-file=no',`--project=${session.project}`,'-e',cancellableJulia(serverCode)],
       {cwd:session.folder.uri.fsPath, windowsHide:true, detached:process.platform!=='win32', stdio:['pipe','pipe','pipe'],
-        env:{...process.env, PERFCHECKER_PLUTO_SECRET:secret, PERFCHECKER_PLUTO_PORT:String(port), PERFCHECKER_PLUTO_NOTEBOOK:session.notebook}});
+        env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter), PERFCHECKER_PLUTO_SECRET:secret, PERFCHECKER_PLUTO_PORT:String(port), PERFCHECKER_PLUTO_NOTEBOOK:session.notebook}});
     const redact = (line: string) => line.replaceAll(secret,'[session secret]').replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]');
     let errors = '';
     child.stderr?.on('data',data=>{
@@ -289,7 +389,7 @@ export class PlutoNotebooks implements vscode.Disposable {
     const exited = new Promise<void>(resolve => {child.once('close',()=>resolve()); child.once('error',()=>resolve());});
     const startup = new Promise<string>((resolve,reject) => {
       let pending = '';
-      const timer = setTimeout(()=>{reject(new Error('Pluto did not become ready. Inspect PerfChecker Pluto output, then restart the session.')); session.cancel?.request();},180000);
+      const timer = setTimeout(()=>{reject(new Error('Pluto did not become ready. Inspect PerfChecker Pluto output, then restart the session.')); cancel.request();},180000);
       child.once('error',error=>{clearTimeout(timer);reject(error);});
       child.once('close',code=>{clearTimeout(timer);reject(new Error(`Pluto stopped before opening (exit ${code}). Inspect PerfChecker Pluto output.`));});
       child.stdout?.on('data',data=>{
@@ -306,18 +406,33 @@ export class PlutoNotebooks implements vscode.Disposable {
     session.stopped = exited;
     child.once('close',()=>{cancel.dispose(); if(session.child===child){session.child=undefined;session.cancel=undefined;
       if(!session.disposed)this.render(session,undefined,'Pluto session stopped. Use Restart session to reopen the saved notebook.');}});
-    const id = await startup;
-    this.assertCurrent(session.folder,session.project);
-    if(session.disposed) {session.cancel?.request(); return;}
-    let uri: vscode.Uri;
-    try {uri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://127.0.0.1:${port}/edit?id=${id}&secret=${secret}`));}
-    catch(error) {throw new Error(redact(`The remote Pluto port could not be forwarded: ${error}`));}
-    session.panel.webview.options={...session.panel.webview.options,portMapping:[{webviewPort:port,extensionHostPort:port}]};
-    this.render(session,uri);
+    try {
+      const id = await startup;
+      const assertActive = () => {
+        this.assertCurrent(session.folder,session.project);
+        if(session.disposed || session.child!==child || child.exitCode!==null || child.signalCode!==null)
+          throw new Error('The Pluto session was stopped or its view was closed. Use Restart session to open it again.');
+      };
+      assertActive();
+      let uri: vscode.Uri;
+      try {uri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://127.0.0.1:${port}/edit?id=${id}&secret=${secret}`));}
+      catch(error) {throw new Error(redact(`The remote Pluto port could not be forwarded: ${error}`));}
+      assertActive();
+      session.panel.webview.options={...session.panel.webview.options,portMapping:[{webviewPort:port,extensionHostPort:port}]};
+      this.render(session,uri);
+    } catch(error) {
+      // Initial opening and Restart have exactly the same ownership and cleanup.
+      // Never cancel a later child that could have replaced this attempt.
+      cancel.request(); await exited;
+      throw new Error(redact(String(error)));
+    }
   }
   private render(session: Session, uri?: vscode.Uri, status='') {
-    const nonce=randomUUID(), origin=uri ? new URL(uri.toString()).origin : 'http://127.0.0.1';
-    const source=uri ? `<iframe class="perfchecker-pluto-frame" title="Interactive Pluto notebook" src="${html(uri.toString())}" allow="clipboard-read; clipboard-write"></iframe>` : `<div class="status" role="status">${html(status)}</div>`;
+    // URI.toString() encodes query delimiters, which makes Pluto's secret a query
+    // key instead of its value. The HTTP URL must retain the forwarded query.
+    const url=uri ? new URL(uri.toString(true)).href : undefined;
+    const nonce=randomUUID(), origin=url ? new URL(url).origin : 'http://127.0.0.1';
+    const source=url ? `<iframe class="perfchecker-pluto-frame" title="Interactive Pluto notebook" src="${html(url)}" allow="clipboard-read; clipboard-write"></iframe>` : `<div class="status" role="status">${html(status)}</div>`;
     session.panel.webview.html=`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src ${html(origin)}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';"><style nonce="${nonce}">html,body{height:100%;margin:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-font-family)}body{display:flex;flex-direction:column}header{display:flex;gap:12px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--vscode-panel-border)}header strong{margin-right:auto}button{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:0;padding:6px 10px;cursor:pointer}.perfchecker-pluto-frame{flex:1;width:100%;border:0}.status{padding:24px;line-height:1.6}</style><title>PerfChecker Pluto</title></head><body><header><strong>PerfChecker · Pluto</strong><span>Run checks explicitly · notebook saved as .jl</span><button id="pluto-source">Open source</button><button id="pluto-stop">Stop session</button><button id="pluto-restart">Restart session</button></header>${source}<script nonce="${nonce}">const api=acquireVsCodeApi();for(const [id,type]of [['pluto-source','plutoSource'],['pluto-stop','plutoStop'],['pluto-restart','plutoRestart']])document.getElementById(id).addEventListener('click',()=>api.postMessage({type}));</script></body></html>`;
   }
   private async stop(session: Session): Promise<void> {

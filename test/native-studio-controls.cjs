@@ -345,7 +345,7 @@ async function testAdvisorAndTools(context) {
     assert.equal(await view.getByRole('button', {name: tab, exact: true}).getAttribute('aria-current'), 'page');
   }
   await view.getByRole('button', {name: 'Worker log', exact: true}).click();
-  context.log('native-tool-catalogue', {backend: 'registered PerfChecker 1.0.0', filter: true, investigationTabs: 4, workerLog: true});
+  context.log('native-tool-catalogue', {backend: context.core, filter: true, investigationTabs: 4, workerLog: true});
 }
 
 async function testSavePalette(context) {
@@ -366,6 +366,45 @@ async function testSavePalette(context) {
   assert.equal(saved.selection.run_ids.length, count);
   assert(Object.values(saved.selection.labels).includes('#a12655'));
   context.log('save-palette-command', {native: true, unsavedTitleSelectionColor: true, destination});
+}
+
+async function testLargePlanAndOrdering(context) {
+  const uri=context.vscode.Uri.file(context.workspace);
+  const settings=()=>context.vscode.workspace.getConfiguration('perfchecker',uri);
+  const previous=settings().inspect('suite')?.workspaceFolderValue;
+  const configFile=path.resolve(context.workspace,settings().get('uiConfiguration','perf/perfchecker-ui.json'));
+  const saved=await fs.readFile(configFile).catch(()=>undefined);
+  try{
+    await fs.rm(configFile,{force:true});
+    await settings().update('suite','perf/large-suite.jl',context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
+    let view=await frame(context,'#cards');
+    await eventually(async()=>/Showing 120 of 125 workload groups/.test(await view.locator('#rendered-count').innerText()),'The real large plan paginates 125 workload groups',120000);
+    assert.equal(await view.locator('#cards .card').count(),120);
+    await view.locator('#reset-filters').click();
+    await view.locator('#select-visible').click();
+    assert.equal(await selectionCount(view),125,'Bulk selection includes the five groups not rendered yet');
+    await view.locator('#show-more').click();
+    assert.equal(await view.locator('#cards .card').count(),125);
+    assert(!await view.locator('#show-more').isVisible());
+    await view.locator('#sort').selectOption('suite');
+    const before=await savedConfiguration(context,view);
+    const first=before.config.selection.run_ids[0];
+    await view.locator('#cards .card').first().dragTo(view.locator('#cards .card').nth(2));
+    const after=await savedConfiguration(context,view);
+    assert.notEqual(after.config.selection.run_ids[0],first,'Native drag changes the persisted execution order');
+    assert.deepEqual(new Set(after.config.selection.run_ids),new Set(before.config.selection.run_ids));
+    await view.locator('#search').fill('workload_125');
+    assert.equal(await view.locator('#cards .card').count(),1);
+    await view.locator('#clear-visible').click();assert.equal(await selectionCount(view),124);
+    context.log('large-plan-pagination-and-drag',{groups:125,initiallyRendered:120,bulkIncludesHidden:true,nativeDrag:true,executionsRequested:0});
+  }finally{
+    if(saved)await fs.writeFile(configFile,saved);else await fs.rm(configFile,{force:true});
+    await settings().update('suite',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);
+    await context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
+    const view=await frame(context,'#cards');
+    await eventually(async()=>!(await view.locator('#show-more').isVisible())&&!/workload_125/.test(await view.locator('#cards').innerText()),'Restore the real measurement suite after plan-only pagination',120000);
+  }
 }
 
 exports.runSelection = async context => {
@@ -411,12 +450,14 @@ exports.run = async context => {
   assert.equal(await view.locator('.card').count(), 9);
   assert.equal(await view.locator('.lab button').count(), 5);
   assert(await view.locator('.hero img').evaluate(image => image.complete && image.naturalWidth > 0));
-  await view.getByText('Workspace environment', {exact: true}).click();
-  assert((await view.locator('details.environment p').innerText()).includes(context.controller));
+  const environment=view.locator('details.environment');
+  if(await environment.getAttribute('open')===null)await environment.locator('summary').click();
+  await eventually(async()=>(await environment.locator('p').innerText()).includes(context.controller),'Studio displays the selected controller after its state arrives');
   context.log('studio-inventory', {cards: 9, workbenchButtons: 5, controllerShown: true});
   const failures = [];
   for (const [name, run] of [['suite-selection', testSuiteSelection], ['git-and-comparisons', testGitTargetsAndComparisons],
-    ['results', testResults], ['provider-and-tools', testAdvisorAndTools], ['save-palette', testSavePalette]]) {
+    ['results', testResults], ['provider-and-tools', testAdvisorAndTools], ['save-palette', testSavePalette],
+    ['large-plan-pagination-and-drag',testLargePlanAndOrdering]]) {
     try {await run(context);}
     catch (error) {
       failures.push(error);

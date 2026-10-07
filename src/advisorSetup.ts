@@ -6,6 +6,7 @@ import {spawn, ChildProcess} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {assertSavedAdvisorConfiguration, localAdvisorConnection, onLocalAdvisorConnectionChanged} from './advisorConnection';
+import {cancellableJulia,controllerCancellation} from './controllerCancellation';
 
 const mapping: Record<string, [string, unknown]> = {
   endpoint: ['advisorEndpoint', 'http://127.0.0.1:8081/v1/chat/completions'], model: ['advisorModel', 'local'],
@@ -31,6 +32,7 @@ export async function readAdvisorConfiguration(folder: vscode.WorkspaceFolder): 
 export class AdvisorSetup implements vscode.Disposable {
   private panel?: vscode.WebviewPanel;
   private child?: ChildProcess;
+  private stopController?: ReturnType<typeof controllerCancellation>;
   private cancelled = false;
   private busy = false;
   private panelWorkspace?: string;
@@ -147,16 +149,18 @@ export class AdvisorSetup implements vscode.Disposable {
       if (this.cancelled) return {status: 'cancelled', message: 'Setup operation cancelled before starting a worker.'};
       return await new Promise((resolve, reject) => {
         const child = spawn(julia, ['--startup-file=no', `--project=${project}`,
-          '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', 'advisor-setup', `--source=${file}`, `--project=${project}`],
-        {cwd: root, windowsHide: true, detached: process.platform !== 'win32'});
+          '-e', cancellableJulia('using PerfChecker; exit(perfchecker_main(ARGS))'), '--', 'advisor-setup', `--source=${file}`, `--project=${project}`],
+        {cwd: root, windowsHide: true, detached: process.platform !== 'win32',env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)}});
         this.child = child;
+        const stop=controllerCancellation(child,(message,forced)=>{if(forced)void vscode.window.showWarningMessage(message);});this.stopController=stop;
         let output = '', error = '';
         const timeout = setTimeout(() => this.cancel(), (Math.min(Number(input.config?.timeout) || 120, 3600) + 60) * 1000);
         child.stdout?.on('data', data => {output += data.toString(); if (output.length > 2_000_000) this.cancel();});
         child.stderr?.on('data', data => {error = (error + data.toString()).slice(-4000);});
-        child.on('error', e => {clearTimeout(timeout); reject(e);});
+        child.on('error', e => {clearTimeout(timeout);stop.dispose();if(this.stopController===stop)this.stopController=undefined;reject(e);});
         child.on('close', code => {
           clearTimeout(timeout);
+          stop.dispose();if(this.stopController===stop)this.stopController=undefined;
           if (this.cancelled) return resolve({status: 'cancelled', message: 'Operation cancelled. The server may retain partial files; refresh its inventory.'});
           try {resolve(JSON.parse(output));} catch {reject(new Error(code ? error || 'Julia setup worker failed.' : 'Invalid setup response.'));}
         });
@@ -171,8 +175,7 @@ export class AdvisorSetup implements vscode.Disposable {
     const child = this.child;
     if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
     this.cancelled = true;
-    if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {windowsHide: true}).on('error', () => child.kill());
-    else {try {process.kill(-child.pid, 'SIGKILL');} catch {child.kill('SIGKILL');}}
+    this.stopController?.request();
   }
   dispose() {this.unsubscribeConnection(); this.cancel(); this.panel?.dispose();}
 }
