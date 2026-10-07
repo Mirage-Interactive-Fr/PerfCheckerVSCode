@@ -205,13 +205,22 @@ exports.run = async () => {
     const allCommands=await vscode.commands.getCommands(true);
     if(allCommands.includes('workbench.action.closeAuxiliaryBar'))await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
     if(process.env.PERFCHECKER_NATIVE_VIDEO==='1'){
-      const cdp=await windowPage.context().newCDPSession(windowPage);
+      let target,cdp;
       try{
-        const {windowId}=await cdp.send('Browser.getWindowForTarget');
+        target=await windowPage.context().newCDPSession(windowPage);
+        cdp=await browser.newBrowserCDPSession();
+        const {targetInfo}=await target.send('Target.getTargetInfo');
+        const {windowId}=await cdp.send('Browser.getWindowForTarget',{targetId:targetInfo.targetId});
         await cdp.send('Browser.setWindowBounds',{windowId,bounds:{windowState:'normal'}});
         await cdp.send('Browser.setWindowBounds',{windowId,bounds:{left:0,top:0,width:1920,height:1080}});
         log('native-recording-layout',{actualWindowBounds:await cdp.send('Browser.getWindowBounds',{windowId}),auxiliaryChatClosed:true});
-      }finally{await cdp.detach();}
+      }catch(error){
+        log('native-recording-layout-warning',{message:String(error),functionalTestsContinue:true});
+        if(allCommands.includes('workbench.action.toggleFullScreen')){
+          await vscode.commands.executeCommand('workbench.action.toggleFullScreen').catch(error=>log('native-recording-layout-warning',{fallback:String(error)}));
+        }
+        log('native-recording-viewport',{dimensions:await windowPage.evaluate(()=>({width:innerWidth,height:innerHeight})),fallback:'actual-workbench-fullscreen-command'});
+      }finally{await target?.detach().catch(()=>{});await cdp?.detach().catch(()=>{});}
     }
     const findFrame = selector => eventually(async () => {
       for (const context of browser.contexts()) for (const page of context.pages()) for (const frame of page.frames()) {

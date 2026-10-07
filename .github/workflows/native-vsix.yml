@@ -16,7 +16,7 @@ on:
       scope:
         description: All supported hosts, or the two Linux hosts for a focused rerun
         type: choice
-        options: [all, linux]
+        options: [all, linux, linux-stable]
         default: all
       core:
         description: Registered minimum, or the explicitly pinned Core fix before registration
@@ -29,6 +29,15 @@ on:
       core_tree:
         description: Expected Git tree for that Core candidate (candidate mode only)
         type: string
+      candidate_run:
+        description: Optional original run ID to reuse its exact candidate bytes
+        type: string
+      candidate_name:
+        description: Artifact name from that original run (requires candidate_run and candidate_sha)
+        type: string
+      candidate_sha:
+        description: Full SHA256 of the original candidate (never repackage when supplied)
+        type: string
   pull_request:
     paths:
       - '.github/workflows/native-vsix.yml'
@@ -39,6 +48,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   package:
@@ -46,18 +56,38 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.digest.outputs.sha }}
+    env:
+      REUSE_RUN: ${{ inputs.candidate_run }}
+      REUSE_NAME: ${{ inputs.candidate_name }}
+      REUSE_SHA: ${{ inputs.candidate_sha }}
     steps:
       - uses: actions/checkout@v7
+      - name: Validate optional exact-archive reuse
+        run: |
+          node -e "const e=process.env,v=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA];if(v.some(Boolean)&&(!/^\d+$/.test(e.REUSE_RUN)||!/^native-candidate-[a-f0-9]{40}$/.test(e.REUSE_NAME)||! /^[a-f0-9]{64}$/.test(e.REUSE_SHA)))throw Error('Supply the original run, artifact name and full SHA256 together')"
+      - name: Download the immutable candidate for additional qualification
+        if: env.REUSE_RUN != ''
+        uses: actions/download-artifact@v7
+        with:
+          run-id: ${{ inputs.candidate_run }}
+          name: ${{ inputs.candidate_name }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+        if: env.REUSE_RUN == ''
       - run: npm run package -- --out candidate.vsix
+        if: env.REUSE_RUN == ''
+      - name: Verify archive digest and unchanged production sources
+        if: env.REUSE_RUN != ''
+        run: |
+          node -e "const fs=require('fs'),cp=require('child_process'),crypto=require('crypto');const p=JSON.parse(fs.readFileSync('candidate.provenance.json'));const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');if(sha!==process.env.REUSE_SHA||p.sha256!==sha||p.version!==JSON.parse(fs.readFileSync('package.json')).version||!/^[a-f0-9]{40}$/.test(p.commit))throw Error('Original archive provenance/digest mismatch');cp.execFileSync('git',['fetch','--depth=1','origin',p.commit]);cp.execFileSync('git',['diff','--exit-code',p.commit,'HEAD','--','src','media','package.json','package-lock.json','README.md','CHANGELOG.md','LICENSE','.vscodeignore'],{stdio:'inherit'});console.log('EXACT_VSIX_REUSED '+sha+' originalRun='+p.run+' originalCommit='+p.commit)"
       - id: digest
         name: Record the shared package digest
         run: |
-          node -e "const fs=require('fs'),crypto=require('crypto'),cp=require('child_process');const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');fs.appendFileSync(process.env.GITHUB_OUTPUT,'sha='+sha+'\n');fs.writeFileSync('candidate.vsix.sha256',sha+'  candidate.vsix\n');fs.writeFileSync('candidate.provenance.json',JSON.stringify({sha256:sha,version:JSON.parse(fs.readFileSync('package.json')).version,commit:cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),tree:cp.execFileSync('git',['rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim(),packagedOnceOn:'Linux',run:process.env.GITHUB_RUN_ID},null,2))"
+          node -e "const fs=require('fs'),crypto=require('crypto'),cp=require('child_process');const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');fs.appendFileSync(process.env.GITHUB_OUTPUT,'sha='+sha+'\n');fs.writeFileSync('candidate.vsix.sha256',sha+'  candidate.vsix\n');if(!process.env.REUSE_RUN)fs.writeFileSync('candidate.provenance.json',JSON.stringify({sha256:sha,version:JSON.parse(fs.readFileSync('package.json')).version,commit:cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),tree:cp.execFileSync('git',['rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim(),packagedOnceOn:'Linux',run:process.env.GITHUB_RUN_ID},null,2))"
       - uses: actions/upload-artifact@v7
         with:
           name: native-candidate-${{ github.sha }}
@@ -73,7 +103,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
