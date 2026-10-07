@@ -5,6 +5,7 @@ import {spawn} from 'node:child_process';
 import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+import {Script} from 'node:vm';
 
 const require=createRequire(import.meta.url);
 const {spawnWindowsOwnedProcess}=require('../dist/windowsOwnedProcess.js');
@@ -95,7 +96,9 @@ test('Windows Job owner stops if its Node parent disappears',{skip:!windows,time
   const {root,script}=await fixture(treeSource);
   const host=path.join(root,'owner host.js');
   const module=require.resolve('../dist/windowsOwnedProcess.js');
-  await writeFile(host,`const fs=require('node:fs');const {spawnWindowsOwnedProcess}=require(${JSON.stringify(module)});const child=spawnWindowsOwnedProcess(process.execPath,[${JSON.stringify(script)},'leader','active'],{cwd:${JSON.stringify(root)},env:{...process.env,PCW_TEST_ROOT:${JSON.stringify(root)}});fs.writeFileSync(${JSON.stringify(path.join(root,'wrapper.pid'))},String(child.pid));let stderr='';child.stdout.resume();child.stderr.on('data',chunk=>stderr+=chunk);child.on('close',(code,signal)=>fs.writeFileSync(${JSON.stringify(path.join(root,'wrapper-result.json'))},JSON.stringify({code,signal,stderr})));child.stdin.end('complete prompt');setInterval(()=>{},1000);`);
+  const hostSource=`const fs=require('node:fs');const {spawnWindowsOwnedProcess}=require(${JSON.stringify(module)});const child=spawnWindowsOwnedProcess(process.execPath,[${JSON.stringify(script)},'leader','active'],{cwd:${JSON.stringify(root)},env:{...process.env,PCW_TEST_ROOT:${JSON.stringify(root)}}});fs.writeFileSync(${JSON.stringify(path.join(root,'wrapper.pid'))},String(child.pid));let stderr='';child.stdout.resume();child.stderr.on('data',chunk=>stderr+=chunk);child.on('close',(code,signal)=>fs.writeFileSync(${JSON.stringify(path.join(root,'wrapper-result.json'))},JSON.stringify({code,signal,stderr})));child.stdin.end('complete prompt');setInterval(()=>{},1000);`;
+  new Script(hostSource,{filename:host});
+  await writeFile(host,hostSource);
   const parent=spawn(process.execPath,[host],{stdio:['ignore','pipe','pipe'],windowsHide:true});
   const parentFinished=completion(parent);let parentResult;
   void parentFinished.then(result=>{parentResult=result;});
