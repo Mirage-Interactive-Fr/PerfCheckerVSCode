@@ -11,6 +11,11 @@ import path from 'node:path';
 let fixture;
 const require = createRequire(import.meta.url), original = Module._load;
 Module._load = function(name, ...args) {
+  if (name === './windowsOwnedProcess') {
+    const owner = original.call(this, name, ...args);
+    return {...owner, spawnWindowsOwnedProcess: (cli, argv, options) => cli === 'sacrificial-codex' ?
+      owner.spawnWindowsOwnedProcess(process.execPath, [fixture, ...argv], options) : owner.spawnWindowsOwnedProcess(cli, argv, options)};
+  }
   if (name === 'node:child_process') return {...nativeChildProcess, spawn: (cli, argv, options) =>
     cli === 'sacrificial-codex' ? nativeSpawn(process.execPath, [fixture, ...argv], options) : nativeSpawn(cli, argv, options)};
   return original.call(this, name, ...args);
@@ -28,6 +33,7 @@ if(args[1]==='--help'){console.log('--ephemeral --sandbox --output-last-message 
 if(args[0]==='login'){process.exit(process.env.PERFCHECKER_FAKE_AUTH==='no'?1:0)}
 let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',s=>prompt+=s);process.stdin.on('end',()=>{
 fs.writeFileSync(path.join(process.cwd(),'captured.json'),JSON.stringify({args,prompt,leaked:Object.keys(process.env).some(k=>k.startsWith('PERFCHECKER_CODEX_TOKEN_'))}));
+if(prompt.includes('EXIT_WITH_CHILD')||prompt.includes('OWNED_ACTIVE_CHILD')){const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:['ignore','inherit','inherit']});fs.writeFileSync(path.join(process.cwd(),'exited-cli.json'),JSON.stringify({leader:process.pid,descendant:child.pid}));if(prompt.includes('EXIT_WITH_CHILD'))process.exit(0);setInterval(()=>{},1000);return}
 if(prompt.includes('SLOW')){const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)']);fs.writeFileSync(path.join(process.cwd(),'descendant.pid'),String(child.pid));setInterval(()=>{},1000);return}
 if(args[args.indexOf('--sandbox')+1]==='workspace-write')fs.writeFileSync(path.join(process.cwd(),'source.txt'),'optimized\\n');
 fs.writeFileSync(args[args.indexOf('--output-last-message')+1],prompt.includes('OVERSIZED')?'x'.repeat(64001):'Review the allocation evidence and verify the suggested changes.');});`);
@@ -40,7 +46,7 @@ async function call(connector, method, params, signal) {
   return (await response.json()).result;
 }
 const tool = (connector, name, args, signal) => call(connector, 'tools/call', {name, arguments: args}, signal);
-async function until(read) {for (let i=0;i<100;i++) {try {return await read();} catch {await new Promise(r=>setTimeout(r,20));}} throw new Error('Fixture process did not start.');}
+async function until(read) {for (let i=0;i<(process.platform==='win32'?1000:100);i++) {try {return await read();} catch {await new Promise(r=>setTimeout(r,20));}} throw new Error('Fixture process did not start.');}
 
 test('authenticated local MCP exposes two exact tools and never forwards its token to Codex', async () => environment(async root => {
   assert.equal(await inspectCodex('sacrificial-codex', root), 'codex-cli 0.159.2');
@@ -85,7 +91,7 @@ test('implementation accepts a canonical PerfChecker checkout and uses workspace
 test('timeout, HTTP cancellation and disposal stop the actual CLI process tree and permit retry', async () => environment(async root => {
   for (const mode of ['timeout','cancel','dispose']) {
     await rm(path.join(root,'descendant.pid'),{force:true});
-    const connector=await new CodexConnector({cli:'sacrificial-codex',root,timeoutMs:mode==='timeout'?300:10000}).start();
+    const connector=await new CodexConnector({cli:'sacrificial-codex',root,timeoutMs:mode==='timeout'?(process.platform==='win32'?10000:300):30000}).start();
     try {
     const controller=new AbortController();
     const pending=tool(connector,'ask_perfchecker',{prompt:'SLOW'},controller.signal);
@@ -101,4 +107,50 @@ test('timeout, HTTP cancellation and disposal stop the actual CLI process tree a
       if(retry.isError)throw new Error(retry.content[0].text);return retry;});
     } finally {await connector.dispose();}
   }
+}));
+
+test('timeout, HTTP cancellation and disposal reclaim the owned CLI descendants before teardown', async t => environment(async root => {
+  const failures=[];
+  const alive=async pid=>{
+    try{process.kill(pid,0);}catch{return false;}
+    if(process.platform==='linux')return !/\) Z /.test(await readFile(`/proc/${pid}/stat`,'utf8').catch(()=>''));
+    return true;
+  };
+  for(const mode of ['timeout','cancel','dispose']){
+    await rm(path.join(root,'exited-cli.json'),{force:true});
+    const windows=process.platform==='win32';
+    const connector=await new CodexConnector({cli:'sacrificial-codex',root,timeoutMs:mode==='timeout'?(windows?10000:350):30000}).start();
+    const controller=new AbortController();
+    const request=tool(connector,'ask_perfchecker',{prompt:windows?'OWNED_ACTIVE_CHILD':'EXIT_WITH_CHILD'},controller.signal).catch(error=>error);
+    let owned;
+    try{
+      owned=JSON.parse(await until(()=>readFile(path.join(root,'exited-cli.json'),'utf8')));
+      if(!windows)await until(async()=>{if(await alive(owned.leader))throw new Error('The CLI leader has not exited yet');return true;});
+      assert(await alive(owned.descendant),'The inherited-stream descendant is actually alive before the owned stop');
+      const leaderAliveBeforeStop=await alive(owned.leader);
+      assert.equal(leaderAliveBeforeStop,windows,'POSIX reproduces an exited leader; Windows owns and stops the Job immediately on natural leader exit (tested separately)');
+      if(mode==='cancel')controller.abort();
+      const disposal=mode==='dispose'?connector.dispose():undefined;
+      const deadline=Date.now()+(windows?15000:2500);
+      while(await alive(owned.descendant)&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+      const survivingBeforeHarnessCleanup=await alive(owned.descendant);
+      t.diagnostic(JSON.stringify({mode,...owned,leaderAliveBeforeStop,survivingBeforeHarnessCleanup}));
+      assert.equal(survivingBeforeHarnessCleanup,false,`${mode}: the owned descendant must stop before fixture teardown`);
+      await disposal;
+      const result=await request;
+      if(mode==='timeout'){assert.equal(result.isError,true);assert.match(result.content[0].text,/timed out/);}
+      if(mode!=='dispose'){
+        await until(async()=>{
+          const retry=await tool(connector,'ask_perfchecker',{prompt:'Retry'});
+          assert.equal(retry.isError,undefined,'Cleanup returns the connector to idle');return retry;
+        });
+      }
+    }catch(error){failures.push(error);}
+    finally{
+      // Only the PID reported by this disposable fixture is eligible for teardown.
+      if(owned&&await alive(owned.descendant))process.kill(owned.descendant,'SIGKILL');
+      await connector.dispose();await request;
+    }
+  }
+  if(failures.length)throw new AggregateError(failures,'Exited CLI descendants survived before harness cleanup');
 }));

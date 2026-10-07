@@ -11,7 +11,7 @@ on:
       stage:
         description: Smoke, full, reload/narrative, selected native controls, or Core-only regression
         type: choice
-        options: [smoke, full, targeted, focused, core-external]
+        options: [smoke, full, targeted, focused, core-external, connector-workers]
         default: full
       case_group:
         description: Native controls to exercise on a clean fixture (focused stage only)
@@ -61,7 +61,36 @@ permissions:
   actions: read
 
 jobs:
+  connector-workers:
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'connector-workers'
+    name: Real CLI ownership (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.scope == 'windows-stable' && '["windows-latest"]' || '["ubuntu-latest","windows-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: Observe CLI ownership before fixture teardown (no VS Code, models or credentials)
+        shell: bash
+        run: |
+          mkdir -p native-qualification-results
+          node --test test/windows-owned-process.test.mjs test/codex-connector.test.mjs > native-qualification-results/connector-workers.tap 2>&1
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: connector-workers-${{ matrix.os }}
+          path: native-qualification-results/
+
   package:
+    if: github.event_name != 'workflow_dispatch' || inputs.stage != 'connector-workers'
     name: Package the exact candidate once
     runs-on: ubuntu-latest
     outputs:
@@ -93,7 +122,7 @@ jobs:
       - name: Verify archive digest and unchanged production sources
         if: env.REUSE_RUN != ''
         run: |
-          node -e "const fs=require('fs'),cp=require('child_process'),crypto=require('crypto');const p=JSON.parse(fs.readFileSync('candidate.provenance.json'));const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');if(sha!==process.env.REUSE_SHA||p.sha256!==sha||p.version!==JSON.parse(fs.readFileSync('package.json')).version||!/^[a-f0-9]{40}$/.test(p.commit))throw Error('Original archive provenance/digest mismatch');cp.execFileSync('git',['fetch','--depth=1','origin',p.commit]);cp.execFileSync('git',['diff','--exit-code',p.commit,'HEAD','--','src','media','package.json','package-lock.json','README.md','CHANGELOG.md','LICENSE','.vscodeignore'],{stdio:'inherit'});console.log('EXACT_VSIX_REUSED '+sha+' originalRun='+p.run+' originalCommit='+p.commit)"
+          node -e "const fs=require('fs'),cp=require('child_process'),crypto=require('crypto');const p=JSON.parse(fs.readFileSync('candidate.provenance.json'));const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');if(sha!==process.env.REUSE_SHA||p.sha256!==sha||p.version!==JSON.parse(fs.readFileSync('package.json')).version||!/^[a-f0-9]{40}$/.test(p.commit))throw Error('Original archive provenance/digest mismatch');cp.execFileSync('git',['fetch','--depth=1','origin',p.commit]);cp.execFileSync('git',['diff','--exit-code',p.commit,'HEAD','--','src','media','resources','package.json','package-lock.json','README.md','CHANGELOG.md','LICENSE','.vscodeignore'],{stdio:'inherit'});console.log('EXACT_VSIX_REUSED '+sha+' originalRun='+p.run+' originalCommit='+p.commit)"
       - id: digest
         name: Record the shared package digest
         run: |

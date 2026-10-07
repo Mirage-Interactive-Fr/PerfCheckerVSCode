@@ -4,6 +4,7 @@ import {randomBytes, timingSafeEqual} from 'node:crypto';
 import {mkdtemp, readFile, realpath, rm, stat} from 'node:fs/promises';
 import {tmpdir, homedir} from 'node:os';
 import * as path from 'node:path';
+import {spawnWindowsOwnedProcess} from './windowsOwnedProcess';
 
 const revisions = ['2026-07-28', '2025-11-25'];
 const tools = [
@@ -14,8 +15,13 @@ const tools = [
 ];
 
 function terminate(child: ChildProcess) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {windowsHide: true}).on('error', () => child.kill('SIGKILL'));
+  if (!child.pid) return;
+  if (process.platform === 'win32') {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    // The launcher owns a private Job before the CLI runs. Closing its only
+    // handle stops descendants even if the original CLI leader already exited.
+    child.kill('SIGKILL');
+  }
   else {try {process.kill(-child.pid, 'SIGKILL');} catch {child.kill('SIGKILL');}}
 }
 
@@ -25,7 +31,8 @@ async function command(cli: string, args: string[], cwd: string, input = '', sig
   const env = {...process.env};
   for (const name of Object.keys(env)) if (name.startsWith('PERFCHECKER_CODEX_TOKEN_')) delete env[name];
   return await new Promise((resolve, reject) => {
-    const child = spawn(cli, args, {cwd, windowsHide: true, detached: process.platform !== 'win32', env});
+    const child = process.platform === 'win32' ? spawnWindowsOwnedProcess(cli, args, {cwd, env}) :
+      spawn(cli, args, {cwd, windowsHide: true, detached: true, env});
     children?.add(child);
     let stdout = '', bytes = 0, failure: Error | undefined;
     const stop = (error: Error) => {failure ??= error; terminate(child);};
