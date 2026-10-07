@@ -12,8 +12,10 @@ const session = await fs.mkdtemp(path.join(os.tmpdir(), 'perfchecker-public-vsix
 let julia = process.env.PERFCHECKER_TEST_JULIA || 'julia';
 const mode = process.env.PERFCHECKER_VSIX_MODE || 'public';
 const coreMode=process.env.PERFCHECKER_NATIVE_CORE || 'general';
-const coreCommit=process.env.PERFCHECKER_NATIVE_CORE_COMMIT || '';
-const coreTree=process.env.PERFCHECKER_NATIVE_CORE_TREE || '';
+// A registered release can contain subsequent documentation-only changes.
+// Candidate inputs apply only to Git candidates, never to General's tree.
+const coreCommit=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_COMMIT || ''):'';
+const coreTree=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_TREE || ''):'';
 if(!['general','candidate'].includes(coreMode))throw new Error('Choose the registered or explicitly pinned candidate Core.');
 if(coreMode==='candidate' && ![coreCommit,coreTree].every(value=>/^[a-f0-9]{40}$/.test(value)))throw new Error('Core candidate mode requires an immutable commit and expected Git tree.');
 const expectedCoreVersion=coreMode==='candidate'||mode==='candidate'?'1.0.1':'1.0.0';
@@ -104,8 +106,9 @@ try {
   }
   const cliProfile = [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`];
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
-  await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify({mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
-    runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception'}}, null, 2));
+  const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
+    runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception'}};
+  await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
   const minimumAvailable=/^\["1\.0\.1"\]$/m.test(await minimumResponse.text());
@@ -211,7 +214,12 @@ try {
   };
   // The first real launch has no PerfChecker settings, Julia or Jupyter extension.
   if(completeCampaign)await launch('fresh');
-  await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]); using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; end; println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode]);
+  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]); using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode]);
+  const installed=JSON.parse(installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_CORE_PROVENANCE ')).slice('QUALIFIED_CORE_PROVENANCE '.length));
+  if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode==='general'&&!installed.registered)
+    throw new Error('The actual Core installation must match its version and registry/candidate provenance.');
+  Object.assign(coreProvenance,installed);
+  await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   if(stage==='full'||stage==='focused'&&caseGroup==='investigation')await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.add(["Aqua","SnoopCompile"]);using Aqua,SnoopCompile;println("OPTIONAL_ANALYZER_INSTALL Aqua=",Base.pkgversion(Aqua)," SnoopCompile=",Base.pkgversion(SnoopCompile))',controller]);
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(["BenchmarkTools","Chairmarks","TestItems"]); Pkg.activate(ARGS[2]); Pkg.add("TestItems")', target, workspace]);
   await fs.mkdir(path.join(workspace, 'perf'), {recursive: true});
@@ -296,7 +304,7 @@ end
   await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': officialRuntime.executable, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
-  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&caseGroup==='mcp-pluto'))await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);if !isempty(ARGS[3]);@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[3];end;println("PLUTO_CORE_MODE=",ARGS[5]," CORE=",Base.pkgversion(PerfChecker)," PLUTO=",Base.pkgversion(Pluto))`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode]);
+  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&caseGroup==='mcp-pluto'))await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid];@assert string(info.tree_hash)==ARGS[6];if ARGS[5]=="general";@assert info.is_tracking_registry;end;println("PLUTO_CORE_MODE=",ARGS[5]," CORE=",Base.pkgversion(PerfChecker)," TREE=",info.tree_hash," REGISTERED=",info.is_tracking_registry," PLUTO=",Base.pkgversion(Pluto))`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode,coreProvenance.tree]);
   if(completeCampaign)await launch('configured');
   // TestItemRunner's default imports use the chosen controller. This explicit fixture
   // preparation is separate from production bootstrap, which never develops a user's package.

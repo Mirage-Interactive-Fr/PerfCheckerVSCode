@@ -13,8 +13,17 @@ const require = createRequire(import.meta.url), original = Module._load;
 Module._load = function(name, ...args) {
   if (name === './windowsOwnedProcess') {
     const owner = original.call(this, name, ...args);
-    return {...owner, spawnWindowsOwnedProcess: (cli, argv, options) => cli === 'sacrificial-codex' ?
-      owner.spawnWindowsOwnedProcess(process.execPath, [fixture, ...argv], options) : owner.spawnWindowsOwnedProcess(cli, argv, options)};
+    return {...owner, spawnWindowsOwnedProcess: (cli, argv, options) => {
+      const child=cli === 'sacrificial-codex' ? owner.spawnWindowsOwnedProcess(process.execPath,[fixture,...argv],options) : owner.spawnWindowsOwnedProcess(cli,argv,options);
+      if(cli==='sacrificial-codex'){
+        const started=Date.now();let stdoutBytes=0,stderrBytes=0,firstOutput;
+        const output=(kind,chunk)=>{if(firstOutput===undefined)firstOutput=Date.now()-started;kind==='stdout'?stdoutBytes+=Buffer.byteLength(chunk):stderrBytes+=Buffer.byteLength(chunk);};
+        child.stdout.on('data',chunk=>output('stdout',chunk));child.stderr.on('data',chunk=>output('stderr',chunk));
+        child.once('close',(code,signal)=>console.log(JSON.stringify({event:'sacrificial-windows-cli-timing',phase:argv[0]==='exec'?'exec-help':argv[0],
+          milliseconds:Date.now()-started,firstOutputMilliseconds:firstOutput,stdoutBytes,stderrBytes,code,signal})));
+      }
+      return child;
+    }};
   }
   if (name === 'node:child_process') return {...nativeChildProcess, spawn: (cli, argv, options) =>
     cli === 'sacrificial-codex' ? nativeSpawn(process.execPath, [fixture, ...argv], options) : nativeSpawn(cli, argv, options)};
