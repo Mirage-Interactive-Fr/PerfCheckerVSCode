@@ -254,7 +254,6 @@ export class AdvisorChat implements vscode.Disposable {
   private async invoke(folder: vscode.WorkspaceFolder, config: Record<string, unknown>, request: unknown, command = 'chat'): Promise<unknown> {
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
     const project = resolveControllerProject(folder.uri.fsPath, settings).project;
-    const target = resolveControllerProject(folder.uri.fsPath, settings, 'scenarioProject').project;
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'perfchecker-chat-'));
     try {
       const source = path.join(directory, 'request.json'), configuration = path.join(directory, 'advisor.json');
@@ -264,7 +263,7 @@ export class AdvisorChat implements vscode.Disposable {
       return await new Promise((resolve, reject) => {
         const child = spawn(settings.get('juliaExecutable', 'julia'), ['--startup-file=no', `--project=${project}`,
           '-e', cancellableJulia('using PerfChecker; exit(perfchecker_main(ARGS))'), '--', command, `--source=${source}`,
-          `--advisor-config=${configuration}`, `--project=${target}`],
+          `--advisor-config=${configuration}`, `--project=${project}`],
         {cwd: folder.uri.fsPath, windowsHide: true, detached: process.platform !== 'win32',
           env: {...process.env, JULIA_LOAD_PATH: process.env.PERFCHECKER_LOAD_PATH || `@${path.delimiter}@stdlib`}});
         this.child = child;

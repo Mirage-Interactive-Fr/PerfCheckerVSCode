@@ -8,7 +8,9 @@ import {tmpdir} from 'node:os';
 import path from 'node:path';
 
 let reply = '', workerError = '', exitCode = 0, largeChunks = false;
-const spawn = () => {
+const invocations = [];
+const spawn = (executable, args, options) => {
+  invocations.push({executable, args, options});
   const child = new EventEmitter();
   child.stdout = new PassThrough(); child.stderr = new PassThrough();
   setImmediate(() => {
@@ -25,7 +27,8 @@ const spawn = () => {
   });
   return child;
 };
-const settings = {get: (name, fallback) => ({runnerProject: 'perf', scenarioProject: 'perf'})[name] ?? fallback};
+const configuredProjects = {runnerProject: 'perf', scenarioProject: 'perf'};
+const settings = {get: (name, fallback) => configuredProjects[name] ?? fallback};
 const vscode = {workspace: {getConfiguration: () => settings}};
 const original = Module._load, require = createRequire(import.meta.url);
 Module._load = function (name, ...args) {
@@ -52,6 +55,41 @@ test('chat subprocess output preserves Unicode when UTF8 sequences cross chunks'
     reply = ''; workerError = 'Échec contrôlé : configuration à vérifier 🧪.'; exitCode = 1;
     await assert.rejects(chat.invoke(folder, {}, {}), error => error.message === workerError);
   } finally {await rm(root, {recursive: true, force: true});}
+});
+
+test('chat and implementation use the controller while measurement keeps its separate worker', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'perfchecker-advisor-projects-'));
+  const projects = {...configuredProjects};
+  try {
+    configuredProjects.runnerProject = 'controller'; configuredProjects.scenarioProject = 'measurement';
+    await mkdir(path.join(root, 'controller'));
+    await mkdir(path.join(root, 'measurement'));
+    await writeFile(path.join(root, 'controller', 'Project.toml'), '[deps]\nPerfChecker="6309bf6b-a531-4b08-891e-8ee981e5c424"\nHTTP="cd3eb016-35fb-5094-929b-558a96fad6f3"\n');
+    await writeFile(path.join(root, 'measurement', 'Project.toml'), '[deps]\nBenchmarkTools="6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"\n');
+    const folder = {name: 'Separate projects', uri: {fsPath: root}};
+    const chat = new AdvisorChat({}, () => [], async () => {});
+    reply = '{}'; workerError = ''; exitCode = 0;
+    for (const command of ['chat', 'implement']) {
+      await chat.invoke(folder, {}, {}, command);
+      const {args} = invocations.at(-1), controller = path.join(root, 'controller');
+      assert.equal(args[1], `--project=${controller}`);
+      assert.ok(args.includes(command));
+      assert.equal(args.at(-1), `--project=${controller}`);
+      assert.ok(!args.includes(`--project=${path.join(root, 'measurement')}`));
+    }
+    const controller = Object.create(InvestigationController.prototype);
+    controller.root = () => root; controller.folder = () => folder;
+    controller.setting = (name, fallback) => configuredProjects[name] ?? fallback;
+    controller.output = {append() {}, appendLine() {}};
+    await controller.invoke('run', [`--project=${path.join(root, 'measurement')}`], root);
+    const {args} = invocations.at(-1);
+    assert.equal(args[1], `--project=${path.join(root, 'controller')}`);
+    assert.ok(args.includes(`--project=${path.join(root, 'measurement')}`));
+    assert.deepEqual(configuredProjects, {runnerProject: 'controller', scenarioProject: 'measurement'});
+  } finally {
+    Object.assign(configuredProjects, projects);
+    await rm(root, {recursive: true, force: true});
+  }
 });
 
 test('investigation subprocess preserves Unicode evidence and logs across byte chunks', async () => {
