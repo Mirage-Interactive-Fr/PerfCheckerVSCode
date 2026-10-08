@@ -91,15 +91,36 @@ async function ownedChatProcesses(log,heldSockets,snapshot,stage){
 async function measuredEvidence(context) {
   const root=path.resolve(context.workspace,context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace)).get('investigationReports','perf/results/investigations'));
   const entries=()=>fs.readdir(root).catch(error=>{if(error.code==='ENOENT')return [];throw error;});
+  const previousDiscovery=new Set(await entries());
   await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
   let frame=await context.findFrame('#app nav[aria-label="Investigation views"]');
   await frame.getByRole('button',{name:'Discover tests',exact:true}).click();
   await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class')).includes('busy')&&
-    await frame.locator('.scenario-title strong').filter({hasText:'sum_squares'}).count()>0,'Actual Core discovers the declared allocation scenario',240000);
+    await frame.locator('.scenario-title strong').filter({hasText:/^advisor_sum_squares$/}).count()===1,'Actual Core discovers the distinct declared advisor allocation scenario',240000);
+  let declared;
+  for(const id of await entries()){
+    if(previousDiscovery.has(id))continue;
+    const bytes=await fs.readFile(path.join(root,id,'discovery.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
+    if(!bytes)continue;
+    const discovery=JSON.parse(bytes),matches=discovery.declared.filter(scenario=>scenario.id==='advisor_sum_squares'&&scenario.implementation==='allocating');
+    if(!matches.length)continue;
+    assert.equal(matches.length,1,'Discovery cannot ambiguously alias the advisor scenario');
+    declared=matches[0];
+    assert.equal(declared.catalog,'perf/advisor/scenarios.toml');
+    assert.deepEqual(declared.collectors,['benchmark']);
+    assert.equal(await fs.realpath(declared.source),await fs.realpath(path.join(context.workspace,'perf','cases.jl')));
+    assert.deepEqual(discovery.declared.find(scenario=>scenario.id==='sum_squares'&&scenario.implementation==='allocating').collectors,
+      ['benchmark','chairmark','profile','profile_alloc'],'The original catalogue retains all four collectors');
+  }
+  assert(declared,'The saved discovery must identify the exact single-collector catalogue before launch');
+  context.proof('native-mcp-benchmark-catalog-discovery',{id:declared.id,implementation:declared.implementation,catalog:declared.catalog,
+    source:declared.source,collectors:declared.collectors,originalFourCollectorsPreserved:true,assertedBeforeMeasurement:true});
   await frame.getByRole('button',{name:'Scenarios',exact:true}).click();
   await frame.getByRole('button',{name:'Clear selection',exact:true}).click();
-  await frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:'sum_squares'})})
-    .filter({has:frame.locator('.implementation',{hasText:'allocating'})}).first().locator('.scenario-title input').check();
+  const selectedCard=frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:/^advisor_sum_squares$/})})
+    .filter({has:frame.locator('.implementation',{hasText:/^allocating$/})});
+  assert.equal(await selectedCard.count(),1,'Only the exact advisor declaration is selected');
+  await selectedCard.locator('.scenario-title input').check();
   const before=new Set(await entries());
   await frame.getByRole('button',{name:'Measure selected',exact:true}).click();
   let measured;
@@ -113,7 +134,7 @@ async function measuredEvidence(context) {
       try{report=JSON.parse(data);}catch(error){if(error instanceof SyntaxError)continue;throw error;}
       if(report.schema_version!=='perfchecker-scenario-run/1')continue;
       assert.equal(report.runs.length,1,'The explicitly selected MCP catalogue measures only BenchmarkTools');
-      assert(report.runs.every(run=>run.scenario.id==='sum_squares'&&run.collector==='benchmark'&&run.qualification.availability==='complete'&&run.qualification.correctness==='passed'));
+      assert(report.runs.every(run=>run.scenario.id==='advisor_sum_squares'&&run.scenario.implementation==='allocating'&&run.collector==='benchmark'&&run.qualification.availability==='complete'&&run.qualification.correctness==='passed'));
       assert(report.runs[0].summaries.some(summary=>summary.metric==='julia.wall.time'&&summary.samples===100),'The real BenchmarkTools report contains 100 timing samples');
       const measurementProject=await fs.realpath(context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace)).get('scenarioProject'));
       const manifests=await Promise.all(report.runs.map(run=>fs.readFile(path.join(directory,run.run_id,'manifest.json'),'utf8').then(JSON.parse)));
@@ -275,7 +296,7 @@ exports.run = async (context,options={}) => {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const values = {advisorEnabled: true, advisorProtocol: 'mcp_http',
-    scenarioProject:measurementProject,scenarioCatalog:'perf/advisor-scenarios.toml',
+    scenarioProject:measurementProject,scenarioCatalog:'perf/advisor/scenarios.toml',
     advisorEndpoint: `http://127.0.0.1:${server.address().port}/mcp`, advisorModel: 'native-fixture',
     advisorMcpTool: 'ask_perfchecker', advisorMcpResponse: 'text', advisorMcpVersion: '2026-07-28',
     advisorImplementationMcpTool: 'implement_perfchecker', advisorTimeout: 180,
