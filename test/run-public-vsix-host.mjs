@@ -108,7 +108,8 @@ async function prepareLandscapeFixture(runtime){
   const archiveInto=async(source,commit,destination)=>{
     await fs.mkdir(destination,{recursive:true});
     const archive=spawn('git',['-C',source,'archive','--format=tar',commit],{env:runnerEnvironment,signal:landscapeAbort.signal,stdio:['ignore','pipe','pipe']});
-    const unpack=spawn('tar',['-xf','-','-C',destination],{env:runnerEnvironment,signal:landscapeAbort.signal,stdio:['pipe','ignore','pipe']});
+    // GNU tar must consume the entire producer stream, including trailing archive padding.
+    const unpack=spawn('tar',['--ignore-zeros','-xf','-','-C',destination],{env:runnerEnvironment,signal:landscapeAbort.signal,stdio:['pipe','ignore','pipe']});
     let errors='';for(const child of [archive,unpack])child.stderr.on('data',data=>{errors=(errors+data.toString()).slice(-5000);});
     const exits=[archive,unpack].map(child=>new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',code=>code===0?resolve():reject(new Error(`Immutable source archive failed (${code}): ${errors}`)));}));
     const timer=setTimeout(()=>{archive.kill('SIGKILL');unpack.kill('SIGKILL');},120000);
