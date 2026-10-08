@@ -54,7 +54,19 @@ async function existingController(context){
     frame=await context.findFrame('#studio-root');
     const environment=frame.locator('details.environment');
     if(await environment.getAttribute('open')===null)await environment.locator('summary').click();
-    await eventually(async()=>(await environment.innerText()).includes(controller),'Studio displays the selected controller');
+    let displayedIdentity;
+    const expectedController=await fs.realpath(controller);
+    const comparable=value=>process.platform==='win32'?value.toLowerCase():value;
+    await eventually(async()=>{
+      const displayed=(await environment.locator('p.subtle').innerText()).trim();
+      let canonical;
+      try{canonical=await fs.realpath(displayed);}catch(error){if(error.code==='ENOENT')return false;throw error;}
+      if(displayedIdentity!==displayed+'\0'+canonical){
+        context.log('native-studio-controller-identity',{displayed,canonical,expectedController,
+          caseInsensitive:process.platform==='win32'});displayedIdentity=displayed+'\0'+canonical;
+      }
+      return comparable(canonical)===comparable(expectedController);
+    },'Studio displays the selected physical controller');
     await vscode.commands.executeCommand('workbench.action.closePanel');
     if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(3000);
     context.proof('bootstrap-existing-controller',{nativeStudioClick:true,realChooser:true,selectionVerified:true,core:context.core,
