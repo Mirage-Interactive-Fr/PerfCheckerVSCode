@@ -159,13 +159,48 @@ async function create(context, file, kind) {
 }
 
 let lastWindowsInventory;
+async function windowsProcesses(context,stage){
+  const {stdout}=await execute('powershell.exe',['-NoProfile','-Command',
+    "$ErrorActionPreference='Stop'; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;name=$_.Name;executable=$_.ExecutablePath;createdAt=$(if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null});pidType=$_.ProcessId.GetType().FullName;parentType=$_.ParentProcessId.GetType().FullName} }); $tcp=@(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalAddress -eq '127.0.0.1' } | ForEach-Object { @{pid=$_.OwningProcess;port=$_.LocalPort;address=$_.LocalAddress;state=[string]$_.State} }); @{rows=$rows;listeners=$tcp} | ConvertTo-Json -Depth 4 -Compress"]);
+  const value=JSON.parse(stdout);assert(Array.isArray(value.rows));assert(Array.isArray(value.listeners));
+  const expectedExecutable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
+  const direct=[];
+  for(const row of value.rows.filter(row=>row.parent===process.pid&&/^julia(?:\.exe)?$/i.test(row.name))){
+    assert.equal(typeof row.pid,'number');assert.equal(typeof row.parent,'number');assert(typeof row.createdAt==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.createdAt)&&Number.isFinite(Date.parse(row.createdAt)),
+      'The process has a nonempty parseable ISO creation date');
+    const canonicalExecutable=await fs.realpath(row.executable);
+    if(canonicalExecutable.toLowerCase()===expectedExecutable.toLowerCase())direct.push({...row,canonicalExecutable});
+  }
+  const owned=new Set(direct.map(row=>row.pid));
+  for(let changed=true;changed;){changed=false;for(const row of value.rows)
+    if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
+  const signature=JSON.stringify({direct,descendants:value.rows.filter(row=>owned.has(row.pid)),listeners:value.listeners.filter(row=>owned.has(row.pid))});
+  if(signature!==lastWindowsInventory){
+    context.log('pluto-windows-process-inventory',{stage,hostPid:process.pid,expectedExecutable,
+      direct,descendants:value.rows.filter(row=>owned.has(row.pid)),listeners:value.listeners.filter(row=>owned.has(row.pid)),
+      commandArgumentsUnavailableAfterJuliaStartup:true});lastWindowsInventory=signature;
+  }
+  return {...value,direct,ownedRows:value.rows.filter(row=>owned.has(row.pid))};
+}
+async function windowsSessionOwner(context,state){
+  const endpoint=new URL(state.frame.url());assert.equal(endpoint.hostname,'127.0.0.1');
+  const port=Number(endpoint.port);assert(Number.isInteger(port)&&port>0&&port<65536);
+  const inventory=await windowsProcesses(context,'running-session');
+  const listeners=inventory.listeners.filter(row=>row.port===port&&row.address==='127.0.0.1'&&row.state==='Listen');
+  assert.equal(listeners.length,1,'The exact live iframe port has one listening process');
+  const owner=inventory.direct.find(row=>row.pid===listeners[0].pid);
+  assert(owner,'The actual session listener is the selected Julia directly owned by the extension host');
+  assert.doesNotThrow(()=>process.kill(owner.pid,0),'The physical session owner is alive');
+  context.log('pluto-windows-session-owner',{port,pid:owner.pid,createdAt:owner.createdAt,parent:owner.parent,
+    canonicalExecutable:owner.canonicalExecutable,exactIframeListener:true,credentialsOmitted:true});
+  const owned=new Set([owner.pid]);
+  for(let changed=true;changed;){changed=false;for(const row of inventory.rows)
+    if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
+  return {...owner,descendants:inventory.rows.filter(row=>owned.has(row.pid))};
+}
 async function serverPids(context){
   if(process.platform==='win32'){
-    const {stdout}=await execute('powershell.exe',['-NoProfile','-Command','@(Get-CimInstance Win32_Process | Where-Object { $_.Name -like "julia*" } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;name=$_.Name;marker=($_.CommandLine -match "PERFCHECKER_PLUTO_READY");commandLength=([string]$_.CommandLine).Length} }) | ConvertTo-Json -Compress']);
-    const value=stdout.trim()?JSON.parse(stdout):[],rows=(Array.isArray(value)?value:[value]).sort((a,b)=>a.pid-b.pid);
-    const signature=JSON.stringify(rows);
-    if(context&&signature!==lastWindowsInventory){context.log('pluto-windows-process-inventory',{hostPid:process.pid,rows,commandContentsOmitted:true});lastWindowsInventory=signature;}
-    return new Set(rows.filter(row=>row.marker).map(row=>Number(row.pid)));
+    return new Set((await windowsProcesses(context,'process-survey')).direct.map(row=>row.pid));
   }
   const {stdout}=await execute('ps',['-eo','pid=,args=']);
   return new Set(stdout.split('\n').filter(line=>line.includes('PERFCHECKER_PLUTO_READY')&&/julia/i.test(line)).map(line=>Number(line.trim().split(/\s+/,1)[0])));
@@ -196,15 +231,55 @@ async function studioNotebookButtons(context,directory){
 
 async function restartFailureCleanup(context,directory){
   const file=path.join(directory,'RestartCleanup.jl');
-  let state=await create(context,file,'investigation');await idle(state.frame);await stop(context,state);
+  let state=await create(context,file,'investigation');await idle(state.frame);
+  const initialOwner=process.platform==='win32'?await windowsSessionOwner(context,state):undefined;
+  await stop(context,state);
+  if(initialOwner)await eventually(async()=>{
+    const actual=await windowsProcesses(context,'after-initial-stop');
+    return actual.direct.length===0&&initialOwner.descendants.every(prior=>!actual.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt));
+  },'Initial Stop leaves no selected-Julia child or observed session descendant before the failed startup');
   const settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
   const previous=settings.get('plutoProject','perf/pluto'),before=await serverPids(context);let startingPids=[];
+  const startingIdentities=new Map();
+  const remember=inventory=>{
+    const parents=new Set([...startingIdentities.values()].filter(prior=>
+      inventory.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt)).map(row=>row.pid));
+    for(let changed=true;changed;){changed=false;for(const row of inventory.rows){
+      if(!parents.has(row.parent)||parents.has(row.pid))continue;
+      assert(typeof row.createdAt==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.createdAt)&&Number.isFinite(Date.parse(row.createdAt)),
+        'Every observed descendant has a nonempty parseable ISO creation date');
+      startingIdentities.set(`${row.pid}:${row.createdAt}`,row);parents.add(row.pid);changed=true;
+    }}
+  };
   try{
     const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
-    startingPids=await eventually(async()=>{const actual=[...await serverPids(context)].filter(pid=>!before.has(pid));return actual.length?actual:false;},'Restart spawns its real owned Julia server');
+    if(process.platform==='win32'){
+      assert.equal(before.size,0,'The failed-startup baseline contains no direct selected-Julia child');
+      const inventory=await eventually(async()=>{
+        const actual=await windowsProcesses(context,'starting-before-configuration-change');
+        return actual.direct.length?actual:false;
+      },'Restart starts its real selected-Julia process');
+      assert.equal(inventory.direct.length,1,'The owned Restart starts exactly one new Julia leader');
+      const leader=inventory.direct[0];assert.doesNotThrow(()=>process.kill(leader.pid,0));
+      startingPids=[leader.pid];startingIdentities.set(`${leader.pid}:${leader.createdAt}`,leader);remember(inventory);
+      const status=await parent.locator('[role="status"]').innerText();
+      assert.match(status,/Starting Pluto/);
+      assert.equal(await parent.locator('iframe.perfchecker-pluto-frame').count(),0,
+        'The configuration change must occur during actual nonREADY startup');
+      context.log('pluto-failed-startup-physical-owner',{leader,descendants:[...startingIdentities.values()],
+        status,iframePublished:false,aliveBeforeConfigurationChange:true,
+        observedListeners:inventory.listeners.filter(row=>startingPids.includes(row.pid)),listenerScope:'diagnostic only'});
+    }else startingPids=await eventually(async()=>{const actual=[...await serverPids(context)].filter(pid=>!before.has(pid));return actual.length?actual:false;},'Restart spawns its real owned Julia server');
     await settings.update('plutoProject','perf/changed-pluto-environment',context.vscode.ConfigurationTarget.WorkspaceFolder);
-    await eventually(async()=>/environment changed|Start the action again/.test(await (await context.findFrame('#pluto-restart')).locator('[role="status"]').innerText()),'Restart reports a changed environment after starting',240000);
-    await eventually(async()=>{const pids=await serverPids(context);return startingPids.every(pid=>!pids.has(pid));},'Every server from the failed Restart exits',90000);
+    await eventually(async()=>{
+      if(process.platform==='win32')remember(await windowsProcesses(context,'startup-configuration-change'));
+      return /environment changed|Start the action again/.test(await (await context.findFrame('#pluto-restart')).locator('[role="status"]').innerText());
+    },'Restart reports a changed environment after starting',240000);
+    if(process.platform==='win32')await eventually(async()=>{
+      const actual=await windowsProcesses(context,'failed-startup-cleanup');remember(actual);
+      return [...startingIdentities.values()].every(prior=>!actual.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt));
+    },'The failed startup leader and every observed descendant incarnation exit before harness teardown',90000);
+    else await eventually(async()=>{const pids=await serverPids(context);return startingPids.every(pid=>!pids.has(pid));},'Every server from the failed Restart exits',90000);
     assert.equal(await (await context.findFrame('#pluto-restart')).locator('iframe').count(),0);
   }catch(error){
     try{
@@ -222,8 +297,17 @@ async function restartFailureCleanup(context,directory){
   const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
   state=await view(context);await idle(state.frame);
   assert(await portOpen(Number(new URL(state.frame.url()).port)),'A later successful Restart remains alive');
+  const finalOwner=process.platform==='win32'?await windowsSessionOwner(context,state):undefined;
   await stop(context,state,true);
-  context.proof('pluto-failed-restart-real-worker-cleanup',{failedPids:startingPids.length,newSessionUnaffected:true,staleIframeAbsent:true,remoteForwardingNotEmulated:true});
+  if(finalOwner)await eventually(async()=>{
+    const actual=await windowsProcesses(context,'after-final-close');
+    return finalOwner.descendants.every(prior=>!actual.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt));
+  },'Final Close stops the exact listening session owner and observed descendants before teardown');
+  context.proof('pluto-failed-restart-real-worker-cleanup',{failedPids:startingPids.length,
+    failedIdentities:[...startingIdentities.values()].map(row=>({pid:row.pid,createdAt:row.createdAt})),
+    nonReadyPhysicalOwnerVerified:process.platform==='win32',exactSuccessfulListenerOwnerVerified:!!finalOwner,
+    observedDescendantIdentitiesGoneBeforeHarnessCleanup:!!finalOwner,
+    newSessionUnaffected:true,staleIframeAbsent:true,remoteForwardingNotEmulated:true});
 }
 
 async function investigation(context, directory) {

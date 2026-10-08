@@ -28,13 +28,49 @@ function assertTemporaryCheckout(temporaryRoot,root,original){
   assert.notEqual(root,original,'The provider never edits the original workspace');
   return relative;
 }
-async function ownedChatProcesses(log){
+async function ownedChatProcesses(log,heldSockets,snapshot,stage){
   const started=Date.now();
   let rows;
   if(process.platform==='win32'){
-    const {stdout}=await execute('powershell.exe',['-NoProfile','-Command',
-      '@(Get-CimInstance Win32_Process | Where-Object { $_.Name -like "julia*" } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;command=$_.CommandLine} }) | ConvertTo-Json -Compress']);
-    const value=stdout.trim()?JSON.parse(stdout):[];rows=Array.isArray(value)?value:[value];
+    assert.equal(heldSockets.length,1,'One actual provider request owns the cancellation probe socket');
+    const socket=heldSockets[0];assert(!socket.destroyed,'The provider keeps the original connection open');
+    const tuple={localAddress:socket.remoteAddress,localPort:socket.remotePort,
+      remoteAddress:socket.localAddress,remotePort:socket.localPort};
+    assert.equal(tuple.localAddress,'127.0.0.1');assert.equal(tuple.remoteAddress,'127.0.0.1');
+    for(const key of ['localPort','remotePort'])assert(Number.isInteger(tuple[key])&&tuple[key]>0&&tuple[key]<65536);
+    const before=await snapshot();
+    let value;
+    try{
+      const {stdout}=await execute('powershell.exe',['-NoProfile','-Command',
+        `$ErrorActionPreference='Stop'; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -like "julia*" } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;executable=$_.ExecutablePath;createdAt=$_.CreationDate.ToUniversalTime().ToString('o');pidType=$_.ProcessId.GetType().FullName;parentType=$_.ParentProcessId.GetType().FullName;commandLength=([string]$_.CommandLine).Length;chatMarker=($_.CommandLine -match 'perfchecker-chat-');sourceArgument=($_.CommandLine -match '--source=');advisorWorker=($_.CommandLine -match 'advisor_worker\\.jl')} }); $tcp=@(Get-NetTCPConnection -State Established -ErrorAction Stop | Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.RemoteAddress -eq '127.0.0.1' -and $_.LocalPort -eq ${tuple.localPort} -and $_.RemotePort -eq ${tuple.remotePort} } | ForEach-Object { @{pid=$_.OwningProcess;localAddress=$_.LocalAddress;localPort=$_.LocalPort;remoteAddress=$_.RemoteAddress;remotePort=$_.RemotePort;state=[string]$_.State} }); @{rows=$rows;connections=$tcp} | ConvertTo-Json -Depth 4 -Compress`]);
+      value=JSON.parse(stdout);
+    }catch(error){log('native-mcp-windows-query-failure',{stage,name:error.name,code:error.code,
+      stderrBytes:Buffer.byteLength(error.stderr||''),queryMilliseconds:Date.now()-started});throw error;}
+    rows=value.rows;assert(Array.isArray(rows));assert(Array.isArray(value.connections));
+    const connection=value.connections.length===1?value.connections[0]:undefined;
+    const worker=connection&&rows.find(row=>row.pid===connection.pid);
+    const cli=worker&&rows.find(row=>row.pid===worker.parent&&row.parent===process.pid);
+    const expectedExecutable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
+    const identities=[];
+    for(const row of [cli,worker].filter(Boolean)){
+      assert.equal(typeof row.pid,'number');assert.equal(typeof row.parent,'number');
+      assert(typeof row.createdAt==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.createdAt)&&Number.isFinite(Date.parse(row.createdAt)),
+        'Every retained process has a nonempty parseable ISO creation date');
+      identities.push({pid:row.pid,canonicalExecutable:await fs.realpath(row.executable)});
+    }
+    const selectedJulia=identities.length===2&&identities.every(row=>row.canonicalExecutable.toLowerCase()===expectedExecutable.toLowerCase());
+    const cliAlive=!!cli&&processAlive(cli.pid),workerAlive=!!worker&&processAlive(worker.pid);
+    const after=await snapshot();
+    log('native-mcp-owned-process-inventory',{stage,extensionHost:process.pid,tuple,connections:value.connections,
+      queryMilliseconds:Date.now()-started,before,after,
+      rows:rows.map(row=>({...row,pidJsonType:typeof row.pid,parentJsonType:typeof row.parent})),
+      identities,expectedExecutable,selectedJulia,matchedCli:cli?.pid??null,matchedWorker:worker?.pid??null,
+      cliAlive,workerAlive,heldSocketOpen:!socket.destroyed,commandArgumentsUnavailableAfterJuliaStartup:true});
+    assert(connection&&connection.state==='Established'&&connection.localAddress===tuple.localAddress&&connection.remoteAddress===tuple.remoteAddress&&
+      connection.localPort===tuple.localPort&&connection.remotePort===tuple.remotePort,'The exact retained HTTP connection identifies its actual worker');
+    assert(before.pending===1&&after.pending===1&&before.uiBusy&&after.uiBusy&&!socket.destroyed,
+      'The original provider request remains held across the physical ownership query');
+    return cli&&worker&&selectedJulia&&cliAlive&&workerAlive?{cli:cli.pid,worker:worker.pid,cliCreatedAt:cli.createdAt,workerCreatedAt:worker.createdAt}:undefined;
   }else{
     const {stdout}=await execute('ps',['-eo','pid=,ppid=,args=']);
     rows=stdout.split('\n').map(line=>{const match=line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);return match?{pid:Number(match[1]),parent:Number(match[2]),command:match[3]}:undefined;}).filter(Boolean);
@@ -124,7 +160,7 @@ exports.run = async (context,options={}) => {
         env: {...process.env, UV_THREADPOOL_SIZE: '1'}})).stdout.trim());
   };
   const baselineBytes = await probe(workspace);
-  const calls = [], pending = new Set(), providerErrors=[];
+  const calls = [], pending = new Set(), pendingSockets=new Map(), providerErrors=[];
   let alternateFolder;
   const foreign=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
   const foreignFinished=new Promise(resolve=>foreign.once('close',resolve));
@@ -164,7 +200,7 @@ exports.run = async (context,options={}) => {
           evidenceIds:projection.evidence.map(row=>row.id),projectionSha256:hash(JSON.stringify(canonical(projection.evidence)))});
         let answer = 'Consider a generator to remove the intermediate squared array. Verify empty inputs and signed floating-point values, then measure allocations; speed is not yet qualified.';
         if (prompt.includes('native cancellation probe')) {
-          pending.add(res); res.on('close', () => pending.delete(res)); return;
+          pending.add(res);pendingSockets.set(res,req.socket); res.on('close', () => {pending.delete(res);pendingSockets.delete(res);}); return;
         }
         if (name === 'implement_perfchecker') {
           const root = await fs.realpath(args[workspaceArgument]);
@@ -291,7 +327,8 @@ exports.run = async (context,options={}) => {
     await view.locator('#chat-question').fill('native cancellation probe');
     await view.getByRole('button', {name: 'Send question', exact: true}).click();
     await eventually(() => pending.size > 0, 'The actual MCP request reached the provider');
-    const owned=await ownedChatProcesses(log);
+    const ownershipSnapshot=async()=>({pending:pending.size,uiBusy:(await state()).busy});
+    const owned=await ownedChatProcesses(log,[...pendingSockets.values()],ownershipSnapshot,'before-folder-switch');
     assert(owned&&processAlive(owned.cli)&&processAlive(owned.worker),'The active native chat owns a real CLI and detached advisor worker');
     const callsBeforeSwitch=calls.length;
     const owningEvidence=(await state()).evidence;
@@ -316,6 +353,8 @@ exports.run = async (context,options={}) => {
       'The displayed chat still identifies its first folder while Studio selects another');
     assert.deepEqual((await state()).evidence,owningEvidence,'Publishing A retains A’s evidence inventory instead of reading the selected folder B');
     assert.equal((await state()).evidenceId,attached.id);
+    assert.deepEqual(await ownedChatProcesses(log,[...pendingSockets.values()],ownershipSnapshot,'after-folder-switch'),owned,
+      'The same physical CLI/worker still owns the original held request after selecting another folder');
     assert(processAlive(owned.cli)&&processAlive(owned.worker),'Selecting the alternate Studio preserves the original active request');
     assert.equal(calls.length,callsBeforeSwitch,'Selecting another Studio must not send another provider request');
     log('native-mcp-cancel-before',{...owned,foreign:foreign.pid,heldResponses:pending.size,uiBusy:(await state()).busy});
