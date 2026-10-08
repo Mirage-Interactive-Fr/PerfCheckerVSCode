@@ -76,18 +76,26 @@ async function living(records){
   }
   return result;
 }
-async function children(pid){
-  const text=await fs.readFile(`/proc/${pid}/task/${pid}/children`,'utf8').catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return '';throw error;});
-  return text.trim().split(/\s+/).filter(Boolean).map(Number);
+async function children(pid,started){
+  const before=await processIdentity(pid);if(!before||before.state==='Z'||started!==undefined&&before.started!==started)return [];
+  const tasks=await fs.readdir(`/proc/${pid}/task`).catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return [];throw error;});
+  const found=new Set();
+  for(const tid of tasks.filter(name=>/^\d+$/.test(name))){
+    const text=await fs.readFile(`/proc/${pid}/task/${tid}/children`,'utf8').catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return '';throw error;});
+    for(const child of text.trim().split(/\s+/).filter(Boolean).map(Number))found.add(child);
+  }
+  const after=await processIdentity(pid);
+  return after?.started===before.started&&after.state!=='Z'?[...found]:[];
 }
-async function trackTree(pid,records,role,provider){
+async function trackTree(pid,records,role,provider,parent,started){
   const current=await processIdentity(pid);if(!current||current.state==='Z')return;
+  if(parent!==undefined&&current.parent!==parent||started!==undefined&&current.started!==started)return;
   const old=records.get(pid);
   assert(!old||old.started===current.started,'A PID cannot change identity inside the observed owned tree');
   const argv=(await fs.readFile(`/proc/${pid}/cmdline`).catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return Buffer.alloc(0);throw error;})).toString().split('\0');
   if(argv.includes(provider)&&!argv.includes('-e'))role='renderer';
   records.set(pid,{...current,role:role==='renderer'?role:old?.role||role});
-  for(const child of await children(pid))await trackTree(child,records,'provider-descendant',provider);
+  for(const child of await children(pid,current.started))await trackTree(child,records,'provider-descendant',provider,pid);
 }
 function observe(root,reports,records){
   const provider=path.join(root,'perf','live_provider.jl');
@@ -97,15 +105,16 @@ function observe(root,reports,records){
       const current=await processIdentity(pid);if(!current||current.parent!==process.pid)continue;
       const argv=(await fs.readFile(`/proc/${pid}/cmdline`).catch(e=>{if(e.code==='ENOENT'||e.code==='ESRCH')return Buffer.alloc(0);throw e;})).toString().split('\0');
       if(argv.includes(root)&&argv.includes(reports)&&argv.some(arg=>arg.includes('PERFCHECKER_LIVE_BUNDLE')||arg.includes('NATIVE_LANDSCAPE_SDK')))
-        await trackTree(pid,records,argv.some(arg=>arg.includes('NATIVE_LANDSCAPE_SDK'))?'sdk-probe':'controller',provider);
+        await trackTree(pid,records,argv.some(arg=>arg.includes('NATIVE_LANDSCAPE_SDK'))?'sdk-probe':'controller',provider,process.pid,current.started);
     }
     for(const record of [...records.values()]){
       const current=await processIdentity(record.pid);
-      if(current?.started===record.started&&current.state!=='Z')await trackTree(record.pid,records,record.role,provider);
+      if(current?.started===record.started&&current.state!=='Z')await trackTree(record.pid,records,record.role,provider,undefined,record.started);
     }
   };
-  const timer=setInterval(()=>{pending=pending.then(inspect).catch(e=>{error??=e;});},50);
-  return {async sample(){await pending;await inspect();if(error)throw error;},async stop(){clearInterval(timer);await pending;if(error)throw error;}};
+  const schedule=()=>pending=pending.then(inspect).catch(e=>{error??=e;});
+  const timer=setInterval(schedule,50);
+  return {async sample(){await schedule();if(error)throw error;},async stop(){clearInterval(timer);await schedule();if(error)throw error;}};
 }
 async function renderedFrame(display){
   const tree=await command('xwininfo',['-display',display,'-root','-tree'],{timeout:5000});
@@ -117,22 +126,29 @@ async function renderedFrame(display){
   for(let i=0;i+4<=pixels.length;i+=4*13)colors.add((header[7]===0?pixels.readUInt32LE(i):pixels.readUInt32BE(i))&0xffffff);
   return colors.size<100?null:{sha256:digest(pixels),sampledColors:colors.size};
 }
-async function stopObserved(records,log){
+async function stopObserved(records,log,observer){
   // Failure cleanup only. The positive oracle has already required an empty tree.
-  const before=await living(records);
+  const terminatedOwnedPids=new Set();
+  let observationError;
   for(const signal of ['SIGTERM','SIGKILL']){
-    for(const record of (await living(records)).reverse()){
-      const current=await processIdentity(record.pid);
-      if(current?.started!==record.started||current.state==='Z')continue;
-      try{process.kill(record.pid,signal);}catch(error){if(error.code!=='ESRCH')throw error;}
-    }
+    const signalled=new Set();
     const until=Date.now()+(signal==='SIGTERM'?5000:2000);
-    while(Date.now()<until&&(await living(records)).length)await delay(100);
+    do{
+      try{await observer?.sample();}catch(error){observationError??=error;}
+      for(const record of (await living(records)).reverse()){
+        const identity=record.pid+'/'+record.started,current=await processIdentity(record.pid);
+        if(signalled.has(identity)||current?.started!==record.started||current.state==='Z')continue;
+        try{process.kill(record.pid,signal);signalled.add(identity);terminatedOwnedPids.add(record.pid);}catch(error){if(error.code!=='ESRCH')throw error;}
+      }
+      if(!(await living(records)).length)break;
+      await delay(100);
+    }while(Date.now()<until);
     if(!(await living(records)).length)break;
   }
   const remaining=await living(records);
-  log('native-landscape-failure-teardown',{terminatedOwnedPids:before.map(x=>x.pid),survivingOwnedPids:remaining.map(x=>x.pid)});
+  log('native-landscape-failure-teardown',{terminatedOwnedPids:[...terminatedOwnedPids],survivingOwnedPids:remaining.map(x=>x.pid)});
   assert.deepEqual(remaining,[],'Only identity-checked owned workers may be stopped, and must die before deleting fixture files');
+  if(observationError)throw observationError;
 }
 
 exports.run=async context=>{
@@ -259,15 +275,14 @@ exports.run=async context=>{
       cancelledReportsUnchanged:true,scope:'Owned native controller/provider and fixture .mem inventory; no physical GPU or arbitrary user callback guarantee'});
   }catch(error){primaryError=error;throw error;}
   finally{
-    const errors=[];
+    const errors=[];let observerFailed=false;
     if(!settled&&invocation)try{await cancel();await bounded(invocation,'Failure cancellation finishes',75000,Date.now()+75000);}catch(error){errors.push(error);}
     if(observer){
-      try{await observer.sample();}catch(error){errors.push(error);}
-      try{await observer.stop();}catch(error){errors.push(error);}
+      try{await observer.sample();}catch(error){observerFailed=true;errors.push(error);}
     }
     if((await living(records)).length){
       errors.push(new Error('Native Landscape left owned processes alive; harness teardown cannot turn that failure into PASS'));
-      try{await stopObserved(records,context.log);}catch(error){errors.push(error);}
+      try{await stopObserved(records,context.log,observer);}catch(error){errors.push(error);}
     }
     if(foreign){
       try{
@@ -284,7 +299,10 @@ exports.run=async context=>{
         assert(!remaining||remaining.started!==foreignIdentity?.started||remaining.state==='Z','The fixture process is dead before its session is removed');
       }catch(error){errors.push(error);}
     }
-    if(!(await living(records)).length){
+    if(observer)try{await observer.stop();}catch(error){observerFailed=true;errors.push(error);}
+    const remaining=await living(records);
+    if(remaining.length||observerFailed)errors.push(new Error('The final drained Landscape inventory could not confirm an empty owned tree; fixture files are preserved'));
+    if(!remaining.length&&!observerFailed){
       try{await fs.rm(sentinel,{force:true});assert.deepEqual(await memSnapshot(roots),baselineMem);}catch(error){errors.push(error);}
       for(const key of keys)try{await settings().update(key,previous[key],vscode.ConfigurationTarget.WorkspaceFolder);}catch(error){errors.push(error);}
     }

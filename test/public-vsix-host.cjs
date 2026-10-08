@@ -26,7 +26,7 @@ function commandCoverage(commands,checks){
     openInvestigationSource:['investigation-discovery-selection-source-draft'],refresh:['suite-selection-and-save'],initialize:['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration','bootstrap-existing-controller'],
     runAll:['all-supported-collectors-measured'],runNode:['native-run-selection-command'],openEntrypoint:['native-workload-command'],
     openOutput:['result-controls'],showLog:['native-suite-worker-output'],openDesigner:['suite-selection-and-save'],openDesignerForWorkspace:['save-palette-command'],
-    runLandscapeLiveForWorkspace:['landscape-live-prerequisite'],saveConfiguration:['save-palette-command','native-suite-save-palette'],
+    runLandscapeLiveForWorkspace:['landscape-live-prerequisite','native-landscape-command-completed','native-landscape-cancel-owned-renderer'],saveConfiguration:['save-palette-command','native-suite-save-palette'],
     openStudio:['native-open-studio-command'],openStudioForWorkspace:['controller-visible-in-studio','studio-inventory','bootstrap-existing-controller'],openChat:['native-mcp-advice-implementation-restore','native-mcp-configuration-only-conversation'],
     openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save','pluto-studio-file-dialog-buttons'],openNotebook:['pluto-reactive-save-reload-close','pluto-studio-file-dialog-buttons'],
     debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],applyImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],
@@ -36,12 +36,14 @@ function commandCoverage(commands,checks){
   return commands.map(command=>{
     const name=command.replace(/^perfchecker\./,''),proof=checks.filter(check=>check.assertionsCompleted===true&&(effects[name]||[]).includes(check.name));
     const narrativeEnabled=proof.some(check=>check.name==='native-narrative-controlled-response');
-    const externalPrerequisite=['connectCodex','runLandscapeLiveForWorkspace'].includes(name)||name==='narrateAdvice'&&!narrativeEnabled;
+    const landscapeExecuted=proof.some(check=>check.name==='native-landscape-command-completed');
+    const externalPrerequisite=name==='connectCodex'||name==='runLandscapeLiveForWorkspace'&&!landscapeExecuted||name==='narrateAdvice'&&!narrativeEnabled;
     const prerequisite=externalPrerequisite||(proof.length>0&&proof.every(check=>['prerequisite','unavailable'].includes(check.status)));
     return {command,registered:true,status:proof.length?(prerequisite?'prerequisite-verified':'effect-verified'):'unverified',evidence:proof.map(check=>({name:check.name,outcome:check.status||'validated-effect',case:check.case,prerequisite:check.prerequisite})),
       ...(prerequisite?{limit:name==='narrateAdvice'?'No configured narrative model; enabled model execution is not qualified.':name==='connectCodex'?'No human Codex authentication in CI; authenticated CLI/General integration is covered by the separate local opt-in test.':name==='runLandscapeLiveForWorkspace'?'No physical Étendue/GPU renderer in this disposable package; only its explicit prerequisites are verified.':'Only explicit prerequisites were validated; this execution was unavailable.'}:{}),
       ...(name==='disconnectCodex'?{limit:'The native test verifies the explicit disconnected return state and preserved saved configuration after a failed temporary connection. An active authenticated CLI disconnect is covered separately by the local opt-in test.'}:{}),
       ...(name==='narrateAdvice'&&narrativeEnabled?{limit:'The actual native button, Core worker and request/response contract use a clearly identified local protocol fixture. This is not evidence of authenticated model inference.'}:{}),
+      ...(name==='runLandscapeLiveForWorkspace'&&landscapeExecuted?{limit:'Real immutable Landscape tag and SDKs through the installed command, SDL/Vulkan llvmpipe software rendering. GPU timing and physical presentation remain unavailable. Cancellation is separate evidence.'}:{}),
       route:'Evidence records actual palette/API or webview backend effects; registration alone is never execution proof.'};
   });
 }
@@ -93,6 +95,8 @@ function buttonCoverage(checks){
     'MCP · select measured evidence / exact IDs / bounded context':['native-mcp-selected-measured-evidence'],
     'MCP · configuration-only conversation':['native-mcp-configuration-only-conversation'],
     'Coordination3D · physical renderer prerequisites':['landscape-live-prerequisite'],
+    'Coordination3D · real software Landscape command / complete opened bundle':['native-landscape-command-completed'],
+    'Coordination3D · native Cancel / owned renderer cleanup':['native-landscape-cancel-owned-renderer'],
     ...Object.fromEntries(['jet','aqua','alloccheck','snoopcompile','latency','gc','memory','heap','locks'].map(tool=>[`Analyzer · ${tool}`,[`investigation-analyzer-${tool}`]])),
   };
   const rows=Object.entries(families).map(([family,names])=>{
@@ -255,9 +259,15 @@ exports.run = async () => {
   };
   const retainEvidence=async name=>{
     const directory=path.join(output,'worker-evidence',phase,name);
-    for(const relative of ['perf/results','perf/notebooks']){
-      const origin=path.join(workspace,relative);
-      await fs.cp(origin,path.join(directory,relative),{recursive:true,filter:async(file)=>{
+    const origins=['perf/results','perf/notebooks'].map(relative=>({root:workspace,relative,prefix:''}));
+    if(phase==='landscape'){
+      const root=process.env.PERFCHECKER_NATIVE_LANDSCAPE_WORKSPACE;
+      assert.equal(root,path.join(session,'landscape'),'Only the runner-owned game reports are retained');
+      origins.push({root,relative:'perf/results/live',prefix:'landscape'});
+    }
+    for(const {root,relative,prefix}of origins){
+      const origin=path.join(root,relative);
+      await fs.cp(origin,path.join(directory,prefix,relative),{recursive:true,filter:async(file)=>{
         const stat=await fs.stat(file);return stat.isDirectory()||(/\.(json|jsonl|md|csv|xml|jl|toml)$/.test(file)&&stat.size<5000000);
       }}).catch(error=>{if(error.code!=='ENOENT')console.error(`NATIVE_EVIDENCE_COPY ${error}`);});
     }
@@ -371,6 +381,7 @@ exports.run = async () => {
         suite:'perf/suite.jl',profile:phase==='studio'?'historical':'quick',reports:'perf/results/vscode',advisorEnabled:false,advisorConfig:'',scenarioSamples:2,analysisTools:[],plutoProject:'perf/pluto'}))
         await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
       if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
+      else if(phase==='landscape')await runCase('native-landscape-controls',()=>require('./native-landscape-controls.cjs').run(context));
       else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
       else if(phase==='pluto-plots')await runCase('native-pluto-rendered-plots',()=>pluto.runPlots(context));
       else if(phase==='mcp-pluto'){
