@@ -738,6 +738,17 @@ end`;
   const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent();return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',360000);
   const data=await evidence();assert.equal(data.kind,'distribution');assert(data.selected.startsWith('distribution-'));assert.equal(data.selectedLabel,distribution.label);assert(data.values.length>=2);
   for(const [name,version] of Object.entries({PerfCheckerMakie:'1.0.0',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'}))assert.equal(data.providers[name].version,version);
+  const diagnosticViewport=stage=>cell.evaluate((node,stage)=>({stage,classes:node.className,
+    focusedWithin:node.contains(document.activeElement),rectangle:node.getBoundingClientRect().toJSON(),
+    plots:[...document.querySelectorAll('iframe[data-perfchecker-plot-frame]')].map(frame=>({token:frame.dataset.perfcheckerPlotFrame,rectangle:frame.getBoundingClientRect().toJSON()}))}),stage);
+  context.log('pluto-plot-diagnostic-viewport',await diagnosticViewport('before-native-fold'));
+  // Pluto follows its focused CodeMirror caret and compensates output height changes.
+  // Fold the completed diagnostic through its real control before viewing the plot.
+  await cell.locator('.foldcode').click();
+  await eventually(async()=>await cell.locator('.cm-content:visible').count()===0,'The native fold control hides the completed diagnostic input');
+  await selector.focus();
+  await eventually(async()=>!(await diagnosticViewport('focus-check')).focusedWithin,'Plot selection owns focus before its separate canvas is scrolled');
+  context.log('pluto-plot-diagnostic-viewport',await diagnosticViewport('after-native-fold'));
   const firstDocument=await plotDocument(state),canvas=firstDocument.canvas;
   const gpu=await canvas.evaluate(node=>{const gl=node.getContext('webgl2')||node.getContext('webgl');if(!gl||gl.isContextLost())return null;const debug=gl.getExtension('WEBGL_debug_renderer_info');return {version:gl.getParameter(gl.VERSION),renderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)};});
   assert(gpu,'The rendered native canvas has a live WebGL context');
