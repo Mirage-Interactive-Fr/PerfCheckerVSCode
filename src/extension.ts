@@ -1029,6 +1029,7 @@ class Controller {
       }
       if (mutates) {this.workspaceOperations += 1; this.designerBusy = true; void this.designer?.webview.postMessage({type: 'designerBusy', busy: true});}
       try {
+      if (message.type === 'designerReady' && this.designer === designer) {this.postPlan(); void designer.webview.postMessage({type: 'designerBusy', busy: this.designerBusy});}
       if (message.type === 'open') await this.open(message.run as PlanRun);
       if (message.type === 'run') await this.run(undefined, message.ids as string[], Boolean(message.reveal));
       if (message.type === 'output') await this.openOutput(message.run as PlanRun | undefined,

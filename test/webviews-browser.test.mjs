@@ -17,7 +17,8 @@ test('real webviews preserve full selection, handle Git targets and render inter
   const root=path.join(temporary,'workspace'),reports=path.join(root,'perf','results','vscode');
   const uri=fsPath=>({scheme:'file',fsPath,toString:()=>`file://${fsPath}`});
   const folder={name:'Example',uri:uri(root)};
-  const commands=new Map(),panels=[];
+  const commands=new Map(),panels=[],spawned=[];
+  let heldPlan;
   const disposable=()=>({dispose(){}});
   const items=()=>({add(){},replace(){},forEach(){}});
   const backends=['benchmark','chairmark','alloc','profile_alloc','profile','wall_profile','network','network_interface','network_isolated'];
@@ -31,11 +32,11 @@ test('real webviews preserve full selection, handle Git targets and render inter
     TestTag:class{constructor(id){this.id=id;}},TestRunProfileKind:{Run:1},ProgressLocation:{Window:1,Notification:2},ViewColumn:{One:1},
     workspace:{onDidChangeWorkspaceFolders:()=>disposable(),onDidChangeConfiguration:()=>disposable(),isTrusted:true,workspaceFolders:[folder],getConfiguration:()=>({get:(key,fallback)=>({juliaExecutable:'julia',runnerProject:'perf',suite:'perf/suite.jl',
       factory:'build_suite',profile:'quick',reports:'perf/results/vscode',uiConfiguration:'perf/perfchecker-ui.json'})[key]??fallback,inspect:()=>undefined}),
-      textDocuments:[],getWorkspaceFolder:()=>folder},
+      textDocuments:[],getWorkspaceFolder:()=>folder,asRelativePath:value=>path.relative(root,value)},
     window:{onDidCloseTerminal:()=>disposable(),onDidChangeActiveTextEditor:()=>disposable(),
       createOutputChannel:()=>({...disposable(),show(){},append(){},appendLine(){}}),
       createTreeView:()=>({...disposable(),onDidChangeCheckboxState:()=>disposable()}),
-      withProgress:(_options,callback)=>callback({report(){}}),showErrorMessage:()=>undefined,
+      withProgress:(_options,callback)=>callback({report(){}}),showErrorMessage:()=>undefined,showInformationMessage:()=>undefined,
       createWebviewPanel:(type,title,column,options)=>{
         const panel={type,title,column,options,messages:[],webview:{cspSource:'http://perfchecker.test',asWebviewUri:value=>`http://perfchecker.test/media/${path.basename(value.fsPath)}`,
           onDidReceiveMessage:callback=>{panel.receive=callback;return disposable();},postMessage:async message=>panel.messages.push(message)},onDidDispose:callback=>{panel.close=callback;return disposable();},reveal(){},dispose(){this.disposed=true;this.close?.();}};
@@ -46,9 +47,11 @@ test('real webviews preserve full selection, handle Git targets and render inter
     extensions:{getExtension:()=>undefined},
   };
   const spawn=(_executable,args)=>{
+    spawned.push(args);
     const child=new EventEmitter();child.stdout=new PassThrough();child.stderr=new PassThrough();
     void(async()=>{
       await new Promise(resolve=>setImmediate(resolve));
+      if(heldPlan&&args.includes('plan')){const held=heldPlan;heldPlan=undefined;held.started();await held.finished;}
       const destination=args.find(arg=>arg.startsWith('--output='));
       if(destination)await writeFile(destination.slice(9),JSON.stringify(plan));
       child.stdout.end();child.stderr.end();child.emit('close',0);
@@ -101,7 +104,14 @@ test('real webviews preserve full selection, handle Git targets and render inter
       if(value.type==='targetOptions' && value.requestId===undefined)value.requestId=window.messages.findLast(item=>item.type==='discoverTargets').requestId;
       window.dispatchEvent(new MessageEvent('message',{data:value}));
     },message);
-    await load('perfchecker.designer');await send({type:'plan',workspace:folder.uri.toString(),plan});
+    const designer=panels.find(panel=>panel.type==='perfchecker.designer');
+    const hydrateDesigner=async()=>{
+      const requests=await page.evaluate(()=>window.messages.filter(message=>message.type==='designerReady'));
+      assert.equal(requests.length,1,'Each real document load requests its own current host state');
+      designer.messages.length=0;await designer.receive(requests[0]);
+      for(const message of designer.messages)await send(message);
+    };
+    await load('perfchecker.designer');await hydrateDesigner();
     await page.waitForFunction(()=>document.querySelectorAll('.check-type').length===9);
     assert.equal(await page.locator('#cards .card').count(),3);
     assert.match(await page.locator('#count').innerText(),/27 selected/);
@@ -149,6 +159,32 @@ test('real webviews preserve full selection, handle Git targets and render inter
     assert.deepEqual(comparison.comparisons[0].baselines,['1.0.0','1.1.0']);assert.deepEqual(comparison.comparisons[0].candidates,['dev@fast-sort']);
     await page.locator('#baseline-targets input[value="dev@fast-sort"]').check();await page.locator('#add-comparison').click();assert.match(await page.locator('#comparison-error').innerText(),/different targets/);
     await send({type:'designerBusy',busy:true});assert.equal(await page.locator('#run').isDisabled(),true);await send({type:'designerBusy',busy:false});
+    await page.locator('#reset-filters').click();
+    await page.locator('#cards .card').first().locator('input.label').fill('#1266aa');
+    await page.locator('#save').click();
+    const savedMessage=await page.evaluate(()=>window.messages.findLast(message=>message.type==='save'));
+    await designer.receive(savedMessage);
+    const savedConfiguration=JSON.parse(await readFile(path.join(root,'perf','perfchecker-ui.json'),'utf8'));
+    assert.equal(savedConfiguration.selection.run_ids.length,26);
+    assert(Object.values(savedConfiguration.selection.labels).includes('#1266aa'));
+    const beforeReload=spawned.length;
+    await page.reload();await hydrateDesigner();
+    assert.equal(spawned.length,beforeReload,'Reload requests the cached plan without another Julia worker');
+    await page.locator('#save').click();
+    assert.deepEqual((await page.evaluate(()=>window.messages.findLast(message=>message.type==='save'))).configuration.selection,
+      savedConfiguration.selection,'A real page reload restores exact saved labels, selected IDs and order');
+    let planStarted,releasePlan;
+    const started=new Promise(resolve=>{planStarted=resolve;});
+    heldPlan={started:planStarted,finished:new Promise(resolve=>{releasePlan=resolve;})};
+    const refreshing=designer.receive({type:'refresh'});await started;
+    const beforeBusyReload=spawned.length;
+    try{
+      await page.reload();await hydrateDesigner();
+      assert.equal(spawned.length,beforeBusyReload,'Reload during an existing action starts no extra worker');
+      assert.equal(await page.locator('#run').isDisabled(),true,'Reload reflects the current host busy state');
+    }finally{releasePlan();await refreshing;}
+    await send(designer.messages.findLast(message=>message.type==='designerBusy'));
+    assert.equal(await page.locator('#run').isDisabled(),false);
     if(process.env.PERFCHECKER_QA_DIR){await mkdir(process.env.PERFCHECKER_QA_DIR,{recursive:true});await page.screenshot({path:path.join(process.env.PERFCHECKER_QA_DIR,'designer.png'),fullPage:true});}
     const mixedLabels=['baseline','0.5.0','dev@0.1.0','4eec7f3','0.5.0-rc.2','0.5.0-rc.10','v0.5.0','0.5.0+build.7','dev'];
     const expectedVersions=['dev@0.1.0','0.5.0-rc.2','0.5.0-rc.10','0.5.0','0.5.0+build.7','v0.5.0','4eec7f3','baseline','dev'];

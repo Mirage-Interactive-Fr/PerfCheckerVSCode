@@ -2,6 +2,8 @@
 
 ## 1.0.1 — Pluto notebooks and first-use fixes
 
+- Reloading the suite editor restores its saved selection, order and group colours,
+  and reflects an action already in progress without starting another worker.
 - Version sorting and target selectors use a consistent order: numeric versions
   (including prereleases and `dev@`), then opaque Git labels, then bare `dev`.
   Anchored numeric parsing preserves Git hashes as labels; a release precedes

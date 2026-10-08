@@ -467,3 +467,4 @@ window.addEventListener('message', event => {
     progress.querySelector('span').textContent = `${Math.round(value.percent || 0)}% · ${value.state}`;
   }
 });
+vscode.postMessage({type: 'designerReady'});
