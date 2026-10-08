@@ -527,7 +527,48 @@ async function drawnCanvas(context,canvas,label,differentFrom){
   },`The native ${label} WebGL figure draws measured evidence`,180000);
 }
 
+function observePlotFrontend(context,state){
+  const page=state.frame.page(),events=[];
+  const clean=value=>String(value).replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]')
+    .replace(/\b[a-f0-9]{64}\b/gi,'[opaque token]').slice(0,2000);
+  const record=(kind,message)=>{if(events.length<80){const item={kind,message:clean(message)};events.push(item);context.log('pluto-plot-frontend-event',item);}};
+  const onError=error=>record('pageerror',error.stack||error.message);
+  const onConsole=message=>{if(['warning','error'].includes(message.type()))record(message.type(),message.text());};
+  const onRequest=request=>{try{const url=new URL(request.url());if(url.origin===new URL(state.frame.url()).origin)
+    record('requestfailed',`${url.pathname}: ${request.failure()?.errorText||'unknown'}`);}catch{}};
+  page.on('pageerror',onError);page.on('console',onConsole);page.on('requestfailed',onRequest);
+  return {
+    snapshot:async stage=>{
+      let timeout;
+      try{
+      const detail=await Promise.race([state.frame.evaluate(()=>{
+        const ids=[...document.querySelectorAll('[data-jscall-id]')].map(node=>node.getAttribute('data-jscall-id'));
+        const counts=new Map();for(const id of ids)counts.set(id,(counts.get(id)||0)+1);
+        const sessions=window.Bonito?.Sessions,queue=window.Bonito?.OBJECT_FREEING_LOCK;
+        return {bonitoLoaded:!!window.Bonito,queue:queue?{size:queue.size,pending:queue.pending,isPaused:queue.isPaused}:null,
+          sessions:sessions?Object.entries(sessions.SESSIONS||{}).slice(0,80).map(([id,tuple])=>{
+            const objects=Array.isArray(tuple)?tuple[0]:null,status=Array.isArray(tuple)?tuple[1]:null;
+            return {id,status:['string','boolean'].includes(typeof status)?status:null,validTuple:Array.isArray(tuple),
+              objects:objects&&typeof objects.size==='number'?objects.size:null,inDocument:!!document.getElementById(id)};
+          }):[],
+          objects:sessions?{total:Object.keys(sessions.GLOBAL_OBJECT_CACHE||{}).length,promises:Object.values(sessions.GLOBAL_OBJECT_CACHE||{}).filter(value=>value instanceof Promise).length}:null,
+          jscallNodes:ids.length,duplicateJscallIds:[...counts].filter(([,count])=>count>1).slice(0,40),
+          figures:document.querySelectorAll('#offline-figure').length,readouts:document.querySelectorAll('#point-readout').length,
+          canvases:[...document.querySelectorAll('#offline-figure canvas')].map(node=>({width:node.width,height:node.height,connected:node.isConnected})),
+          scripts:[...document.querySelectorAll('pluto-output script')].map(node=>({type:node.type,inlineBytes:node.textContent.length,external:!!node.src})).slice(0,80)};
+      }),new Promise((_,reject)=>{timeout=setTimeout(()=>reject(new Error('Read-only frontend diagnostic exceeded 2.5 seconds')),2500);})]);
+      context.log('pluto-plot-frontend-state',{stage,...detail,events:[...events]});
+      }catch(error){try{context.log('pluto-plot-frontend-diagnostic-failure',{stage,message:clean(error.message)});}catch{}}
+      finally{clearTimeout(timeout);}
+    },
+    stop:()=>{page.off('pageerror',onError);page.off('console',onConsole);page.off('requestfailed',onRequest);}
+  };
+}
+
 async function renderedPlots(context,state,selector,completedRoot){
+  const frontend=observePlotFrontend(context,state);
+  try{
+  await frontend.snapshot('before-selection');
   const reportsBefore=await fingerprint(completedRoot);
   const options=await selector.locator('option').evaluateAll(nodes=>nodes.map(node=>({value:node.value,label:node.textContent})));
   context.log('pluto-plot-catalog-ui',{options});
@@ -560,6 +601,7 @@ end`;
   const gpu=await canvas.evaluate(node=>{const gl=node.getContext('webgl2')||node.getContext('webgl');if(!gl||gl.isContextLost())return null;const debug=gl.getExtension('WEBGL_debug_renderer_info');return {version:gl.getParameter(gl.VERSION),renderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)};});
   assert(gpu,'The rendered native canvas has a live WebGL context');
   const before=await drawnCanvas(context,canvas,'distribution');
+  await frontend.snapshot('distribution-drawn');
   const slider=state.frame.getByRole('slider',{name:'Inspect measured point'});
   const distinct=data.values.findIndex((value,index)=>index>0&&(value!==data.values[0]||data.versions[index]!==data.versions[0]));
   const selectedIndex=distinct<0?1:distinct;
@@ -567,6 +609,7 @@ end`;
   const expected=`Point ${selectedIndex+1}: ${data.values[selectedIndex]} ${data.unit} · ${data.versions[selectedIndex]}`;
   await eventually(async()=>await state.frame.locator('#point-readout').innerText()===expected,'A real native slider gesture inspects the chosen measured sample');
   const after=await drawnCanvas(context,canvas,'highlight',distinct<0?undefined:before.sha256);
+  await frontend.snapshot('distribution-point-inspected');
   await capture(context,'pluto-rendered-distribution');
   await selector.selectOption(trajectory.value);await ready(state.frame,'Launch selected checks');
   const second=await eventually(async()=>{const current=await evidence();return current.selectedLabel===trajectory.label&&current;},'The real plot selector regenerates the version-series figure');
@@ -575,6 +618,7 @@ end`;
     const text=await state.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
     return match&&Number(match[1])===second.values[0]&&match[2]===second.unit&&match[3]===second.versions[0];
   },'The newly rendered trajectory inspector identifies its actual measured value');
+  await frontend.snapshot('trajectory-readout-ready');
   const trajectoryPixels=await drawnCanvas(context,state.frame.locator('pluto-output #offline-figure canvas').first(),'trajectory');
   await capture(context,'pluto-rendered-version-series');
   // Keep the allocation plot, including legitimate coincident samples. A
@@ -600,6 +644,10 @@ end`;
   }
   assert.deepEqual(await fingerprint(completedRoot),reportsBefore,'Plotting and point inspection do not rerun measurements or save reports');
   context.proof('pluto-rendered-measured-plots',{providerVersions:Object.fromEntries(Object.entries(data.providers).map(([name,item])=>[name,item.version])),extensionLoaded:data.extension,figureType:data.figure,actualMeasuredSamples:data.values.length,selectedKinds:[data.kind,second.kind],webgl:gpu,pixels:{distribution:before,highlight:after,trajectory:trajectoryPixels},pointInteraction:{nativeKeyboard:true,observedReadout:expected,selectedSample:selectedIndex+1,distinctPosition:distinct>=0,canvasMovementQualified:distinct>=0,coincidentSamples:distinct<0?'All (version,value) coordinates coincide; readout verified, no movement claimed':null},temporalInteraction,reportsUnchanged:true,source:'Actual installed VSIX, generated suite cell, real Julia measurement and native Pluto WebGL; software renderer only'});
+  }finally{
+    await frontend.snapshot('before-cleanup');
+    frontend.stop();
+  }
 }
 
 async function suite(context, directory, requirePlots=false) {

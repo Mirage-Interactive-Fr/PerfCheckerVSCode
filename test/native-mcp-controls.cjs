@@ -28,7 +28,8 @@ function assertTemporaryCheckout(temporaryRoot,root,original){
   assert.notEqual(root,original,'The provider never edits the original workspace');
   return relative;
 }
-async function ownedChatProcesses(){
+async function ownedChatProcesses(log){
+  const started=Date.now();
   let rows;
   if(process.platform==='win32'){
     const {stdout}=await execute('powershell.exe',['-NoProfile','-Command',
@@ -40,6 +41,14 @@ async function ownedChatProcesses(){
   }
   const cli=rows.find(row=>row.parent===process.pid&&/perfchecker-chat-/.test(row.command||'')&&/--source=/.test(row.command||''));
   const worker=cli&&rows.find(row=>row.parent===cli.pid&&/advisor_worker\.jl/.test(row.command||''));
+  // Keep the original ownership predicate. Physical inventory explains a
+  // missing match without disclosing command lines or accepting another tree.
+  log('native-mcp-owned-process-inventory',{extensionHost:process.pid,queryMilliseconds:Date.now()-started,
+    rows:rows.filter(row=>process.platform==='win32'||/julia|perfchecker-chat-|advisor_worker\.jl/.test(row.command||''))
+      .map(row=>({pid:Number(row.pid),parent:Number(row.parent),commandLength:(row.command||'').length,
+        chatMarker:/perfchecker-chat-/.test(row.command||''),sourceArgument:/--source=/.test(row.command||''),
+        advisorWorker:/advisor_worker\.jl/.test(row.command||''),extensionHostChild:row.parent===process.pid})),
+    matchedCli:cli?Number(cli.pid):null,matchedWorker:worker?Number(worker.pid):null});
   return cli&&worker?{cli:Number(cli.pid),worker:Number(worker.pid)}:undefined;
 }
 
@@ -282,7 +291,7 @@ exports.run = async (context,options={}) => {
     await view.locator('#chat-question').fill('native cancellation probe');
     await view.getByRole('button', {name: 'Send question', exact: true}).click();
     await eventually(() => pending.size > 0, 'The actual MCP request reached the provider');
-    const owned=await ownedChatProcesses();
+    const owned=await ownedChatProcesses(log);
     assert(owned&&processAlive(owned.cli)&&processAlive(owned.worker),'The active native chat owns a real CLI and detached advisor worker');
     const callsBeforeSwitch=calls.length;
     const owningEvidence=(await state()).evidence;
