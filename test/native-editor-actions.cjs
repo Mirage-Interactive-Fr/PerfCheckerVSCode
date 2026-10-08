@@ -179,6 +179,15 @@ exports.runSuiteLog=async context=>{
   // editor; the native channel selector independently identifies the suite log.
   const output=windowPage.locator('.output-view:visible');await output.waitFor({state:'visible'});
   const canonicalController=await fs.realpath(controller);
+  // Monaco only renders the current viewport. Reveal the first physical log
+  // line with a native editor gesture before asserting its visible contents.
+  await output.locator('.view-lines').click();
+  await windowPage.keyboard.press(process.platform==='darwin'?'Meta+Home':'Control+Home');
+  const file=`native-${process.platform}-vscode-${vscode.version}-suite-worker-output.png`;
+  await windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,file)});
+  context.log('native-suite-worker-output-visible',{screenshot:file,
+    channels:await windowPage.locator('select:visible').evaluateAll(nodes=>nodes.map(node=>node.selectedOptions[0]?.textContent)),
+    controllerLine:(await output.locator('.view-lines').allInnerTexts()).join('').split('\n').find(line=>line.includes('Controller project:'))});
   await eventually(async()=>{
     const selected=await windowPage.locator('select:visible').evaluateAll(nodes=>nodes.map(node=>node.selectedOptions[0]?.textContent));
     const text=(await output.locator('.view-lines').allInnerTexts()).join('').replace(/\s+/g,'');
@@ -187,8 +196,6 @@ exports.runSuiteLog=async context=>{
     const normalize=value=>process.platform==='win32'?value.toLowerCase():value;
     return normalize(await fs.realpath(shown))===normalize(canonicalController);
   },'The real Show worker output palette command displays the suite channel and actual controller log');
-  const file=`native-${process.platform}-vscode-${vscode.version}-suite-worker-output.png`;
-  await windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,file)});
   context.proof('native-suite-worker-output',{nativePaletteClick:true,command:'perfchecker.showLog',
     channel:'PerfChecker',actualControllerVisible:true,controller,screenshot:file});
   await vscode.commands.executeCommand('workbench.action.closePanel');
