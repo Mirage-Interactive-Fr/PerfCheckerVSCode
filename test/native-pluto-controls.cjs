@@ -473,17 +473,42 @@ function renderedPng(png){
   }
   const raw=inflateSync(Buffer.concat(chunks)),stride=width*channels;
   assert.equal(raw.length,(stride+1)*height);
-  let previous=Buffer.alloc(stride),colored=0;const colors=new Set();
+  let previous=Buffer.alloc(stride),colored=0;const colors=new Map();
   const paeth=(a,b,c)=>{const p=a+b-c,da=Math.abs(p-a),db=Math.abs(p-b),dc=Math.abs(p-c);return da<=db&&da<=dc?a:db<=dc?b:c;};
   for(let y=0;y<height;y++){
     const mode=raw[y*(stride+1)],row=Buffer.from(raw.subarray(y*(stride+1)+1,(y+1)*(stride+1)));assert(mode<=4);
     for(let x=0;x<stride;x++){const a=x>=channels?row[x-channels]:0,b=previous[x],c=x>=channels?previous[x-channels]:0;row[x]=(row[x]+[0,a,b,Math.floor((a+b)/2),paeth(a,b,c)][mode])&255;}
-    for(let x=0;x<stride;x+=channels){const alpha=channels===4?row[x+3]:255;if(alpha===0)continue;const [r,g,b]=row.subarray(x,x+3);colors.add((r>>4)*256+(g>>4)*16+(b>>4));if(Math.max(r,g,b)-Math.min(r,g,b)>25)colored++;}
+    for(let x=0;x<stride;x+=channels){const alpha=channels===4?row[x+3]:255;if(alpha===0)continue;const [r,g,b]=row.subarray(x,x+3),key=(r>>4)*256+(g>>4)*16+(b>>4);colors.set(key,(colors.get(key)||0)+1);if(Math.max(r,g,b)-Math.min(r,g,b)>25)colored++;}
     previous=row;
   }
-  assert(width>=300&&height>=200,'The native figure has a visible viewport');
-  assert(colors.size>20&&colored>100,'Real canvas pixels contain a drawn figure, beyond an empty canvas or flat background');
-  return {width,height,quantizedColors:colors.size,coloredPixels:colored,sha256:createHash('sha256').update(png).digest('hex')};
+  const channelsOf=key=>[key>>8,(key>>4)&15,key&15];
+  const dominant=[...colors.entries()].sort((a,b)=>b[1]-a[1])[0]?.[0],background=channelsOf(dominant||0);
+  const highContrastPixels=[...colors.entries()].reduce((count,[key,pixels])=>count+
+    (Math.max(...channelsOf(key).map((value,index)=>Math.abs(value-background[index])))>=4?pixels:0),0);
+  return {width,height,quantizedColors:colors.size,coloredPixels:colored,highContrastPixels,dominantColorBin:dominant,sha256:createHash('sha256').update(png).digest('hex')};
+}
+
+function assertDrawnFigure(pixels){
+  assert(pixels.width>=300&&pixels.height>=200,'The native figure has a visible viewport');
+  assert(pixels.highContrastPixels>1000&&pixels.coloredPixels>=10,
+    'The canvas contains contrasted plotted ink and a chromatic marker, beyond blank, flat or monochrome axes');
+}
+
+async function drawnCanvas(context,canvas,label,differentFrom){
+  let previousSha,pixels;
+  return eventually(async()=>{
+    const png=await canvas.screenshot(),sha=createHash('sha256').update(png).digest('hex');
+    if(sha!==previousSha){
+      const file=`native-${process.platform}-vscode-${context.vscode.version}-pluto-canvas-${label}-${sha.slice(0,16)}.png`;
+      await fs.writeFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,file),png);
+      pixels=renderedPng(png);
+      context.log('pluto-canvas-pixels-before-assertion',{label,file,pixels});
+      previousSha=sha;
+    }
+    assertDrawnFigure(pixels);
+    if(differentFrom)assert.notEqual(pixels.sha256,differentFrom,'A distinct measured point moves the rendered highlight');
+    return pixels;
+  },`The native ${label} WebGL figure draws measured evidence`,180000);
 }
 
 async function renderedPlots(context,state,selector,completedRoot){
@@ -518,14 +543,14 @@ end`;
   await canvas.waitFor({state:'visible',timeout:360000});await canvas.scrollIntoViewIfNeeded();
   const gpu=await canvas.evaluate(node=>{const gl=node.getContext('webgl2')||node.getContext('webgl');if(!gl||gl.isContextLost())return null;const debug=gl.getExtension('WEBGL_debug_renderer_info');return {version:gl.getParameter(gl.VERSION),renderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)};});
   assert(gpu,'The rendered native canvas has a live WebGL context');
-  const before=await eventually(async()=>renderedPng(await canvas.screenshot()),'The native WebGL figure draws non-empty pixels',180000);
+  const before=await drawnCanvas(context,canvas,'distribution');
   const slider=state.frame.getByRole('slider',{name:'Inspect measured point'});
   const distinct=data.values.findIndex((value,index)=>index>0&&(value!==data.values[0]||data.versions[index]!==data.versions[0]));
   const selectedIndex=distinct<0?1:distinct;
   await slider.focus();for(let step=0;step<selectedIndex;step++)await slider.press('ArrowRight');
   const expected=`Point ${selectedIndex+1}: ${data.values[selectedIndex]} ${data.unit} · ${data.versions[selectedIndex]}`;
   await eventually(async()=>await state.frame.locator('#point-readout').innerText()===expected,'A real native slider gesture inspects the chosen measured sample');
-  const after=distinct<0?renderedPng(await canvas.screenshot()):await eventually(async()=>{const pixels=renderedPng(await canvas.screenshot());return pixels.sha256!==before.sha256&&pixels;},'Selecting a distinct measured point changes the rendered WebGL highlight');
+  const after=await drawnCanvas(context,canvas,'highlight',distinct<0?undefined:before.sha256);
   await capture(context,'pluto-rendered-distribution');
   await selector.selectOption(trajectory.value);await ready(state.frame,'Launch selected checks');
   const second=await eventually(async()=>{const current=await evidence();return current.selectedLabel===trajectory.label&&current;},'The real plot selector regenerates the version-series figure');
@@ -534,10 +559,31 @@ end`;
     const text=await state.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
     return match&&Number(match[1])===second.values[0]&&match[2]===second.unit&&match[3]===second.versions[0];
   },'The newly rendered trajectory inspector identifies its actual measured value');
-  const trajectoryPixels=await eventually(async()=>renderedPng(await state.frame.locator('pluto-output #offline-figure canvas').first().screenshot()),'The selected measured trajectory is visibly drawn');
+  const trajectoryPixels=await drawnCanvas(context,state.frame.locator('pluto-output #offline-figure canvas').first(),'trajectory');
   await capture(context,'pluto-rendered-version-series');
+  // Keep the allocation plot, including legitimate coincident samples. A
+  // separately measured wall-time series can qualify actual marker movement.
+  const timing=options.find(option=>option.label.includes(' · julia.wall.time · ')&&option.label.endsWith(' · Sample distribution'));
+  let temporalInteraction={available:false,canvasMovementQualified:false};
+  if(timing){
+    await selector.selectOption(timing.value);await ready(state.frame,'Launch selected checks');
+    const temporal=await eventually(async()=>{const current=await evidence();return current.selectedLabel===timing.label&&current;},'The actual measured wall-time distribution is selected');
+    assert.equal(temporal.kind,'distribution');assert(temporal.selected.startsWith('distribution-'));assert(temporal.values.length>=2);
+    const temporalCanvas=state.frame.locator('pluto-output #offline-figure canvas').first();
+    const initial=await drawnCanvas(context,temporalCanvas,'wall-time');
+    const point=temporal.values.findIndex((value,index)=>index>0&&(value!==temporal.values[0]||temporal.versions[index]!==temporal.versions[0]));
+    const index=point<0?1:point;
+    await slider.focus();for(let step=0;step<index;step++)await slider.press('ArrowRight');
+    const readout=`Point ${index+1}: ${temporal.values[index]} ${temporal.unit} · ${temporal.versions[index]}`;
+    await eventually(async()=>await state.frame.locator('#point-readout').innerText()===readout,'A native gesture inspects the actual wall-time sample');
+    const moved=await drawnCanvas(context,temporalCanvas,'wall-time-highlight',point<0?undefined:initial.sha256);
+    await capture(context,'pluto-rendered-wall-time-highlight');
+    temporalInteraction={available:true,selected:temporal.selected,measuredSamples:temporal.values.length,nativeKeyboard:true,
+      observedReadout:readout,selectedSample:index+1,canvasMovementQualified:point>=0,pixels:{initial,highlight:moved},
+      limit:point<0?'All measured wall-time coordinates coincide; readout verified, no movement claimed':null};
+  }
   assert.deepEqual(await fingerprint(completedRoot),reportsBefore,'Plotting and point inspection do not rerun measurements or save reports');
-  context.proof('pluto-rendered-measured-plots',{providerVersions:Object.fromEntries(Object.entries(data.providers).map(([name,item])=>[name,item.version])),extensionLoaded:data.extension,figureType:data.figure,actualMeasuredSamples:data.values.length,selectedKinds:[data.kind,second.kind],webgl:gpu,pixels:{distribution:before,highlight:after,trajectory:trajectoryPixels},pointInteraction:{nativeKeyboard:true,observedReadout:expected,selectedSample:selectedIndex+1,distinctPosition:distinct>=0,canvasMovementQualified:distinct>=0,coincidentSamples:distinct<0?'All (version,value) coordinates coincide; readout verified, no movement claimed':null},reportsUnchanged:true,source:'Actual installed VSIX, generated suite cell, real Julia measurement and native Pluto WebGL; software renderer only'});
+  context.proof('pluto-rendered-measured-plots',{providerVersions:Object.fromEntries(Object.entries(data.providers).map(([name,item])=>[name,item.version])),extensionLoaded:data.extension,figureType:data.figure,actualMeasuredSamples:data.values.length,selectedKinds:[data.kind,second.kind],webgl:gpu,pixels:{distribution:before,highlight:after,trajectory:trajectoryPixels},pointInteraction:{nativeKeyboard:true,observedReadout:expected,selectedSample:selectedIndex+1,distinctPosition:distinct>=0,canvasMovementQualified:distinct>=0,coincidentSamples:distinct<0?'All (version,value) coordinates coincide; readout verified, no movement claimed':null},temporalInteraction,reportsUnchanged:true,source:'Actual installed VSIX, generated suite cell, real Julia measurement and native Pluto WebGL; software renderer only'});
 }
 
 async function suite(context, directory, requirePlots=false) {
