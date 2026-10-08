@@ -16,7 +16,7 @@ on:
       case_group:
         description: Native controls to exercise on a clean fixture (focused stage only)
         type: choice
-        options: [narrative, mcp, mcp-pluto, pluto-plots, workbench, advisor, investigation, investigation-limits, studio, studio-ordering, editor, testitems, restricted]
+        options: [narrative, mcp, mcp-pluto, pluto-plots, workbench, advisor, investigation, investigation-limits, studio, studio-ordering, studio-color, editor, testitems, restricted]
         default: narrative
       backend_julia:
         description: Core runtime for a manual qualification; automatic PR coverage remains latest
@@ -185,7 +185,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-stable' && '[{"os":"macos-15-intel","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 150
+    timeout-minutes: ${{ (github.event_name != 'workflow_dispatch' || inputs.stage == 'full') && 180 || 150 }}
     env:
       PERFCHECKER_VSCODE_VERSION: ${{ matrix.vscode }}
       PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
@@ -193,8 +193,8 @@ jobs:
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '59578c840d94d908dcd1d2f849bf41c24cd82a91' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '309e12d55896cbe5b9aed2b07e39421793c7248f' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '7e9c380f0b6f08676c73658743661dcc5f826162' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '5c133dbafd6110e54cfbec330614bc42ae3d6ffd' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
@@ -244,6 +244,15 @@ jobs:
             sudo apt-get install -y --no-install-recommends ffmpeg
           fi
           ffmpeg -version
+      - name: Install native colour-picker tools in the disposable Linux host
+        if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_STAGE == 'focused' && env.PERFCHECKER_NATIVE_CASE_GROUP == 'studio-color'
+        timeout-minutes: 15
+        run: |
+          if ! command -v xdotool >/dev/null 2>&1 || ! command -v xwd >/dev/null 2>&1 || ! command -v xwininfo >/dev/null 2>&1 || ! command -v convert >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends xdotool x11-apps x11-utils imagemagick
+          fi
+          xdotool version
       - name: Run isolated native workflows on Linux
         if: runner.os == 'Linux'
         run: xvfb-run -a --server-args="-screen 0 1920x1080x24" node test/run-public-vsix-host.mjs

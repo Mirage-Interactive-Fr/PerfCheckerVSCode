@@ -31,7 +31,7 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','workbench','advisor','investigation','investigation-limits','studio','studio-ordering','editor','testitems','restricted','landscape'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','workbench','advisor','investigation','investigation-limits','studio','studio-ordering','editor','testitems','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 // The real game and SDKs are immutable fixtures, never development checkouts.
 // A trailing delimiter expands only Julia's system depots, excluding the human depot.
@@ -351,15 +351,26 @@ try {
           await retainHostLogs().catch(error=>console.error(`NATIVE_STARTUP_LOGS ${error.message}`));stop();
           reject(new Error(`The ${phase} helper did not activate within 3 minutes. Retained Electron/extension-host logs distinguish startup failure from campaign duration.`));
         })();},180000);
-        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?100:40;
-        const timer=setTimeout(()=>{stop();reject(new Error(`The ${phase} native phase exceeded its explicit ${minutes}-minute bound`));},minutes*60*1000);
+        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?130:40;
+        const deadlineStartedAt=new Date().toISOString();
+        let globalDeadlineExpired=false;
+        const timer=setTimeout(()=>{globalDeadlineExpired=true;void(async()=>{
+          const failure=new Error(`The ${phase} native phase exceeded its explicit ${minutes}-minute bound`);
+          try{await fs.writeFile(path.join(output,`${phase}-global-limit.json`),JSON.stringify({status:'failed',phase,
+            stage:environment.PERFCHECKER_NATIVE_STAGE,limitMinutes:minutes,startedAt:deadlineStartedAt,
+            expiredAt:new Date().toISOString(),lastObservedCase:activeCase||null,
+            hostStopRequested:true,productCleanupQualified:false,error:failure.message},null,2));}
+          catch(error){console.error(`NATIVE_GLOBAL_LIMIT_REPORT ${error.message}`);}
+          stop();reject(failure);
+        })();},minutes*60*1000);
         const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
         const clean=()=>{clearTimeout(timer);clearTimeout(activationTimer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
-        child.once('error',error=>{clean();reject(error);});
-        child.once('close',async code=>{clean();try{
+        child.once('error',error=>{clean();if(!globalDeadlineExpired)reject(error);});
+        child.once('close',async code=>{clean();if(globalDeadlineExpired)return;try{
           const result=JSON.parse(await fs.readFile(path.join(output,`${phase}-finished.json`),'utf8'));
+          if(globalDeadlineExpired)return;
           result.status==='passed'?resolve():reject(new Error(result.error||`${phase} failed`));
-        }catch(error){reject(new Error(`Native host exited ${code} before writing its final qualification: ${error}`));}});
+        }catch(error){if(!globalDeadlineExpired)reject(new Error(`Native host exited ${code} before writing its final qualification: ${error}`));}});
       });
     } catch (error) {await retainHostLogs().catch(logError=>console.error(`NATIVE_HOST_LOGS ${logError.message}`));phaseFailures.push({phase, error: String(error)});}
     finally {
@@ -472,10 +483,16 @@ end
   await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': officialRuntime.executable, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
-  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots'].includes(caseGroup)))await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev="v1.0.0")); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid];@assert string(info.tree_hash)==ARGS[6];if ARGS[5]=="general";@assert info.is_tracking_registry;end;println("PLUTO_CORE_MODE=",ARGS[5]," CORE=",Base.pkgversion(PerfChecker)," TREE=",info.tree_hash," REGISTERED=",info.is_tracking_registry," PLUTO=",Base.pkgversion(Pluto))`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode,coreProvenance.tree]);
+  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots'].includes(caseGroup))){
+    const companion={commit:'7e9c380f0b6f08676c73658743661dcc5f826162',tree:'9bc464202aa5b60262be9483bda5968bacd2960a',version:'1.0.1'};
+    const revision=coreMode==='candidate'?companion.commit:'v1.0.1';
+    const text=await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev=ARGS[7]);preserve=Pkg.PRESERVE_ALL); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid];@assert string(info.tree_hash)==ARGS[6];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[8];if ARGS[5]=="general";@assert info.is_tracking_registry;end;print("PLUTO_ENV_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerPluto,Pluto,PlutoUI)));println()`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode,coreProvenance.tree,revision,companion.tree]);
+    artifactRecord.plutoEnvironment={companion:{...companion,revision},packages:JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('PLUTO_ENV_PROVENANCE ')).slice('PLUTO_ENV_PROVENANCE '.length))};
+    await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+  }
   if(stage==='focused'&&caseGroup==='pluto-plots'){
-    const pins={companionCommit:'74d0deca140f34e72e2d074d185838ecc6980ecb',makieTree:'300c1a3ee5c32a8fc7e5245d00badb3f68c235f6',plutoTree:'d83ffe514e2bdbd2047f49c969d83ef4fb16ec66',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'};
-    const text=await execute(julia,['--startup-file=no','-e',      'using Pkg;Pkg.activate(ARGS[1]);Pkg.add([PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerMakie",rev=ARGS[2]),PackageSpec(name="WGLMakie",version="0.13.15"),PackageSpec(name="Makie",version="0.24.15"),PackageSpec(name="Bonito",version="4.2.0")];preserve=Pkg.PRESERVE_ALL);using PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto;@assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(WGLMakie)==v"0.13.15";@assert Base.pkgversion(Makie)==v"0.24.15";@assert Base.pkgversion(Bonito)==v"4.2.0";@assert Base.get_extension(PerfCheckerMakie,:WGLMakieExt)!==nothing;@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerMakie).uuid].tree_hash)==ARGS[3];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[4];@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[5];print("PLUTO_PLOT_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto)));println()',plutoProject,pins.companionCommit,pins.makieTree,pins.plutoTree,coreProvenance.tree]);
+    const pins={makieCommit:'74d0deca140f34e72e2d074d185838ecc6980ecb',plutoCommit:'7e9c380f0b6f08676c73658743661dcc5f826162',makieTree:'300c1a3ee5c32a8fc7e5245d00badb3f68c235f6',plutoTree:'9bc464202aa5b60262be9483bda5968bacd2960a',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'};
+    const text=await execute(julia,['--startup-file=no','-e',      'using Pkg;Pkg.activate(ARGS[1]);Pkg.add([PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerMakie",rev=ARGS[2]),PackageSpec(name="WGLMakie",version="0.13.15"),PackageSpec(name="Makie",version="0.24.15"),PackageSpec(name="Bonito",version="4.2.0")];preserve=Pkg.PRESERVE_ALL);using PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto;@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(WGLMakie)==v"0.13.15";@assert Base.pkgversion(Makie)==v"0.24.15";@assert Base.pkgversion(Bonito)==v"4.2.0";@assert Base.get_extension(PerfCheckerMakie,:WGLMakieExt)!==nothing;@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerMakie).uuid].tree_hash)==ARGS[3];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[4];@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[5];print("PLUTO_PLOT_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto)));println()',plutoProject,pins.makieCommit,pins.makieTree,pins.plutoTree,coreProvenance.tree]);
     const provenance=JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('PLUTO_PLOT_PROVENANCE ')).slice('PLUTO_PLOT_PROVENANCE '.length));
     await fs.writeFile(path.join(output,'pluto-plot-provider-provenance.json'),JSON.stringify({pins,providers:provenance,manifestSha256:createHash('sha256').update(await fs.readFile(path.join(plutoProject,'Manifest.toml'))).digest('hex'),renderer:'Disposable Electron ANGLE/SwiftShader; no physical GPU qualification'},null,2));
   }

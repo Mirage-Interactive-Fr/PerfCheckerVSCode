@@ -70,6 +70,7 @@ function buttonCoverage(checks){
     'Designer · median / mean / minimum / maximum calculated':['computed-reference-aggregation'],
     'Designer · pagination125 / drag / bulk hidden selection':['large-plan-pagination-and-drag'],
     'Designer · Run selected and native backend':['native-run-selection'],
+    'Designer · native colour picker / group labels / save / reload':['native-colour-picker-save-reload'],
     'Results · filters / reports / keyboard navigation':['result-controls'],
     'Investigation · adoption / validation / duplicate rejection':['investigation-adoption-types-and-duplicate-rejected'],
     'Editor · real proposal and diagnosis CodeLens / quick fix':['native-codelens-and-quickfix'],
@@ -382,6 +383,7 @@ exports.run = async () => {
         await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
       if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
       else if(phase==='landscape')await runCase('native-landscape-controls',()=>require('./native-landscape-controls.cjs').run(context));
+      else if(phase==='studio-color')await runCase('native-colour-picker-save-reload',()=>controls.runColour(context));
       else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
       else if(phase==='pluto-plots')await runCase('native-pluto-rendered-plots',()=>pluto.runPlots(context));
       else if(phase==='mcp-pluto'){
