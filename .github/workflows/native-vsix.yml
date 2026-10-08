@@ -48,6 +48,10 @@ on:
       candidate_sha:
         description: Full SHA256 of the original candidate (never repackage when supplied)
         type: string
+      new_candidate_origin:
+        description: Explicitly declare a new 1.0.1 candidate origin after product changes; otherwise reuse the frozen release archive
+        type: boolean
+        default: false
   pull_request:
     paths:
       - '.github/workflows/native-vsix.yml'
@@ -97,38 +101,74 @@ jobs:
     outputs:
       sha: ${{ steps.digest.outputs.sha }}
     env:
+      NATIVE_EVENT: ${{ github.event_name }}
+      NATIVE_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
+      NATIVE_NEW_ORIGIN: ${{ inputs.new_candidate_origin || 'false' }}
       REUSE_RUN: ${{ inputs.candidate_run }}
       REUSE_NAME: ${{ inputs.candidate_name }}
       REUSE_SHA: ${{ inputs.candidate_sha }}
     steps:
       - uses: actions/checkout@v7
+      - name: Select the declared archive origin for qualification
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),e=process.env;
+          const requested=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA].some(Boolean),newOrigin=e.NATIVE_NEW_ORIGIN==='true';
+          if(e.NATIVE_VSIX_MODE==='public'){
+            if(requested||newOrigin)throw Error('Public reproduction uses its published release, not candidate-origin inputs');
+            process.exit(0);
+          }
+          if(newOrigin&&(e.NATIVE_EVENT!=='workflow_dispatch'||requested))throw Error('A new candidate origin requires an explicit manual run without archive-reuse inputs');
+          if(JSON.parse(fs.readFileSync('package.json')).version==='1.0.1'&&!requested&&!newOrigin){
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=37704616586\nREUSE_NAME=native-candidate-984d8156557946932168edfea8b2437b3815340e\nREUSE_SHA=b899ea751d7baf1d99c150271721f935aa4591f6292dbf41f224b5bd2016664c\n');
+            console.log('Release 1.0.1 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
+          }
+          NODE
       - name: Validate optional exact-archive reuse
+        if: env.NATIVE_VSIX_MODE != 'public'
         run: |
           node -e "const e=process.env,v=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA];if(v.some(Boolean)&&(!/^\d+$/.test(e.REUSE_RUN)||!/^native-candidate-[a-f0-9]{40}$/.test(e.REUSE_NAME)||! /^[a-f0-9]{64}$/.test(e.REUSE_SHA)))throw Error('Supply the original run, artifact name and full SHA256 together')"
       - name: Download the immutable candidate for additional qualification
-        if: env.REUSE_RUN != ''
+        if: env.NATIVE_VSIX_MODE != 'public' && env.REUSE_RUN != ''
         uses: actions/download-artifact@v7
         with:
-          run-id: ${{ inputs.candidate_run }}
-          name: ${{ inputs.candidate_name }}
+          run-id: ${{ env.REUSE_RUN }}
+          name: ${{ env.REUSE_NAME }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-node@v7
+        if: env.NATIVE_VSIX_MODE != 'public'
         with:
           node-version: 22
           cache: npm
       - run: npm ci
-        if: env.REUSE_RUN == ''
+        if: env.NATIVE_VSIX_MODE != 'public' && env.REUSE_RUN == ''
       - run: npm run package -- --out candidate.vsix
-        if: env.REUSE_RUN == ''
+        if: env.NATIVE_VSIX_MODE != 'public' && env.REUSE_RUN == ''
       - name: Verify archive digest and unchanged production sources
-        if: env.REUSE_RUN != ''
+        if: env.NATIVE_VSIX_MODE != 'public' && env.REUSE_RUN != ''
         run: |
-          node -e "const fs=require('fs'),cp=require('child_process'),crypto=require('crypto');const p=JSON.parse(fs.readFileSync('candidate.provenance.json'));const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');if(sha!==process.env.REUSE_SHA||p.sha256!==sha||p.version!==JSON.parse(fs.readFileSync('package.json')).version||!/^[a-f0-9]{40}$/.test(p.commit))throw Error('Original archive provenance/digest mismatch');cp.execFileSync('git',['fetch','--depth=1','origin',p.commit]);cp.execFileSync('git',['diff','--exit-code',p.commit,'HEAD','--','src','media','resources','package.json','package-lock.json','README.md','CHANGELOG.md','LICENSE','.vscodeignore'],{stdio:'inherit'});console.log('EXACT_VSIX_REUSED '+sha+' originalRun='+p.run+' originalCommit='+p.commit)"
+          node <<'NODE'
+          const fs=require('fs'),cp=require('child_process'),crypto=require('crypto'),e=process.env;
+          const p=JSON.parse(fs.readFileSync('candidate.provenance.json'));
+          const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');
+          if(sha!==e.REUSE_SHA||p.sha256!==sha||p.version!==JSON.parse(fs.readFileSync('package.json')).version||
+            String(p.run)!==e.REUSE_RUN||p.commit!==e.REUSE_NAME.slice('native-candidate-'.length)||
+            !/^[a-f0-9]{40}$/.test(p.commit)||!/^[a-f0-9]{40}$/.test(p.tree))throw Error('Original archive origin/provenance/digest mismatch');
+          cp.execFileSync('git',['fetch','--depth=1','origin',p.commit]);
+          const tree=cp.execFileSync('git',['rev-parse',p.commit+'^{tree}'],{encoding:'utf8'}).trim();
+          if(p.tree!==tree)throw Error('Original archive tree does not match its Git commit');
+          const changed=cp.execFileSync('git',['diff','--name-only','-z',p.commit,'HEAD'],{encoding:'utf8'}).split('\0').filter(Boolean);
+          const forbidden=changed.filter(file=>!file.startsWith('test/')&&file!=='.github/workflows/native-vsix.yml');
+          if(forbidden.length)throw Error('Frozen release product/package inputs changed (including tsconfig and every non-qualification file): '+forbidden.join(', ')+'. Declare and qualify a new candidate origin explicitly.');
+          console.log('EXACT_VSIX_REUSED '+sha+' originalRun='+p.run+' originalCommit='+p.commit+' originalTree='+p.tree+' qualificationRevision='+e.GITHUB_SHA);
+          NODE
       - id: digest
         name: Record the shared package digest
+        if: env.NATIVE_VSIX_MODE != 'public'
         run: |
           node -e "const fs=require('fs'),crypto=require('crypto'),cp=require('child_process');const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');fs.appendFileSync(process.env.GITHUB_OUTPUT,'sha='+sha+'\n');fs.writeFileSync('candidate.vsix.sha256',sha+'  candidate.vsix\n');if(!process.env.REUSE_RUN)fs.writeFileSync('candidate.provenance.json',JSON.stringify({sha256:sha,version:JSON.parse(fs.readFileSync('package.json')).version,commit:cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),tree:cp.execFileSync('git',['rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim(),packagedOnceOn:'Linux',run:process.env.GITHUB_RUN_ID},null,2))"
       - uses: actions/upload-artifact@v7
+        if: env.NATIVE_VSIX_MODE != 'public'
         with:
           name: native-candidate-${{ github.sha }}
           path: |
