@@ -462,8 +462,11 @@ function renderedPng(png){
 async function renderedPlots(context,state,selector,completedRoot){
   const reportsBefore=await fingerprint(completedRoot);
   const options=await selector.locator('option').evaluateAll(nodes=>nodes.map(node=>({value:node.value,label:node.textContent})));
-  const distribution=options.find(option=>option.value.startsWith('distribution-'));
-  const trajectory=options.find(option=>option.value.startsWith('version-series-'));
+  context.log('pluto-plot-catalog-ui',{options});
+  // PlutoUI may encode the DOM value as puiselect-N; its bond maps that
+  // opaque value back to the real Julia catalogue ID.
+  const distribution=options.find(option=>option.label.endsWith(' · Sample distribution'));
+  const trajectory=options.find(option=>option.label.endsWith(' · Version trajectory'));
   assert(distribution&&trajectory,'Real measured samples provide distribution and version-series entries');
   await selector.selectOption(distribution.value);await idle(state.frame);
   // Inspect the actual running notebook through a user-edited diagnostic cell.
@@ -477,13 +480,14 @@ async function renderedPlots(context,state,selector,completedRoot){
     @assert Base.get_extension(modules["PerfCheckerMakie"],:WGLMakieExt) !== nothing
     f = performance_figure(p)
     @assert f isa getfield(modules["Makie"],:Figure)
-    info = Dict("selected"=>selected_plot,"kind"=>string(p.kind),"values"=>[row["value"] for row in p.data],"versions"=>[row["version"] for row in p.data],"unit"=>p.options["unit"],"figure"=>string(typeof(f)),"extension"=>true,"providers"=>Dict(n=>Dict("version"=>string(Base.pkgversion(modules[n])),"source"=>pathof(modules[n])) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito")))
+    entry = only(filter(entry -> entry["id"] == selected_plot, plot_entries))
+    info = Dict("selected"=>selected_plot,"selectedLabel"=>entry["title"] * " · " * entry["label"],"kind"=>string(p.kind),"values"=>[row["value"] for row in p.data],"versions"=>[row["version"] for row in p.data],"unit"=>p.options["unit"],"figure"=>string(typeof(f)),"extension"=>true,"providers"=>Dict(n=>Dict("version"=>string(Base.pkgversion(modules[n])),"source"=>pathof(modules[n])) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito")))
     HTML("<pre id=\\"native-plot-evidence\\" hidden>" * replace(sprint(PerfChecker.JSON.print,info),"&"=>"&amp;","<"=>"&lt;",">"=>"&gt;") * "</pre>")
 end`;
   await editor.click();await editor.press('ControlOrMeta+A');await editor.pressSequentially(diagnostic);await editor.press('ControlOrMeta+Enter');
   await ready(state.frame,'Launch selected checks');
   const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent();return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',360000);
-  const data=await evidence();assert.equal(data.kind,'distribution');assert.equal(data.selected,distribution.value);assert(data.values.length>=2);
+  const data=await evidence();assert.equal(data.kind,'distribution');assert(data.selected.startsWith('distribution-'));assert.equal(data.selectedLabel,distribution.label);assert(data.values.length>=2);
   for(const [name,version] of Object.entries({PerfCheckerMakie:'1.0.0',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'}))assert.equal(data.providers[name].version,version);
   const canvas=state.frame.locator('pluto-output #offline-figure canvas').first();
   await canvas.waitFor({state:'visible',timeout:360000});await canvas.scrollIntoViewIfNeeded();
@@ -499,8 +503,8 @@ end`;
   const after=distinct<0?renderedPng(await canvas.screenshot()):await eventually(async()=>{const pixels=renderedPng(await canvas.screenshot());return pixels.sha256!==before.sha256&&pixels;},'Selecting a distinct measured point changes the rendered WebGL highlight');
   await capture(context,'pluto-rendered-distribution');
   await selector.selectOption(trajectory.value);await ready(state.frame,'Launch selected checks');
-  const second=await eventually(async()=>{const current=await evidence();return current.selected===trajectory.value&&current;},'The real plot selector regenerates the version-series figure');
-  assert.equal(second.kind,'version_series');
+  const second=await eventually(async()=>{const current=await evidence();return current.selectedLabel===trajectory.label&&current;},'The real plot selector regenerates the version-series figure');
+  assert.equal(second.kind,'version_series');assert(second.selected.startsWith('version-series-'));
   await eventually(async()=>{
     const text=await state.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
     return match&&Number(match[1])===second.values[0]&&match[2]===second.unit&&match[3]===second.versions[0];
