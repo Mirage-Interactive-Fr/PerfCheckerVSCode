@@ -291,17 +291,25 @@ exports.run = async (context,options={}) => {
       if(process.platform==='darwin'){
         try{
           const expectedExecutable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
-          const {stdout}=await execute('ps',['-axo','pid=,ppid=,args='],{timeout:5000});
+          const snapshot=execute('ps',['-axo','pid=,ppid=,args='],{timeout:5000});
+          const observerPID=snapshot.child.pid;
+          const {stdout}=await snapshot;
           const rows=stdout.split('\n').map(line=>{const match=line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);return match?{pid:Number(match[1]),parent:Number(match[2]),command:match[3]}:undefined;}).filter(Boolean);
+          const observer=rows.find(row=>row.pid===observerPID);
+          if(observer){assert.equal(observer.parent,process.pid);diagnostic.excludedObserver={pid:observerPID,parent:observer.parent};}
           const parents=new Set([process.pid]),owned=[];
-          for(let depth=0;depth<2;depth++)for(const row of rows.filter(row=>parents.has(row.parent)&&!owned.some(x=>x.pid===row.pid))){
+          diagnostic.ownedProcesses=owned;
+          diagnostic.processDiagnosticErrors=[];
+          for(let depth=0;depth<2;depth++)for(const row of rows.filter(row=>row.pid!==observerPID&&parents.has(row.parent)&&!owned.some(x=>x.pid===row.pid))){
+            try{
             const {stdout:files}=await execute('lsof',['-nP','-a','-p',String(row.pid),'-d','txt','-F','n'],{timeout:5000});
             const executables=await Promise.all(files.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1)).catch(()=>undefined)));
             if(!executables.includes(expectedExecutable))continue;
             const start=(await execute('ps',['-p',String(row.pid),'-o','lstart='],{timeout:5000})).stdout.trim();
             const item={pid:row.pid,parent:row.parent,canonicalExecutable:expectedExecutable,startIdentity:start,
               alive:processAlive(row.pid),projects:[...row.command.matchAll(/--project=(\S+)/g)].map(match=>match[1]),
-              commandLength:row.command.length,advisorWorker:/advisor_worker\.jl/.test(row.command)};
+              commandLength:row.command.length,advisorWorker:/advisor_worker\.jl/.test(row.command),sameIdentityAfterRead:false};
+            owned.push(item);parents.add(row.pid);
             const configuration=row.command.match(/--advisor-config=(\S+)/)?.[1];
             if(configuration){
               const directory=await fs.realpath(path.dirname(configuration)),temporaryRoot=await fs.realpath(os.tmpdir());
@@ -318,9 +326,9 @@ exports.run = async (context,options={}) => {
                 .filter(line=>/^PERFCHECKER_ADVISOR_PHASE [a-z_]+ [0-9]+\.[0-9]+(?:e[+-]?[0-9]+)?$/.test(line));
             }
             const after=(await execute('ps',['-p',String(row.pid),'-o','lstart='],{timeout:5000})).stdout.trim();
-            item.sameIdentityAfterRead=!!start&&start===after;owned.push(item);parents.add(row.pid);
+            item.sameIdentityAfterRead=!!start&&start===after;
+            }catch(error){diagnostic.processDiagnosticErrors.push({pid:row.pid,parent:row.parent,error:String(error)});}
           }
-          diagnostic.ownedProcesses=owned;
         }catch(error){diagnostic.processDiagnosticError=String(error);}
       }
       log('native-mcp-send-diagnostic',diagnostic);
