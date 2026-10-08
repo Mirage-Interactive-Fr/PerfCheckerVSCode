@@ -901,6 +901,16 @@ exports.runSelection = async context => {
     processStarted:active.worker?.started,activeBusyHydrationQualified,nativeProcessIdentityPreserved:activeBusyHydrationQualified,
     busyControlsPreserved:activeBusyHydrationQualified,naturallyCompletedDuringReload:!activeBusyHydrationQualified,inventorySelectionOrderPreserved:true,
     intendedLaunches:1,additionalLaunches:0,source:'Existing real selected-suite worker; no additional workload or injected busy state'});
+  context.log('native-designer-layout',await view.evaluate(()=>{
+    const root=document.documentElement,width=root.clientWidth;
+    const geometry=node=>{const rect=node.getBoundingClientRect();return {tag:node.tagName,id:node.id,
+      classes:typeof node.className==='string'?node.className:'',left:rect.left,right:rect.right,width:rect.width,
+      clientWidth:node.clientWidth,scrollWidth:node.scrollWidth};};
+    return {viewportWidth:window.innerWidth,document:geometry(root),body:geometry(document.body),
+      scrollX:window.scrollX,overflowingElements:[...document.body.querySelectorAll('*')].map(geometry)
+        .filter(item=>item.width>0&&(item.right>width+1||item.left < -1)).sort((a,b)=>b.right-a.right).slice(0,20),
+      scope:'Read-only geometry of the actual reloaded Designer document; no layout modification'};
+  }));
   const report = await eventually(async () => {
     const text = await fs.readFile(reportPath, 'utf8');
     if (text === old) return false;
