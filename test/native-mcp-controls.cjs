@@ -112,14 +112,17 @@ async function measuredEvidence(context) {
       let report;
       try{report=JSON.parse(data);}catch(error){if(error instanceof SyntaxError)continue;throw error;}
       if(report.schema_version!=='perfchecker-scenario-run/1')continue;
-      assert(report.runs.length>0);
-      assert(report.runs.every(run=>run.scenario.id==='sum_squares'&&run.qualification.availability==='complete'&&run.qualification.correctness==='passed'));
+      assert.equal(report.runs.length,1,'The explicitly selected MCP catalogue measures only BenchmarkTools');
+      assert(report.runs.every(run=>run.scenario.id==='sum_squares'&&run.collector==='benchmark'&&run.qualification.availability==='complete'&&run.qualification.correctness==='passed'));
+      assert(report.runs[0].summaries.some(summary=>summary.metric==='julia.wall.time'&&summary.samples===100),'The real BenchmarkTools report contains 100 timing samples');
       const measurementProject=await fs.realpath(context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace)).get('scenarioProject'));
       const manifests=await Promise.all(report.runs.map(run=>fs.readFile(path.join(directory,run.run_id,'manifest.json'),'utf8').then(JSON.parse)));
       const environments=manifests.flatMap(manifest=>manifest.environment_provenance);
       assert(environments.length>0,'The actual measurement retains its worker environment provenance');
       for(const environment of environments){
         assert.equal(await fs.realpath(environment.path),measurementProject,'Real measurements use the distinct selected worker environment');
+        assert.equal(environment.project_sha256,hash(await fs.readFile(path.join(measurementProject,'Project.toml'))));
+        assert.equal(environment.manifest_sha256,hash(await fs.readFile(path.join(measurementProject,'Manifest.toml'))));
         const packages=environment.resolved_packages.map(item=>item.name);
         assert(packages.includes('BenchmarkTools'),'The actual worker resolves its collector');
         assert(!packages.includes('PerfChecker')&&!packages.includes('HTTP'),'The measurement worker cannot supply the provider Core or HTTP dependencies');
@@ -128,22 +131,34 @@ async function measuredEvidence(context) {
       if(!adviceBytes)continue;
       let advice;
       try{advice=JSON.parse(adviceBytes);}catch(error){if(error instanceof SyntaxError)continue;throw error;}
-      assert(advice.recommendations.some(row=>row.rule_id==='evidence.samples'),'Two actual samples retain deterministic advice');
-      const rawEvidence=advice.recommendations.map(row=>({id:row.id,rule:row.rule_id,observation:row.hypothesis,experiment:row.action,verification:row.validation,
-        limits:['Evidence is limited to the recorded configuration; no unmeasured gain is established.']}));
+      assert.deepEqual(advice.recommendations,[],'The 100-sample passed report has no deterministic recommendation');
+      const rawEvidence=advice.measurement_summaries;
+      assert.equal(rawEvidence.length,3,'The actual saved advice retains all three canonical measured quantities');
+      assert.deepEqual(rawEvidence.map(row=>[row.metric,row.unit]).sort(),[['julia.alloc.bytes','By'],['julia.alloc.count','1'],['julia.wall.time','s']]);
+      const observations=(await fs.readFile(path.join(directory,report.runs[0].run_id,'observations.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+      for(const row of rawEvidence){
+        assert.match(row.id,/^measurement-[a-f0-9]{64}$/);
+        assert.equal(row.run_id,report.runs[0].run_id);
+        assert.equal(row.collector,'benchmark');assert.equal(row.record_count,100);
+        assert.equal(row.record_semantics,'operation_measurement');assert.equal(row.aggregation,'sample');
+        assert.equal(row.bundle_status,'complete');assert.equal(row.correctness,'passed');
+        assert.equal(observations.filter(record=>record.measurement_definition===row.measurement_definition&&record.metric===row.metric&&record.unit===row.unit).length,row.record_count,'Summary count comes from the actual saved records');
+      }
       const adviceFile=path.join(directory,'advice','advice.json');
-      // Ask the installed Core for its real bounded projection. It intentionally
-      // deduplicates IDs before sending recommendations; transport must preserve
-      // those exact rows rather than all raw recommendation records.
+      // The installed Core validates and serializes the canonical saved summaries.
+      // No recommendation or measurement row is fabricated by this native test.
       const projected=await execute(process.env.PERFCHECKER_NATIVE_JULIA,
         ['--startup-file=no',`--project=${context.controller}`,'-e',
-          'using PerfChecker; advice=PerfChecker.read_advice(ARGS[1]); config=PerfChecker.AdvisorConfig(protocol=:mcp_http,mcp_tool="ask_perfchecker",mcp_response=:text); print(PerfChecker.JSON.json(PerfChecker._advisor_evidence(advice,config)))',adviceFile],
+          'using PerfChecker; advice=PerfChecker.read_advice(ARGS[1]); config=PerfChecker.AdvisorConfig(protocol=:mcp_http,mcp_tool="ask_perfchecker",mcp_response=:text); evidence=PerfChecker._advisor_evidence(advice,config); serialized=PerfChecker.JSON.json(evidence); print(PerfChecker.JSON.json(Dict("evidence"=>evidence,"serialized"=>serialized,"characters"=>length(serialized),"budget"=>config.max_evidence_chars)))',adviceFile],
         {windowsHide:true,env:{...process.env,JULIA_LOAD_PATH:process.env.PERFCHECKER_LOAD_PATH||'@'+path.delimiter+'@stdlib'}});
-      const evidence=JSON.parse(projected.stdout);
+      const projection=JSON.parse(projected.stdout),evidence=projection.evidence;
       assert.equal(new Set(evidence.map(row=>row.id)).size,evidence.length,'The Core projection has unique evidence IDs');
-      assert([...JSON.stringify(evidence)].length<=12000,'The actual projection respects the default character limit');
-      for(const row of evidence)assert(rawEvidence.some(raw=>JSON.stringify(canonical(raw))===JSON.stringify(canonical(row))),'Every transmitted row retains exact recorded content');
-      measured={id,file,adviceFile,evidence,rawEvidence,runSha256:hash(data),adviceSha256:hash(adviceBytes),
+      assert.equal(projection.budget,12000);assert.equal([...projection.serialized].length,projection.characters);
+      assert(projection.characters<=projection.budget,'The actual Core serialized array respects the exact Unicode character limit');
+      assert.deepEqual(JSON.parse(projection.serialized),evidence);
+      assert.deepEqual(evidence,rawEvidence,'The bounded projection preserves all saved canonical summaries exactly');
+      measured={id,file,adviceFile,evidence,rawEvidence,recommendations:advice.recommendations,
+        evidenceCharacters:projection.characters,evidenceBudget:projection.budget,runSha256:hash(data),adviceSha256:hash(adviceBytes),
         measurementEnvironments:environments.map(environment=>({path:environment.path,projectSha256:environment.project_sha256,
           manifestSha256:environment.manifest_sha256,collector:environment.resolved_packages.find(item=>item.name==='BenchmarkTools'),
           providerDependenciesAbsent:true}))};
@@ -187,7 +202,7 @@ exports.run = async (context,options={}) => {
   const custom=options.customArguments===true;
   const adviceArgument=custom?'question':'prompt',implementationArgument=custom?'change_request':'prompt',workspaceArgument=custom?'checkout_path':'workspace';
   const additional=custom?{native_contract:{label:'real-native-request',enabled:true}}:{};
-  let implementationBytes,attached;
+  let implementationBytes,attached,savedEvidence;
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'DELETE') {receipts.push({method:'DELETE',observedAt:new Date().toISOString()});res.writeHead(204); res.end(); return;}
@@ -216,9 +231,18 @@ exports.run = async (context,options={}) => {
           assert.deepEqual(Object.keys(args).sort(),[promptArgument,...(name==='implement_perfchecker'?[workspaceArgument]:[]),'native_contract'].sort());}
         const projection=JSON.parse(prompt.split('\n\nPerfChecker evidence:\n').at(-1));
         assert(Array.isArray(projection.evidence));
-        if(attached)assert.deepEqual(projection.evidence,attached.evidence,'The actual selected advice IDs and content reach tools/call');
+        if(attached){
+          assert.deepEqual(projection.evidence,attached.evidence,'The explicitly attached canonical measured IDs and content reach tools/call before the reply');
+          assert([...JSON.stringify(projection.evidence)].length<=attached.evidenceBudget,'The actual request remains inside the serialized evidence budget');
+          if(name!=='implement_perfchecker')assert(prompt.includes('No recommendations does not mean no measurements'));
+        }else{
+          assert.deepEqual(projection.evidence,[],'No saved measurement reaches the server without explicit Attach');
+          assert(prompt.includes('No saved report was attached.'));
+          assert(savedEvidence,'A real saved report already exists before testing the absence of implicit attachment');
+        }
         calls.push({name,prompt,promptArgument,workspaceArgument:name==='implement_perfchecker'?workspaceArgument:undefined,additionalArgumentsVerified:custom,
-          evidenceIds:projection.evidence.map(row=>row.id),projectionSha256:hash(JSON.stringify(canonical(projection.evidence)))});
+          evidenceIds:projection.evidence.map(row=>row.id),projectionSha256:hash(JSON.stringify(canonical(projection.evidence))),
+          evidenceInspectedBeforeReply:true,savedReportPresent:!!savedEvidence,explicitAttachment:!!attached});
         let answer = 'Consider a generator to remove the intermediate squared array. Verify empty inputs and signed floating-point values, then measure allocations; speed is not yet qualified.';
         if (prompt.includes('native cancellation probe')) {
           pending.add(res);pendingSockets.set(res,req.socket); res.on('close', () => {pending.delete(res);pendingSockets.delete(res);}); return;
@@ -251,14 +275,14 @@ exports.run = async (context,options={}) => {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const values = {advisorEnabled: true, advisorProtocol: 'mcp_http',
-    scenarioProject:measurementProject,
+    scenarioProject:measurementProject,scenarioCatalog:'perf/advisor-scenarios.toml',
     advisorEndpoint: `http://127.0.0.1:${server.address().port}/mcp`, advisorModel: 'native-fixture',
     advisorMcpTool: 'ask_perfchecker', advisorMcpResponse: 'text', advisorMcpVersion: '2026-07-28',
     advisorImplementationMcpTool: 'implement_perfchecker', advisorTimeout: 180,
     advisorMcpPromptArgument:adviceArgument,advisorMcpArguments:additional,
     advisorImplementationMcpPromptArgument:implementationArgument,advisorImplementationMcpWorkspaceArgument:workspaceArgument,
     codexExecutable: path.join(workspace, 'not-installed-codex')};
-  values.scenarioSamples=2;
+  values.scenarioSamples=100;
   const previous = Object.fromEntries(Object.keys(values).map(key => [key, settings().inspect(key)?.workspaceFolderValue]));
   const state = () => vscode.commands.executeCommand('perfchecker.chatState');
   try {
@@ -344,11 +368,14 @@ exports.run = async (context,options={}) => {
           return !value.busy && value.messages.length === count;}, 'Actual Julia MCP worker returns the conversation');
       }catch(error){await diagnoseSend('failed-before-teardown');throw error;}
     };
+    savedEvidence=await measuredEvidence(context);
+    await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#chat-root');
+    assert.equal((await state()).evidenceId,'','Saving a real report does not attach it to the conversation');
     await send('Inspect the intermediate allocation in sum_squares without editing. What should I verify?', 2);
     assert.deepEqual(calls[0].evidenceIds,[],'The configuration-only path remains valid without saved measurements');
-    proof('native-mcp-configuration-only-conversation',{adviceTurns:1,noSavedEvidence:true,sourceUnchanged:await fs.readFile(source,'utf8')===original});
-    attached=await measuredEvidence(context);
-    await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#chat-root');
+    proof('native-mcp-configuration-only-conversation',{adviceTurns:1,noSavedEvidence:true,savedReportPresent:true,
+      historyId:savedEvidence.id,evidenceInspectedBeforeReply:calls[0].evidenceInspectedBeforeReply,sourceUnchanged:await fs.readFile(source,'utf8')===original});
+    attached=savedEvidence;
     await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(attached.id);
     await eventually(async()=>{const value=await state();return value.evidenceId===attached.id&&value.messages.length===0;},'The real evidence selector starts a conversation with the selected measured bundle');
     await send('Inspect the intermediate allocation in sum_squares using this measured evidence without editing. What should I verify?',2);
@@ -362,7 +389,9 @@ exports.run = async (context,options={}) => {
     proof('native-mcp-selected-measured-evidence',{nativeSelector:true,historyId:attached.id,evidenceIds:calls[1].evidenceIds,
       controllerProject,measurementProject,measurementEnvironments:attached.measurementEnvironments,
       runSha256:attached.runSha256,adviceSha256:attached.adviceSha256,projectionSha256:calls[1].projectionSha256,
-      rawRecommendations:attached.rawEvidence,boundedCoreProjection:attached.evidence,uniqueEvidenceIds:true,maxEvidenceCharacters:12000,
+      rawRecommendations:attached.recommendations,canonicalMeasurementSummaries:attached.rawEvidence,boundedCoreProjection:attached.evidence,
+      uniqueEvidenceIds:true,evidenceCharacters:attached.evidenceCharacters,maxEvidenceCharacters:attached.evidenceBudget,
+      samples:100,noDeterministicRecommendations:true,evidenceInspectedBeforeBothReplies:calls.slice(1,3).every(call=>call.evidenceInspectedBeforeReply),
       contextualTurns:2,provider:'Controlled real HTTP MCP service; no inference or credentials',sourceUnchanged:true});
     assert.equal(await view.locator('.message.assistant').count(), 2);
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,
@@ -382,6 +411,11 @@ exports.run = async (context,options={}) => {
     await eventually(async () => {const value = await state(); return !value.busy && value.proposal?.files.includes('src/PerfCheckerNativeFixture.jl');}, 'The real implementation worker returns its Git proposal', 240000);
     assert.equal(await fs.readFile(source, 'utf8'), original);
     assert.match((await state()).backupRef, /^refs\/perfchecker\/checkpoints\//);
+    const proposedChanges=view.getByLabel('Proposed changes',{exact:true});
+    assert((await proposedChanges.innerText()).includes('init=zero'),'The real proposed patch is populated before the review capture');
+    await proposedChanges.scrollIntoViewIfNeeded();
+    await eventually(async()=>proposedChanges.evaluate(element=>{const box=element.getBoundingClientRect();return box.top>=0&&box.bottom<=innerHeight;}),'The actual proposed patch fits the native review viewport');
+    await view.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-${vscode.version}-mcp-reviewed-proposal.png`)});await hold();
     log('native-ui-action',{surface:'MCP implementation',action:'Open full diff'});
     await view.getByRole('button', {name: 'Open full diff', exact: true}).click();
