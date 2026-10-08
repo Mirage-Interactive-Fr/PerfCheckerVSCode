@@ -119,16 +119,26 @@ test('timeout, HTTP cancellation and disposal stop the actual CLI process tree a
 }));
 
 test('timeout, HTTP cancellation and disposal reclaim the owned CLI descendants before teardown', async t => environment(async root => {
-  const failures=[];
+  const failures=[], processObservations=[];
   const alive=async pid=>{
-    try{process.kill(pid,0);}catch{return false;}
+    try{process.kill(pid,0);}catch(error){
+      if(error.code!=='ESRCH')throw error;
+      processObservations.push({pid,state:'absent',code:error.code});return false;
+    }
     if(process.platform==='linux'){
-      try{return !/\) Z /.test(await readFile(`/proc/${pid}/stat`,'utf8'));}
-      catch(error){if(error.code==='ENOENT'||error.code==='ESRCH')return false;throw error;}
+      try{
+        const stat=await readFile(`/proc/${pid}/stat`,'utf8'), fields=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\s+/);
+        processObservations.push({pid,state:fields[0],startTicks:fields[19],statBytes:stat.length});
+        return fields[0]!=='Z';
+      }catch(error){
+        if(error.code!=='ENOENT'&&error.code!=='ESRCH')throw error;
+        processObservations.push({pid,state:'absent',code:error.code});return false;
+      }
     }
     return true;
   };
   for(const mode of ['timeout','cancel','dispose']){
+    processObservations.length=0;
     await rm(path.join(root,'exited-cli.json'),{force:true});
     const windows=process.platform==='win32';
     const connector=await new CodexConnector({cli:'sacrificial-codex',root,timeoutMs:mode==='timeout'?(windows?10000:350):30000}).start();
@@ -144,9 +154,12 @@ test('timeout, HTTP cancellation and disposal reclaim the owned CLI descendants 
       if(mode==='cancel')controller.abort();
       const disposal=mode==='dispose'?connector.dispose():undefined;
       const deadline=Date.now()+(windows?15000:2500);
-      while(await alive(owned.descendant)&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
-      const survivingBeforeHarnessCleanup=await alive(owned.descendant);
-      t.diagnostic(JSON.stringify({mode,...owned,leaderAliveBeforeStop,survivingBeforeHarnessCleanup}));
+      let survivingBeforeHarnessCleanup=await alive(owned.descendant);
+      while(survivingBeforeHarnessCleanup&&Date.now()<deadline){
+        await new Promise(resolve=>setTimeout(resolve,20));
+        survivingBeforeHarnessCleanup=await alive(owned.descendant);
+      }
+      t.diagnostic(JSON.stringify({mode,...owned,leaderAliveBeforeStop,survivingBeforeHarnessCleanup,processObservations}));
       assert.equal(survivingBeforeHarnessCleanup,false,`${mode}: the owned descendant must stop before fixture teardown`);
       await disposal;
       const result=await request;
@@ -157,7 +170,7 @@ test('timeout, HTTP cancellation and disposal reclaim the owned CLI descendants 
           assert.equal(retry.isError,undefined,'Cleanup returns the connector to idle');return retry;
         });
       }
-    }catch(error){failures.push(error);}
+    }catch(error){t.diagnostic(JSON.stringify({mode,error:String(error),stack:error.stack,processObservations}));failures.push(error);}
     finally{
       // Only the PID reported by this disposable fixture is eligible for teardown.
       if(owned&&await alive(owned.descendant)){
