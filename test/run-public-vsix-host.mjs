@@ -29,7 +29,7 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','workbench','advisor','investigation','investigation-limits','studio','studio-ordering','editor','testitems'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','workbench','advisor','investigation','investigation-limits','studio','studio-ordering','editor','testitems','restricted'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 const completeCampaign=['smoke','full'].includes(stage);
 const phaseFailures = [];
 const publicSha = 'c4123271e71e4c4d148fe0e613ba260f4aeea6f28445338cab11d3fb9513df09';
@@ -170,7 +170,7 @@ try {
         // Actual interactive host: no --extensionTestsPath or smoke driver, and
         // no intercepted APIs. All dialogs are clicked through the real UI.
         const child=spawn(vscode,[phase==='prepared'||stage==='focused'?workspaceFile:workspace,...phaseCliProfile,'--new-window','--skip-welcome','--skip-release-notes',
-          '--disable-workspace-trust',...(phase==='pluto-plots'?['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']:['--disable-gpu']),'--remote-debugging-port=9222',
+          ...(phase==='restricted'?[]:['--disable-workspace-trust']),...(phase==='pluto-plots'?['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']:['--disable-gpu']),'--remote-debugging-port=9222',
           ...(process.platform==='linux'?['--no-sandbox']:[]),
           `--extensionDevelopmentPath=${path.join(repository,'test','qualification-host')}`],
           {env:environment,windowsHide:false,detached:process.platform!=='win32',stdio:'inherit'});

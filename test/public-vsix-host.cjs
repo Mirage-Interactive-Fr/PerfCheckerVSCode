@@ -342,6 +342,10 @@ exports.run = async () => {
         if(visible)return frame;
       }
     }, `Locate the real webview ${selector}`);
+    if(phase==='restricted'){
+      await runCase('native-restricted-mode',()=>require('./native-restricted-controls.cjs').run({
+        vscode,windowPage,workspace,log,proof,eventually}));
+    }else{
     const extension = vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');
     assert(extension, 'The product must come from the separate installed VSIX');
     assert.equal(extension.packageJSON.version, process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION);
@@ -576,6 +580,7 @@ exports.run = async () => {
           });
         }
       }
+    }
     }
   } catch (error) {failures.push({name: 'host-bootstrap', message: String(error), stack: error.stack});}
   finally {
