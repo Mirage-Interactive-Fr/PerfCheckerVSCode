@@ -62,6 +62,37 @@ function cellId(source, fragment) {
   return matches[0][1];
 }
 
+async function interactiveEditor(context,state,cell,label){
+  const errors=[],page=state.frame.page();
+  const details=error=>({name:error.name,message:String(error.message).replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]').replace(/\b[a-f0-9]{64}\b/gi,'[opaque token]').slice(0,1500)});
+  const onError=error=>errors.push(details(error));
+  const geometry=()=>cell.evaluate(element=>{
+    const rect=node=>{const r=node.getBoundingClientRect(),s=getComputedStyle(node);return {x:r.x,y:r.y,width:r.width,height:r.height,display:s.display,visibility:s.visibility};};
+    return {classes:element.className,viewport:{width:innerWidth,height:innerHeight},cell:rect(element),inputs:[...element.querySelectorAll('pluto-input .cm-editor')].map(node=>({fake:node.classList.contains('cm-ssr-fake'),geometry:rect(node),contentEditable:node.querySelector('.cm-content')?.getAttribute('contenteditable')}))};
+  });
+  const observe=async stage=>context.log('pluto-editor-readiness',{label,stage,state:await geometry(),frontendErrors:[...errors]});
+  page.on('pageerror',onError);
+  try{
+    await cell.scrollIntoViewIfNeeded();await observe('before-gesture');
+    const shown=cell.locator('pluto-input .cm-editor');
+    if(!await shown.isVisible())await cell.locator('.foldcode').click();
+    await observe('after-fold-gesture');
+    await shown.waitFor({state:'visible'});
+    // Pluto replaces the static placeholder with CodeMirror when its input
+    // intersects the viewport. Scrolling the cell can leave that input clipped.
+    await shown.scrollIntoViewIfNeeded();
+    const editor=cell.locator('pluto-input .cm-editor:not(.cm-ssr-fake) .cm-content[contenteditable="true"]');
+    await eventually(async()=>await editor.isVisible()&&await editor.isEditable(),'The real UI exposes an interactive CodeMirror input');
+    await observe('interactive');return editor;
+  }catch(error){
+    try{await observe('failed');}catch(diagnosticError){
+      try{context.log('pluto-editor-diagnostic-failure',{label,error:details(diagnosticError)});}catch{}
+    }
+    throw error;
+  }
+  finally{page.off('pageerror',onError);}
+}
+
 async function idle(frame) {
   await eventually(async () => await frame.locator('pluto-cell.running, pluto-cell.queued').count() === 0,
     'Pluto reactive cells finish');
@@ -222,12 +253,8 @@ async function investigation(context, directory) {
   // Use the real CodeMirror editor, reactive evaluation and Pluto's on-disk autosave.
   const id = cellId(state.source, '# PerfChecker investigations');
   const cell = state.frame.locator(`pluto-cell[id="${id}"]`);
-  await cell.scrollIntoViewIfNeeded();
   const title = 'PerfChecker native reactive qualification';
-  const editor = cell.locator('pluto-input .cm-editor:not(.cm-ssr-fake) .cm-content[contenteditable="true"]');
-  if (!await editor.isVisible()) await cell.locator('.foldcode').click();
-  await eventually(async()=>!((await cell.getAttribute('class'))||'').split(/\s+/).includes('code_folded')&&await editor.isVisible(),
-    'The real unfold gesture finishes and exposes the interactive CodeMirror input');
+  const editor = await interactiveEditor(context,state,cell,'investigation reactive title');
   await editor.click(); await editor.press('ControlOrMeta+A');
   context.log('native-ui-action',{surface:'Pluto investigation',action:'Edit reactive cell and evaluate'});
   await editor.pressSequentially(`md"# ${title}: $(4 + 5)"`); await editor.press('ControlOrMeta+Enter');
@@ -472,9 +499,7 @@ async function renderedPlots(context,state,selector,completedRoot){
   // Inspect the actual running notebook through a user-edited diagnostic cell.
   // The generated rendering cell and measured bundle remain untouched.
   const cell=state.frame.locator(`pluto-cell[id="${cellId(state.source,'## Performance curves')}"]`);
-  const editor=cell.locator('pluto-input .cm-editor:not(.cm-ssr-fake) .cm-content[contenteditable="true"]');
-  await cell.scrollIntoViewIfNeeded();if(!await editor.isVisible())await cell.locator('.foldcode').click();
-  await eventually(()=>editor.isVisible(),'The native diagnostic cell unfolds');
+  const editor=await interactiveEditor(context,state,cell,'measured plot diagnostic');
   const diagnostic=`let p = performance_plot(plot_bundle, selected_plot), modules = Dict(k.name => m for (k,m) in Base.loaded_modules)
     @assert all(haskey(modules,n) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito"))
     @assert Base.get_extension(modules["PerfCheckerMakie"],:WGLMakieExt) !== nothing

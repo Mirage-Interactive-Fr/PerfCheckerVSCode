@@ -5,6 +5,7 @@ const path=require('node:path');
 const {clickStudioAction}=require('./native-studio-controls.cjs');
 
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const preCleanupCaptures=new WeakSet();
 class DebugExecutionFailed extends Error {}
 async function eventually(read,description,timeout=180000){
   const end=Date.now()+timeout;let last;
@@ -13,12 +14,21 @@ async function eventually(read,description,timeout=180000){
 }
 async function existingController(context){
   const {vscode,workspace,controller,windowPage}=context;
-  const uri=vscode.Uri.file(workspace),settings=vscode.workspace.getConfiguration('perfchecker',uri);
+  const uri=vscode.Uri.file(workspace),settings=()=>vscode.workspace.getConfiguration('perfchecker',uri);
   const files=vscode.workspace.getConfiguration('files',uri),oldDialog=files.inspect('simpleDialog.enable')?.globalValue;
-  const previous=settings.inspect('runnerProject')?.workspaceFolderValue;
+  const previous=settings().inspect('runnerProject')?.workspaceFolderValue;
+  const invalid='perf/not-installed-controller',selected=path.relative(workspace,controller)||'.';
+  const settingsFile=path.join(workspace,'.vscode','settings.json');
+  const folderInput=windowPage.locator('.quick-input-widget input[type="text"][placeholder="Folder path"][aria-label="Folder path - PerfChecker · Choose controller project"]');
+  let primaryError;
   try{
     await files.update('simpleDialog.enable',true,vscode.ConfigurationTarget.Global);
-    await settings.update('runnerProject','perf/not-installed-controller',vscode.ConfigurationTarget.WorkspaceFolder);
+    await settings().update('runnerProject',invalid,vscode.ConfigurationTarget.WorkspaceFolder);
+    await eventually(async()=>{
+      const current=settings(),persisted=JSON.parse(await fs.readFile(settingsFile,'utf8'));
+      return current.get('runnerProject')===invalid&&current.inspect('runnerProject')?.workspaceFolderValue===invalid&&
+        persisted['perfchecker.runnerProject']===invalid;
+    },'The selected folder really has an invalid controller before opening setup');
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',uri);
     let frame=await context.findFrame('#setup-workspace');
     await frame.locator('#setup-workspace').click();
@@ -27,8 +37,19 @@ async function existingController(context){
       assert(await picker.locator('.monaco-list-row').filter({hasText:name}).isVisible());
     if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(2500);
     await picker.locator('.monaco-list-row').filter({hasText:'Use an existing controller'}).click();
-    const input=picker.locator('input[type="text"]');await input.fill(controller+path.sep);await delay(300);await input.press('Enter');
-    await eventually(()=>vscode.Uri.file(path.resolve(workspace,settings.get('runnerProject'))).fsPath===vscode.Uri.file(controller).fsPath,
+    // VS Code reuses this widget for the QuickPick and the asynchronous folder dialog.
+    await folderInput.waitFor({state:'visible',timeout:60000});
+    assert(await folderInput.isEditable(),'The actual controller folder dialog accepts a path');
+    await folderInput.fill(controller+path.sep);
+    await eventually(async()=>vscode.Uri.file(path.resolve(await folderInput.inputValue())).fsPath===vscode.Uri.file(controller).fsPath,
+      'The real folder dialog contains the requested controller before confirmation',60000);
+    await folderInput.press('Enter');
+    await folderInput.waitFor({state:'hidden',timeout:60000});
+    await eventually(async()=>{
+      const current=settings(),persisted=JSON.parse(await fs.readFile(settingsFile,'utf8'));
+      return current.inspect('runnerProject')?.workspaceFolderValue===selected&&persisted['perfchecker.runnerProject']===selected&&
+        vscode.Uri.file(path.resolve(workspace,current.get('runnerProject'))).fsPath===vscode.Uri.file(controller).fsPath;
+    },
       'The real controller chooser verifies the existing Core environment and saves its selected path',180000);
     frame=await context.findFrame('#studio-root');
     const environment=frame.locator('details.environment');
@@ -37,8 +58,39 @@ async function existingController(context){
     await vscode.commands.executeCommand('workbench.action.closePanel');
     if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(3000);
     context.proof('bootstrap-existing-controller',{nativeStudioClick:true,realChooser:true,selectionVerified:true,core:context.core,
+      invalidSettingVerified:true,folderDialogClosed:true,workspaceFolderSettingPersisted:true,
       installerNotInvoked:true,registeredBootstrapQualified:false,minimum:'1.0.1',controller});
-  }finally{await settings.update('runnerProject',previous,vscode.ConfigurationTarget.WorkspaceFolder);await files.update('simpleDialog.enable',oldDialog,vscode.ConfigurationTarget.Global);}
+  }catch(error){
+    primaryError=error;
+    // Retain the primitive failure while its owning dialog is still visible.
+    try{
+      await windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`${process.env.PERFCHECKER_NATIVE_PHASE}-existing-controller-failure.png`)});
+      if(error&&typeof error==='object')preCleanupCaptures.add(error);
+    }catch{}
+    try{
+      const visible=await folderInput.isVisible();
+      context.log('existing-controller-before-cleanup',{message:String(error),stack:error.stack,
+        folderDialogVisible:visible,folderPath:visible?await folderInput.inputValue():undefined,
+        runnerProject:settings().get('runnerProject'),workspaceFolderValue:settings().inspect('runnerProject')?.workspaceFolderValue});
+    }catch{}
+    throw error;
+  }finally{
+    const cleanupErrors=[];
+    try{
+      if(await folderInput.isVisible()){
+        await folderInput.press('Escape');
+        await folderInput.waitFor({state:'hidden',timeout:30000});
+      }
+    }catch(error){cleanupErrors.push(error);}
+    try{await settings().update('runnerProject',previous,vscode.ConfigurationTarget.WorkspaceFolder);}catch(error){cleanupErrors.push(error);}
+    try{await files.update('simpleDialog.enable',oldDialog,vscode.ConfigurationTarget.Global);}catch(error){cleanupErrors.push(error);}
+    if(cleanupErrors.length){
+      const error=new AggregateError(primaryError?[primaryError,...cleanupErrors]:cleanupErrors,
+        'Controller chooser cleanup failed; the original validation error is retained',{cause:primaryError});
+      if(primaryError&&preCleanupCaptures.has(primaryError))preCleanupCaptures.add(error);
+      throw error;
+    }
+  }
 }
 async function repl(context){
   const {vscode,workspace,controller,windowPage}=context;
@@ -178,7 +230,7 @@ exports.run=async context=>{
     const commands=await context.vscode.commands.getCommands(true);
     if(commands.includes('notifications.clearAll'))await context.vscode.commands.executeCommand('notifications.clearAll');
     try{await run(context);}catch(error){
-      await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`${process.env.PERFCHECKER_NATIVE_PHASE}-${name}-failure.png`)}).catch(()=>{});
+      if(!preCleanupCaptures.has(error))await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`${process.env.PERFCHECKER_NATIVE_PHASE}-${name}-failure.png`)}).catch(()=>{});
       failures.push(error);context.log(`${name}-failure`,{message:String(error),stack:error.stack});
     }
   }
