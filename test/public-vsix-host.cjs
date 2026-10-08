@@ -330,9 +330,9 @@ exports.run = async () => {
         log('native-recording-viewport',{dimensions:await windowPage.evaluate(()=>({width:innerWidth,height:innerHeight})),fallback:'actual-workbench-fullscreen-command'});
       }finally{await target?.detach().catch(()=>{});await cdp?.detach().catch(()=>{});}
     }
-    const findFrame = selector => eventually(async () => {
+    const findFrame = (selector,{allowAttached=false}={}) => eventually(async () => {
       for (const context of browser.contexts()) for (const page of context.pages()) for (const frame of page.frames()) {
-        if (!await frame.locator(selector).first().isVisible().catch(() => false)) continue;
+        if (allowAttached?!await frame.locator(selector).count().catch(()=>0):!await frame.locator(selector).first().isVisible().catch(() => false)) continue;
         let visible=true;
         for(let current=frame;current.parentFrame();current=current.parentFrame()) {
           const owner=await current.frameElement().catch(()=>undefined);

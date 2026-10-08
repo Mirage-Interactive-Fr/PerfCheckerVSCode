@@ -158,10 +158,14 @@ async function create(context, file, kind) {
   return state;
 }
 
-async function serverPids(){
+let lastWindowsInventory;
+async function serverPids(context){
   if(process.platform==='win32'){
-    const {stdout}=await execute('powershell.exe',['-NoProfile','-Command','@(Get-CimInstance Win32_Process | Where-Object { $_.Name -like "julia*" -and $_.CommandLine -match "PERFCHECKER_PLUTO_READY" } | ForEach-Object { $_.ProcessId }) | ConvertTo-Json -Compress']);
-    const value=stdout.trim()?JSON.parse(stdout):[];return new Set((Array.isArray(value)?value:[value]).map(Number));
+    const {stdout}=await execute('powershell.exe',['-NoProfile','-Command','@(Get-CimInstance Win32_Process | Where-Object { $_.Name -like "julia*" } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;name=$_.Name;marker=($_.CommandLine -match "PERFCHECKER_PLUTO_READY");commandLength=([string]$_.CommandLine).Length} }) | ConvertTo-Json -Compress']);
+    const value=stdout.trim()?JSON.parse(stdout):[],rows=(Array.isArray(value)?value:[value]).sort((a,b)=>a.pid-b.pid);
+    const signature=JSON.stringify(rows);
+    if(context&&signature!==lastWindowsInventory){context.log('pluto-windows-process-inventory',{hostPid:process.pid,rows,commandContentsOmitted:true});lastWindowsInventory=signature;}
+    return new Set(rows.filter(row=>row.marker).map(row=>Number(row.pid)));
   }
   const {stdout}=await execute('ps',['-eo','pid=,args=']);
   return new Set(stdout.split('\n').filter(line=>line.includes('PERFCHECKER_PLUTO_READY')&&/julia/i.test(line)).map(line=>Number(line.trim().split(/\s+/,1)[0])));
@@ -194,14 +198,26 @@ async function restartFailureCleanup(context,directory){
   const file=path.join(directory,'RestartCleanup.jl');
   let state=await create(context,file,'investigation');await idle(state.frame);await stop(context,state);
   const settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
-  const previous=settings.get('plutoProject','perf/pluto'),before=await serverPids();let startingPids=[];
+  const previous=settings.get('plutoProject','perf/pluto'),before=await serverPids(context);let startingPids=[];
   try{
     const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
-    startingPids=await eventually(async()=>{const actual=[...await serverPids()].filter(pid=>!before.has(pid));return actual.length?actual:false;},'Restart spawns its real owned Julia server');
+    startingPids=await eventually(async()=>{const actual=[...await serverPids(context)].filter(pid=>!before.has(pid));return actual.length?actual:false;},'Restart spawns its real owned Julia server');
     await settings.update('plutoProject','perf/changed-pluto-environment',context.vscode.ConfigurationTarget.WorkspaceFolder);
     await eventually(async()=>/environment changed|Start the action again/.test(await (await context.findFrame('#pluto-restart')).locator('[role="status"]').innerText()),'Restart reports a changed environment after starting',240000);
-    await eventually(async()=>{const pids=await serverPids();return startingPids.every(pid=>!pids.has(pid));},'Every server from the failed Restart exits',90000);
+    await eventually(async()=>{const pids=await serverPids(context);return startingPids.every(pid=>!pids.has(pid));},'Every server from the failed Restart exits',90000);
     assert.equal(await (await context.findFrame('#pluto-restart')).locator('iframe').count(),0);
+  }catch(error){
+    try{
+      const parent=await context.findFrame('#pluto-restart'),src=await parent.locator('iframe.perfchecker-pluto-frame').getAttribute('src').catch(()=>undefined);
+      const port=src?Number(new URL(src).port):undefined;
+      let listeners;
+      if(process.platform==='win32'&&port)listeners=JSON.parse((await execute('powershell.exe',['-NoProfile','-Command',
+        `@(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { @{pid=$_.OwningProcess;port=$_.LocalPort} }) | ConvertTo-Json -Compress`])).stdout.trim()||'[]');
+      context.log('pluto-restart-before-cleanup',{primary:String(error),priorPids:[...before],startingPids,
+        currentPids:[...await serverPids(context)],status:await parent.locator('[role="status"]').innerText(),
+        listener:{port,open:port?await portOpen(port):false,owners:listeners},credentialsOmitted:true});
+    }catch(secondary){context.log('pluto-restart-diagnostic-error',{primary:String(error),secondary:String(secondary)});}
+    throw error;
   }finally{await settings.update('plutoProject',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);}
   const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
   state=await view(context);await idle(state.frame);

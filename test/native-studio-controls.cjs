@@ -86,7 +86,24 @@ async function options(view, selector) {
 
 async function designer(context) {
   await clickStudioAction(context, 'suite');
-  const view = await frame(context, '#cards');
+  // An attached empty #cards has no height while the real controller is loading.
+  // Its visible owner and generated check-type controls identify a ready plan.
+  const view = await context.findFrame('#cards',{allowAttached:true});
+  const started=Date.now();
+  const observe=async stage=>{
+    const state=await view.locator('#cards').evaluate(node=>{const rect=node.getBoundingClientRect();return {cards:node.querySelectorAll('.card').length,
+      geometry:{x:rect.x,y:rect.y,width:rect.width,height:rect.height},checkTypes:document.querySelectorAll('#check-types label').length};});
+    const file=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json');
+    const bytes=await fs.readFile(file).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
+    const plan=bytes?{bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')}:null;
+    if(bytes){try{plan.runs=JSON.parse(bytes).runs.length;}catch(error){plan.parseIncomplete=true;plan.parseDiagnostic=String(error);}}
+    context.log('native-designer-plan-readiness',{stage,elapsedMs:Date.now()-started,state,
+      plan});
+  };
+  await observe('attached');
+  try{await eventually(async()=>await view.locator('#check-types label').count()>0,'The controller supplies real check types before any filter gesture',360000);}
+  catch(error){try{await observe('failed');}catch(secondary){context.log('native-designer-readiness-diagnostic-error',{message:String(secondary),primary:String(error)});}throw error;}
+  await observe('plan-ready');
   await view.locator('#reset-filters').click();
   await eventually(async () => (await view.locator('#cards .card').count()) > 0,
     'General-backed suite plan renders workload cards', 120000);

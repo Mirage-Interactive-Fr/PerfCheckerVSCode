@@ -98,15 +98,18 @@ async function repl(context){
   await clickStudioAction(context,'julia');
   const terminal=await eventually(()=>vscode.window.terminals.find(item=>!before.has(item)&&/Julia/i.test(item.name))||vscode.window.terminals.find(item=>/Julia/i.test(item.name)),'The Studio REPL button starts the official Julia terminal');
   const marker=path.join(workspace,'julia-repl-version.txt');
+  const started=Date.now();
   terminal.sendText(`using Pkg; Pkg.activate(${JSON.stringify(controller)}); using PerfChecker; println("Julia ",VERSION," · PerfChecker ",Base.pkgversion(PerfChecker)); println("Active project: ",Base.active_project()); write(${JSON.stringify(marker)}, string(Base.pkgversion(PerfChecker))*"\\n"*string(VERSION)*"\\n"*Base.active_project())`);
   await eventually(async()=>{
     const [coreVersion,juliaVersion,activeProject]=(await fs.readFile(marker,'utf8')).split('\n');
     return coreVersion===context.coreVersion&&juliaVersion===process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION&&
       activeProject&&vscode.Uri.file(activeProject).fsPath===vscode.Uri.file(path.join(controller,'Project.toml')).fsPath;
-  },'The official Julia REPL evaluates code with its documented runtime in the explicitly activated controller');
+  },'The official Julia REPL evaluates code with its documented runtime in the explicitly activated controller',360000);
+  const firstImportMeasuredElapsedMs=Date.now()-started;
   if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(3000);
   await vscode.commands.executeCommand('language-julia.stopREPL');
-  context.proof('official-julia-repl',{nativeStudioClick:true,explicitTestActivation:true,activeProjectVerified:true,controller,core:context.core,julia:process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION,runnerJulia:process.env.PERFCHECKER_NATIVE_JULIA_VERSION});
+  context.proof('official-julia-repl',{nativeStudioClick:true,explicitTestActivation:true,activeProjectVerified:true,controller,core:context.core,julia:process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION,runnerJulia:process.env.PERFCHECKER_NATIVE_JULIA_VERSION,
+    firstImportMeasuredElapsedMs,firstImportBoundSeconds:360,preloadedByFixture:false});
 }
 async function debug(context){
   const {vscode,workspace,windowPage}=context;
