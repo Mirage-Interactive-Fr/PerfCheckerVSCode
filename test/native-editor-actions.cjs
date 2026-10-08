@@ -165,6 +165,35 @@ exports.run=async context=>{
   }
 };
 
+exports.runSuiteLog=async context=>{
+  const {vscode,windowPage,workspace,controller}=context;
+  await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',vscode.Uri.file(workspace));
+  await vscode.commands.executeCommand('perfchecker.refresh');
+  await vscode.commands.executeCommand('workbench.action.closePanel');
+  await vscode.commands.executeCommand('workbench.action.showCommands');
+  const picker=windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
+  await picker.locator('input[type="text"]').fill('>PerfChecker: Show worker output');
+  await picker.getByText('PerfChecker: Show worker output',{exact:true}).click();
+  await picker.waitFor({state:'hidden'});
+  // OutputViewPane's official output-view class scopes the visible Monaco
+  // editor; the native channel selector independently identifies the suite log.
+  const output=windowPage.locator('.output-view:visible');await output.waitFor({state:'visible'});
+  const canonicalController=await fs.realpath(controller);
+  await eventually(async()=>{
+    const selected=await windowPage.locator('select:visible').evaluateAll(nodes=>nodes.map(node=>node.selectedOptions[0]?.textContent));
+    const text=(await output.locator('.view-lines').allInnerTexts()).join('').replace(/\s+/g,'');
+    const shown=/Controllerproject:(.*?)\(/.exec(text)?.[1];
+    if(!selected.includes('PerfChecker')||!shown)return false;
+    const normalize=value=>process.platform==='win32'?value.toLowerCase():value;
+    return normalize(await fs.realpath(shown))===normalize(canonicalController);
+  },'The real Show worker output palette command displays the suite channel and actual controller log');
+  const file=`native-${process.platform}-vscode-${vscode.version}-suite-worker-output.png`;
+  await windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,file)});
+  context.proof('native-suite-worker-output',{nativePaletteClick:true,command:'perfchecker.showLog',
+    channel:'PerfChecker',actualControllerVisible:true,controller,screenshot:file});
+  await vscode.commands.executeCommand('workbench.action.closePanel');
+};
+
 exports.runTestItems=async context=>{
   const {vscode,workspace}=context,settings=vscode.workspace.getConfiguration('perfchecker',vscode.Uri.file(workspace));
   const keys=['testItemTags','testItemExcludeTags','testItemSamples'],previous=Object.fromEntries(keys.map(key=>[key,settings.inspect(key)?.workspaceFolderValue]));

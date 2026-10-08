@@ -122,6 +122,25 @@ async function resetDesigner(view) {
 async function testSuiteSelection(context) {
   let view = await designer(context);
   await resetDesigner(view);
+  const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage',
+    'mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
+  assert(plan.runs.every(run=>run.workload),'The real native fixture declares explicit workload identities');
+  const groupKey=run=>JSON.stringify([run.package,run.workload,run.version]);
+  const renderedGroups=()=>view.locator('#cards .card').evaluateAll(cards=>cards.map(card=>({id:card.dataset.id,
+    key:JSON.stringify([card.querySelector('.package').textContent,card.querySelector('strong').textContent,card.querySelector('.version').textContent])})));
+  const assertFiltered=async(expected,label)=>{
+    const ids=new Set(expected.map(run=>run.id)),keys=[...new Set(expected.map(groupKey))].sort();
+    assert(keys.length<=120,'This filter fixture fits entirely within the native page');
+    await eventually(async()=>{
+      const counter=await view.locator('#count').innerText(),match=/· (\d+)\/(\d+) visible/.exec(counter);
+      const groups=await renderedGroups();
+      return match&&Number(match[1])===expected.length&&Number(match[2])===plan.runs.length&&
+        groups.every(group=>ids.has(group.id))&&groups.length===keys.length&&
+        JSON.stringify(groups.map(group=>group.key).sort())===JSON.stringify(keys);
+    },`The native ${label} filter displays exactly the matching planned runs`);
+    context.log('native-designer-filter-effect',{label,matchingRuns:expected.length,
+      renderedGroupIds:await view.locator('#cards .card').evaluateAll(cards=>cards.map(card=>card.dataset.id))});
+  };
   const all = await selectionCount(view);
   assert(all > 1, 'The native fixture exercises more than one selectable run');
   const labels = await view.locator('#check-types label span').allTextContents();
@@ -142,7 +161,7 @@ async function testSuiteSelection(context) {
   assert(targets.length >= 2, 'At least two real targets are needed to qualify hidden selections and versions');
   for (const target of targets) {
     await view.locator('#target-filter').selectOption(target.value);
-    await eventually(async () => (await view.locator('#cards .card').count()) > 0, `Filter target ${target.value}`);
+    await assertFiltered(plan.runs.filter(run=>run.version===target.value),`target=${target.value}`);
     assert.equal(await selectionCount(view), all, 'Target filtering preserves hidden selected runs');
   }
   await view.locator('#clear-visible').click();
@@ -169,6 +188,8 @@ async function testSuiteSelection(context) {
   for (const selector of ['#package', '#target-kind']) {
     for (const option of await options(view, selector)) {
       await view.locator(selector).selectOption(option.value);
+      const key=selector==='#package'?'package':'target_kind';
+      await assertFiltered(plan.runs.filter(run=>run[key]===option.value),`${key}=${option.value}`);
       assert.equal(await selectionCount(view), all);
     }
     await view.locator(selector).selectOption('');
@@ -177,13 +198,42 @@ async function testSuiteSelection(context) {
   if (releaseTargets.length) {
     await view.locator('#from').fill(releaseTargets[0].value);
     await view.locator('#to').fill(releaseTargets.at(-1).value);
+    const version=value=>value.replace(/^v/,'').split('.').slice(0,3).map(Number);
+    const comparison=(a,b)=>{const x=version(a),y=version(b);return x[0]-y[0]||x[1]-y[1]||x[2]-y[2];};
+    await assertFiltered(plan.runs.filter(run=>run.target_kind!=='release'||
+      comparison(run.version,releaseTargets[0].value)>=0&&comparison(run.version,releaseTargets.at(-1).value)<=0),'inclusive release bounds');
     assert.equal(await selectionCount(view), all, 'Release bounds preserve selected Git targets');
     await view.locator('#from').fill('999.0.0');
     await view.locator('#to').fill('0.0.0');
+    await assertFiltered(plan.runs.filter(run=>run.target_kind!=='release'),'inverted release bounds');
     assert.equal(await selectionCount(view), all, 'Inverted release bounds do not discard hidden selections');
   } else context.log('release-range-prerequisite', 'Fixture has only Git/dev targets; a registered-release fixture is still required');
   await view.locator('#reset-filters').click();
-  for (const sort of ['package', 'feature', 'version', 'suite']) await view.locator('#sort').selectOption(sort);
+  await view.locator('#sort').selectOption('suite');
+  const {config:orderConfiguration}=await savedConfiguration(context,view);
+  assert.equal(orderConfiguration.selection.run_ids.length,plan.runs.length,'The real saved order includes every selected fixture run');
+  const byId=new Map(plan.runs.map(run=>[run.id,run]));
+  const suiteOrder=[...new Set(orderConfiguration.selection.run_ids.map(id=>groupKey(byId.get(id))))];
+  assert(suiteOrder.length>=2,'The native ordering fixture includes distinct workload groups');
+  let previousOrder=(await renderedGroups()).map(group=>group.key),observedSortChange=false;
+  for (const sort of ['package', 'feature', 'version', 'suite']) {
+    await view.locator('#sort').selectOption(sort);
+    await eventually(async()=>{
+      const groups=await renderedGroups(),actual=groups.map(group=>group.key);
+      if(groups.length!==suiteOrder.length||JSON.stringify([...actual].sort())!==JSON.stringify([...suiteOrder].sort()))return false;
+      if(sort==='suite')return JSON.stringify(actual)===JSON.stringify(suiteOrder);
+      const values=groups.map(group=>byId.get(group.id)[sort]);
+      const compare=(a,b)=>sort==='version'?(a==='dev'?1:b==='dev'?-1:a.localeCompare(b,undefined,{numeric:true})):a.localeCompare(b);
+      return values.every((value,index)=>index===0||value===values[index-1]||compare(values[index-1],value)<=0);
+    },`The displayed workload groups follow ${sort} order`);
+    const groups=await renderedGroups(),actual=groups.map(group=>group.key),changed=JSON.stringify(actual)!==JSON.stringify(previousOrder);
+    observedSortChange||=changed;
+    context.log('native-designer-sort-effect',{sort,renderedGroups:groups,inventoryPreserved:true,orderChanged:changed,
+      distinctPrimaryValues:sort==='suite'?suiteOrder.length:new Set(groups.map(group=>byId.get(group.id)[sort])).size,
+      limit:changed?null:'Displayed ordering verified; this transition did not change the previous order'});
+    previousOrder=actual;
+  }
+  assert(observedSortChange,'At least one discriminating native sort gesture changes the displayed group order');
   const group = view.locator('#cards .card').first();
   await group.locator('.pick').uncheck();
   assert((await selectionCount(view)) < all);
@@ -344,7 +394,28 @@ async function testResults(context) {
     }
     await view.locator(`#result-${id}`).selectOption('');
   }
-  for (const sort of await options(view, '#result-sort')) await view.locator('#result-sort').selectOption(sort.value);
+  const resultGroups=()=>view.locator('.result-list,.chart-grid,.flame-grid,tbody').evaluateAll(containers=>containers.map(container=>
+    [...container.children].filter(item=>item.matches('[data-result-item]')).map(item=>({kind:item.dataset.kind,package:item.dataset.package,
+      workload:item.dataset.workload,backend:item.dataset.backend,version:item.dataset.version,status:item.dataset.status,search:item.dataset.search}))));
+  const originalGroups=await resultGroups(),inventory=groups=>groups.map(items=>items.map(item=>JSON.stringify(item)).sort());
+  assert(originalGroups.some(items=>items.length>=2),'The real Results fixture contains a group with multiple sortable entries');
+  let previousResults=originalGroups,observedResultSortChange=false;
+  for (const sort of await options(view, '#result-sort')) {
+    await view.locator('#result-sort').selectOption(sort.value);
+    const key=sort.value==='name'?'search':sort.value;
+    await eventually(async()=>{
+      const groups=await resultGroups();
+      return JSON.stringify(inventory(groups))===JSON.stringify(inventory(originalGroups))&&groups.every(items=>items.every((item,index)=>index===0||
+        (items[index-1][key]||'').localeCompare(item[key]||'',undefined,{numeric:true})<=0));
+    },`Each actual Results group follows ${sort.text} order`);
+    const groups=await resultGroups(),changed=JSON.stringify(groups)!==JSON.stringify(previousResults);
+    observedResultSortChange||=changed;
+    context.log('native-results-sort-effect',{sort:sort.value,renderedGroups:groups,inventoryPreserved:true,orderChanged:changed,
+      discriminatingGroups:groups.filter(items=>items.length>=2&&new Set(items.map(item=>item[key])).size>=2).length,
+      limit:changed?null:'Rendered order and inventory verified; no change from the preceding order observed'});
+    previousResults=groups;
+  }
+  assert(observedResultSortChange,'At least one discriminating Results sort gesture changes a rendered group order');
   await view.locator('#result-search').fill('there-is-no-matching-native-result');
   assert.equal(await view.locator('[data-result-item]:visible').count(), 0);
   await view.locator('#result-search').fill(''); assert.equal(await view.locator('[data-result-item]').count(), total);

@@ -25,7 +25,7 @@ function commandCoverage(commands,checks){
     cancelInvestigation:['investigation-cancel-active-julia-worker'],prepareScenario:['investigation-discovery-selection-source-draft'],
     openInvestigationSource:['investigation-discovery-selection-source-draft'],refresh:['suite-selection-and-save'],initialize:['bootstrap-first-install-and-measurement','bootstrap-awaiting-registration','bootstrap-existing-controller'],
     runAll:['all-supported-collectors-measured'],runNode:['native-run-selection-command'],openEntrypoint:['native-workload-command'],
-    openOutput:['result-controls'],showLog:['native-tool-catalogue'],openDesigner:['suite-selection-and-save'],openDesignerForWorkspace:['save-palette-command'],
+    openOutput:['result-controls'],showLog:['native-suite-worker-output'],openDesigner:['suite-selection-and-save'],openDesignerForWorkspace:['save-palette-command'],
     runLandscapeLiveForWorkspace:['landscape-live-prerequisite'],saveConfiguration:['save-palette-command','native-suite-save-palette'],
     openStudio:['native-open-studio-command'],openStudioForWorkspace:['controller-visible-in-studio','studio-inventory','bootstrap-existing-controller'],openChat:['native-mcp-advice-implementation-restore','native-mcp-configuration-only-conversation'],
     openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save','pluto-studio-file-dialog-buttons'],openNotebook:['pluto-reactive-save-reload-close','pluto-studio-file-dialog-buttons'],
@@ -387,6 +387,7 @@ exports.run = async () => {
       else if(phase==='investigation-limits')await runCase('native-investigation-limits',()=>require('./native-investigation-limits.cjs').run(context));
       else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
       else if(phase==='editor'){
+        await runCase('native-suite-worker-output',()=>require('./native-editor-actions.cjs').runSuiteLog(context));
         await runCase('native-testitem-tag-selection-and-samples',()=>require('./native-editor-actions.cjs').runTestItems(context));
         await runCase('native-codelens-and-quickfix',()=>require('./native-editor-actions.cjs').run(context));
         await runCase('native-active-controller-runtime-settings',()=>require('./native-editor-actions.cjs').runActiveSettings(context));

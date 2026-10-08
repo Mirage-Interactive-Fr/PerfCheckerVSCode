@@ -20,6 +20,14 @@ const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?
   Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
 const processAlive=pid=>{try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}};
+function assertTemporaryCheckout(temporaryRoot,root,original){
+  const relative=path.relative(temporaryRoot,root),parts=relative.split(path.sep);
+  assert(relative&&!path.isAbsolute(relative)&&parts.length===2&&parts[0]!=='..'&&
+    /^perfchecker-implementation-[^/\\]+$/.test(parts[0])&&parts[1]==='checkout',
+    'Only the supplied disposable checkout is edited');
+  assert.notEqual(root,original,'The provider never edits the original workspace');
+  return relative;
+}
 async function ownedChatProcesses(){
   let rows;
   if(process.platform==='win32'){
@@ -151,8 +159,18 @@ exports.run = async (context,options={}) => {
         }
         if (name === 'implement_perfchecker') {
           const root = await fs.realpath(args[workspaceArgument]);
-          assert.notEqual(root, await fs.realpath(workspace));
-          assert(path.relative(os.tmpdir(), root).split(path.sep)[0] !== '..', 'Only the supplied disposable checkout is edited');
+          const temporaryRoot=await fs.realpath(os.tmpdir()),originalRoot=await fs.realpath(workspace);
+          // Record the physical alias boundary before any refusal or file edit.
+          log('native-implementation-checkout-boundary',{temporaryRoot:os.tmpdir(),canonicalTemporaryRoot:temporaryRoot,
+            suppliedCheckout:args[workspaceArgument],canonicalCheckout:root,canonicalOriginalWorkspace:originalRoot,
+            temporaryAliasResolved:temporaryRoot!==os.tmpdir(),checkoutAliasResolved:root!==args[workspaceArgument]});
+          const relative=assertTemporaryCheckout(temporaryRoot,root,originalRoot);
+          for(const refused of [temporaryRoot,path.join(temporaryRoot,'perfchecker-implementation-sibling'),
+            path.join(temporaryRoot,'perfchecker-implementation-sibling','not-checkout'),
+            path.join(root,'nested-workspace'),
+            path.join(path.dirname(temporaryRoot),'perfchecker-implementation-outside','checkout'),originalRoot])
+            assert.throws(()=>assertTemporaryCheckout(temporaryRoot,refused,originalRoot));
+          log('native-implementation-boundary-refusals',{rootSiblingOutsideOriginalRejected:true,relativeCheckout:relative});
           const file = path.join(root, 'src', 'PerfCheckerNativeFixture.jl');
           assert.equal(await fs.readFile(file, 'utf8'), original);
           await fs.writeFile(file, proposed);
