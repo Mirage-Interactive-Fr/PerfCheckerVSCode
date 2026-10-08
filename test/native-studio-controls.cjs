@@ -674,6 +674,82 @@ exports.runOrdering = async context => {
   await testLargePlanAndOrdering(context);
 };
 
+exports.runColour = async context => {
+  assertDisposable(context);
+  assert.equal(process.platform,'linux','The real colour-picker gesture is scoped to Linux/X11');
+  assert(process.env.DISPLAY&&process.env.PERFCHECKER_NATIVE_PHASE==='studio-color',
+    'Use only the separately selected disposable Xvfb colour campaign');
+  const {execFile}=require('node:child_process'),{promisify}=require('node:util');
+  const execute=promisify(execFile),xdotool=process.env.PERFCHECKER_TEST_XDOTOOL||'xdotool';
+  const native=async args=>(await execute(xdotool,args,{timeout:10000})).stdout.trim();
+  const windows=async()=>{
+    const {stdout}=await execute('xwininfo',['-root','-tree'],{timeout:10000});
+    return stdout.split('\n').flatMap(line=>{
+      const match=/^\s+(0x[\da-f]+).*?\s(\d+)x(\d+)[+-]\d+[+-]\d+\s+([+-]\d+)([+-]\d+)\s*$/i.exec(line);
+      return match?[{id:match[1],width:Number(match[2]),height:Number(match[3]),x:Number(match[4]),y:Number(match[5])}]:[];
+    });
+  };
+  let view=await designer(context);await resetDesigner(view);
+  const before=await savedConfiguration(context,view);
+  const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage',
+    'mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
+  const group=view.locator('#cards .card').first(),leader=await group.getAttribute('data-id');
+  const first=plan.runs.find(run=>run.id===leader);assert(first,'The visible group belongs to the real controller plan');
+  const ids=plan.runs.filter(run=>run.package===first.package&&run.workload===first.workload&&run.version===first.version).map(run=>run.id);
+  assert(ids.length>1,'The picker labels a real group of multiple checks');
+  const colours=async()=>view.locator('#cards .card').evaluateAll(cards=>cards.map(card=>({id:card.dataset.id,
+    colour:card.querySelector('input.label').value,border:getComputedStyle(card).borderLeftColor})));
+  const previous=await colours(),windowIds=new Set((await windows()).map(window=>window.id));
+  await group.locator('input.label').scrollIntoViewIfNeeded();
+  context.log('native-ui-action',{surface:'Suite designer',action:'Open real colour picker'});
+  await group.locator('input.label').click();
+  const popup=await eventually(async()=>{
+    const opened=(await windows()).filter(window=>!windowIds.has(window.id)&&window.width>=220&&window.width<=260&&window.height>=240&&window.height<=280);
+    return opened.length===1&&opened[0];
+  },'The trusted colour click creates its actual X11 picker popup',10000);
+  const output=process.env.PERFCHECKER_NATIVE_OUTPUT,temporary=path.join(output,'native-colour-popup.xwd');
+  const image=path.join(output,`native-${process.platform}-vscode-${context.vscode.version}-colour-picker.png`);
+  try{await execute('xwd',['-id',popup.id,'-silent','-out',temporary],{timeout:10000});
+    await execute('convert',[temporary,image],{timeout:10000});}
+  finally{await fs.rm(temporary,{force:true});}
+  context.log('native-colour-picker-before-input',{popup,file:path.basename(image),
+    sha256:createHash('sha256').update(await fs.readFile(image)).digest('hex')});
+  // Click the actual RGB field in the native popup, then use real X11 keys.
+  // The prepared Chromium probe demonstrates this layout; VSIX assertions
+  // below independently require the chosen colour and all persisted effects.
+  await native(['mousemove','--window',popup.id,'50',String(popup.height-52),'click','1']);
+  for(const [index,value]of ['18','102','170'].entries()){
+    if(index)await native(['key','--clearmodifiers','Tab']);
+    await native(['key','--clearmodifiers','ctrl+a']);
+    await native(['type','--clearmodifiers',value]);
+  }
+  await native(['key','--clearmodifiers','Return']);
+  await eventually(async()=>!(await windows()).some(window=>window.id===popup.id),'Return dismisses the real colour picker',10000);
+  const verify=async()=>{
+    const current=await colours(),changed=current.find(card=>card.id===leader);
+    assert.equal(changed.colour,'#1266aa');assert.equal(changed.border,'rgb(18, 102, 170)');
+    assert.deepEqual(current.filter(card=>card.id!==leader),previous.filter(card=>card.id!==leader),
+      'Other visible groups retain exactly their previous colours');
+  };
+  await eventually(async()=>{await verify();return true;},'The real picker updates the visible group border');
+  await capture(context,'native-colour-group-border');
+  const after=await savedConfiguration(context,view);
+  assert.deepEqual(after.config.selection.run_ids,before.config.selection.run_ids,'Colouring preserves exact selection and execution order');
+  assert.deepEqual(after.config.selection.labels,{...before.config.selection.labels,...Object.fromEntries(ids.map(id=>[id,'#1266aa']))},
+    'Every real run of this group gets the colour and no other label changes');
+  const command='workbench.action.webview.reloadWebviewAction';
+  assert((await context.vscode.commands.getCommands(true)).includes(command),'The actual VS Code reload-webviews command is available');
+  await context.vscode.commands.executeCommand(command);
+  view=await frame(context,'#cards');
+  await eventually(async()=>{await verify();return true;},'A real webview reload restores the saved group colour');
+  const reloaded=await savedConfiguration(context,view);
+  assert.deepEqual(reloaded.config.selection,after.config.selection,'Reload preserves exact labels, selected IDs and order');
+  await capture(context,'native-colour-reloaded-border');
+  context.proof('native-colour-picker-save-reload',{colour:'#1266aa',groupRunIds:ids,nativeX11ClickAndKeys:true,
+    actualPopup:true,visibleBorderVerified:true,exactOtherLabelsPreserved:true,exactSelectionPreserved:true,
+    savedAndReloaded:true,scope:'Linux stable isolated Xvfb; group/card labels only'});
+};
+
 exports.runSelection = async context => {
   assertDisposable(context);
   let view = await designer(context);
