@@ -35,8 +35,9 @@ REPL/debugger while using a newer Julia for PerfChecker if needed.
 
 For notebooks, select **New Pluto notebook** and choose **Feature suite** or
 **Investigation**. The extension uses real reactive Pluto `.jl` notebooks in an
-editor tab. Stable Pluto 1.0.4 uses a separate `perf/pluto` Julia environment;
-its installation is an explicit choice and does not modify the MCP controller.
+editor tab. Stable Pluto 1.0.4 and PerfCheckerPluto 1.0.1 use a separate `perf/pluto`
+Julia environment. Installing or upgrading it requires an explicit choice and
+does not modify the MCP controller.
 Opening the notebook or changing selectors does not launch measurements.
 Use its Launch/Cancel/Refresh controls, and **Save completed reports** in a suite
 notebook. Pluto saves edited cells to the `.jl` file; the header provides

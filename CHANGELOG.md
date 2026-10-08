@@ -11,6 +11,9 @@
   happens without a user choice; target test dependencies remain explicit.
 - Studio refreshes its displayed controller after setup or folder-scoped
   configuration changes, without publishing another workspace's state.
+- Require PerfCheckerPluto 1.0.1 for isolated interactive plot documents; the
+  separate Pluto environment installer uses its explicit v1.0.1 source tag.
+  Existing environments require an explicit upgrade choice.
 - Reactive Pluto `.jl` notebooks in editor tabs replace the Jupyter notebook
   path. Feature-suite and investigation dashboards use the official companion,
   a separate Julia environment and explicit measurement controls.

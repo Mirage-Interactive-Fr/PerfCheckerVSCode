@@ -20,7 +20,7 @@ Pkg.add(PackageSpec(name="PerfChecker", version="1.0.1"))
 Pkg.add([PackageSpec(name="Pluto", version="1.0.4"), PackageSpec(name="PlutoUI"),
     PackageSpec(name="BenchmarkTools"), PackageSpec(name="Chairmarks")])
 Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",
-    subdir="packages/PerfCheckerPluto", rev="v1.0.0"))
+    subdir="packages/PerfCheckerPluto", rev="v1.0.1"))
 using PerfChecker, PerfCheckerPluto, Pluto, PlutoUI
 `;
 const generateCode = `
@@ -46,8 +46,9 @@ end
 `;
 const environmentCode = `
 using PerfChecker, PerfCheckerPluto, Pluto, PlutoUI
-println("Detected PerfChecker ", Base.pkgversion(PerfChecker), "; Pluto ", Base.pkgversion(Pluto))
+println("Detected PerfChecker ", Base.pkgversion(PerfChecker), "; PerfCheckerPluto ", Base.pkgversion(PerfCheckerPluto), "; Pluto ", Base.pkgversion(Pluto))
 v"1.0.1" <= Base.pkgversion(PerfChecker) < v"2.0.0" || error("This integration requires PerfChecker 1.0.1 or newer in the 1.x series. Explicitly upgrade the separate Pluto environment from General before continuing.")
+v"1.0.1" <= Base.pkgversion(PerfCheckerPluto) < v"2.0.0" || error("This integration requires PerfCheckerPluto 1.0.1 or newer in the 1.x series. Explicitly upgrade the separate Pluto environment before continuing.")
 Base.pkgversion(Pluto) == v"1.0.4" || error("This integration currently qualifies Pluto 1.0.4. Explicitly update the separate Pluto environment to use it.")
 all(name -> isdefined(Pluto, name), (:ServerSession, :http_router_for, :auth_middleware,
     :create_session_context_middleware, :process_ws_message, :unpack)) || error("Pluto server API is unavailable.")
@@ -382,13 +383,14 @@ export class PlutoNotebooks implements vscode.Disposable {
         if (/cancelled|settings changed|workspace was closed|environment changed/.test(String(error))) throw error;
       }
     }
+    const action = exists ? 'Upgrade Pluto environment' : 'Install Pluto environment';
     const choice = await vscode.window.showWarningMessage(
-      `Pluto needs its own Julia environment at ${project}. Install registered PerfChecker 1.0.1, Pluto 1.0.4, PlutoUI and the official Pluto companion there? This downloads packages and updates that environment. Your MCP controller stays separate.`,
-      {modal: true}, 'Install Pluto environment', 'Open setup guide');
+      `${exists ? 'This existing separate Pluto environment needs an explicit upgrade' : 'Pluto needs its own Julia environment'} at ${project}. Install registered PerfChecker 1.0.1, PerfCheckerPluto 1.0.1, Pluto 1.0.4 and PlutoUI there? This downloads packages and updates that environment. Your MCP controller stays separate.`,
+      {modal: true}, action, 'Open setup guide');
     if (choice === 'Open setup guide') {
       await vscode.env.openExternal(vscode.Uri.parse('https://perfchecker.mirageinteractive.fr/interfaces/repl-pluto.html')); return;
     }
-    if (choice !== 'Install Pluto environment') return;
+    if (choice !== action) return;
     this.assertCurrent(folder, project);
     const settings=vscode.workspace.getConfiguration('perfchecker',folder.uri), selected=await canonical(project);
     for(const key of ['runnerProject','scenarioProject'] as const){

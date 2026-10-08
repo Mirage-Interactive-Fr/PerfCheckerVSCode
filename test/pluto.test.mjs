@@ -10,6 +10,43 @@ import {createServer,request as httpRequest} from 'node:http';
 import {createServer as createPortServer} from 'node:net';
 import {randomBytes} from 'node:crypto';
 
+test('the production Pluto check accepts current metadata and rejects the old companion',{
+  skip:!process.env.PERFCHECKER_PLUTO_OLD_COMPANION_PROJECT||!process.env.PERFCHECKER_PLUTO_CURRENT_COMPANION_PROJECT,
+  timeout:390000,
+},async t=>{
+  const source=await readFile(new URL('../src/plutoNotebook.ts',import.meta.url),'utf8');
+  const code=source.match(/const environmentCode = `([\s\S]*?)`;/)[1];
+  const check=async project=>{
+    const child=spawn(process.env.PERFCHECKER_TEST_JULIA||'julia',['--startup-file=no','--history-file=no',`--project=${project}`,'-e',code],
+      {env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)},detached:process.platform!=='win32',stdio:['ignore','pipe','pipe']});
+    let stdout='',stderr='';child.stdout.on('data',data=>stdout+=data);child.stderr.on('data',data=>stderr=(stderr+data).slice(-4000));
+    const closed=new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',exit=>resolve(exit));});
+    let timer,abort;
+    const cancelled=new Promise((_,reject)=>{
+      abort=()=>reject(Error('The owned Pluto metadata check was aborted'));
+      t.signal.addEventListener('abort',abort,{once:true});
+      timer=setTimeout(()=>reject(Error('The owned Pluto metadata check exceeded 180 seconds')),180000);
+      if(t.signal.aborted)abort();
+    });
+    try{return {exit:await Promise.race([closed,cancelled]),stdout,stderr};}
+    finally{
+      clearTimeout(timer);t.signal.removeEventListener('abort',abort);
+      if(child.pid&&child.exitCode===null&&child.signalCode===null){
+        if(process.platform==='win32'){
+          const killer=spawn('taskkill',['/pid',String(child.pid),'/t','/f'],{stdio:'ignore'});await once(killer,'close');
+        }else try{process.kill(-child.pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}
+        await closed;
+      }
+    }
+  };
+  const old=await check(process.env.PERFCHECKER_PLUTO_OLD_COMPANION_PROJECT);
+  assert.match(old.stdout,/Detected PerfChecker 1\.0\.1; PerfCheckerPluto 1\.0\.0; Pluto 1\.0\.4/);
+  assert.notEqual(old.exit,0);assert.match(old.stderr,/requires PerfCheckerPluto 1\.0\.1.*Explicitly upgrade the separate Pluto environment/);
+  const current=await check(process.env.PERFCHECKER_PLUTO_CURRENT_COMPANION_PROJECT);
+  assert.match(current.stdout,/Detected PerfChecker 1\.0\.1; PerfCheckerPluto 1\.0\.1; Pluto 1\.0\.4/);
+  assert.equal(current.exit,0,current.stderr);
+});
+
 test('real Pluto 1.0.4 keeps native components and authenticates its complete embedded navigation',{
   skip:!process.env.PERFCHECKER_PLUTO_TEST_PROJECT,timeout:360000,
 },async()=>{
@@ -323,13 +360,13 @@ test('embedded Pluto preserves authenticated internal links without forwarding i
 test('Pluto requires explicit installation, a trusted workspace and a native notebook',async()=>{
   const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-pluto-boundaries-'));
   const uri=file=>({scheme:'file',fsPath:file,toString:()=>`file://${file}`});
-  const folder={name:'fixture',uri:uri(root)},messages=[],scopes=[],values=new Map();
+  const folder={name:'fixture',uri:uri(root)},messages=[],choices=[],scopes=[],values=new Map();
   const disposable=()=>({dispose(){}});
   const vscode={env:{openExternal:async()=>false},workspace:{isTrusted:true,workspaceFolders:[folder],getWorkspaceFolder:source=>source.fsPath.startsWith(root+path.sep)?folder:undefined,
     getConfiguration:(_name,scope)=>{scopes.push(scope);return{get:(key,fallback)=>values.has(key)?values.get(key):fallback};},onDidChangeWorkspaceFolders:disposable},
     Uri:{file:uri,joinPath:(base,...pieces)=>uri(path.join(base.fsPath,...pieces)),parse:value=>({toString:()=>value})},ViewColumn:{One:1},
     window:{createOutputChannel:()=>({append(){},appendLine(){},dispose(){}}),
-      showWarningMessage:async message=>{messages.push(message);return undefined;}},
+      showWarningMessage:async(message,_options,...actions)=>{messages.push(message);choices.push(actions);return undefined;}},
   };
   const original=Module._load;
   Module._load=function(name,...args){return name==='vscode'?vscode:original.call(this,name,...args);};
@@ -340,6 +377,7 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
     assert.equal(await pluto.create(notebook,{kind:'suite'}),undefined);
     assert.equal(messages.length,1,'No package manager runs before the installation choice');
     assert.match(messages[0],/own Julia environment.*perf.*pluto/);
+    assert.deepEqual(choices[0],['Install Pluto environment','Open setup guide']);
     assert.deepEqual(await readdir(root),[],'Declining setup creates neither an environment nor a notebook');
     vscode.workspace.isTrusted=false;
     await assert.rejects(pluto.create(notebook,{kind:'suite'}),/Trust/);
@@ -354,6 +392,24 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
     await assert.rejects(pluto.create(uri(path.join(root,'perf','existing.jl')),{kind:'suite'}),/already exists/);
     assert.equal(messages.length,1,'Invalid files never start environment setup');
     assert(scopes.every(scope=>scope.toString()===folder.uri.toString()));
+    // The environment boundary must request an explicit upgrade and perform no
+    // package write on refusal. Actual metadata rejection is exercised above.
+    const outdated=path.join(root,'perf','pluto');await mkdir(outdated,{recursive:true});
+    const projectBytes='name="ExistingPlutoFixture"\n',manifestBytes='# Existing environment preserved on refusal\n';
+    await writeFile(path.join(outdated,'Project.toml'),projectBytes);await writeFile(path.join(outdated,'Manifest.toml'),manifestBytes);
+    const originalCheck=pluto.command,checks=[];
+    pluto.command=async(...args)=>{checks.push(args);throw Error('This integration requires PerfCheckerPluto1.0.1');};
+    try{
+      assert.equal(await pluto.ensureEnvironment(folder),undefined);
+      assert.equal(checks.length,1);assert.equal(checks[0][3],'PerfChecker · Check Pluto environment');
+      assert.match(messages.at(-1),/existing separate Pluto environment needs an explicit upgrade/);
+      assert.match(messages.at(-1),/PerfCheckerPluto 1\.0\.1/);
+      assert.deepEqual(choices.at(-1),['Upgrade Pluto environment','Open setup guide']);
+      assert.equal(await readFile(path.join(outdated,'Project.toml'),'utf8'),projectBytes);
+      assert.equal(await readFile(path.join(outdated,'Manifest.toml'),'utf8'),manifestBytes);
+      assert.equal((await readdir(outdated)).length,2,'Declining does not install or rewrite this environment');
+    }finally{pluto.command=originalCheck;}
+
     const server=createServer((request,response)=>{
       const query=new URL(request.url,'http://localhost').searchParams;
       response.statusCode=query.get('secret')==='isolated-test-secret' ? 200 : 403;
