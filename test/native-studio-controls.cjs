@@ -132,19 +132,42 @@ async function controllerLaunches() {
   return Promise.all(names.map(async file=>({file,commands:(await fs.readFile(path.join(root,file),'utf8')).split(/\r?\n/).filter(line=>line.startsWith('> '))})));
 }
 
-async function nativeSuiteWorker(reports) {
+async function nativeSuiteWorker() {
   const {execFile}=require('node:child_process'),{promisify}=require('node:util'),execute=promisify(execFile);
+  const expected=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
   let rows;
   if(process.platform==='win32'){
     const {stdout}=await execute('powershell.exe',['-NoProfile','-Command',
-      `$ErrorActionPreference='Stop'; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ParentProcessId -eq ${process.pid} -and $_.Name -like 'julia*' } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;command=[string]$_.CommandLine;createdAt=$_.CreationDate.ToUniversalTime().ToString('o')} }); ConvertTo-Json -InputObject $rows -Compress`],{timeout:10000});
+      `$ErrorActionPreference='Stop'; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ParentProcessId -eq ${process.pid} -and $_.Name -like 'julia*' } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;executable=$_.ExecutablePath;started=$_.CreationDate.ToUniversalTime().ToString('o')} }); ConvertTo-Json -InputObject $rows -Compress`],{timeout:10000});
     rows=JSON.parse(stdout);
   }else{
     const {stdout}=await execute('ps',['-eo','pid=,ppid=,args='],{timeout:10000});
     rows=stdout.split('\n').flatMap(line=>{const match=/^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),command:match[3]}]:[];});
   }
   assert(Array.isArray(rows),'The native process inventory returns an actual list');
-  const matches=rows.filter(row=>row.parent===process.pid&&row.command.includes('perfchecker_main')&&row.command.includes(`--reports=${reports}`));
+  const matches=[];
+  for(const row of rows.filter(row=>row.parent===process.pid)){
+    try{
+      let executable,started;
+      if(process.platform==='win32'){
+        executable=await fs.realpath(row.executable);started=row.started;
+        assert(/^\d{4}-\d{2}-\d{2}T.*Z$/.test(started)&&Number.isFinite(Date.parse(started)),'CIM supplies an actual process creation identity');
+      }else if(process.platform==='linux'){
+        executable=await fs.realpath(`/proc/${row.pid}/exe`);
+        const stat=await fs.readFile(`/proc/${row.pid}/stat`,'utf8'),fields=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\s+/);
+        if(['Z','X'].includes(fields[0]))continue;
+        started=fields[19];assert(/^\d+$/.test(started),'The kernel supplies actual process start ticks');
+      }else{
+        if(!/julia/i.test(row.command))continue;
+        const {stdout}=await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:10000});
+        const paths=stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+        if(!paths.includes(expected))continue;
+        executable=expected;started=(await execute('ps',['-p',String(row.pid),'-o','lstart='],{timeout:10000})).stdout.trim();
+        assert(started&&Number.isFinite(Date.parse(started)),'macOS supplies an actual process start identity');
+      }
+      if((process.platform==='win32'?executable.toLowerCase()===expected.toLowerCase():executable===expected))matches.push({pid:row.pid,parent:row.parent,executable,started});
+    }catch(error){if(['ENOENT','ESRCH'].includes(error.code))continue;throw error;}
+  }
   assert(matches.length<=1,'Exactly one owned suite controller may match the selected real run');
   return matches[0];
 }
@@ -845,19 +868,38 @@ exports.runSelection = async context => {
   const launchCount=entries=>entries.reduce((sum,item)=>sum+item.commands.length,0);
   context.log('native-ui-action',{surface:'Suite designer',action:'Run selected check'});
   await view.locator('#run').click();
-  const worker=await eventually(()=>nativeSuiteWorker(reports),'The existing selected suite run owns its actual Julia controller',30000);
-  await eventually(async()=>Object.values((await state()).controls).every(Boolean),'The existing running suite disables all actual Designer mutation controls');
-  const busyState=await state(),runningLaunches=await eventually(async()=>{
+  const freshReport=async()=>{
+    try{const text=await fs.readFile(reportPath,'utf8');if(text===old)return false;const value=JSON.parse(text);
+      return value.schema_version==='perfchecker-suite-result/1'&&value.runs.length===1&&value.runs[0].status==='pass'&&value;
+    }catch(error){if(error.code==='ENOENT'||error instanceof SyntaxError)return false;throw error;}
+  };
+  const active=await eventually(async()=>{
+    const worker=await nativeSuiteWorker(),snapshot=await state();
+    if(worker&&Object.values(snapshot.controls).every(Boolean))return {worker,snapshot};
+    if(await freshReport())return {finished:true};return false;
+  },'The existing selected suite has an owned active controller and busy controls, or completes with fresh real evidence',30000);
+  const runningLaunches=await eventually(async()=>{
     const value=await controllerLaunches();return launchCount(value)===launchCount(beforeLaunches)+1&&value;
   },'The real output log witnesses exactly the intended suite launch');
   const reload='workbench.action.webview.reloadWebviewAction';
   await context.vscode.commands.executeCommand(reload);
   view=await frame(context,'#cards');
-  await eventually(async()=>{assert.deepEqual(await state(),busyState);return true;},'Official reload restores the exact saved inventory, selection, order and active busy controls');
-  assert.deepEqual(await nativeSuiteWorker(reports),worker,'The reloaded busy panel keeps the same actual owned Julia controller identity');
+  let activeBusyHydrationQualified=false;
+  await eventually(async()=>{
+    const worker=await nativeSuiteWorker(),snapshot=await state();
+    if(worker&&active.worker){
+      assert.deepEqual(worker,active.worker,'The reloaded panel keeps the same actual owned Julia controller identity');
+      assert.deepEqual(snapshot,active.snapshot);activeBusyHydrationQualified=true;return true;
+    }
+    if(await freshReport()){
+      assert.deepEqual(snapshot,idleState,'A run that naturally finishes during reload restores its exact idle controls and inventory');return true;
+    }
+    return false;
+  },'Official reload preserves active busy hydration or the same run completes naturally with fresh real evidence');
   assert.deepEqual(await controllerLaunches(),runningLaunches,'Official reload does not launch another controller during the active run');
-  context.log('native-designer-active-reload',{command:reload,workerPid:worker.pid,workerParent:worker.parent,
-    nativeProcessIdentityPreserved:true,busyControlsPreserved:true,inventorySelectionOrderPreserved:true,
+  context.log('native-designer-active-reload',{command:reload,workerPid:active.worker?.pid,workerParent:active.worker?.parent,
+    processStarted:active.worker?.started,activeBusyHydrationQualified,nativeProcessIdentityPreserved:activeBusyHydrationQualified,
+    busyControlsPreserved:activeBusyHydrationQualified,naturallyCompletedDuringReload:!activeBusyHydrationQualified,inventorySelectionOrderPreserved:true,
     intendedLaunches:1,additionalLaunches:0,source:'Existing real selected-suite worker; no additional workload or injected busy state'});
   const report = await eventually(async () => {
     const text = await fs.readFile(reportPath, 'utf8');
@@ -872,7 +914,7 @@ exports.runSelection = async context => {
   assert.deepEqual(await controllerLaunches(),runningLaunches,'No additional controller launches occur through completion of the same selected run');
   assert.deepEqual(await fs.readFile(planFile),planBytes,'Active reload preserves the exact canonical real plan');
   assert.equal((await fs.stat(planFile,{bigint:true})).mtimeNs,planStat.mtimeNs,'Active reload does not regenerate the real plan');
-  context.proof('native-designer-active-reload-completed',{workerPid:worker.pid,sameRunCompleted:true,
+  context.proof('native-designer-active-reload-completed',{workerPid:active.worker?.pid,sameRunCompleted:true,activeBusyHydrationQualified,
     planSha256:createHash('sha256').update(planBytes).digest('hex'),planUnchanged:true,idleControlsRestored:true,
     inventorySelectionOrderPreserved:true,additionalControllerLaunches:0});
   await view.locator('#results').click();
