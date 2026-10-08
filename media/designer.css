@@ -38,6 +38,7 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 24px; }
 .output, .open { min-width: 30px; padding: 5px; }
 .label { width: 25px; height: 25px; padding: 1px; } aside { border-left: 1px solid var(--vscode-panel-border); padding-left: 20px; }
 .aside-panel { margin-bottom: 26px; } .aside-panel > label { display: grid; gap: 5px; margin-bottom: 12px; } fieldset { display: grid; gap: 8px; border: 1px solid var(--vscode-panel-border); }
+.aside-panel select, .aside-panel input:not([type="checkbox"]) { min-width: 0; width: 100%; }
 #target-list, #comparison-list { display: grid; gap: 6px; margin-bottom: 12px; }
 .target { display: grid; grid-template-columns: 1fr auto; gap: 7px; padding: 7px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; }
 .target span { display: grid; overflow: hidden; } .target small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

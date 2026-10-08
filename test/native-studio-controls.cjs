@@ -381,6 +381,43 @@ async function testGitTargetsAndComparisons(context) {
     const groups = await view.locator('#target-reference optgroup').evaluateAll(items => items.map(item => item.label));
     assert(groups.includes('Branches') && groups.includes('Tags') && groups.includes('Recent commits'),
       'Disposable Git fixture contains branch, tag and commit references');
+    await context.vscode.commands.executeCommand('workbench.action.closePanel');
+    await view.locator('#target-reference').scrollIntoViewIfNeeded();
+    await view.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const geometry=()=>view.evaluate(()=>{
+      const rect=node=>{const value=node.getBoundingClientRect();return {left:value.left,right:value.right,width:value.width,
+        clientWidth:node.clientWidth,scrollWidth:node.scrollWidth};};
+      const visible=node=>{const value=node.getBoundingClientRect(),style=getComputedStyle(node);
+        return value.width>0&&value.height>0&&style.display!=='none'&&style.visibility!=='hidden';};
+      return {viewportWidth:innerWidth,document:rect(document.documentElement),body:rect(document.body),
+        controls:[...document.querySelectorAll('.aside-panel select, .aside-panel input:not([type="checkbox"])')].filter(visible)
+          .map(node=>({id:node.id,control:rect(node),column:rect(node.closest('label')),aside:rect(node.closest('aside'))})),
+        checkboxWidths:[...document.querySelectorAll('.aside-panel input[type="checkbox"]')].filter(visible).map(node=>rect(node).width),
+        overflowingElements:[...document.querySelectorAll('body *')].filter(node=>visible(node)&&node.getBoundingClientRect().right>document.documentElement.clientWidth+1)
+          .slice(0,20).map(node=>({tag:node.tagName,id:node.id,classes:node.className,...rect(node)}))};
+    });
+    let layout;
+    try{
+      layout=await eventually(async()=>{
+        const current=await geometry();
+        assert(current.controls.some(item=>item.id==='target-reference'),'The real Git inventory selector is visible');
+        assert(current.document.scrollWidth<=current.document.clientWidth+1,'The real Designer document has no horizontal overflow');
+        assert(current.body.scrollWidth<=current.body.clientWidth+1,'The real Designer body has no horizontal overflow');
+        for(const {id,control,column,aside}of current.controls){
+          assert(control.width<=column.width+1&&control.left>=column.left-1&&control.right<=column.right+1,`${id} fits its actual field column`);
+          assert(control.left>=aside.left-1&&control.right<=aside.right+1,`${id} fits its actual aside`);
+          assert(control.left>=-1&&control.right<=current.document.clientWidth+1&&control.right<=current.viewportWidth+1,`${id} fits the actual viewport`);
+        }
+        assert(current.checkboxWidths.length>0&&current.checkboxWidths.every(width=>width>0&&width<=32),'Visible documentation checkboxes retain compact native geometry');
+        return current;
+      },'The actual Git controls fit their columns and viewport after discovery');
+    }catch(error){
+      try{context.log('native-git-reference-geometry-timeout',{state:await geometry(),primary:String(error)});}
+      catch(secondary){context.log('native-git-reference-geometry-diagnostic-error',{message:String(secondary),primary:String(error)});}
+      throw error;
+    }
+    await capture(context,'git-reference-column');
+    context.proof('native-git-reference-geometry',{...layout,scope:'Actual installed Designer after real Git discovery; no CSS or DOM modification'});
     const refs = await view.locator('#target-reference option[data-commit]').evaluateAll(items =>
       items.map(item => ({ref: item.value, commit: item.dataset.commit, kind: item.dataset.kind})).filter(item => item.ref));
     for (const kind of ['branch', 'tag', 'commit']) {
