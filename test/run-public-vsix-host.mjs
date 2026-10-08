@@ -285,6 +285,10 @@ try {
     const phaseProfile=path.join(profile,phase);
     await fs.mkdir(path.join(phaseProfile,'User'),{recursive:true});
     await fs.copyFile(path.join(profile,'User','settings.json'),path.join(phaseProfile,'User','settings.json'));
+    if(phase==='restricted'){
+      const settingsFile=path.join(phaseProfile,'User','settings.json');
+      await fs.writeFile(settingsFile,JSON.stringify({...JSON.parse(await fs.readFile(settingsFile,'utf8')),'security.workspace.trust.startupPrompt':'always'}));
+    }
     const phaseCliProfile=[`--user-data-dir=${phaseProfile}`,`--extensions-dir=${extensions}`];
     const video=path.join(output,`native-${process.platform}-vscode-${version}-${expectedVersion}-${phase}.mp4`);
     const display=phase==='landscape'?landscapeFixture.environment.DISPLAY:process.env.DISPLAY;
