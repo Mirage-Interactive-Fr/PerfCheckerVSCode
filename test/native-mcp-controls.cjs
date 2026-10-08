@@ -114,6 +114,16 @@ async function measuredEvidence(context) {
       if(report.schema_version!=='perfchecker-scenario-run/1')continue;
       assert(report.runs.length>0);
       assert(report.runs.every(run=>run.scenario.id==='sum_squares'&&run.qualification.availability==='complete'&&run.qualification.correctness==='passed'));
+      const measurementProject=await fs.realpath(context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace)).get('scenarioProject'));
+      const manifests=await Promise.all(report.runs.map(run=>fs.readFile(path.join(directory,run.run_id,'manifest.json'),'utf8').then(JSON.parse)));
+      const environments=manifests.flatMap(manifest=>manifest.environment_provenance);
+      assert(environments.length>0,'The actual measurement retains its worker environment provenance');
+      for(const environment of environments){
+        assert.equal(await fs.realpath(environment.path),measurementProject,'Real measurements use the distinct selected worker environment');
+        const packages=environment.resolved_packages.map(item=>item.name);
+        assert(packages.includes('BenchmarkTools'),'The actual worker resolves its collector');
+        assert(!packages.includes('PerfChecker')&&!packages.includes('HTTP'),'The measurement worker cannot supply the provider Core or HTTP dependencies');
+      }
       const adviceBytes=await fs.readFile(path.join(directory,'advice','advice.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
       if(!adviceBytes)continue;
       let advice;
@@ -133,7 +143,10 @@ async function measuredEvidence(context) {
       assert.equal(new Set(evidence.map(row=>row.id)).size,evidence.length,'The Core projection has unique evidence IDs');
       assert([...JSON.stringify(evidence)].length<=12000,'The actual projection respects the default character limit');
       for(const row of evidence)assert(rawEvidence.some(raw=>JSON.stringify(canonical(raw))===JSON.stringify(canonical(row))),'Every transmitted row retains exact recorded content');
-      measured={id,file,adviceFile,evidence,rawEvidence,runSha256:hash(data),adviceSha256:hash(adviceBytes)};
+      measured={id,file,adviceFile,evidence,rawEvidence,runSha256:hash(data),adviceSha256:hash(adviceBytes),
+        measurementEnvironments:environments.map(environment=>({path:environment.path,projectSha256:environment.project_sha256,
+          manifestSha256:environment.manifest_sha256,collector:environment.resolved_packages.find(item=>item.name==='BenchmarkTools'),
+          providerDependenciesAbsent:true}))};
       return !(await frame.locator('#app .status').getAttribute('class')).includes('busy');
     }
     return false;
@@ -146,6 +159,13 @@ exports.run = async (context,options={}) => {
   const {vscode, workspace, findFrame, log, proof} = context;
   const uri = vscode.Uri.file(workspace);
   const settings = () => vscode.workspace.getConfiguration('perfchecker', uri);
+  const measurementProject=await fs.realpath(path.join(workspace,'worker-environment'));
+  const controllerProject=await fs.realpath(context.controller);
+  assert.notEqual(measurementProject,controllerProject,'Controller and measurement projects are physically distinct');
+  const measurementDependencies=await fs.readFile(path.join(measurementProject,'Project.toml'),'utf8');
+  assert(!/^\s*(PerfChecker|HTTP)\s*=/m.test(measurementDependencies));
+  assert(!process.env.PERFCHECKER_LOAD_PATH||process.env.PERFCHECKER_LOAD_PATH==='@'+path.delimiter+'@stdlib',
+    'No extra load path may hide provider/measurement dependency separation');
   const source = path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl');
   const original = await fs.readFile(source, 'utf8');
   const proposed = original.replace('sum(xs .^ 2)', 'sum((x * x for x in xs); init=zero(eltype(xs)))');
@@ -230,6 +250,7 @@ exports.run = async (context,options={}) => {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const values = {advisorEnabled: true, advisorProtocol: 'mcp_http',
+    scenarioProject:measurementProject,
     advisorEndpoint: `http://127.0.0.1:${server.address().port}/mcp`, advisorModel: 'native-fixture',
     advisorMcpTool: 'ask_perfchecker', advisorMcpResponse: 'text', advisorMcpVersion: '2026-07-28',
     advisorImplementationMcpTool: 'implement_perfchecker', advisorTimeout: 180,
@@ -241,6 +262,10 @@ exports.run = async (context,options={}) => {
   const state = () => vscode.commands.executeCommand('perfchecker.chatState');
   try {
     for (const [key, value] of Object.entries(values)) await settings().update(key, value, vscode.ConfigurationTarget.WorkspaceFolder);
+    assert.equal(await fs.realpath(settings().get('runnerProject')),controllerProject);
+    assert.equal(await fs.realpath(settings().get('scenarioProject')),measurementProject);
+    proof('native-mcp-distinct-controller-and-measurement-projects',{controllerProject,measurementProject,
+      providerDependenciesExcludedFromMeasurement:true,extraLoadPath:false,settingsRestoredInFinally:true});
     const configuredPath=settings().get('advisorConfig','perf/advisor.json');
     const configuredFile=typeof configuredPath==='string'&&configuredPath.trim()?path.resolve(workspace,configuredPath):undefined;
     const readSavedConfiguration=()=>configuredFile?fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;}):Promise.resolve(undefined);
@@ -279,6 +304,7 @@ exports.run = async (context,options={}) => {
     assert.equal(hash(await fs.readFile(attached.file)),attached.runSha256);
     assert.equal(hash(await fs.readFile(attached.adviceFile)),attached.adviceSha256);
     proof('native-mcp-selected-measured-evidence',{nativeSelector:true,historyId:attached.id,evidenceIds:calls[1].evidenceIds,
+      controllerProject,measurementProject,measurementEnvironments:attached.measurementEnvironments,
       runSha256:attached.runSha256,adviceSha256:attached.adviceSha256,projectionSha256:calls[1].projectionSha256,
       rawRecommendations:attached.rawEvidence,boundedCoreProjection:attached.evidence,uniqueEvidenceIds:true,maxEvidenceCharacters:12000,
       contextualTurns:2,provider:'Controlled real HTTP MCP service; no inference or credentials',sourceUnchanged:true});
