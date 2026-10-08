@@ -349,7 +349,11 @@ exports.run = async (context,options={}) => {
     await eventually(async()=>await owningChatTab().getAttribute('aria-selected')==='true',
       'The exact owning Chat tab is active, rather than the alternate Studio with a similar title');
     view=await findFrame('#chat-root');
-    assert.equal((await state()).workspace,vscode.workspace.workspaceFolders.find(folder=>folder.uri.fsPath===workspace).name,
+    const requestedOwner=vscode.Uri.file(workspace),owner=vscode.workspace.getWorkspaceFolder(requestedOwner);
+    assert(owner,'The native workspace API resolves the actual owning chat folder');
+    assert.equal(owner.uri.toString(),requestedOwner.toString(),'The native owning folder is the exact requested chat workspace');
+    log('native-mcp-owning-workspace',{requestedPath:workspace,requestedUri:requestedOwner.toString(),ownerUri:owner.uri.toString(),ownerPath:owner.uri.fsPath,name:owner.name});
+    assert.equal((await state()).workspace,owner.name,
       'The displayed chat still identifies its first folder while Studio selects another');
     assert.deepEqual((await state()).evidence,owningEvidence,'Publishing A retains A’s evidence inventory instead of reading the selected folder B');
     assert.equal((await state()).evidenceId,attached.id);

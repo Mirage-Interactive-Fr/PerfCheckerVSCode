@@ -262,10 +262,14 @@ async function restartFailureCleanup(context,directory){
       assert.equal(inventory.direct.length,1,'The owned Restart starts exactly one new Julia leader');
       const leader=inventory.direct[0];assert.doesNotThrow(()=>process.kill(leader.pid,0));
       startingPids=[leader.pid];startingIdentities.set(`${leader.pid}:${leader.createdAt}`,leader);remember(inventory);
-      const status=await parent.locator('[role="status"]').innerText();
-      assert.match(status,/Starting Pluto/);
-      assert.equal(await parent.locator('iframe.perfchecker-pluto-frame').count(),0,
-        'The configuration change must occur during actual nonREADY startup');
+      const status=await eventually(async()=>{
+        const current=await context.findFrame('#pluto-restart');
+        const value=await current.locator('[role="status"]').innerText();
+        assert.match(value,/Starting Pluto/);
+        assert.equal(await current.locator('iframe.perfchecker-pluto-frame').count(),0,
+          'The configuration change must occur during actual nonREADY startup');
+        return value;
+      },'The current re-rendered parent witnesses actual nonREADY startup before the configuration change',10000);
       context.log('pluto-failed-startup-physical-owner',{leader,descendants:[...startingIdentities.values()],
         status,iframePublished:false,aliveBeforeConfigurationChange:true,
         observedListeners:inventory.listeners.filter(row=>startingPids.includes(row.pid)),listenerScope:'diagnostic only'});
@@ -283,13 +287,17 @@ async function restartFailureCleanup(context,directory){
     assert.equal(await (await context.findFrame('#pluto-restart')).locator('iframe').count(),0);
   }catch(error){
     try{
-      const parent=await context.findFrame('#pluto-restart'),src=await parent.locator('iframe.perfchecker-pluto-frame').getAttribute('src').catch(()=>undefined);
-      const port=src?Number(new URL(src).port):undefined;
+      const current=await eventually(async()=>{
+        const parent=await context.findFrame('#pluto-restart'),status=await parent.locator('[role="status"]').innerText();
+        const iframe=parent.locator('iframe.perfchecker-pluto-frame');
+        return {status,src:await iframe.count()?await iframe.getAttribute('src'):undefined};
+      },'Read the actual current failed-startup parent before teardown',10000);
+      const port=current.src?Number(new URL(current.src).port):undefined;
       let listeners;
       if(process.platform==='win32'&&port)listeners=JSON.parse((await execute('powershell.exe',['-NoProfile','-Command',
         `@(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { @{pid=$_.OwningProcess;port=$_.LocalPort} }) | ConvertTo-Json -Compress`])).stdout.trim()||'[]');
       context.log('pluto-restart-before-cleanup',{primary:String(error),priorPids:[...before],startingPids,
-        currentPids:[...await serverPids(context)],status:await parent.locator('[role="status"]').innerText(),
+        currentPids:[...await serverPids(context)],status:current.status,
         listener:{port,open:port?await portOpen(port):false,owners:listeners},credentialsOmitted:true});
     }catch(secondary){context.log('pluto-restart-diagnostic-error',{primary:String(error),secondary:String(secondary)});}
     throw error;
