@@ -6,15 +6,70 @@ import {promisify} from 'node:util';
 import {mkdtemp,writeFile,readFile,rm,mkdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 const require=createRequire(import.meta.url),execute=promisify(execFile);
-const {CodexConnector,inspectCodex}=require('../dist/codexConnector.js');
-const {createImplementationCheckout,applyImplementation}=require('../dist/implementation.js');
+const client=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const product=()=>({
+  ...require(path.join(process.env.PERFCHECKER_TEST_EXTENSION_PATH||client,'dist','codexConnector.js')),
+  ...require(path.join(process.env.PERFCHECKER_TEST_EXTENSION_PATH||client,'dist','implementation.js')),
+});
 // Read-only status observations must not refresh Git's index stat cache after restore.
 const git=async(root,...args)=>(await execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout;
 
+export async function ownedProcessState(pid) {
+  try{
+    const stat=await readFile(`/proc/${pid}/stat`,'utf8'),fields=stat.slice(stat.lastIndexOf(') ')+2).trim().split(/\s+/);
+    return fields[0]==='Z'?undefined:{pid,parent:Number(fields[1]),group:Number(fields[2]),start:fields[19]};
+  }catch(error){if(error.code==='ENOENT'||error.code==='ESRCH')return undefined;throw error;}
+}
+
+// Failure teardown only. Recorded start times and ancestry protect unrelated processes;
+// a private process group is signalled only while its recorded leader still owns it.
+export async function stopObservedCodexProcesses(records) {
+  const live=async()=>{
+    const result=[];for(const record of records)if((await ownedProcessState(record.pid))?.start===record.start)result.push(record);
+    return result;
+  };
+  const signal=async(record,value)=>{
+    const current=await ownedProcessState(record.pid);if(current?.start!==record.start)return;
+    assert(current.parent===record.parent||(current.parent===1&&!await ownedProcessState(record.parent)),
+      'Refuse failure teardown when the observed process ancestry has changed');
+    try{process.kill(current.group===record.pid?-record.pid:record.pid,value);}catch(error){if(error.code!=='ESRCH')throw error;}
+  };
+  for(const record of [...records].reverse())await signal(record,'SIGTERM');
+  let until=Date.now()+2000;while((await live()).length&&Date.now()<until)await new Promise(resolve=>setTimeout(resolve,50));
+  for(const record of (await live()).reverse())await signal(record,'SIGKILL');
+  until=Date.now()+5000;while((await live()).length&&Date.now()<until)await new Promise(resolve=>setTimeout(resolve,50));
+  assert.equal((await live()).length,0,'Observed owned processes must be dead before deleting the temporary fixture');
+}
+
+export async function probeJuliaCodexFixture(directory,julia) {
+  const code='include("src/PerfCheckerNativeFixture.jl"); score=PerfCheckerNativeFixture.sum_squares; @assert score(Float64[])==0.0;@assert score([1.0,-2.0,3.0])==14.0;xs=collect(1.0:1000.0);score(xs);@assert score(xs)==333833500.0;println(@allocated score(xs))';
+  const bytes=Number((await execute(julia,['--startup-file=no','--history-file=no','-e',code],{cwd:directory,timeout:60000})).stdout.trim());
+  assert(Number.isFinite(bytes)&&bytes>=0,'The actual Julia allocation oracle returns bytes');return bytes;
+}
+
+// Shared by the CLI and installed-VSIX hosts: the same real Julia source and oracle.
+export async function prepareJuliaCodexFixture(root,{julia,project,coreTree,coreVersion='1.0.0'}) {
+  const relative='src/PerfCheckerNativeFixture.jl',file=path.join(root,relative);
+  const source='module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nend\n';
+  await mkdir(path.dirname(file),{recursive:true});await writeFile(file,source);
+  await git(root,'init');await git(root,'config','user.name','PerfChecker qualification');await git(root,'config','user.email','qualification@example.invalid');
+  await git(root,'add','.');await git(root,'commit','-m','Sacrificial Julia allocation fixture');
+  const index=await readFile(path.join(root,'.git','index')),head=await git(root,'rev-parse','HEAD');
+  const probe=directory=>probeJuliaCodexFixture(directory,julia);
+  const baselineBytes=await probe(root);assert(baselineBytes>0);
+  const core=JSON.parse((await execute(julia,['--startup-file=no',`--project=${project}`,'-e','using PerfChecker,Pkg; info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; PerfChecker.JSON.print(Dict("uuid"=>string(Base.PkgId(PerfChecker).uuid),"version"=>string(Base.pkgversion(PerfChecker)),"tree"=>bytes2hex(Pkg.GitTools.tree_hash(pkgdir(PerfChecker))),"registered"=>info.is_tracking_registry))'],{timeout:60000})).stdout);
+  assert.equal(core.uuid,'6309bf6b-a531-4b08-891e-8ee981e5c424');assert.equal(core.version,coreVersion);
+  assert.equal(core.tree,coreTree??'7af0cc74194b953c5e998efd7523f0c5f455e395');
+  if(!coreTree)assert.equal(core.registered,true);
+  return {relative,file,source,index,head,probe,baselineBytes,core};
+}
+
 // Opt-in named-agent qualification; it uses the user's existing CLI account and model quota.
-test('real authenticated Codex through local MCP: two advice turns, isolated edits, verified diff, apply, restore, cancel and disconnect',
+if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('real authenticated Codex through local MCP: two advice turns, isolated edits, verified diff, apply, restore, cancel and disconnect',
   {skip:!process.env.PERFCHECKER_TEST_CODEX,timeout:300000},async()=>{
+    const {CodexConnector,inspectCodex,createImplementationCheckout,applyImplementation}=product();
     const root=await mkdtemp(path.join(tmpdir(),'perfchecker-codex-real-'));
     const requests=await mkdtemp(path.join(tmpdir(),'perfchecker-codex-requests-'));
     let connector,checkout;
@@ -89,28 +144,16 @@ test('real authenticated Codex through local MCP: two advice turns, isolated edi
 
 // Separate Julia-source proof: the earlier JavaScript test remains useful, but
 // cannot qualify an agent's Julia edits or their actual allocation measurements.
-test('real Codex Julia implementation: measured sum_squares, contextual advice, isolated patch, oracles, apply and exact restore',
+if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('real Codex Julia implementation: measured sum_squares, contextual advice, isolated patch, oracles, apply and exact restore',
   {skip:!process.env.PERFCHECKER_TEST_CODEX_JULIA||!process.env.PERFCHECKER_TEST_CODEX||!process.env.PERFCHECKER_TEST_JULIA_PROJECT,timeout:360000},async()=>{
+    const {CodexConnector,inspectCodex,createImplementationCheckout,applyImplementation}=product();
     const root=await mkdtemp(path.join(tmpdir(),'perfchecker-codex-julia-real-'));
     const requests=await mkdtemp(path.join(tmpdir(),'perfchecker-codex-julia-requests-'));
     const julia=process.env.PERFCHECKER_TEST_JULIA||'julia',project=process.env.PERFCHECKER_TEST_JULIA_PROJECT;
     let connector,checkout;
     try{
-      const relative='src/PerfCheckerNativeFixture.jl',file=path.join(root,relative);
-      await mkdir(path.dirname(file));
-      const source='module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nend\n';
-      await writeFile(file,source);
-      await git(root,'init');await git(root,'config','user.name','PerfChecker qualification');await git(root,'config','user.email','qualification@example.invalid');
-      await git(root,'add','.');await git(root,'commit','-m','Sacrificial Julia allocation fixture');
-      const index=await readFile(path.join(root,'.git','index')),head=await git(root,'rev-parse','HEAD');
-      const probe=async directory=>{
-        const code='include("src/PerfCheckerNativeFixture.jl"); score=PerfCheckerNativeFixture.sum_squares; @assert score(Float64[])==0.0;@assert score([1.0,-2.0,3.0])==14.0;xs=collect(1.0:1000.0);score(xs);@assert score(xs)==333833500.0;println(@allocated score(xs))';
-        return Number((await execute(julia,['--startup-file=no','--history-file=no','-e',code],{cwd:directory,timeout:60000})).stdout.trim());
-      };
-      const baselineBytes=await probe(root);assert(baselineBytes>0);
-      const core=JSON.parse((await execute(julia,['--startup-file=no',`--project=${project}`,'-e','using PerfChecker,Pkg; info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>bytes2hex(Pkg.GitTools.tree_hash(pkgdir(PerfChecker))),"registered"=>info.is_tracking_registry))'])).stdout);
-      if(process.env.PERFCHECKER_TEST_CORE_TREE)assert.equal(core.tree,process.env.PERFCHECKER_TEST_CORE_TREE);
-      else {assert.equal(core.version,'1.0.0');assert.equal(core.tree,'7af0cc74194b953c5e998efd7523f0c5f455e395');assert.equal(core.registered,true);}
+      const {relative,file,source,index,head,probe,baselineBytes,core}=await prepareJuliaCodexFixture(root,{julia,project,
+        coreTree:process.env.PERFCHECKER_TEST_CORE_TREE,coreVersion:process.env.PERFCHECKER_TEST_CORE_VERSION||'1.0.0'});
       const version=await inspectCodex(process.env.PERFCHECKER_TEST_CODEX,root);
       connector=await new CodexConnector({cli:process.env.PERFCHECKER_TEST_CODEX,root,timeoutMs:150000}).start();
       const invoke=async(command,messages,workspace)=>{
