@@ -351,7 +351,7 @@ against an existing project or your normal editor profile.
 ```powershell
 npm ci
 npm test
-npm run package -- --out perfchecker-vscode.vsix
+npm run package -- --out perfchecker-vscode-1.0.1.vsix
 ```
 
 `npm test` compiles TypeScript and runs the model/contract tests. The generated
@@ -370,7 +370,7 @@ For a manual stable release:
 
 ```powershell
 npx vsce login mirage-interactive-fr
-npx vsce publish --packagePath .\perfchecker-vscode-1.0.0.vsix
+npx vsce publish --packagePath .\perfchecker-vscode-1.0.1.vsix
 ```
 
 Publishing requires a free Microsoft identity and Marketplace publisher, not a
