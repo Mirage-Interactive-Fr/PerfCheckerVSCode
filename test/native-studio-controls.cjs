@@ -699,8 +699,18 @@ exports.runColour = async context => {
   assert(ids.length>1,'The picker labels a real group of multiple checks');
   const colours=async()=>view.locator('#cards .card').evaluateAll(cards=>cards.map(card=>({id:card.dataset.id,
     colour:card.querySelector('input.label').value,border:getComputedStyle(card).borderLeftColor})));
-  const previous=await colours(),windowIds=new Set((await windows()).map(window=>window.id));
   await group.locator('input.label').scrollIntoViewIfNeeded();
+  const previous=await eventually(async()=>{
+    const cards=await colours();assert(cards.length>0,'The real plan has visible groups');
+    for(const card of cards){
+      assert.match(card.colour,/^#[a-f0-9]{6}$/i);
+      const rgb=[1,3,5].map(offset=>parseInt(card.colour.slice(offset,offset+2),16));
+      assert.equal(card.border,`rgb(${rgb.join(', ')})`,'Every initial group border renders its actual colour');
+    }
+    return cards;
+  },'The real initial group borders are ready before the colour gesture');
+  context.log('native-colour-initial-borders',{cards:previous});
+  const windowIds=new Set((await windows()).map(window=>window.id));
   context.log('native-ui-action',{surface:'Suite designer',action:'Open real colour picker'});
   await group.locator('input.label').click();
   const popup=await eventually(async()=>{
