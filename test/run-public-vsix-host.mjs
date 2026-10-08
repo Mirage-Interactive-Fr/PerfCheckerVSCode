@@ -228,6 +228,13 @@ try {
     'print("{\\\"executable\\\":", repr(joinpath(Sys.BINDIR, Base.julia_exename())), ",\\\"version\\\":", repr(string(VERSION)), "}")'])).trim());
   const expectedVersion = mode === 'public' ? '1.0.0' : JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version;
   const vscode = await downloadAndUnzipVSCode({version, cachePath: path.join(session, 'vscode')});
+  const application=process.platform==='darwin'?path.resolve(path.dirname(vscode),'../Resources/app'):path.join(path.dirname(vscode),'resources','app');
+  const hostVersion=JSON.parse(await fs.readFile(path.join(application,'package.json'),'utf8')).version;
+  const cliSource=await fs.readFile(path.join(application,'out','cli.js'),'utf8');
+  const privateDirectoryFlags=['shared-data-dir','agent-plugins-dir','agents-user-data-dir','agents-extensions-dir']
+    .filter(flag=>cliSource.includes(`"${flag}":`));
+  const [hostMajor,hostMinor]=hostVersion.split('.').map(Number);
+  if(hostMajor>1||hostMajor===1&&hostMinor>=141)assert.equal(privateDirectoryFlags.length,4,'The actual host CLI must support all four isolated shared/agent directories');
   const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscode, {reuseMachineInstall: true});
   const extensions = path.join(session, 'extensions');
   const profile = path.join(session, 'profile');
@@ -266,10 +273,15 @@ try {
     if(packageProvenance.sha256!==sha||packageProvenance.version!==expectedVersion)throw new Error('The candidate package provenance differs from the installed archive.');
     await fs.writeFile(path.join(output,'candidate.provenance.json'),JSON.stringify(packageProvenance,null,2));
   }
-  const cliProfile = [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`];
+  const privateProfile=async root=>{
+    const directories=privateDirectoryFlags.map(flag=>[flag,path.join(root,flag)]);
+    await Promise.all(directories.map(([,directory])=>fs.mkdir(directory,{recursive:true})));
+    return [`--user-data-dir=${root}`,`--extensions-dir=${extensions}`,...directories.map(([flag,directory])=>`--${flag}=${directory}`)];
+  };
+  const cliProfile = await privateProfile(profile);
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
-    runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception'}};
+    runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,privateDirectoryFlags}};
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
@@ -289,7 +301,7 @@ try {
       const settingsFile=path.join(phaseProfile,'User','settings.json');
       await fs.writeFile(settingsFile,JSON.stringify({...JSON.parse(await fs.readFile(settingsFile,'utf8')),'security.workspace.trust.startupPrompt':'always'}));
     }
-    const phaseCliProfile=[`--user-data-dir=${phaseProfile}`,`--extensions-dir=${extensions}`];
+    const phaseCliProfile=await privateProfile(phaseProfile);
     const video=path.join(output,`native-${process.platform}-vscode-${version}-${expectedVersion}-${phase}.mp4`);
     const display=phase==='landscape'?landscapeFixture.environment.DISPLAY:process.env.DISPLAY;
     const retainHostLogs=async()=>{
