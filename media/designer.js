@@ -37,15 +37,34 @@ function logicalFeature(run) {
 }
 function checkLabel(backend) { return checkLabels[backend] || backend.replaceAll('_', ' '); }
 
-function compareVersion(a, b) {
+function compareVersion(a, b, precedenceOnly = false) {
   if (a === b) return 0;
   if (a === 'dev') return 1;
   if (b === 'dev') return -1;
-  const parse = value => ((value.startsWith('dev@') ? value.slice(4) : value)
-    .match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/) || []).slice(1).map(x => Number(x || 0));
+  const parse = value => {
+    const match = (value.startsWith('dev@') ? value.slice(4) : value)
+      .match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/);
+    return match ? {parts: [BigInt(match[1]), BigInt(match[2] || 0), BigInt(match[3] || 0)],
+      prerelease: match[4]?.split('.')} : undefined;
+  };
   const x = parse(a), y = parse(b);
-  if (!x.length || !y.length) return a.localeCompare(b);
-  for (let i = 0; i < 3; i += 1) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+  // Keep the same total order as the host model: numeric, opaque Git, bare dev.
+  if (!x || !y) return x ? -1 : y ? 1 : a.localeCompare(b);
+  for (let i = 0; i < 3; i += 1) if (x.parts[i] !== y.parts[i]) return x.parts[i] < y.parts[i] ? -1 : 1;
+  if (!!x.prerelease !== !!y.prerelease) return x.prerelease ? -1 : 1;
+  if (x.prerelease && y.prerelease) {
+    for (let i = 0; i < Math.max(x.prerelease.length, y.prerelease.length); i += 1) {
+      const left = x.prerelease[i], right = y.prerelease[i];
+      if (left === undefined || right === undefined) return left === undefined ? -1 : 1;
+      if (left === right) continue;
+      const numericLeft = /^\d+$/.test(left), numericRight = /^\d+$/.test(right);
+      if (numericLeft !== numericRight) return numericLeft ? -1 : 1;
+      const order = numericLeft ? (BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0) : (left < right ? -1 : left > right ? 1 : 0);
+      if (order) return order;
+    }
+  }
+  // Bounds ignore equivalent numeric spellings; sorting retains a label tie-break.
+  if (precedenceOnly) return 0;
   if (a.startsWith('dev@') !== b.startsWith('dev@')) return a.startsWith('dev@') ? 1 : -1;
   return a.localeCompare(b);
 }
@@ -57,8 +76,8 @@ function visibleRuns() {
   const from = byId('from').value.trim(), to = byId('to').value.trim();
   let runs = plan.runs.filter(run => selectedChecks.has(run.backend) && (!packageName || run.package === packageName) && (!target || run.version === target) && (!kind || run.target_kind === kind) &&
     (!search || [run.package, logicalFeature(run), run.feature, checkLabel(run.backend), run.backend, run.version, run.description, run.target_revision].some(value => String(value || '').toLowerCase().includes(search))) &&
-    (run.target_kind !== 'release' || !from || compareVersion(run.version, from) >= 0) &&
-    (run.target_kind !== 'release' || !to || compareVersion(run.version, to) <= 0));
+    (run.target_kind !== 'release' || !from || compareVersion(run.version, from, true) >= 0) &&
+    (run.target_kind !== 'release' || !to || compareVersion(run.version, to, true) <= 0));
   const sort = byId('sort').value;
   if (sort === 'suite') {
     const rank = new Map(order.map((id, index) => [id, index]));

@@ -126,6 +126,14 @@ the Julia package or enter measured workers.
 - Save selections, comparison policies and documentation blocks in the shared
   `perfchecker-ui-config/1` format.
 
+Version sorting puts numeric targets first, opaque Git labels in lexical order
+next, and the unversioned `dev` target last. Numeric targets accept `1`, `1.2`
+or `1.2.3`, optional `v` or `dev@` prefixes, and prerelease/build suffixes such
+as `1.2.3-rc.2+build.7`. Prereleases precede their release; build metadata does
+not change release-range inclusion, and `v` prefixes represent the same version.
+Sorting breaks equivalent numeric ties by target label, with a release before
+`dev@` at the same version.
+
 ## Requirements
 
 - VS Code 1.96 or newer.

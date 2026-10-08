@@ -2,6 +2,10 @@
 
 ## 1.0.1 — Pluto notebooks and first-use fixes
 
+- Version sorting and target selectors use a consistent order: numeric versions
+  (including prereleases and `dev@`), then opaque Git labels, then bare `dev`.
+  Anchored numeric parsing preserves Git hashes as labels; a release precedes
+  `dev@` at an equal version.
 - Explicit Studio setup for a controller and starter suite, including existing
   package environments that do not contain PerfChecker. No package installation
   happens without a user choice; target test dependencies remain explicit.

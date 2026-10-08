@@ -232,17 +232,28 @@ async function testSuiteSelection(context) {
   const byId=new Map(plan.runs.map(run=>[run.id,run]));
   const suiteOrder=[...new Set(orderConfiguration.selection.run_ids.map(id=>groupKey(byId.get(id))))];
   assert(suiteOrder.length>=2,'The native ordering fixture includes distinct workload groups');
+  // This fixture declares version0.1.0, Example's four release targets and the
+  // opaque baseline. An explicit independent order catches category cycles.
+  const versionOrder=['dev@0.1.0','0.5.0','0.5.3','0.5.4','0.5.5','baseline'];
+  assert.deepEqual([...new Set(plan.runs.map(run=>run.version))].sort(),[...versionOrder].sort(),
+    'The mixed native fixture retains every numeric and opaque target');
+  const versionRank=new Map(versionOrder.map((value,index)=>[value,index]));
   let previousOrder=(await renderedGroups()).map(group=>group.key),observedSortChange=false;
   for (const sort of ['package', 'feature', 'version', 'suite']) {
     await view.locator('#sort').selectOption(sort);
+    let observed=[];
+    try{
     await eventually(async()=>{
       const groups=await renderedGroups(),actual=groups.map(group=>group.key);
+      observed=groups.map(group=>({id:group.id,key:group.key,value:byId.get(group.id)?.[sort]}));
       if(groups.length!==suiteOrder.length||JSON.stringify([...actual].sort())!==JSON.stringify([...suiteOrder].sort()))return false;
       if(sort==='suite')return JSON.stringify(actual)===JSON.stringify(suiteOrder);
       const values=groups.map(group=>byId.get(group.id)[sort]);
-      const compare=(a,b)=>sort==='version'?(a==='dev'?1:b==='dev'?-1:a.localeCompare(b,undefined,{numeric:true})):a.localeCompare(b);
+      const compare=(a,b)=>sort==='version'?versionRank.get(a)-versionRank.get(b):a.localeCompare(b);
       return values.every((value,index)=>index===0||value===values[index-1]||compare(values[index-1],value)<=0);
     },`The displayed workload groups follow ${sort} order`);
+    }catch(error){context.log('native-designer-sort-before-cleanup',{sort,observed,expectedVersionOrder:versionOrder,
+      expectedInventory:suiteOrder,message:String(error.message)});throw error;}
     const groups=await renderedGroups(),actual=groups.map(group=>group.key),changed=JSON.stringify(actual)!==JSON.stringify(previousOrder);
     observedSortChange||=changed;
     context.log('native-designer-sort-effect',{sort,renderedGroups:groups,inventoryPreserved:true,orderChanged:changed,

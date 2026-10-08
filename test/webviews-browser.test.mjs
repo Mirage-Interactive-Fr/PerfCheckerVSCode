@@ -150,6 +150,38 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await page.locator('#baseline-targets input[value="dev@fast-sort"]').check();await page.locator('#add-comparison').click();assert.match(await page.locator('#comparison-error').innerText(),/different targets/);
     await send({type:'designerBusy',busy:true});assert.equal(await page.locator('#run').isDisabled(),true);await send({type:'designerBusy',busy:false});
     if(process.env.PERFCHECKER_QA_DIR){await mkdir(process.env.PERFCHECKER_QA_DIR,{recursive:true});await page.screenshot({path:path.join(process.env.PERFCHECKER_QA_DIR,'designer.png'),fullPage:true});}
+    const mixedLabels=['baseline','0.5.0','dev@0.1.0','4eec7f3','0.5.0-rc.2','0.5.0-rc.10','v0.5.0','0.5.0+build.7','dev'];
+    const expectedVersions=['dev@0.1.0','0.5.0-rc.2','0.5.0-rc.10','0.5.0','0.5.0+build.7','v0.5.0','4eec7f3','baseline','dev'];
+    const mixedRuns=mixedLabels.map((version,index)=>({...runs[0],id:`mixed-${index}`,version,
+      target_kind:/^v?0\.5\./.test(version)?'release':'git'}));
+    let permutation=0;
+    for(const first of ['baseline','0.5.0','dev@0.1.0'])for(const second of ['baseline','0.5.0','dev@0.1.0'].filter(value=>value!==first)){
+      const third=['baseline','0.5.0','dev@0.1.0'].find(value=>value!==first&&value!==second);
+      const versions=[first,second,third,...mixedLabels.filter(value=>![first,second,third].includes(value))];
+      await send({type:'plan',workspace:`mixed-version-order-${permutation++}`,plan:{...plan,runs:versions.map(version=>mixedRuns.find(run=>run.version===version))}});
+      await page.locator('#reset-filters').click();await page.locator('#sort').selectOption('version');
+      await page.waitForFunction(expected=>JSON.stringify([...document.querySelectorAll('#cards .card .version')].map(node=>node.textContent))===JSON.stringify(expected),expectedVersions);
+      assert.deepEqual(await page.locator('#cards .card').evaluateAll(nodes=>nodes.map(node=>node.dataset.id)),
+        expectedVersions.map(version=>mixedRuns.find(run=>run.version===version).id));
+      assert.deepEqual(await page.locator('#target-filter option').evaluateAll(nodes=>nodes.map(node=>node.value)),['',...expectedVersions]);
+      assert.deepEqual(await page.locator('#versions option').evaluateAll(nodes=>nodes.map(node=>node.value)),expectedVersions);
+      assert.match(await page.locator('#count').innerText(),/9 selected · 9\/9 visible/);
+    }
+    await page.locator('#from').fill('0.5.0-rc.10');await page.locator('#to').fill('0.5.0');
+    const bounded=expectedVersions.filter(version=>version!=='0.5.0-rc.2');
+    await page.waitForFunction(expected=>JSON.stringify([...document.querySelectorAll('#cards .card .version')].map(node=>node.textContent))===JSON.stringify(expected),bounded);
+    assert.match(await page.locator('#count').innerText(),/9 selected · 8\/9 visible · 1 selected outside filters/);
+    await page.locator('#from').fill('0.5.0');await page.locator('#to').fill('0.5.0');
+    const exactBounded=expectedVersions.filter(version=>!version.includes('-rc.'));
+    await page.waitForFunction(expected=>JSON.stringify([...document.querySelectorAll('#cards .card .version')].map(node=>node.textContent))===JSON.stringify(expected),exactBounded);
+    assert.match(await page.locator('#count').innerText(),/9 selected · 7\/9 visible · 2 selected outside filters/);
+    await page.locator('#target-filter').selectOption('4eec7f3');
+    await page.waitForFunction(()=>document.querySelectorAll('#cards .card').length===1);
+    assert.deepEqual(await page.locator('#cards .card .version').allTextContents(),['4eec7f3']);
+    assert.match(await page.locator('#count').innerText(),/9 selected · 1\/9 visible · 8 selected outside filters/);
+    await page.locator('#reset-filters').click();
+    assert.deepEqual(await page.locator('#cards .card .version').allTextContents(),expectedVersions);
+    assert.match(await page.locator('#count').innerText(),/9 selected · 9\/9 visible/);
     const large={...plan,runs:Array.from({length:1000},(_,index)=>({...runs[0],id:`large-${index}`,feature:`work-${index}`,workload:`work-${index}`}))};
     await send({type:'plan',workspace:'new-workspace',plan:large});await page.locator('#reset-filters').click();
     assert.equal(await page.locator('#cards .card').count(),120);await page.locator('#clear-all').click();assert.equal(await page.locator('#run').isDisabled(),true);
