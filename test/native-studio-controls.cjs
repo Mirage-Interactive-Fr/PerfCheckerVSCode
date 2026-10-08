@@ -691,14 +691,30 @@ exports.runColour = async context => {
   };
   let view=await designer(context);await resetDesigner(view);
   const before=await savedConfiguration(context,view);
-  const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage',
-    'mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
+  const planFile=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage',
+    'mirage-interactive-fr.perfchecker-vscode','suite-plan.json');
+  const planBytes=await fs.readFile(planFile),plan=JSON.parse(planBytes);
   const group=view.locator('#cards .card').first(),leader=await group.getAttribute('data-id');
   const first=plan.runs.find(run=>run.id===leader);assert(first,'The visible group belongs to the real controller plan');
   const ids=plan.runs.filter(run=>run.package===first.package&&run.workload===first.workload&&run.version===first.version).map(run=>run.id);
   assert(ids.length>1,'The picker labels a real group of multiple checks');
   const colours=async()=>view.locator('#cards .card').evaluateAll(cards=>cards.map(card=>({id:card.dataset.id,
     colour:card.querySelector('input.label').value,border:getComputedStyle(card).borderLeftColor})));
+  const idle=async()=>view.evaluate(()=>({controls:Object.fromEntries(['run','refresh','save','add-target','add-comparison']
+    .map(id=>[id,document.getElementById(id).disabled])),progressHidden:document.getElementById('progress').hidden,
+    cards:[...document.querySelectorAll('#cards .card')].map(card=>card.dataset.id),checkTypes:document.querySelectorAll('#check-types label').length}));
+  const launches=async()=>{
+    const root=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'logs');
+    const names=(await fs.readdir(root,{recursive:true})).filter(file=>/(?:\d+-)?PerfChecker\.log$/.test(path.basename(file))).sort();
+    assert(names.length,'The real PerfChecker output log witnesses controller launches');
+    return Promise.all(names.map(async file=>({file,commands:(await fs.readFile(path.join(root,file),'utf8')).split(/\r?\n/).filter(line=>line.startsWith('> '))})));
+  };
+  const captureGroup=async name=>{
+    await context.vscode.commands.executeCommand('workbench.action.closePanel');
+    await view.locator(`#cards .card[data-id="${leader}"]`).scrollIntoViewIfNeeded();
+    await capture(context,name);
+  };
+  await context.vscode.commands.executeCommand('workbench.action.closePanel');
   await group.locator('input.label').scrollIntoViewIfNeeded();
   const previous=await eventually(async()=>{
     const cards=await colours();assert(cards.length>0,'The real plan has visible groups');
@@ -719,10 +735,15 @@ exports.runColour = async context => {
   },'The trusted colour click creates its actual X11 picker popup',10000);
   const output=process.env.PERFCHECKER_NATIVE_OUTPUT,temporary=path.join(output,'native-colour-popup.xwd');
   const image=path.join(output,`native-${process.platform}-vscode-${context.vscode.version}-colour-picker.png`);
-  try{await execute('xwd',['-id',popup.id,'-silent','-out',temporary],{timeout:10000});
-    await execute('convert',[temporary,image],{timeout:10000});}
+  let painted;
+  try{await eventually(async()=>{
+      await execute('xwd',['-screen','-id',popup.id,'-silent','-out',temporary],{timeout:10000});
+      await execute('convert',[temporary,image],{timeout:10000});
+      painted=Number((await execute('identify',['-format','%k',image],{timeout:10000})).stdout.trim());
+      return painted>20;
+    },'The actual OS picker is painted before its review capture',10000);}
   finally{await fs.rm(temporary,{force:true});}
-  context.log('native-colour-picker-before-input',{popup,file:path.basename(image),
+  context.log('native-colour-picker-before-input',{popup,paintedColors:painted,file:path.basename(image),
     sha256:createHash('sha256').update(await fs.readFile(image)).digest('hex')});
   // Click the actual RGB field in the native popup, then use real X11 keys.
   // The prepared Chromium probe demonstrates this layout; VSIX assertions
@@ -742,19 +763,33 @@ exports.runColour = async context => {
       'Other visible groups retain exactly their previous colours');
   };
   await eventually(async()=>{await verify();return true;},'The real picker updates the visible group border');
-  await capture(context,'native-colour-group-border');
+  await captureGroup('native-colour-group-border');
   const after=await savedConfiguration(context,view);
   assert.deepEqual(after.config.selection.run_ids,before.config.selection.run_ids,'Colouring preserves exact selection and execution order');
   assert.deepEqual(after.config.selection.labels,{...before.config.selection.labels,...Object.fromEntries(ids.map(id=>[id,'#1266aa']))},
     'Every real run of this group gets the colour and no other label changes');
   const command='workbench.action.webview.reloadWebviewAction';
   assert((await context.vscode.commands.getCommands(true)).includes(command),'The actual VS Code reload-webviews command is available');
+  const beforeReload=await eventually(async()=>{
+    const state=await idle();assert(Object.values(state.controls).every(disabled=>!disabled));assert(state.progressHidden);return state;
+  },'The saved real Designer is idle before its official reload');
+  const beforeLaunches=await launches(),beforePlan=await fs.stat(planFile,{bigint:true});
+  assert(beforeLaunches.some(item=>item.commands.length),'Controller launch commands are present before comparing the real log');
   await context.vscode.commands.executeCommand(command);
   view=await frame(context,'#cards');
   await eventually(async()=>{await verify();return true;},'A real webview reload restores the saved group colour');
+  await eventually(async()=>{assert.deepEqual(await idle(),beforeReload);return true;},'Official reload restores the exact real card inventory, check types and idle controls');
   const reloaded=await savedConfiguration(context,view);
   assert.deepEqual(reloaded.config.selection,after.config.selection,'Reload preserves exact labels, selected IDs and order');
-  await capture(context,'native-colour-reloaded-border');
+  await eventually(async()=>{assert.deepEqual(await idle(),beforeReload);return true;},'Saving after reload returns the real Designer to its idle state');
+  await captureGroup('native-colour-reloaded-border');
+  assert.deepEqual(await fs.readFile(planFile),planBytes,'Official reload keeps the exact canonical controller plan bytes');
+  assert.equal((await fs.stat(planFile,{bigint:true})).mtimeNs,beforePlan.mtimeNs,'Reload does not regenerate the real controller plan');
+  const afterLaunches=await launches();assert.deepEqual(afterLaunches,beforeLaunches,'Official reload and configuration save launch no additional Julia controller');
+  context.log('native-designer-idle-reload',{command,planSha256:createHash('sha256').update(planBytes).digest('hex'),
+    planRuns:plan.runs.length,planUnchanged:true,planMtimeUnchanged:true,before:beforeReload,after:await idle(),
+    controllerLaunches:beforeLaunches.reduce((sum,item)=>sum+item.commands.length,0),noAdditionalControllerLaunch:true,
+    scope:'Real native idle reload; active busy hydration is qualified separately'});
   context.proof('native-colour-picker-save-reload',{colour:'#1266aa',groupRunIds:ids,nativeX11ClickAndKeys:true,
     actualPopup:true,visibleBorderVerified:true,exactOtherLabelsPreserved:true,exactSelectionPreserved:true,
     savedAndReloaded:true,scope:'Linux stable isolated Xvfb; group/card labels only'});
