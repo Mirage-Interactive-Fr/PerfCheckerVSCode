@@ -354,6 +354,24 @@ async function testSuiteSelection(context) {
 
 async function testGitTargetsAndComparisons(context) {
   let view = await designer(context);
+  // A retained plan can render while the preceding real replan is still running.
+  // Git discovery is independent of that worker; wait for its native idle state first.
+  const idleState=()=>view.evaluate(()=>({
+    controls:Object.fromEntries(['run','refresh','save','add-target','add-comparison'].map(id=>[id,document.getElementById(id).disabled])),
+    progressHidden:document.getElementById('progress').hidden,
+    progress:document.getElementById('progress').textContent,
+    error:document.getElementById('designer-error').textContent,
+  }));
+  try{
+    await eventually(async()=>{
+      const state=await idleState();
+      return state.progressHidden&&Object.values(state.controls).every(disabled=>!disabled);
+    },'The preceding actual plan finishes before Git target gestures',120000);
+  }catch(error){
+    try{context.log('git-target-idle-timeout',{state:await idleState(),primary:String(error)});}
+    catch(secondary){context.log('git-target-idle-diagnostic-error',{message:String(secondary),primary:String(error)});}
+    throw error;
+  }
   const settings = () => context.vscode.workspace.getConfiguration('perfchecker', context.vscode.Uri.file(context.workspace));
   const previousTargets = settings().inspect('gitTargets')?.workspaceFolderValue;
   const previousPolicies = settings().inspect('comparisonPolicies')?.workspaceFolderValue;
