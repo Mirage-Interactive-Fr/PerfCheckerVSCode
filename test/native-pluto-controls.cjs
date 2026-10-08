@@ -573,19 +573,22 @@ function renderedPng(png){
   }
   const raw=inflateSync(Buffer.concat(chunks)),stride=width*channels;
   assert.equal(raw.length,(stride+1)*height);
-  let previous=Buffer.alloc(stride),colored=0;const colors=new Map();
+  let previous=Buffer.alloc(stride),colored=0,orange=0,orangeX=0,orangeY=0;const colors=new Map();
   const paeth=(a,b,c)=>{const p=a+b-c,da=Math.abs(p-a),db=Math.abs(p-b),dc=Math.abs(p-c);return da<=db&&da<=dc?a:db<=dc?b:c;};
   for(let y=0;y<height;y++){
     const mode=raw[y*(stride+1)],row=Buffer.from(raw.subarray(y*(stride+1)+1,(y+1)*(stride+1)));assert(mode<=4);
     for(let x=0;x<stride;x++){const a=x>=channels?row[x-channels]:0,b=previous[x],c=x>=channels?previous[x-channels]:0;row[x]=(row[x]+[0,a,b,Math.floor((a+b)/2),paeth(a,b,c)][mode])&255;}
-    for(let x=0;x<stride;x+=channels){const alpha=channels===4?row[x+3]:255;if(alpha===0)continue;const [r,g,b]=row.subarray(x,x+3),key=(r>>4)*256+(g>>4)*16+(b>>4);colors.set(key,(colors.get(key)||0)+1);if(Math.max(r,g,b)-Math.min(r,g,b)>25)colored++;}
+    for(let x=0;x<stride;x+=channels){const alpha=channels===4?row[x+3]:255;if(alpha===0)continue;const [r,g,b]=row.subarray(x,x+3),key=(r>>4)*256+(g>>4)*16+(b>>4);colors.set(key,(colors.get(key)||0)+1);if(Math.max(r,g,b)-Math.min(r,g,b)>25)colored++;
+      // The canonical point inspector draws its highlight in Makie's :orange.
+      if(r>=200&&g>=70&&g<=210&&b<=80&&r>g+25){orange++;orangeX+=x/channels;orangeY+=y;}}
     previous=row;
   }
   const channelsOf=key=>[key>>8,(key>>4)&15,key&15];
   const dominant=[...colors.entries()].sort((a,b)=>b[1]-a[1])[0]?.[0],background=channelsOf(dominant||0);
   const highContrastPixels=[...colors.entries()].reduce((count,[key,pixels])=>count+
     (Math.max(...channelsOf(key).map((value,index)=>Math.abs(value-background[index])))>=4?pixels:0),0);
-  return {width,height,quantizedColors:colors.size,coloredPixels:colored,highContrastPixels,dominantColorBin:dominant,sha256:createHash('sha256').update(png).digest('hex')};
+  return {width,height,quantizedColors:colors.size,coloredPixels:colored,highContrastPixels,dominantColorBin:dominant,
+    highlight:orange>=10?{pixels:orange,x:orangeX/orange,y:orangeY/orange}:null,sha256:createHash('sha256').update(png).digest('hex')};
 }
 
 function assertDrawnFigure(pixels){
@@ -594,7 +597,24 @@ function assertDrawnFigure(pixels){
     'The canvas contains contrasted plotted ink and a chromatic marker, beyond blank, flat or monochrome axes');
 }
 
-async function drawnCanvas(context,canvas,label,differentFrom){
+function assertMovedHighlight(before,after){
+  assert.equal(after.width,before.width);assert.equal(after.height,before.height);
+  assert(before.highlight&&after.highlight,'Both actual screenshots contain the canonical orange point highlight');
+  assert.notEqual(after.sha256,before.sha256,'A distinct measured point changes the actual canvas');
+  assert(Math.hypot(after.highlight.x-before.highlight.x,after.highlight.y-before.highlight.y)>1,
+    'The orange point changes position, rather than merely changing a readout or drawing a spinner');
+}
+
+function distinctMeasuredPoint(data){
+  let selected=-1,distance=0;
+  for(let index=1;index<data.values.length;index++){
+    const next=data.versions[index]!==data.versions[0]?Infinity:Math.abs(data.values[index]-data.values[0]);
+    if(next>distance){selected=index;distance=next;}
+  }
+  return selected;
+}
+
+async function drawnCanvas(context,canvas,label,movedFrom){
   let previousSha,pixels;
   return eventually(async()=>{
     const png=await canvas.screenshot(),sha=createHash('sha256').update(png).digest('hex');
@@ -606,14 +626,42 @@ async function drawnCanvas(context,canvas,label,differentFrom){
       previousSha=sha;
     }
     assertDrawnFigure(pixels);
-    if(differentFrom)assert.notEqual(pixels.sha256,differentFrom,'A distinct measured point moves the rendered highlight');
+    if(movedFrom)assertMovedHighlight(movedFrom,pixels);
     return pixels;
   },`The native ${label} WebGL figure draws measured evidence`,180000);
 }
 
+async function plotDocument(state,previous){
+  const element=await eventually(async()=>{
+    const frames=state.frame.locator('pluto-output iframe[data-perfchecker-plot-frame]');
+    if(await frames.count()!==1)return false;
+    const handle=await frames.elementHandle();
+    const token=await handle.getAttribute('data-perfchecker-plot-frame');
+    if(previous&&token===previous.token){await handle.dispose();return false;}
+    return handle;
+  },'The actual generator displays one fresh SuitePlotFrame document');
+  const attributes=await element.evaluate(node=>({token:node.getAttribute('data-perfchecker-plot-frame'),id:node.id,
+    title:node.title,sandbox:node.getAttribute('sandbox'),srcdoc:node.getAttribute('srcdoc')}));
+  assert(attributes.token&&attributes.id===attributes.token,'The real frame carries its generator identity');
+  assert(attributes.title.startsWith('Performance plot: '),'The generator provides an accessible plot title');
+  assert.equal(attributes.sandbox,'allow-scripts','The real plot frame keeps its opaque origin sandbox');
+  assert(attributes.srcdoc&&/<html[\s>]/i.test(attributes.srcdoc),'The frame contains the complete canonical standalone export');
+  const frame=await element.contentFrame();assert(frame,'The actual srcdoc has its own browser document');
+  assert.equal(frame.parentFrame(),state.frame);
+  if(previous){
+    assert.notEqual(frame,previous.frame,'Selecting another plot creates a different child document');
+    await eventually(()=>previous.frame.isDetached(),'Pluto removes the previous plot document');
+  }
+  const canvas=frame.locator('#offline-figure canvas');
+  await canvas.waitFor({state:'visible',timeout:360000});await canvas.scrollIntoViewIfNeeded();
+  return {frame,canvas,token:attributes.token,title:attributes.title,
+    htmlSha256:createHash('sha256').update(attributes.srcdoc).digest('hex')};
+}
+
 function observePlotFrontend(context,state){
   const page=state.frame.page(),events=[];
-  const clean=value=>String(value).replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]')
+  const clean=value=>String(value).replace(/data:[^\s)]+/gi,'[inline module]')
+    .replace(/([?&]secret=)[^&\s"'<>]*/gi,'$1[session secret]')
     .replace(/\b[a-f0-9]{64}\b/gi,'[opaque token]').slice(0,2000);
   const record=(kind,message)=>{if(events.length<80){const item={kind,message:clean(message)};events.push(item);context.log('pluto-plot-frontend-event',item);}};
   const onError=error=>record('pageerror',error.stack||error.message);
@@ -625,11 +673,12 @@ function observePlotFrontend(context,state){
     snapshot:async stage=>{
       let timeout;
       try{
-      const detail=await Promise.race([state.frame.evaluate(()=>{
+      const detail=await Promise.race([(async()=>{
+      const inspect=()=>{
         const ids=[...document.querySelectorAll('[data-jscall-id]')].map(node=>node.getAttribute('data-jscall-id'));
         const counts=new Map();for(const id of ids)counts.set(id,(counts.get(id)||0)+1);
         const sessions=window.Bonito?.Sessions,queue=window.Bonito?.OBJECT_FREEING_LOCK;
-        return {bonitoLoaded:!!window.Bonito,queue:queue?{size:queue.size,pending:queue.pending,isPaused:queue.isPaused}:null,
+        return {readyState:document.readyState,viewport:{width:innerWidth,height:innerHeight},bonitoLoaded:!!window.Bonito,queue:queue?{size:queue.size,pending:queue.pending,isPaused:queue.isPaused}:null,
           sessions:sessions?Object.entries(sessions.SESSIONS||{}).slice(0,80).map(([id,tuple])=>{
             const objects=Array.isArray(tuple)?tuple[0]:null,status=Array.isArray(tuple)?tuple[1]:null;
             return {id,status:['string','boolean'].includes(typeof status)?status:null,validTuple:Array.isArray(tuple),
@@ -639,8 +688,15 @@ function observePlotFrontend(context,state){
           jscallNodes:ids.length,duplicateJscallIds:[...counts].filter(([,count])=>count>1).slice(0,40),
           figures:document.querySelectorAll('#offline-figure').length,readouts:document.querySelectorAll('#point-readout').length,
           canvases:[...document.querySelectorAll('#offline-figure canvas')].map(node=>({width:node.width,height:node.height,connected:node.isConnected})),
-          scripts:[...document.querySelectorAll('pluto-output script')].map(node=>({type:node.type,inlineBytes:node.textContent.length,external:!!node.src})).slice(0,80)};
-      }),new Promise((_,reject)=>{timeout=setTimeout(()=>reject(new Error('Read-only frontend diagnostic exceeded 2.5 seconds')),2500);})]);
+          scripts:[...document.querySelectorAll('script')].map(node=>({type:node.type,inlineBytes:node.textContent.length,external:!!node.src})).slice(0,80)};
+      };
+      const notebook=await state.frame.evaluate(inspect),documents=[];
+      for(const element of await state.frame.locator('iframe[data-perfchecker-plot-frame]').elementHandles()){
+        const token=await element.getAttribute('data-perfchecker-plot-frame'),frame=await element.contentFrame();
+        if(frame&&!frame.isDetached())documents.push({token,...await frame.evaluate(inspect)});
+      }
+      return {notebook,documents};
+      })(),new Promise((_,reject)=>{timeout=setTimeout(()=>reject(new Error('Read-only frontend diagnostic exceeded 2.5 seconds')),2500);})]);
       context.log('pluto-plot-frontend-state',{stage,...detail,events:[...events]});
       }catch(error){try{context.log('pluto-plot-frontend-diagnostic-failure',{stage,message:clean(error.message)});}catch{}}
       finally{clearTimeout(timeout);}
@@ -650,6 +706,8 @@ function observePlotFrontend(context,state){
 }
 
 async function renderedPlots(context,state,selector,completedRoot){
+  assert(state.source.includes('SuitePlotFrame(performance_plot_html(plot),'),
+    'The installed companion generates the real isolated renderer; the driver does not wrap an older export');
   const frontend=observePlotFrontend(context,state);
   try{
   await frontend.snapshot('before-selection');
@@ -680,54 +738,68 @@ end`;
   const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent();return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',360000);
   const data=await evidence();assert.equal(data.kind,'distribution');assert(data.selected.startsWith('distribution-'));assert.equal(data.selectedLabel,distribution.label);assert(data.values.length>=2);
   for(const [name,version] of Object.entries({PerfCheckerMakie:'1.0.0',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'}))assert.equal(data.providers[name].version,version);
-  const canvas=state.frame.locator('pluto-output #offline-figure canvas').first();
-  await canvas.waitFor({state:'visible',timeout:360000});await canvas.scrollIntoViewIfNeeded();
+  const firstDocument=await plotDocument(state),canvas=firstDocument.canvas;
   const gpu=await canvas.evaluate(node=>{const gl=node.getContext('webgl2')||node.getContext('webgl');if(!gl||gl.isContextLost())return null;const debug=gl.getExtension('WEBGL_debug_renderer_info');return {version:gl.getParameter(gl.VERSION),renderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)};});
   assert(gpu,'The rendered native canvas has a live WebGL context');
   const before=await drawnCanvas(context,canvas,'distribution');
   await frontend.snapshot('distribution-drawn');
-  const slider=state.frame.getByRole('slider',{name:'Inspect measured point'});
-  const distinct=data.values.findIndex((value,index)=>index>0&&(value!==data.values[0]||data.versions[index]!==data.versions[0]));
+  const slider=firstDocument.frame.getByRole('slider',{name:'Inspect measured point'});
+  const distinct=distinctMeasuredPoint(data);
   const selectedIndex=distinct<0?1:distinct;
   await slider.focus();for(let step=0;step<selectedIndex;step++)await slider.press('ArrowRight');
   const expected=`Point ${selectedIndex+1}: ${data.values[selectedIndex]} ${data.unit} · ${data.versions[selectedIndex]}`;
-  await eventually(async()=>await state.frame.locator('#point-readout').innerText()===expected,'A real native slider gesture inspects the chosen measured sample');
-  const after=await drawnCanvas(context,canvas,'highlight',distinct<0?undefined:before.sha256);
+  await eventually(async()=>await firstDocument.frame.locator('#point-readout').innerText()===expected,'A real native slider gesture inspects the chosen measured sample');
+  const after=await drawnCanvas(context,canvas,'highlight',distinct<0?undefined:before);
   await frontend.snapshot('distribution-point-inspected');
   await capture(context,'pluto-rendered-distribution');
   await selector.selectOption(trajectory.value);await ready(state.frame,'Launch selected checks');
   const second=await eventually(async()=>{const current=await evidence();return current.selectedLabel===trajectory.label&&current;},'The real plot selector regenerates the version-series figure');
   assert.equal(second.kind,'version_series');assert(second.selected.startsWith('version-series-'));
+  const secondDocument=await plotDocument(state,firstDocument);
   await eventually(async()=>{
-    const text=await state.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
+    const text=await secondDocument.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
     return match&&Number(match[1])===second.values[0]&&match[2]===second.unit&&match[3]===second.versions[0];
   },'The newly rendered trajectory inspector identifies its actual measured value');
   await frontend.snapshot('trajectory-readout-ready');
-  const trajectoryPixels=await drawnCanvas(context,state.frame.locator('pluto-output #offline-figure canvas').first(),'trajectory');
+  const trajectoryPixels=await drawnCanvas(context,secondDocument.canvas,'trajectory');
   await capture(context,'pluto-rendered-version-series');
+  await selector.selectOption(distribution.value);await ready(state.frame,'Launch selected checks');
+  const returned=await eventually(async()=>{const current=await evidence();return current.selectedLabel===distribution.label&&current;},'The real selector returns to the original measured distribution');
+  assert.deepEqual(returned.values,data.values);assert.deepEqual(returned.versions,data.versions);
+  const returnedDocument=await plotDocument(state,secondDocument);
+  assert.notEqual(returnedDocument.token,firstDocument.token,'Even a cached plot creates a new document identity');
+  assert.equal(returnedDocument.htmlSha256,firstDocument.htmlSha256,'The unchanged cached HTML is reused without patching queues or providers');
+  await eventually(async()=>await returnedDocument.frame.locator('#point-readout').innerText()===`Point 1: ${data.values[0]} ${data.unit} · ${data.versions[0]}`,
+    'The returned document starts with its own initial inspector state');
+  const returnedPixels=await drawnCanvas(context,returnedDocument.canvas,'distribution-returned');
+  await frontend.snapshot('distribution-returned');
   // Keep the allocation plot, including legitimate coincident samples. A
   // separately measured wall-time series can qualify actual marker movement.
   const timing=options.find(option=>option.label.includes(' · julia.wall.time · ')&&option.label.endsWith(' · Sample distribution'));
-  let temporalInteraction={available:false,canvasMovementQualified:false};
-  if(timing){
+  assert(timing,'Interactive plot qualification requires the real measured wall-time distribution');
+  let temporalInteraction;
+  {
     await selector.selectOption(timing.value);await ready(state.frame,'Launch selected checks');
     const temporal=await eventually(async()=>{const current=await evidence();return current.selectedLabel===timing.label&&current;},'The actual measured wall-time distribution is selected');
     assert.equal(temporal.kind,'distribution');assert(temporal.selected.startsWith('distribution-'));assert(temporal.values.length>=2);
-    const temporalCanvas=state.frame.locator('pluto-output #offline-figure canvas').first();
+    const temporalDocument=await plotDocument(state,returnedDocument),temporalCanvas=temporalDocument.canvas;
     const initial=await drawnCanvas(context,temporalCanvas,'wall-time');
-    const point=temporal.values.findIndex((value,index)=>index>0&&(value!==temporal.values[0]||temporal.versions[index]!==temporal.versions[0]));
-    const index=point<0?1:point;
-    await slider.focus();for(let step=0;step<index;step++)await slider.press('ArrowRight');
+    const point=distinctMeasuredPoint(temporal);
+    assert(point>=0,'The measured wall-time coordinates coincide; required pixel movement cannot be qualified');
+    const index=point;
+    const temporalSlider=temporalDocument.frame.getByRole('slider',{name:'Inspect measured point'});
+    await temporalSlider.focus();for(let step=0;step<index;step++)await temporalSlider.press('ArrowRight');
     const readout=`Point ${index+1}: ${temporal.values[index]} ${temporal.unit} · ${temporal.versions[index]}`;
-    await eventually(async()=>await state.frame.locator('#point-readout').innerText()===readout,'A native gesture inspects the actual wall-time sample');
-    const moved=await drawnCanvas(context,temporalCanvas,'wall-time-highlight',point<0?undefined:initial.sha256);
+    await eventually(async()=>await temporalDocument.frame.locator('#point-readout').innerText()===readout,'A native gesture inspects the actual wall-time sample');
+    const moved=await drawnCanvas(context,temporalCanvas,'wall-time-highlight',initial);
     await capture(context,'pluto-rendered-wall-time-highlight');
     temporalInteraction={available:true,selected:temporal.selected,measuredSamples:temporal.values.length,nativeKeyboard:true,
-      observedReadout:readout,selectedSample:index+1,canvasMovementQualified:point>=0,pixels:{initial,highlight:moved},
-      limit:point<0?'All measured wall-time coordinates coincide; readout verified, no movement claimed':null};
+      observedReadout:readout,selectedSample:index+1,canvasMovementQualified:true,document:{token:temporalDocument.token,htmlSha256:temporalDocument.htmlSha256},pixels:{initial,highlight:moved}};
   }
   assert.deepEqual(await fingerprint(completedRoot),reportsBefore,'Plotting and point inspection do not rerun measurements or save reports');
-  context.proof('pluto-rendered-measured-plots',{providerVersions:Object.fromEntries(Object.entries(data.providers).map(([name,item])=>[name,item.version])),extensionLoaded:data.extension,figureType:data.figure,actualMeasuredSamples:data.values.length,selectedKinds:[data.kind,second.kind],webgl:gpu,pixels:{distribution:before,highlight:after,trajectory:trajectoryPixels},pointInteraction:{nativeKeyboard:true,observedReadout:expected,selectedSample:selectedIndex+1,distinctPosition:distinct>=0,canvasMovementQualified:distinct>=0,coincidentSamples:distinct<0?'All (version,value) coordinates coincide; readout verified, no movement claimed':null},temporalInteraction,reportsUnchanged:true,source:'Actual installed VSIX, generated suite cell, real Julia measurement and native Pluto WebGL; software renderer only'});
+  context.proof('pluto-rendered-measured-plots',{providerVersions:Object.fromEntries(Object.entries(data.providers).map(([name,item])=>[name,item.version])),extensionLoaded:data.extension,figureType:data.figure,actualMeasuredSamples:data.values.length,selectedKinds:[data.kind,second.kind,returned.kind],
+    documents:[firstDocument,secondDocument,returnedDocument].map(item=>({token:item.token,title:item.title,htmlSha256:item.htmlSha256})),previousDocumentsDetached:true,cachedExportReused:true,
+    webgl:gpu,pixels:{distribution:before,highlight:after,trajectory:trajectoryPixels,returnedDistribution:returnedPixels},pointInteraction:{nativeKeyboard:true,observedReadout:expected,selectedSample:selectedIndex+1,distinctPosition:distinct>=0,canvasMovementQualified:distinct>=0,coincidentSamples:distinct<0?'All (version,value) coordinates coincide; readout verified, no movement claimed':null},temporalInteraction,reportsUnchanged:true,source:'Actual installed VSIX, generated SuitePlotFrame srcdoc, real Julia measurement and native Pluto WebGL; software renderer only'});
   }finally{
     await frontend.snapshot('before-cleanup');
     frontend.stop();
@@ -785,8 +857,9 @@ async function suite(context, directory, requirePlots=false) {
   }else if (plotted) {
     context.log('pluto-plot-prerequisite', {available: false, reason: 'Install PerfCheckerMakie and WGLMakie in the separate notebook environment'});
   } else {
-    assert(await state.frame.locator('canvas').count() > 0, 'An available WGLMakie provider renders an actual plot');
-    context.log('pluto-rendered-plot', {available: true, canvas: true});
+    const document=await plotDocument(state);
+    assert(await document.canvas.count() > 0, 'An available WGLMakie provider renders inside its actual plot document');
+    context.log('pluto-rendered-plot', {available: true, canvas: true,documentToken:document.token});
   }
   const completed = await fingerprint(root);
   await state.frame.locator('bond[def="samples"] input').fill('3');
