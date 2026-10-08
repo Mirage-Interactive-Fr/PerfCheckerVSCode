@@ -180,7 +180,7 @@ exports.run = async (context,options={}) => {
         env: {...process.env, UV_THREADPOOL_SIZE: '1'}})).stdout.trim());
   };
   const baselineBytes = await probe(workspace);
-  const calls = [], pending = new Set(), pendingSockets=new Map(), providerErrors=[];
+  const calls = [], pending = new Set(), pendingSockets=new Map(), providerErrors=[],receipts=[];
   let alternateFolder;
   const foreign=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
   const foreignFinished=new Promise(resolve=>foreign.once('close',resolve));
@@ -190,9 +190,10 @@ exports.run = async (context,options={}) => {
   let implementationBytes,attached;
   const server = http.createServer(async (req, res) => {
     try {
-      if (req.method === 'DELETE') {res.writeHead(204); res.end(); return;}
+      if (req.method === 'DELETE') {receipts.push({method:'DELETE',observedAt:new Date().toISOString()});res.writeHead(204); res.end(); return;}
       let text = ''; for await (const chunk of req) text += chunk;
       const body = JSON.parse(text);
+      receipts.push({method:req.method,rpc:body.method,observedAt:new Date().toISOString()});
       res.setHeader('Content-Type', 'application/json');
       if (body.method === 'notifications/initialized') {res.writeHead(202); res.end(); return;}
       let result = {};
@@ -282,11 +283,58 @@ exports.run = async (context,options={}) => {
     assert.deepEqual(await readSavedConfiguration(),savedConfig,'The failed temporary CLI connection and explicit disconnect preserve the saved provider bytes');
     proof('codex-disconnected-command',{command:'perfchecker.disconnectCodex',returnValueVerified:true,alreadyDisconnected:true,savedConfigurationPreserved:true,optionalConfigurationPath:configuredPath,directoryRead:false,activeAuthenticatedDisconnection:false});
     await view.getByRole('button', {name: 'New conversation', exact: true}).click();
+    const diagnoseSend=async(stage)=>{
+      const diagnostic={stage,extensionHost:process.pid,controllerProject,measurementProject,
+        configuredTimeoutSeconds:values.advisorTimeout,externalTimeoutSeconds:values.advisorTimeout+60,
+        nativeOracleTimeoutSeconds:180,receipts:[...receipts],providerErrors:[...providerErrors]};
+      try{diagnostic.chatState=await state();}catch(error){diagnostic.stateError=String(error);}
+      if(process.platform==='darwin'){
+        try{
+          const expectedExecutable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
+          const {stdout}=await execute('ps',['-axo','pid=,ppid=,args='],{timeout:5000});
+          const rows=stdout.split('\n').map(line=>{const match=line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);return match?{pid:Number(match[1]),parent:Number(match[2]),command:match[3]}:undefined;}).filter(Boolean);
+          const parents=new Set([process.pid]),owned=[];
+          for(let depth=0;depth<2;depth++)for(const row of rows.filter(row=>parents.has(row.parent)&&!owned.some(x=>x.pid===row.pid))){
+            const {stdout:files}=await execute('lsof',['-nP','-a','-p',String(row.pid),'-d','txt','-F','n'],{timeout:5000});
+            const executables=await Promise.all(files.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1)).catch(()=>undefined)));
+            if(!executables.includes(expectedExecutable))continue;
+            const start=(await execute('ps',['-p',String(row.pid),'-o','lstart='],{timeout:5000})).stdout.trim();
+            const item={pid:row.pid,parent:row.parent,canonicalExecutable:expectedExecutable,startIdentity:start,
+              alive:processAlive(row.pid),projects:[...row.command.matchAll(/--project=(\S+)/g)].map(match=>match[1]),
+              commandLength:row.command.length,advisorWorker:/advisor_worker\.jl/.test(row.command)};
+            const configuration=row.command.match(/--advisor-config=(\S+)/)?.[1];
+            if(configuration){
+              const directory=await fs.realpath(path.dirname(configuration)),temporaryRoot=await fs.realpath(os.tmpdir());
+              assert.equal(path.dirname(directory),temporaryRoot);assert(/^perfchecker-chat-/.test(path.basename(directory)));
+              const bytes=await fs.readFile(configuration),config=JSON.parse(bytes);
+              item.actualAdvisorFile={path:configuration,sha256:hash(bytes),timeout:config.timeout,protocol:config.protocol};
+            }
+            const request=row.command.match(/\s(\/\S+\/request\.toml)(?:\s|$)/)?.[1];
+            if(request){
+              const directory=await fs.realpath(path.dirname(request)),temporaryRoot=await fs.realpath(os.tmpdir());
+              assert.equal(path.dirname(directory),temporaryRoot);
+              const bytes=await fs.readFile(path.join(directory,'worker.log'));
+              item.workerPhaseMarkers=bytes.subarray(Math.max(0,bytes.length-8192)).toString('utf8').split('\n')
+                .filter(line=>/^PERFCHECKER_ADVISOR_PHASE [a-z_]+ [0-9]+\.[0-9]+(?:e[+-]?[0-9]+)?$/.test(line));
+            }
+            const after=(await execute('ps',['-p',String(row.pid),'-o','lstart='],{timeout:5000})).stdout.trim();
+            item.sameIdentityAfterRead=!!start&&start===after;owned.push(item);parents.add(row.pid);
+          }
+          diagnostic.ownedProcesses=owned;
+        }catch(error){diagnostic.processDiagnosticError=String(error);}
+      }
+      log('native-mcp-send-diagnostic',diagnostic);
+    };
     const send = async (question, count) => {
       await view.locator('#chat-question').fill(question);
       log('native-ui-action',{surface:'MCP conversation',action:'Send question',turn:count/2});
       await view.getByRole('button', {name: 'Send question', exact: true}).click();
-      await eventually(async () => {assert.deepEqual(providerErrors,[],'The real provider must accept the exact Core request');const value = await state(); return !value.busy && value.messages.length === count;}, 'Actual Julia MCP worker returns the conversation');
+      let nextDiagnostic=Date.now()+60000;
+      try{
+        await eventually(async () => {assert.deepEqual(providerErrors,[],'The real provider must accept the exact Core request');const value = await state();
+          if(process.platform==='darwin'&&Date.now()>=nextDiagnostic){await diagnoseSend('waiting');nextDiagnostic=Date.now()+60000;}
+          return !value.busy && value.messages.length === count;}, 'Actual Julia MCP worker returns the conversation');
+      }catch(error){await diagnoseSend('failed-before-teardown');throw error;}
     };
     await send('Inspect the intermediate allocation in sum_squares without editing. What should I verify?', 2);
     assert.deepEqual(calls[0].evidenceIds,[],'The configuration-only path remains valid without saved measurements');
