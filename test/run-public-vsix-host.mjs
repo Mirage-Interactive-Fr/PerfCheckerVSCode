@@ -8,6 +8,7 @@ import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
+import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -228,14 +229,15 @@ try {
     'print("{\\\"executable\\\":", repr(joinpath(Sys.BINDIR, Base.julia_exename())), ",\\\"version\\\":", repr(string(VERSION)), "}")'])).trim());
   const expectedVersion = mode === 'public' ? '1.0.0' : JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version;
   const vscode = await downloadAndUnzipVSCode({version, cachePath: path.join(session, 'vscode')});
-  const application=process.platform==='darwin'?path.resolve(path.dirname(vscode),'../Resources/app'):path.join(path.dirname(vscode),'resources','app');
-  const hostVersion=JSON.parse(await fs.readFile(path.join(application,'package.json'),'utf8')).version;
-  const cliSource=await fs.readFile(path.join(application,'out','cli.js'),'utf8');
+  const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscode, {reuseMachineInstall: true});
+  const application=await nativeVSCodeApplication(vscode,cli,{expectedVersion:version});
+  const hostVersion=application.version,cliSource=application.cliSource;
+  console.log('NATIVE_VSCODE_APPLICATION '+JSON.stringify({version:hostVersion,commit:application.commit,
+    applicationName:application.applicationName,relativePath:path.relative(path.dirname(vscode),application.application),cli:path.relative(path.dirname(vscode),cli)}));
   const privateDirectoryFlags=['shared-data-dir','agent-plugins-dir','agents-user-data-dir','agents-extensions-dir']
     .filter(flag=>cliSource.includes(`"${flag}":`));
   const [hostMajor,hostMinor]=hostVersion.split('.').map(Number);
   if(hostMajor>1||hostMajor===1&&hostMinor>=141)assert.equal(privateDirectoryFlags.length,4,'The actual host CLI must support all four isolated shared/agent directories');
-  const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscode, {reuseMachineInstall: true});
   const extensions = path.join(session, 'extensions');
   const profile = path.join(session, 'profile');
   // Exercise real VS Code dialogs through CDP instead of invisible OS-native modals.
@@ -281,7 +283,9 @@ try {
   const cliProfile = await privateProfile(profile);
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
-    runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,privateDirectoryFlags}};
+    runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,
+      actualCommit:application.commit,applicationName:application.applicationName,applicationRelativePath:path.relative(path.dirname(vscode),application.application),
+      cliRelativePath:path.relative(path.dirname(vscode),cli),privateDirectoryFlags}};
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
