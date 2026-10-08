@@ -125,6 +125,30 @@ async function savedConfiguration(context, view) {
   return {config, destination};
 }
 
+async function controllerLaunches() {
+  const root=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'logs');
+  const names=(await fs.readdir(root,{recursive:true})).filter(file=>/(?:\d+-)?PerfChecker\.log$/.test(path.basename(file))).sort();
+  assert(names.length,'The real PerfChecker output log witnesses controller launches');
+  return Promise.all(names.map(async file=>({file,commands:(await fs.readFile(path.join(root,file),'utf8')).split(/\r?\n/).filter(line=>line.startsWith('> '))})));
+}
+
+async function nativeSuiteWorker(reports) {
+  const {execFile}=require('node:child_process'),{promisify}=require('node:util'),execute=promisify(execFile);
+  let rows;
+  if(process.platform==='win32'){
+    const {stdout}=await execute('powershell.exe',['-NoProfile','-Command',
+      `$ErrorActionPreference='Stop'; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ParentProcessId -eq ${process.pid} -and $_.Name -like 'julia*' } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;command=[string]$_.CommandLine;createdAt=$_.CreationDate.ToUniversalTime().ToString('o')} }); ConvertTo-Json -InputObject $rows -Compress`],{timeout:10000});
+    rows=JSON.parse(stdout);
+  }else{
+    const {stdout}=await execute('ps',['-eo','pid=,ppid=,args='],{timeout:10000});
+    rows=stdout.split('\n').flatMap(line=>{const match=/^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),command:match[3]}]:[];});
+  }
+  assert(Array.isArray(rows),'The native process inventory returns an actual list');
+  const matches=rows.filter(row=>row.parent===process.pid&&row.command.includes('perfchecker_main')&&row.command.includes(`--reports=${reports}`));
+  assert(matches.length<=1,'Exactly one owned suite controller may match the selected real run');
+  return matches[0];
+}
+
 async function output(context) {
   await clickStudioAction(context, 'results');
   return frame(context, 'button[data-report="suite-result.json"]');
@@ -703,12 +727,6 @@ exports.runColour = async context => {
   const idle=async()=>view.evaluate(()=>({controls:Object.fromEntries(['run','refresh','save','add-target','add-comparison']
     .map(id=>[id,document.getElementById(id).disabled])),progressHidden:document.getElementById('progress').hidden,
     cards:[...document.querySelectorAll('#cards .card')].map(card=>card.dataset.id),checkTypes:document.querySelectorAll('#check-types label').length}));
-  const launches=async()=>{
-    const root=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'logs');
-    const names=(await fs.readdir(root,{recursive:true})).filter(file=>/(?:\d+-)?PerfChecker\.log$/.test(path.basename(file))).sort();
-    assert(names.length,'The real PerfChecker output log witnesses controller launches');
-    return Promise.all(names.map(async file=>({file,commands:(await fs.readFile(path.join(root,file),'utf8')).split(/\r?\n/).filter(line=>line.startsWith('> '))})));
-  };
   const captureGroup=async name=>{
     await context.vscode.commands.executeCommand('workbench.action.closePanel');
     await view.locator(`#cards .card[data-id="${leader}"]`).scrollIntoViewIfNeeded();
@@ -773,7 +791,7 @@ exports.runColour = async context => {
   const beforeReload=await eventually(async()=>{
     const state=await idle();assert(Object.values(state.controls).every(disabled=>!disabled));assert(state.progressHidden);return state;
   },'The saved real Designer is idle before its official reload');
-  const beforeLaunches=await launches(),beforePlan=await fs.stat(planFile,{bigint:true});
+  const beforeLaunches=await controllerLaunches(),beforePlan=await fs.stat(planFile,{bigint:true});
   assert(beforeLaunches.some(item=>item.commands.length),'Controller launch commands are present before comparing the real log');
   await context.vscode.commands.executeCommand(command);
   view=await frame(context,'#cards');
@@ -785,7 +803,7 @@ exports.runColour = async context => {
   await captureGroup('native-colour-reloaded-border');
   assert.deepEqual(await fs.readFile(planFile),planBytes,'Official reload keeps the exact canonical controller plan bytes');
   assert.equal((await fs.stat(planFile,{bigint:true})).mtimeNs,beforePlan.mtimeNs,'Reload does not regenerate the real controller plan');
-  const afterLaunches=await launches();assert.deepEqual(afterLaunches,beforeLaunches,'Official reload and configuration save launch no additional Julia controller');
+  const afterLaunches=await controllerLaunches();assert.deepEqual(afterLaunches,beforeLaunches,'Official reload and configuration save launch no additional Julia controller');
   context.log('native-designer-idle-reload',{command,planSha256:createHash('sha256').update(planBytes).digest('hex'),
     planRuns:plan.runs.length,planUnchanged:true,planMtimeUnchanged:true,before:beforeReload,after:await idle(),
     controllerLaunches:beforeLaunches.reduce((sum,item)=>sum+item.commands.length,0),noAdditionalControllerLaunch:true,
@@ -814,8 +832,33 @@ exports.runSelection = async context => {
   const reports = path.resolve(context.workspace, settings.get('reports', 'perf/results/vscode'));
   const reportPath = path.join(reports, 'suite-result.json');
   const old = await fs.readFile(reportPath, 'utf8').catch(() => undefined);
+  const saved=await savedConfiguration(context,view);
+  assert.equal(saved.config.selection.run_ids.length,1,'The actual run selection and order are saved before reloading its working panel');
+  const planFile=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json');
+  const planBytes=await fs.readFile(planFile),planStat=await fs.stat(planFile,{bigint:true});
+  const state=async()=>view.evaluate(()=>({controls:Object.fromEntries(['run','refresh','save','add-target','add-comparison']
+    .map(id=>[id,document.getElementById(id).disabled])),inventory:[...document.querySelectorAll('#cards .card')].map(card=>({id:card.dataset.id,
+      colour:card.querySelector('input.label').value,checks:[...card.querySelectorAll('.check-option')].map(check=>({name:check.querySelector('.check-name').textContent,selected:check.querySelector('input').checked}))})),
+    count:document.getElementById('count').textContent,sort:document.getElementById('sort').value,openAfterRun:document.getElementById('open-after-run').checked}));
+  await eventually(async()=>Object.values((await state()).controls).every(disabled=>!disabled),'The saved real run panel returns to idle before launching');
+  const idleState=await state(),beforeLaunches=await controllerLaunches();
+  const launchCount=entries=>entries.reduce((sum,item)=>sum+item.commands.length,0);
   context.log('native-ui-action',{surface:'Suite designer',action:'Run selected check'});
   await view.locator('#run').click();
+  const worker=await eventually(()=>nativeSuiteWorker(reports),'The existing selected suite run owns its actual Julia controller',30000);
+  await eventually(async()=>Object.values((await state()).controls).every(Boolean),'The existing running suite disables all actual Designer mutation controls');
+  const busyState=await state(),runningLaunches=await eventually(async()=>{
+    const value=await controllerLaunches();return launchCount(value)===launchCount(beforeLaunches)+1&&value;
+  },'The real output log witnesses exactly the intended suite launch');
+  const reload='workbench.action.webview.reloadWebviewAction';
+  await context.vscode.commands.executeCommand(reload);
+  view=await frame(context,'#cards');
+  await eventually(async()=>{assert.deepEqual(await state(),busyState);return true;},'Official reload restores the exact saved inventory, selection, order and active busy controls');
+  assert.deepEqual(await nativeSuiteWorker(reports),worker,'The reloaded busy panel keeps the same actual owned Julia controller identity');
+  assert.deepEqual(await controllerLaunches(),runningLaunches,'Official reload does not launch another controller during the active run');
+  context.log('native-designer-active-reload',{command:reload,workerPid:worker.pid,workerParent:worker.parent,
+    nativeProcessIdentityPreserved:true,busyControlsPreserved:true,inventorySelectionOrderPreserved:true,
+    intendedLaunches:1,additionalLaunches:0,source:'Existing real selected-suite worker; no additional workload or injected busy state'});
   const report = await eventually(async () => {
     const text = await fs.readFile(reportPath, 'utf8');
     if (text === old) return false;
@@ -825,6 +868,13 @@ exports.runSelection = async context => {
   }, 'The native Run button completes the registered Julia backend and writes current evidence', 240000);
   assert.equal(report.runs[0].status, 'pass', 'Actual correctness-checked benchmark succeeds');
   await eventually(async () => !(await view.locator('#run').isDisabled()), 'Run control returns to idle');
+  assert.deepEqual(await state(),idleState,'The same reloaded run finishes with the original exact idle controls and inventory');
+  assert.deepEqual(await controllerLaunches(),runningLaunches,'No additional controller launches occur through completion of the same selected run');
+  assert.deepEqual(await fs.readFile(planFile),planBytes,'Active reload preserves the exact canonical real plan');
+  assert.equal((await fs.stat(planFile,{bigint:true})).mtimeNs,planStat.mtimeNs,'Active reload does not regenerate the real plan');
+  context.proof('native-designer-active-reload-completed',{workerPid:worker.pid,sameRunCompleted:true,
+    planSha256:createHash('sha256').update(planBytes).digest('hex'),planUnchanged:true,idleControlsRestored:true,
+    inventorySelectionOrderPreserved:true,additionalControllerLaunches:0});
   await view.locator('#results').click();
   const result = await frame(context, 'button[data-report="suite-result.json"]');
   assert.equal(await result.locator('.empty').count(), 0);
