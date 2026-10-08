@@ -81,6 +81,7 @@ function buttonCoverage(checks){
     'Workspace · actual extension-host reload / owned allocation cleanup':['native-reload-owned-allocation-cleanup'],
     'Pluto · reactive edit / evaluate / autosave / reload':['pluto-reactive-save-reload-close'],
     'Pluto · Launch selected checks / Refresh / Save reports':['pluto-suite-select-launch-save'],
+    'Pluto · measured Makie/WGLMakie figures and point inspection':['pluto-rendered-measured-plots'],
     'Pluto · Launch selected investigation / Refresh':['pluto-investigation-real-run'],
     'Pluto · Cancel investigation':['pluto-cancel-active-worker'],
     'Pluto · Cancel active suite / repeat Cancel / owned allocation cleanup':['pluto-suite-cancel-active-allocation'],
@@ -367,6 +368,7 @@ exports.run = async () => {
         await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
       if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
       else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
+      else if(phase==='pluto-plots')await runCase('native-pluto-rendered-plots',()=>pluto.runPlots(context));
       else if(phase==='mcp-pluto'){
         await runCase('native-mcp-controls',()=>mcp.run(context));
         await runCase('native-pluto-controls',()=>pluto.run(context));

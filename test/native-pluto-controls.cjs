@@ -6,6 +6,7 @@ const net = require('node:net');
 const {createHash} = require('node:crypto');
 const {execFile}=require('node:child_process');
 const execute=require('node:util').promisify(execFile);
+const {inflateSync}=require('node:zlib');
 const {clickStudioAction}=require('./native-studio-controls.cjs');
 
 async function eventually(read, name, timeout = 180000) {
@@ -435,7 +436,82 @@ async function ownedWorkerClose(context,directory){
   }
 }
 
-async function suite(context, directory) {
+function renderedPng(png){
+  assert.equal(png.subarray(0,8).toString('hex'),'89504e470d0a1a0a');
+  const chunks=[];let width,height,channels;
+  for(let at=8;at<png.length;){
+    const length=png.readUInt32BE(at),kind=png.toString('ascii',at+4,at+8),data=png.subarray(at+8,at+8+length);at+=length+12;
+    if(kind==='IHDR'){width=data.readUInt32BE(0);height=data.readUInt32BE(4);assert.equal(data[8],8);assert([2,6].includes(data[9]));channels=data[9]===6?4:3;assert.equal(data[12],0);}
+    if(kind==='IDAT')chunks.push(data);
+  }
+  const raw=inflateSync(Buffer.concat(chunks)),stride=width*channels;
+  assert.equal(raw.length,(stride+1)*height);
+  let previous=Buffer.alloc(stride),colored=0;const colors=new Set();
+  const paeth=(a,b,c)=>{const p=a+b-c,da=Math.abs(p-a),db=Math.abs(p-b),dc=Math.abs(p-c);return da<=db&&da<=dc?a:db<=dc?b:c;};
+  for(let y=0;y<height;y++){
+    const mode=raw[y*(stride+1)],row=Buffer.from(raw.subarray(y*(stride+1)+1,(y+1)*(stride+1)));assert(mode<=4);
+    for(let x=0;x<stride;x++){const a=x>=channels?row[x-channels]:0,b=previous[x],c=x>=channels?previous[x-channels]:0;row[x]=(row[x]+[0,a,b,Math.floor((a+b)/2),paeth(a,b,c)][mode])&255;}
+    for(let x=0;x<stride;x+=channels){const alpha=channels===4?row[x+3]:255;if(alpha===0)continue;const [r,g,b]=row.subarray(x,x+3);colors.add((r>>4)*256+(g>>4)*16+(b>>4));if(Math.max(r,g,b)-Math.min(r,g,b)>25)colored++;}
+    previous=row;
+  }
+  assert(width>=300&&height>=200,'The native figure has a visible viewport');
+  assert(colors.size>20&&colored>100,'Real canvas pixels contain a drawn figure, beyond an empty canvas or flat background');
+  return {width,height,quantizedColors:colors.size,coloredPixels:colored,sha256:createHash('sha256').update(png).digest('hex')};
+}
+
+async function renderedPlots(context,state,selector,completedRoot){
+  const reportsBefore=await fingerprint(completedRoot);
+  const options=await selector.locator('option').evaluateAll(nodes=>nodes.map(node=>({value:node.value,label:node.textContent})));
+  const distribution=options.find(option=>option.value.startsWith('distribution-'));
+  const trajectory=options.find(option=>option.value.startsWith('version-series-'));
+  assert(distribution&&trajectory,'Real measured samples provide distribution and version-series entries');
+  await selector.selectOption(distribution.value);await idle(state.frame);
+  // Inspect the actual running notebook through a user-edited diagnostic cell.
+  // The generated rendering cell and measured bundle remain untouched.
+  const cell=state.frame.locator(`pluto-cell[id="${cellId(state.source,'## Performance curves')}"]`);
+  const editor=cell.locator('pluto-input .cm-editor:not(.cm-ssr-fake) .cm-content[contenteditable="true"]');
+  await cell.scrollIntoViewIfNeeded();if(!await editor.isVisible())await cell.locator('.foldcode').click();
+  await eventually(()=>editor.isVisible(),'The native diagnostic cell unfolds');
+  const diagnostic=`let p = performance_plot(plot_bundle, selected_plot), modules = Dict(k.name => m for (k,m) in Base.loaded_modules)
+    @assert all(haskey(modules,n) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito"))
+    @assert Base.get_extension(modules["PerfCheckerMakie"],:WGLMakieExt) !== nothing
+    f = performance_figure(p)
+    @assert f isa getfield(modules["Makie"],:Figure)
+    info = Dict("selected"=>selected_plot,"kind"=>string(p.kind),"values"=>[row["value"] for row in p.data],"versions"=>[row["version"] for row in p.data],"unit"=>p.options["unit"],"figure"=>string(typeof(f)),"extension"=>true,"providers"=>Dict(n=>Dict("version"=>string(Base.pkgversion(modules[n])),"source"=>pathof(modules[n])) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito")))
+    HTML("<pre id=\\"native-plot-evidence\\" hidden>" * replace(sprint(PerfChecker.JSON.print,info),"&"=>"&amp;","<"=>"&lt;",">"=>"&gt;") * "</pre>")
+end`;
+  await editor.click();await editor.press('ControlOrMeta+A');await editor.pressSequentially(diagnostic);await editor.press('ControlOrMeta+Enter');
+  await ready(state.frame,'Launch selected checks');
+  const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent();return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',360000);
+  const data=await evidence();assert.equal(data.kind,'distribution');assert.equal(data.selected,distribution.value);assert(data.values.length>=2);
+  for(const [name,version] of Object.entries({PerfCheckerMakie:'1.0.0',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'5.2.0'}))assert.equal(data.providers[name].version,version);
+  const canvas=state.frame.locator('pluto-output #offline-figure canvas').first();
+  await canvas.waitFor({state:'visible',timeout:360000});await canvas.scrollIntoViewIfNeeded();
+  const gpu=await canvas.evaluate(node=>{const gl=node.getContext('webgl2')||node.getContext('webgl');if(!gl||gl.isContextLost())return null;const debug=gl.getExtension('WEBGL_debug_renderer_info');return {version:gl.getParameter(gl.VERSION),renderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)};});
+  assert(gpu,'The rendered native canvas has a live WebGL context');
+  const before=await eventually(async()=>renderedPng(await canvas.screenshot()),'The native WebGL figure draws non-empty pixels',180000);
+  const slider=state.frame.getByRole('slider',{name:'Inspect measured point'});
+  const distinct=data.values.findIndex((value,index)=>index>0&&(value!==data.values[0]||data.versions[index]!==data.versions[0]));
+  const selectedIndex=distinct<0?1:distinct;
+  await slider.focus();for(let step=0;step<selectedIndex;step++)await slider.press('ArrowRight');
+  const expected=`Point ${selectedIndex+1}: ${data.values[selectedIndex]} ${data.unit} · ${data.versions[selectedIndex]}`;
+  await eventually(async()=>await state.frame.locator('#point-readout').innerText()===expected,'A real native slider gesture inspects the chosen measured sample');
+  const after=distinct<0?renderedPng(await canvas.screenshot()):await eventually(async()=>{const pixels=renderedPng(await canvas.screenshot());return pixels.sha256!==before.sha256&&pixels;},'Selecting a distinct measured point changes the rendered WebGL highlight');
+  await capture(context,'pluto-rendered-distribution');
+  await selector.selectOption(trajectory.value);await ready(state.frame,'Launch selected checks');
+  const second=await eventually(async()=>{const current=await evidence();return current.selected===trajectory.value&&current;},'The real plot selector regenerates the version-series figure');
+  assert.equal(second.kind,'version_series');
+  await eventually(async()=>{
+    const text=await state.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
+    return match&&Number(match[1])===second.values[0]&&match[2]===second.unit&&match[3]===second.versions[0];
+  },'The newly rendered trajectory inspector identifies its actual measured value');
+  const trajectoryPixels=await eventually(async()=>renderedPng(await state.frame.locator('pluto-output #offline-figure canvas').first().screenshot()),'The selected measured trajectory is visibly drawn');
+  await capture(context,'pluto-rendered-version-series');
+  assert.deepEqual(await fingerprint(completedRoot),reportsBefore,'Plotting and point inspection do not rerun measurements or save reports');
+  context.proof('pluto-rendered-measured-plots',{providerVersions:Object.fromEntries(Object.entries(data.providers).map(([name,item])=>[name,item.version])),extensionLoaded:data.extension,figureType:data.figure,actualMeasuredSamples:data.values.length,selectedKinds:[data.kind,second.kind],webgl:gpu,pixels:{distribution:before,highlight:after,trajectory:trajectoryPixels},pointInteraction:{nativeKeyboard:true,observedReadout:expected,selectedSample:selectedIndex+1,distinctPosition:distinct>=0,canvasMovementQualified:distinct>=0,coincidentSamples:distinct<0?'All (version,value) coordinates coincide; readout verified, no movement claimed':null},reportsUnchanged:true,source:'Actual installed VSIX, generated suite cell, real Julia measurement and native Pluto WebGL; software renderer only'});
+}
+
+async function suite(context, directory, requirePlots=false) {
   const root = path.resolve(context.workspace, context.vscode.workspace.getConfiguration('perfchecker',
     context.vscode.Uri.file(context.workspace)).get('reports', 'perf/results/vscode'));
   const before = await fingerprint(root);
@@ -480,7 +556,10 @@ async function suite(context, directory) {
   const choices = await plots.locator('option').allTextContents();
   assert(choices.length > 0 && !choices.includes('No completed measurements'), 'Actual measured values feed the Pluto plot catalogue');
   const plotted = await state.frame.locator('pluto-cell').filter({hasText: 'Install PerfCheckerMakie and WGLMakie'}).count();
-  if (plotted) {
+  if(requirePlots){
+    assert.equal(plotted,0,'The positive qualification requires the real plot provider');
+    await renderedPlots(context,state,plots,root);
+  }else if (plotted) {
     context.log('pluto-plot-prerequisite', {available: false, reason: 'Install PerfCheckerMakie and WGLMakie in the separate notebook environment'});
   } else {
     assert(await state.frame.locator('canvas').count() > 0, 'An available WGLMakie provider renders an actual plot');
@@ -524,4 +603,15 @@ exports.run = async context => {
     finally {await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession', context.vscode.Uri.file(context.workspace));}
   }
   if (failures.length) throw new AggregateError(failures, 'Actual Pluto controls failed');
+};
+
+exports.runPlots = async context => {
+  assert.equal(process.env.CI,'true','Never use a human VS Code installation');
+  const session=process.env.PERFCHECKER_NATIVE_SESSION;
+  assert(session&&path.isAbsolute(session));
+  assert.equal(await fs.realpath(context.workspace),path.join(await fs.realpath(session),'workspace'));
+  const directory=path.join(context.workspace,'perf','notebooks');await fs.mkdir(directory,{recursive:true});
+  try{await suite(context,directory,true);}
+  catch(error){await capture(context,'pluto-rendered-plots-failed');throw error;}
+  finally{await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));}
 };
