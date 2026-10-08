@@ -19,7 +19,9 @@ async function existingController(context){
   const previous=settings().inspect('runnerProject')?.workspaceFolderValue;
   const invalid='perf/not-installed-controller',selected=path.relative(workspace,controller)||'.';
   const settingsFile=path.join(workspace,'.vscode','settings.json');
-  const folderInput=windowPage.locator('.quick-input-widget input[type="text"][placeholder="Folder path"][aria-label="Folder path - PerfChecker · Choose controller project"]');
+  const folderDialog=windowPage.locator('.quick-input-widget').filter({
+    has:windowPage.locator('.quick-input-title').filter({hasText:/^PerfChecker · Choose controller project$/})});
+  const folderInput=folderDialog.locator('input[type="text"]');
   let primaryError;
   try{
     await files.update('simpleDialog.enable',true,vscode.ConfigurationTarget.Global);
@@ -37,7 +39,13 @@ async function existingController(context){
       assert(await picker.locator('.monaco-list-row').filter({hasText:name}).isVisible());
     if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(2500);
     await picker.locator('.monaco-list-row').filter({hasText:'Use an existing controller'}).click();
-    // VS Code reuses this widget for the QuickPick and the asynchronous folder dialog.
+    // VS Code reuses this widget for the QuickPick and folder dialog; 1.96
+    // has no Folder-path placeholder. The exact owning title identifies both.
+    await folderDialog.waitFor({state:'visible',timeout:60000});
+    context.log('native-controller-folder-dialog',{title:await folderDialog.locator('.quick-input-title').innerText(),
+      inputs:await folderInput.evaluateAll(nodes=>nodes.map(node=>({ariaLabel:node.getAttribute('aria-label'),
+        placeholder:node.getAttribute('placeholder'),readOnly:node.readOnly,disabled:node.disabled}))),
+      selectorContract:'Official SimpleFileDialog title; placeholder not required'});
     await folderInput.waitFor({state:'visible',timeout:60000});
     assert(await folderInput.isEditable(),'The actual controller folder dialog accepts a path');
     await folderInput.fill(controller+path.sep);
