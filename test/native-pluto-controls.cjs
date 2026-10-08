@@ -769,8 +769,10 @@ end`;
   const returnedDocument=await plotDocument(state,secondDocument);
   assert.notEqual(returnedDocument.token,firstDocument.token,'Even a cached plot creates a new document identity');
   assert.equal(returnedDocument.htmlSha256,firstDocument.htmlSha256,'The unchanged cached HTML is reused without patching queues or providers');
-  await eventually(async()=>await returnedDocument.frame.locator('#point-readout').innerText()===`Point 1: ${data.values[0]} ${data.unit} · ${data.versions[0]}`,
-    'The returned document starts with its own initial inspector state');
+  await eventually(async()=>{
+    const text=await returnedDocument.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
+    return match&&Number(match[1])===data.values[0]&&match[2]===data.unit&&match[3]===data.versions[0];
+  },'The returned document starts with its own initial inspector state');
   const returnedPixels=await drawnCanvas(context,returnedDocument.canvas,'distribution-returned');
   await frontend.snapshot('distribution-returned');
   // Keep the allocation plot, including legitimate coincident samples. A
