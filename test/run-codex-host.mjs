@@ -60,8 +60,17 @@ try{
   const privateEnv={...process.env,DISPLAY:display,XAUTHORITY:''};
   const vscodeExecutablePath=await sdk.downloadAndUnzipVSCode({version:'1.141.0',cachePath:path.join(session,'vscode'),timeout:30000});
   assert(vscodeExecutablePath.startsWith(session+path.sep),'Use only the temporary VS Code download');
+  const application=path.join(path.dirname(vscodeExecutablePath),'resources','app');
+  assert.equal(JSON.parse(await fs.readFile(path.join(application,'package.json'),'utf8')).version,'1.141.0');
+  const cliSource=await fs.readFile(path.join(application,'out','cli.js'),'utf8');
+  const privateDirectoryFlags=['shared-data-dir','agent-plugins-dir','agents-user-data-dir','agents-extensions-dir'];
+  for(const flag of privateDirectoryFlags)assert(cliSource.includes(`"${flag}":`),`The actual host CLI must support ${flag}`);
+  const privateDirectories=privateDirectoryFlags.map(flag=>[flag,path.join(profile,flag)]);
+  await Promise.all(privateDirectories.map(([,directory])=>fs.mkdir(directory,{recursive:true})));
+  const privateProfile=[`--user-data-dir=${profile}`,`--extensions-dir=${extensions}`,
+    ...privateDirectories.map(([flag,directory])=>`--${flag}=${directory}`)];
   const [cli,...cliArgs]=sdk.resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);
-  await execute(cli,[...cliArgs,'--user-data-dir',profile,'--extensions-dir',extensions,'--install-extension',archive],{env:privateEnv,timeout:120000});
+  await execute(cli,[...cliArgs,...privateProfile,'--install-extension',archive],{env:privateEnv,timeout:120000});
   const portServer=createServer();await new Promise((resolve,reject)=>{portServer.once('error',reject);portServer.listen(0,'127.0.0.1',resolve);});
   const port=portServer.address().port;await new Promise(resolve=>portServer.close(resolve));
   // VS Code requires a development location to execute its test runner. This
@@ -71,7 +80,7 @@ try{
   assert(!expired,'The local runner exceeded its eighteen-minute total deadline before launch');
   await sdk.runTests({vscodeExecutablePath,extensionDevelopmentPath:driver,extensionTestsPath:path.join(client,'test','codex-vscode-host.cjs'),
     launchArgs:[root,'--new-window','--disable-workspace-trust','--skip-welcome','--skip-release-notes','--disable-gpu',
-      `--user-data-dir=${profile}`,`--extensions-dir=${extensions}`,`--remote-debugging-port=${port}`,'--remote-debugging-address=127.0.0.1'],
+      ...privateProfile,`--remote-debugging-port=${port}`,'--remote-debugging-address=127.0.0.1'],
     extensionTestsEnv:{DISPLAY:display,XAUTHORITY:'',PERFCHECKER_HOST_RESULT:path.join(session,'result.json'),
       PERFCHECKER_HOST_SESSION:session,PERFCHECKER_HOST_ARCHIVE:archive,PERFCHECKER_HOST_ARCHIVE_EXTENSION:archiveExtension,
       PERFCHECKER_HOST_VSIX_SHA:vsixSha,PERFCHECKER_HOST_CDP_PORT:String(port),PERFCHECKER_HOST_BASELINE_BYTES:String(fixture.baselineBytes),
