@@ -15,11 +15,24 @@ async function prerequisites(context){
   const {vscode,workspace,windowPage,proof}=context,uri=vscode.Uri.file(workspace),settings=vscode.workspace.getConfiguration('perfchecker',uri);
   const tracked=[path.join(context.controller,'Project.toml'),path.join(context.controller,'Manifest.toml'),path.join(workspace,'.vscode','settings.json')];
   const hashes=async()=>Object.fromEntries(await Promise.all(tracked.map(async file=>[file,hash(await fs.readFile(file))])));const before=await hashes();
-  const guided=vscode.commands.executeCommand('perfchecker.initialize',uri);
-  const picker=windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:180000});
-  assert((await picker.innerText()).includes('Create controller environment'));await windowPage.keyboard.press('Escape');await guided;
-  assert.deepEqual(await hashes(),before,'The incompatible guided setup is declined without changing the registered controller or settings');
-  proof('native-general100-guided-prerequisite',{minimum:'1.0.1',actualCore:context.core,nativePicker:true,upgradeNotAccepted:true,bytesPreserved:true,positiveSetupQualified:false});
+  const files=vscode.workspace.getConfiguration('files',uri),oldDialog=files.inspect('simpleDialog.enable')?.globalValue;
+  let guidedResult;
+  try{
+    await files.update('simpleDialog.enable',true,vscode.ConfigurationTarget.Global);
+    // Observe rejection from creation: a real failed version check must not become unhandled.
+    const guided=Promise.resolve(vscode.commands.executeCommand('perfchecker.initialize',uri)).then(()=>({returned:true}),error=>({error}));
+    const picker=windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:180000});
+    await picker.locator('.monaco-list-row').filter({hasText:'Use an existing controller'}).click();
+    const dialog=windowPage.locator('.quick-input-widget').filter({has:windowPage.locator('.quick-input-title').filter({hasText:/^PerfChecker · Choose controller project$/})});
+    const input=dialog.locator('input[type="text"]');await input.waitFor({state:'visible',timeout:60000});
+    await input.fill(context.controller+path.sep);await input.press('Enter');await input.waitFor({state:'hidden',timeout:60000});
+    guidedResult=await guided;
+    assert(guidedResult.error,'Choosing the real registered100 controller must fail its actual minimum-version check');
+    assert.match(String(guidedResult.error),/requires registered PerfChecker 1\.0\.1/);
+  }finally{await files.update('simpleDialog.enable',oldDialog,vscode.ConfigurationTarget.Global);}
+  assert.deepEqual(await hashes(),before,'Real guided version refusal changes neither the registered controller nor workspace settings');
+  proof('native-general100-guided-prerequisite',{minimum:'1.0.1',actualCore:context.core,nativeExistingControllerPicker:true,
+    actualVersionCheckRejected:true,error:String(guidedResult.error),upgradeNotAccepted:true,bytesPreserved:true,positiveSetupQualified:false});
   const notebook=path.join(workspace,'perf','notebooks','general100-prerequisite.jl');
   const requested=vscode.commands.executeCommand('perfchecker.newNotebook',vscode.Uri.file(notebook),{kind:'suite'});
   await windowPage.getByRole('button',{name:'Install Pluto environment',exact:true}).waitFor({timeout:180000});
@@ -47,10 +60,23 @@ exports.run=async context=>{
   const reports=path.join(workspace,'perf','results','vscode');
   await eventually(async()=>{const file=await fs.readFile(path.join(reports,'suite-result.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});if(!file)return false;let value;try{value=JSON.parse(file);}catch(error){if(error instanceof SyntaxError)return false;throw error;}return value.runs.length===1&&value.runs[0].status==='pass'&&!(await designer.locator('#run').isDisabled());},'General100 completes the single real selected suite',360000);
   await vscode.commands.executeCommand('perfchecker.openOutput');const output=await findFrame('button[data-report="suite-result.json"]');
-  assert(await output.locator('[data-result-item]').count()>0);const points=output.locator('.distribution .sample');assert(await points.count()>0);await points.first().focus();
-  assert((await output.locator('.distribution-view .plot-detail').first().innerText()).trim().length>0);
-  const before=await fs.readFile(path.join(reports,'version-series.json'));await output.locator('.distribution-toolbar button').filter({hasText:/^Fit$/}).first().click();assert.deepEqual(await fs.readFile(path.join(reports,'version-series.json')),before);
-  proof('native-general100-suite-output',{selectedChecks:1,collector:'BenchmarkTools',realRunSelection:true,realSavedOutput:true,pointFocus:true,fit:true,reportBytesPreserved:true,noComparisonGainClaimed:true});
+  assert(await output.locator('[data-result-item]').count()>0);
+  const temporal=output.locator('.chart-card').filter({has:output.locator('header strong',{hasText:/^julia\.wall\.time distribution$/})}).first().locator('.distribution-view');
+  assert.equal(await temporal.count(),1,'Use the actual timing distribution, not constant allocation or GC measurements');
+  const full={min:Number(await temporal.getAttribute('data-full-min')),max:Number(await temporal.getAttribute('data-full-max'))};
+  assert(full.max>full.min,'The actual temporal samples must have nonzero extent');
+  const range=async()=>({min:Number(await temporal.locator('svg').getAttribute('data-current-min')),max:Number(await temporal.locator('svg').getAttribute('data-current-max'))});
+  const fit=temporal.getByRole('button',{name:'Fit all samples',exact:true}),zoom=temporal.getByRole('button',{name:'Zoom in',exact:true});
+  assert.deepEqual(await range(),full);assert(await fit.isDisabled());assert(await zoom.isEnabled());
+  const points=temporal.locator('.sample'),pointCount=await points.count();assert(pointCount>1);await points.first().focus();
+  assert((await temporal.locator('.plot-detail').innerText()).includes('sorted sample'));
+  const before=await fs.readFile(path.join(reports,'version-series.json'));
+  await zoom.click();const zoomed=await eventually(async()=>{const current=await range();return current.max-current.min<full.max-full.min&&await fit.isEnabled()&&current;},'Real temporal Zoom narrows the range and enables Fit');
+  assert(zoomed.min>=full.min&&zoomed.max<=full.max);await fit.click();
+  await eventually(async()=>{const current=await range();return current.min===full.min&&current.max===full.max&&await fit.isDisabled();},'Native Fit restores the exact initial full temporal range');
+  assert.equal(await points.count(),pointCount);assert.deepEqual(await fs.readFile(path.join(reports,'version-series.json')),before);
+  proof('native-general100-suite-output',{selectedChecks:1,collector:'BenchmarkTools',realRunSelection:true,realSavedOutput:true,
+    metric:'julia.wall.time',pointFocus:true,pointCount,fullRange:full,zoomedRange:zoomed,fitRestoresExactFullRange:true,reportBytesPreserved:true,noComparisonGainClaimed:true});
   await require('./native-mcp-controls.cjs').run(context,{general100:true});
   assert.deepEqual(await controllerHashes(),controllerBefore,'Every native compatibility action preserves the pinned registered controller bytes');
   context.proof('native-general100-controller-preserved',{core:context.core,hashes:controllerBefore,noUpgrade:true,noGitFallback:true});
