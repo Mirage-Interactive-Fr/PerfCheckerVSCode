@@ -81,10 +81,13 @@ if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('real authenticated Codex 
       const version=await inspectCodex(process.env.PERFCHECKER_TEST_CODEX,root);
       connector=await new CodexConnector({cli:process.env.PERFCHECKER_TEST_CODEX,root,timeoutMs:120000}).start();
       const call=async(method,params,signal)=>{
-        const response=await fetch(connector.endpoint,{method:'POST',signal,headers:{'Content-Type':'application/json',Authorization:`Bearer ${connector.token}`,'MCP-Protocol-Version':'2026-07-28'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
+        const response=await fetch(connector.endpoint,{method:'POST',signal,headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',
+          Authorization:`Bearer ${connector.token}`,'MCP-Protocol-Version':'2026-07-28','Mcp-Method':method,...(method==='tools/call'?{'Mcp-Name':params.name}:{})},
+          body:JSON.stringify({jsonrpc:'2.0',id:1,method,params:{...params,_meta:{'io.modelcontextprotocol/protocolVersion':'2026-07-28',
+            'io.modelcontextprotocol/clientInfo':{name:'PerfChecker authenticated qualification',version:'1'},'io.modelcontextprotocol/clientCapabilities':{}}}})});
         const result=(await response.json()).result;assert.ok(!result.isError,result.content?.[0]?.text);return result;
       };
-      await call('initialize',{protocolVersion:'2026-07-28'});assert.equal((await call('tools/list')).tools.length,2);
+      assert((await call('server/discover')).supportedVersions.includes('2026-07-28'));assert.equal((await call('tools/list')).tools.length,2);
       const juliaProject=process.env.PERFCHECKER_TEST_JULIA_PROJECT;
       const julia=process.env.PERFCHECKER_TEST_JULIA||'julia';
       const juliaEnvironment={...process.env,PERFCHECKER_UUID:'6309bf6b-a531-4b08-891e-8ee981e5c424'};
@@ -181,8 +184,10 @@ if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('real Codex Julia implemen
       await applyImplementation(proposal);assert.equal(await probe(root),candidateBytes);assert.notEqual(await readFile(file,'utf8'),source);
       await applyImplementation(proposal,true);assert.equal(await readFile(file,'utf8'),source);assert.deepEqual(await readFile(path.join(root,'.git','index')),index);assert.equal(await git(root,'rev-parse','HEAD'),head);
       const abort=new AbortController();
-      const pending=fetch(connector.endpoint,{method:'POST',signal:abort.signal,headers:{'Content-Type':'application/json',Authorization:`Bearer ${connector.token}`,'MCP-Protocol-Version':'2026-07-28'},
-        body:JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'ask_perfchecker',arguments:{prompt:'Advice only, no tools: discuss the remaining uncertainty in this Julia sum_squares optimization in detail.'}}})});
+      const pending=fetch(connector.endpoint,{method:'POST',signal:abort.signal,headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',
+        Authorization:`Bearer ${connector.token}`,'MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/call','Mcp-Name':'ask_perfchecker'},
+        body:JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'ask_perfchecker',arguments:{prompt:'Advice only, no tools: discuss the remaining uncertainty in this Julia sum_squares optimization in detail.'},
+          _meta:{'io.modelcontextprotocol/protocolVersion':'2026-07-28','io.modelcontextprotocol/clientCapabilities':{}}}})});
       const rejected=assert.rejects(pending,/abort|cancel|fetch/i);
       const until=Date.now()+20000;while(!connector.children.size&&Date.now()<until)await new Promise(resolve=>setTimeout(resolve,20));
       assert(connector.children.size>0);const child=[...connector.children][0];let events='';child.stdout.on('data',chunk=>events+=chunk);

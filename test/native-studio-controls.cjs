@@ -565,7 +565,17 @@ async function testFlameControls(context,view) {
   assert.deepEqual(await expectedGeometry(),beforeReversed,'Reversed user bounds leave the previous valid viewport unchanged');
   await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
   await start.fill('10');await end.fill('90');await end.press('Tab');
-  await eventually(async()=>await svg.getAttribute('data-current-min')==='0.1'&&await svg.getAttribute('data-current-max')==='0.9',
+  // Normalized bounds may differ by a few floating-point ULPs, never by a displayed percentage.
+  const rangeTolerance=Number.EPSILON*8;
+  const explicitRange=await eventually(async()=>{
+    const actual={from:Number(await svg.getAttribute('data-current-min')),to:Number(await svg.getAttribute('data-current-max')),
+      start:await start.inputValue(),end:await end.inputValue()};
+    assert(Math.abs(actual.from-.1)<=rangeTolerance&&Math.abs(actual.to-.9)<=rangeTolerance,
+      `Expected normalized bounds 0.1–0.9 within ${rangeTolerance}; received ${JSON.stringify(actual)}`);
+    assert.equal(actual.start,'10',`Start must be readable: ${JSON.stringify(actual)}`);
+    assert.equal(actual.end,'90',`End must be readable: ${JSON.stringify(actual)}`);
+    return actual;
+  },
     'A valid explicit percentage range changes only the viewport');
   await expectedGeometry();await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
   await graph.locator('.flame-range summary').click();
@@ -576,7 +586,8 @@ async function testFlameControls(context,view) {
   }));assert(labels.every(label=>label.length<=label.available+1e-6),'Native frame labels fit their visible weighted rectangle');
   context.proof('native-flame-exact-geometry-and-controls',{graphs:await graphs.count(),frames:model.frames.length,
     inspected:narrow.index,fullCallPath:true,exactWeights:true,noFrameWidthFloor:true,nativeZoomPanFit:true,
-    modelSha256:createHash('sha256').update(payload).digest('hex'),fittingLabels:labels.length,invalidPercentageRangesRejected:5});
+    modelSha256:createHash('sha256').update(payload).digest('hex'),fittingLabels:labels.length,invalidPercentageRangesRejected:5,
+    explicitPercentageRange:{...explicitRange,normalizedTolerance:rangeTolerance}});
   await testFlamePresentation(context,view,graph);
 }
 

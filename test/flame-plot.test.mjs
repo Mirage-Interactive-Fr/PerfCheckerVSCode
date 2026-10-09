@@ -1,10 +1,33 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {performance} from 'node:perf_hooks';
-import {flameModel, flameFramePath, flameGraph, profileGroups} from '../dist/flame-plot.js';
+import {flameModel, flameFramePath, flameGraph, profileGroups, flameViewportRange, flameViewportPercent} from '../dist/flame-plot.js';
 
 const observation=(stack,value,extra={})=>({case_id:'profile-case',target_id:'v1',metric:'julia.profile.samples',
   measurement_definition:'julia-profile-v1',unit:'1',value,attributes:{stack,...extra}});
+
+test('explicit viewport bounds stay exact and display rounding stays separate',()=>{
+  assert.deepEqual(flameViewportRange(.1,1),[.1,1],
+    'Editing Start to 10 must not clamp it to 1-(1-.1)');
+  assert.deepEqual(flameViewportRange(.1,.9),[.1,.9]);
+  assert.deepEqual(flameViewportRange(.8,1),[.8,1]);
+  assert.deepEqual(flameViewportRange(0,1),[0,1]);
+  for(const end of [1e-100,Number.MIN_VALUE])assert.deepEqual(flameViewportRange(0,end),[0,1e-6],
+    'Manual subnormal ranges retain the minimum span, preventing infinite SVG coordinates');
+  for(const range of [[-.2,.3],[.7,1.2],[-1,2]]){
+    const [from,to]=flameViewportRange(...range);
+    assert(from>=0&&to<=1&&to>from);
+    assert(Math.abs(to-from-Math.min(1,range[1]-range[0]))<Number.EPSILON*2);
+  }
+  for(const range of [[NaN,1],[0,Infinity],[.9,.1],[.1,.1]])assert.equal(flameViewportRange(...range),undefined);
+  assert.equal(flameViewportPercent(.09999999999999998),'10');
+  assert.equal(flameViewportPercent(.1),'10');assert.equal(flameViewportPercent(.9),'90');
+  assert.equal(flameViewportPercent(.30000000000000004),'30');
+  assert.equal(flameViewportPercent(1e-6),'0.0001');
+  const range=flameViewportRange(.123456789012345,.9),saved=[...range];
+  for(const bound of range)flameViewportPercent(bound);
+  assert.deepEqual(range,saved,'Readable percentages never replace the numerical viewport bounds');
+});
 
 test('inclusive geometry preserves sibling shares and separate call paths',()=>{
   const rows=[observation(['entry','hot'],3),observation(['entry','cold'],1),observation(['other','hot'],1)];

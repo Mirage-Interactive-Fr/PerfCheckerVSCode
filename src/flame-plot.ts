@@ -111,6 +111,20 @@ export function flameFramePath(model: FlameModel, index: number): string[] {
   return path.reverse();
 }
 
+/** Preserve renderable bounds exactly; retain the minimum viewport span for every input. */
+export function flameViewportRange(start: number, end: number, minimumWidth = 1e-6): [number, number] | undefined {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || !(end > start)) return;
+  if (start >= 0 && end <= 1 && end-start >= minimumWidth) return [start, end];
+  const span = Math.min(1, Math.max(minimumWidth, end-start));
+  const from = Math.max(0, Math.min(start, 1-span));
+  return [from, Math.min(1, from+span)];
+}
+
+/** Display rounding never feeds back into the viewport or measured frame coordinates. */
+export function flameViewportPercent(value: number): string {
+  return String(Number((value*100).toPrecision(12)));
+}
+
 export function flameGraph(observations: ProfileObservation[], id: string): string {
   if (!observations.length) return '';
   const model = flameModel(observations);
@@ -142,6 +156,7 @@ export const flameChartStyle = String.raw`
 
 export const flameChartScript = String.raw`
 (() => {
+  const viewportRange=${flameViewportRange.toString()},viewportPercent=${flameViewportPercent.toString()};
   for (const view of document.querySelectorAll('.flame-view')) {
     const model=JSON.parse(view.dataset.flame),svg=view.querySelector('svg.flame'),viewport=view.querySelector('.flame-wrap');
     const frames=[...svg.querySelectorAll('.flame-node')],detail=document.getElementById(view.dataset.detailTarget);
@@ -194,16 +209,20 @@ export const flameChartScript = String.raw`
       // Batch DOM writes, then measurements, then presentation writes: no layout per frame.
       for(const item of labels){item.visible=item.available>0&&item.label.getComputedTextLength()<=item.available;item.ink=item.visible?foregroundInk(item.group):undefined;}
       for(const item of labels){item.label.style.display=item.visible?'':'none';if(item.ink)item.label.style.fill=item.ink;}
-      for(const input of view.querySelectorAll('[data-flame-bound]'))input.value=String((input.dataset.flameBound==='min'?from:to)*100);
+      const startPercent=viewportPercent(from),endPercent=viewportPercent(to),distinct=Number(startPercent)<Number(endPercent);
+      for(const input of view.querySelectorAll('[data-flame-bound]')){
+        const isStart=input.dataset.flameBound==='min';
+        input.value=distinct?(isStart?startPercent:endPercent):String((isStart?from:to)*100);
+      }
       for(const button of view.querySelectorAll('[data-flame-action]')){
         const action=button.dataset.flameAction;
         button.disabled=(action==='in'&&span<=minimumWidth)||(action==='left'&&from===0)||(action==='right'&&to===1)||(['out','fit'].includes(action)&&from===0&&to===1);
       }
     };
     const setRange=(start,end)=>{
-      if(!Number.isFinite(start)||!Number.isFinite(end)||!(end>start)){error.textContent='Enter a finite start below the end.';render();return false;}
-      const span=Math.min(1,Math.max(minimumWidth,end-start));from=Math.max(0,Math.min(start,1-span));to=from+span;
-      if(span>=1){from=0;to=1;}if(1-to<Number.EPSILON*4)to=1;if(from<Number.EPSILON*4)from=0;
+      const range=viewportRange(start,end,minimumWidth);
+      if(!range){error.textContent='Enter a finite start below the end.';render();return false;}
+      [from,to]=range;
       error.textContent='';render();return true;
     };
     const inspect=(index,reveal)=>{
@@ -225,7 +244,8 @@ export const flameChartScript = String.raw`
       if(!start.trim()||!end.trim()||!Number.isFinite(Number(start))||!Number.isFinite(Number(end))||Number(start)<0||Number(end)>100||Number(end)<=Number(start)){
         error.textContent='Enter a start and end from 0 to 100, with the start below the end.';render();return;
       }
-      setRange(Number(start)/100,Number(end)/100);
+      // Reuse the untouched numeric bound, rather than reparsing its rounded display.
+      setRange(input.dataset.flameBound==='min'?Number(start)/100:from,input.dataset.flameBound==='max'?Number(end)/100:to);
     });
     indexInput.addEventListener('change',()=>inspect(Number(indexInput.value),true));slider.addEventListener('input',()=>inspect(Number(slider.value),true));
     const frameFor=event=>event.target.closest?.('.flame-node');

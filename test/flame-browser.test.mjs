@@ -65,6 +65,32 @@ test('the production flame renderer exposes thin, coincident and deep frames at 
     assert.equal(await graph.locator('svg').getAttribute('data-current-max'),'1');
     assert.equal(await graph.getAttribute('data-flame'),payload);
     assert.deepEqual(await exactGeometry(graph),originalGeometry);
+    await graph.locator('.flame-range summary').tap();
+    const start=graph.locator('[data-flame-bound="min"]'),end=graph.locator('[data-flame-bound="max"]');
+    await start.fill('10');await end.fill('90');await end.press('Tab');
+    const range=await graph.locator('svg').evaluate(svg=>({from:Number(svg.dataset.currentMin),to:Number(svg.dataset.currentMax)}));
+    assert(Math.abs(range.from-.1)<=Number.EPSILON*8&&Math.abs(range.to-.9)<=Number.EPSILON*8,JSON.stringify(range));
+    assert.equal(await start.inputValue(),'10');assert.equal(await end.inputValue(),'90');
+    await exactGeometry(graph);
+    await start.fill('12.3456789012345');await start.press('Tab');
+    const exactStart=Number('12.3456789012345')/100;
+    assert.equal(await start.inputValue(),'12.3456789012');
+    await end.fill('89.12345678901234');await end.press('Tab');
+    assert.equal(Number(await graph.locator('svg').getAttribute('data-current-min')),exactStart,
+      'Editing End must retain the exact numerical Start, independently of its rounded display');
+    await exactGeometry(graph);
+    await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).tap();
+    assert.deepEqual(await exactGeometry(graph),originalGeometry);
+    await end.fill('1e-100');await end.press('Tab');
+    assert.equal(Number(await graph.locator('svg').getAttribute('data-current-min')),0);
+    assert.equal(Number(await graph.locator('svg').getAttribute('data-current-max')),1e-6);
+    assert.equal(await end.inputValue(),'0.0001');
+    const tinyGeometry=await exactGeometry(graph);
+    assert(tinyGeometry.every(frame=>Number.isFinite(frame.x)&&Number.isFinite(frame.width)),
+      'A tiny manual End must retain the minimum span and finite SVG geometry');
+    await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).tap();
+    assert.deepEqual(await exactGeometry(graph),originalGeometry);
+    await graph.locator('.flame-range summary').tap();
     await capture('controls',graph.locator('.flame-toolbar'));
     const geometry=await graph.evaluate(node=>({scrollWidth:node.scrollWidth,clientWidth:node.clientWidth,
       overflowing:[...node.querySelectorAll('*')].filter(item=>item.getBoundingClientRect().right>node.getBoundingClientRect().right+1)

@@ -7,6 +7,9 @@ import * as path from 'node:path';
 import {spawnWindowsOwnedProcess} from './windowsOwnedProcess';
 
 const revisions = ['2026-07-28', '2025-11-25'];
+const serverInfo = {name: 'PerfChecker local Codex connector', version: '1.0.1'};
+const object = (value: unknown): value is Record<string, any> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
 const tools = [
   {name: 'ask_perfchecker', description: 'Ask the locally authenticated Codex CLI for read-only advice.',
     inputSchema: {type: 'object', properties: {prompt: {type: 'string'}}, required: ['prompt'], additionalProperties: false}},
@@ -157,28 +160,76 @@ export class CodexConnector {
     const controller = new AbortController(); this.requests.add(controller);
     const bodyDeadline = setTimeout(() => {controller.abort(); request.destroy();}, 10000);
     response.on('close', () => {if (!response.writableEnded) controller.abort();});
-    let id: unknown;
-    const send = (result: unknown) => {
+    let id: unknown, modern = false;
+    const send = (result: Record<string, unknown>) => {
       if (response.destroyed) return;
-      response.writeHead(200, {'Content-Type': 'application/json'}); response.end(JSON.stringify({jsonrpc: '2.0', id, result}));
+      response.writeHead(200, {'Content-Type': 'application/json'}); response.end(JSON.stringify({jsonrpc: '2.0', id,
+        result: modern ? {resultType: 'complete', _meta: {'io.modelcontextprotocol/serverInfo': serverInfo}, ...result} : result}));
+    };
+    const reject = (code: number, message: string, status = 400, data?: unknown) => {
+      if (response.destroyed) return;
+      response.writeHead(status, {'Content-Type': 'application/json'}); response.end(JSON.stringify({jsonrpc: '2.0',
+        id: id ?? null, error: {code, message, ...(data === undefined ? {} : {data})}}));
     };
     try {
       const chunks: Buffer[] = []; let bytes = 0;
       for await (const chunk of request) {bytes += chunk.length; if (bytes > 250000) throw new Error('Local Codex connector request exceeded 250 KB.'); chunks.push(Buffer.from(chunk));}
       clearTimeout(bodyDeadline);
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')); id = body.id;
-      if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') throw new Error('Invalid MCP request.');
-      if (body.method === 'notifications/initialized') {response.writeHead(202); response.end(); return;}
-      if (body.method === 'initialize') {
-        if (!revisions.includes(body.params?.protocolVersion)) throw new Error('Unsupported MCP protocol revision.');
-        send({protocolVersion: body.params.protocolVersion, capabilities: {tools: {}}, serverInfo: {name: 'PerfChecker local Codex connector', version: '1.0.0'}});
-      } else {
-        if (!revisions.includes(String(request.headers['mcp-protocol-version'] ?? ''))) throw new Error('Unsupported MCP protocol revision.');
-        if (body.method === 'tools/list') send({tools});
-        else if (body.method === 'tools/call') send(await this.invoke(body.params?.name, body.params?.arguments ?? {}, controller.signal));
-        else throw new Error('Unsupported MCP method.');
+      let body: unknown;
+      try {body = JSON.parse(Buffer.concat(chunks).toString('utf8'));}
+      catch {reject(-32700, 'Invalid JSON.'); return;}
+      if (!object(body) || body.jsonrpc !== '2.0' || typeof body.method !== 'string') {
+        reject(-32600, 'Invalid MCP request.'); return;
       }
-    } catch (error) {send({isError: true, content: [{type: 'text', text: String(error)}]});}
+      if (typeof body.id === 'string' || (typeof body.id === 'number' && Number.isInteger(body.id))) id = body.id;
+      const version = String(request.headers['mcp-protocol-version'] ?? '');
+      if (body.method === 'notifications/initialized' && body.id === undefined && version === '2025-11-25') {
+        response.writeHead(202); response.end(); return;
+      }
+      if (id === undefined) {reject(-32600, 'A request requires a string or integer ID.'); return;}
+      if (body.params !== undefined && !object(body.params)) {reject(-32602, 'MCP params must be an object.'); return;}
+      const params = body.params ?? {};
+      // Legacy initialization is separate from modern stateless per-request metadata.
+      if (body.method === 'initialize' && params.protocolVersion === '2025-11-25' && (!version || version === '2025-11-25')) {
+        send({protocolVersion: '2025-11-25', capabilities: {tools: {}}, serverInfo}); return;
+      }
+      if (!version) {reject(-32020, 'Missing MCP-Protocol-Version header.'); return;}
+      if (version !== '2025-11-25') {
+        const meta = params._meta;
+        if (!object(meta) || typeof meta['io.modelcontextprotocol/protocolVersion'] !== 'string' ||
+          !object(meta['io.modelcontextprotocol/clientCapabilities'])) {
+          reject(-32602, 'Modern MCP requests require protocolVersion and clientCapabilities metadata.'); return;
+        }
+        const clientInfo = meta['io.modelcontextprotocol/clientInfo'];
+        if (clientInfo !== undefined && (!object(clientInfo) || typeof clientInfo.name !== 'string' || typeof clientInfo.version !== 'string')) {
+          reject(-32602, 'MCP clientInfo must provide a name and version.'); return;
+        }
+        const encodedName = request.headers['mcp-name'];
+        let name = encodedName;
+        if (typeof encodedName === 'string' && encodedName.startsWith('=?base64?') && encodedName.endsWith('?=')) {
+          const encoded = encodedName.slice(9, -2), decoded = Buffer.from(encoded, 'base64');
+          if (decoded.toString('base64') !== encoded) {reject(-32020, 'Invalid Mcp-Name header encoding.'); return;}
+          name = decoded.toString('utf8');
+        }
+        if (meta['io.modelcontextprotocol/protocolVersion'] !== version || request.headers['mcp-method'] !== body.method ||
+          (body.method === 'tools/call' && (typeof params.name !== 'string' || name !== params.name))) {
+          reject(-32020, 'MCP headers do not match the request body.'); return;
+        }
+      }
+      if (!revisions.includes(version)) {reject(-32022, 'Unsupported MCP protocol revision.', 400, {supported: revisions, requested: version}); return;}
+      modern = version === '2026-07-28';
+      if (body.method === 'server/discover' && modern) {
+        send({supportedVersions: revisions, capabilities: {tools: {}}, ttlMs: 0, cacheScope: 'private'});
+      } else if (body.method === 'tools/list') {
+        send({tools, ...(modern ? {ttlMs: 0, cacheScope: 'private'} : {})});
+      } else if (body.method === 'tools/call') {
+        if (!tools.some(tool => tool.name === params.name) || !object(params.arguments ?? {})) {
+          reject(-32602, 'Select an available MCP tool and an arguments object.'); return;
+        }
+        try {send(await this.invoke(params.name, params.arguments ?? {}, controller.signal));}
+        catch (error) {send({isError: true, content: [{type: 'text', text: String(error)}]});}
+      } else reject(-32601, 'Unsupported MCP method.', modern ? 404 : 400);
+    } catch {reject(-32600, 'Invalid or oversized MCP request.');}
     finally {clearTimeout(bodyDeadline); this.requests.delete(controller);}
   }
   async dispose() {

@@ -48,14 +48,79 @@ if(args[args.indexOf('--sandbox')+1]==='workspace-write')fs.writeFileSync(path.j
 fs.writeFileSync(args[args.indexOf('--output-last-message')+1],prompt.includes('OVERSIZED')?'x'.repeat(64001):'Review the allocation evidence and verify the suggested changes.');});`);
   try {await run(root);} finally {delete process.env.PERFCHECKER_FAKE_AUTH; await rm(root, {recursive: true, force: true});}
 }
-async function call(connector, method, params, signal) {
+const metadata=version=>({'io.modelcontextprotocol/protocolVersion':version,
+  'io.modelcontextprotocol/clientInfo':{name:'Connector contract test',version:'1'},
+  'io.modelcontextprotocol/clientCapabilities':{}});
+async function request(connector, method, params = {}, {signal,version='2026-07-28',headers={},body} = {}) {
   const response = await fetch(connector.endpoint, {method: 'POST', signal,
-    headers: {'Content-Type': 'application/json', Authorization: `Bearer ${connector.token}`, 'MCP-Protocol-Version': '2026-07-28'},
-    body: JSON.stringify({jsonrpc: '2.0', id: 1, method, params})});
-  return (await response.json()).result;
+    headers: {'Content-Type': 'application/json', Accept:'application/json, text/event-stream',
+      Authorization: `Bearer ${connector.token}`, 'MCP-Protocol-Version': version,
+      ...(version==='2025-11-25'?{}:{'Mcp-Method':method,...(method==='tools/call'?{'Mcp-Name':params.name}:{})}),...headers},
+    body: body ?? JSON.stringify({jsonrpc: '2.0', id: 1, method,
+      params:version==='2025-11-25'?params:{...params,_meta:metadata(version)}})});
+  return {status:response.status,message:await response.json()};
+}
+async function call(connector, method, params, signal) {
+  const {status,message}=await request(connector,method,params,{signal});
+  assert.equal(status,200,JSON.stringify(message));assert.equal(message.error,undefined,JSON.stringify(message));
+  assert.equal(message.result.resultType,'complete');
+  return message.result;
 }
 const tool = (connector, name, args, signal) => call(connector, 'tools/call', {name, arguments: args}, signal);
 async function until(read) {for (let i=0;i<(process.platform==='win32'?1000:100);i++) {try {return await read();} catch {await new Promise(r=>setTimeout(r,20));}} throw new Error('Fixture process did not start.');}
+
+test('modern discovery is authenticated, stateless and never starts a CLI; legacy 2025 remains distinct',async()=>environment(async root=>{
+  const connector=await new CodexConnector({cli:path.join(root,'must-not-run'),root}).start();
+  try{
+    for(const options of [{headers:{Authorization:'Bearer invalid'}},{headers:{Origin:'https://example.test'}}]){
+      const response=await fetch(connector.endpoint,{method:'POST',headers:{Authorization:`Bearer ${connector.token}`,...options.headers},
+        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'server/discover'})});
+      assert.equal(response.status,401);
+    }
+    // There is deliberately no initialize request before these modern operations.
+    const discovered=await call(connector,'server/discover');
+    assert.deepEqual(discovered.supportedVersions,['2026-07-28','2025-11-25']);
+    assert.deepEqual(discovered.capabilities,{tools:{}});
+    assert.equal(discovered._meta['io.modelcontextprotocol/serverInfo'].name,'PerfChecker local Codex connector');
+    assert.equal(discovered.ttlMs,0);assert.equal(discovered.cacheScope,'private');
+    const listed=await call(connector,'tools/list');
+    assert.deepEqual(listed.tools.map(tool=>tool.name),['ask_perfchecker','implement_perfchecker']);
+    assert.equal(listed.ttlMs,0);assert.equal(listed.cacheScope,'private');
+    const legacy=await request(connector,'initialize',{protocolVersion:'2025-11-25'},{version:'2025-11-25'});
+    assert.equal(legacy.status,200);assert.equal(legacy.message.result.protocolVersion,'2025-11-25');
+    assert.equal(legacy.message.result.resultType,undefined);
+    const initialized=await fetch(connector.endpoint,{method:'POST',headers:{Authorization:`Bearer ${connector.token}`,'MCP-Protocol-Version':'2025-11-25'},
+      body:JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})});
+    assert.equal(initialized.status,202);assert.equal(await initialized.text(),'');
+    const legacyTools=await request(connector,'tools/list',{}, {version:'2025-11-25'});
+    assert.equal(legacyTools.status,200);assert.deepEqual(legacyTools.message.result.tools,listed.tools);
+    assert.equal(legacyTools.message.result.resultType,undefined);
+    const errors=[
+      ['server/discover',{}, {version:'2099-01-01'},400,-32022],
+      ['server/discover',{}, {headers:{'Mcp-Method':'tools/list'}},400,-32020],
+      ['tools/call',{name:'ask_perfchecker',arguments:{prompt:'Never run'}},{headers:{'Mcp-Name':'implement_perfchecker'}},400,-32020],
+      ['server/discover',{}, {body:JSON.stringify({jsonrpc:'2.0',id:1,method:'server/discover',params:{}})},400,-32602],
+      ['server/discover',{}, {body:JSON.stringify({jsonrpc:'2.0',id:1,method:'server/discover',params:{_meta:metadata('2025-11-25')}})},400,-32020],
+      ['initialize',{protocolVersion:'2026-07-28'},{},404,-32601],
+      ['unavailable/method',{}, {},404,-32601],
+      ['tools/call',{name:'unavailable_tool',arguments:{}},{},400,-32602],
+    ];
+    for(const [method,params,options,status,code]of errors){
+      const received=await request(connector,method,params,options);
+      assert.equal(received.status,status,JSON.stringify(received));assert.equal(received.message.error.code,code);
+      assert.equal(received.message.result,undefined,'Protocol failures must not masquerade as tool results');
+      if(code===-32022)assert.deepEqual(received.message.error.data,{supported:['2026-07-28','2025-11-25'],requested:'2099-01-01'});
+    }
+    for(const [body,code]of [['{',-32700],['[]',-32600],[JSON.stringify({jsonrpc:'2.0',method:'server/discover',id:null}),-32600]]){
+      const malformed=await request(connector,'server/discover',{}, {body});
+      assert.equal(malformed.status,400);assert.equal(malformed.message.error.code,code);
+      assert.equal(malformed.message.id,null,'Malformed requests with no readable ID must return JSON-RPC id:null');
+    }
+    assert.equal(connector.children.size,0);assert.equal(connector.busy,false);
+    await assert.rejects(readFile(path.join(root,'captured.json')),error=>error.code==='ENOENT');
+  }finally{await connector.dispose();}
+  assert.equal(process.env[connector.keyEnvironment],undefined);await assert.rejects(fetch(connector.endpoint));
+}));
 
 test('authenticated local MCP exposes two exact tools and never forwards its token to Codex', async () => environment(async root => {
   assert.equal(await inspectCodex('sacrificial-codex', root), 'codex-cli 0.159.2');
@@ -65,7 +130,7 @@ test('authenticated local MCP exposes two exact tools and never forwards its tok
   try {
     assert.equal((await fetch(connector.endpoint, {method:'POST'})).status,401);
     assert.equal((await fetch(connector.endpoint, {method:'POST',headers:{Authorization:`Bearer ${connector.token}`,Origin:'https://example.test'}})).status,401);
-    const initialized=await call(connector,'initialize',{protocolVersion:'2026-07-28'}); assert.equal(initialized.protocolVersion,'2026-07-28');
+    const discovered=await call(connector,'server/discover');assert(discovered.supportedVersions.includes('2026-07-28'));
     const listed=await call(connector,'tools/list'); assert.deepEqual(listed.tools.map(t=>t.name),['ask_perfchecker','implement_perfchecker']);
     assert.deepEqual(listed.tools[1].inputSchema.required,['prompt','workspace']);
     assert.equal(listed.tools[1].inputSchema.additionalProperties,false);
@@ -75,6 +140,12 @@ test('authenticated local MCP exposes two exact tools and never forwards its tok
     assert.ok(captured.args.includes('--ignore-user-config'));assert.ok(captured.args.includes('--ignore-rules'));assert.ok(captured.args.includes('--ephemeral'));
     assert.equal(captured.args[0],'--no-daemon');assert.equal(captured.args[1],'exec');
     assert.ok(!captured.args.includes('--model'));assert.match(captured.prompt,/Give advice only/);
+    const legacyAdvice=await request(connector,'tools/call',{name:'ask_perfchecker',arguments:{prompt:'Legacy advice only.'}},{version:'2025-11-25'});
+    assert.equal(legacyAdvice.status,200);assert.match(legacyAdvice.message.result.content[0].text,/allocation evidence/);
+    assert.equal(legacyAdvice.message.result.resultType,undefined);
+    const encodedAdvice=await request(connector,'tools/call',{name:'ask_perfchecker',arguments:{prompt:'Encoded tool name.'}},
+      {headers:{'Mcp-Name':'=?base64?'+Buffer.from('ask_perfchecker').toString('base64')+'?='}});
+    assert.equal(encodedAdvice.status,200);assert.equal(encodedAdvice.message.result.resultType,'complete');
     assert.equal((await tool(connector,'ask_perfchecker',{prompt:'Unexpected',workspace:root})).isError,true);
     assert.equal((await tool(connector,'implement_perfchecker',{prompt:'Edit',workspace:root})).isError,true);
     assert.equal((await tool(connector,'ask_perfchecker',{prompt:'OVERSIZED'})).isError,true);
