@@ -137,7 +137,7 @@ if(m.method==='initialize'){if(mode==='hold-init')return;initialized=true;send(m
 if(!initialized&&m.params?._meta?.['io.modelcontextprotocol/protocolVersion']!=='2026-07-28')throw Error('Missing explicit modern version');
 if(m.method==='server/discover'){send(m.id,{resultType:'complete',ttlMs:0,cacheScope:'private',supportedVersions:['2026-07-28'],capabilities:{tools:{}},_meta:{'io.modelcontextprotocol/serverInfo':{name:'Neutral tools',version:'1'}}});return}
 if(m.method==='tools/list'){
- if(mode==='slow-pages'){setTimeout(()=>send(m.id,m.params.cursor?{tools:[schemas[1]]}:{tools:[schemas[0]],nextCursor:'second'}),300);return}
+ if(mode==='slow-pages'&&fs.existsSync('slow-pages')){setTimeout(()=>send(m.id,m.params.cursor?{tools:[schemas[1]]}:{tools:[schemas[0]],nextCursor:'second'}),300);return}
  if(mode==='slow-list'&&fs.existsSync('slow-list')){fs.writeFileSync('listing-waiting','yes');setTimeout(()=>send(m.id,{tools:schemas}),1000);return}
  if(mode==='duplicate'){send(m.id,{tools:[schemas[0],schemas[0]]});return}
  if(mode==='bad-cursor'){send(m.id,{tools:[],nextCursor:'same'});return}
@@ -297,8 +297,8 @@ for(const mode of ['eof','partial-eof'])test(`stdio ${mode}: output EOF retires 
   const evidenceDeadline=Date.now()+5000;
   const response=post(connector,'tools/call',{name:'consult',arguments:{question:'Close output',flavour:'fixture'}}).catch(error=>error);
   const ownerState=()=>({pid:connector.child?.pid,exitCode:connector.child?.exitCode,signalCode:connector.child?.signalCode,
-    stdout:{readable:connector.child?.stdout?.readable,readableEnded:connector.child?.stdout?.readableEnded,
-      destroyed:connector.child?.stdout?.destroyed,bufferedBytes:connector.child?.stdout?.readableLength}});
+    protocolOutput:{readable:connector.output?.readable,readableEnded:connector.output?.readableEnded,
+      destroyed:connector.output?.destroyed,bufferedBytes:connector.output?.readableLength}});
   let closed,stage='verified-stdout-close';
   try {
     closed=await until(async()=>JSON.parse(await readFile(path.join(root,'output-closed.json'),'utf8')),Math.max(1,evidenceDeadline-Date.now()));
@@ -347,8 +347,15 @@ test('Windows owned Job retries a failed owner stop while childClosed is false',
 },'ignore-eof'));
 
 test('one bounded discovery deadline includes all actual tool pages',()=>fixture(async({root,create})=>{
-  const connector=create({timeoutMs:450});
-  await assert.rejects(connector.start(),/tool discovery timed out/);
+  const connector=await create().start();
+  const before=(await readFile(path.join(root,'requests.jsonl'),'utf8')).trim().split('\n').map(JSON.parse).length;
+  await writeFile(path.join(root,'slow-pages'),'enabled');
+  connector.options.timeoutMs=450;
+  await assert.rejects(connector.discover(),/tool discovery timed out/);
+  const requests=(await readFile(path.join(root,'requests.jsonl'),'utf8')).trim().split('\n').map(JSON.parse).slice(before);
+  assert.deepEqual(requests.filter(row=>row.method==='tools/list').map(row=>row.params.cursor),[undefined,'second'],
+    'Two actual slow pages share the same discovery deadline after normal startup');
+  await connector.dispose();
   const pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));
   assert.equal(await alive(pid),false,'Discovery deadline stops the owned server before teardown');
 },'slow-pages'));

@@ -6,6 +6,7 @@ import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {Script} from 'node:vm';
+import {createConnection} from 'node:net';
 
 const require=createRequire(import.meta.url);
 const {spawnWindowsOwnedProcess}=require('../dist/windowsOwnedProcess.js');
@@ -18,9 +19,12 @@ async function until(predicate,description,timeout=20000){
 }
 function completion(child){
   let stdout='',stderr='';
-  child.stdout?.setEncoding('utf8');child.stdout?.on('data',chunk=>stdout+=chunk);
+  const output=child.protocolOutput??child.stdout;
+  const outputClosed=child.protocolOutput?new Promise(resolve=>{output.once('end',resolve);output.once('close',resolve);}):Promise.resolve();
+  output?.setEncoding('utf8');output?.on('data',chunk=>stdout+=chunk);
   child.stderr?.setEncoding('utf8');child.stderr?.on('data',chunk=>stderr+=chunk);
-  return new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>{
+  return new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',async(code,signal)=>{
+    await outputClosed;
     const result={code,signal,stdout,stderr};
     if(code!==0&&code!==37&&signal===null)console.log(JSON.stringify({event:'owned-process-finished',...result,stdout:stdout.slice(0,4000),stderr:stderr.slice(0,12000)}));
     resolve(result);
@@ -139,7 +143,8 @@ test('Windows owner preserves Unicode argv/cwd/env, stdin EOF, simultaneous larg
   const {root,script}=await fixture(body);
   const args=['','two words','ü Δ 漢字','quote"value','trailing\\','two\\\\"slashes','$literal'];
   try{
-    const child=spawnWindowsOwnedProcess(process.execPath,[script,...args],{cwd:root,env:{...process.env,PCW_VALUE:'ü " $ \\ value'}});
+    const child=spawnWindowsOwnedProcess(process.execPath,[script,...args],{cwd:root,env:{...process.env,PCW_VALUE:'ü " $ \\ value'},privateStdout:true});
+    assert(child.protocolOutput,'The actual CLI output uses its authenticated private stream');
     const finished=completion(child);child.stdin.end('Prompt ü Δ\nsecond line\n');
     const result=await finished;
     assert.equal(result.code,37,result.stderr);
@@ -149,7 +154,7 @@ test('Windows owner preserves Unicode argv/cwd/env, stdin EOF, simultaneous larg
     assert.deepEqual(actual,{args,cwd:root,value:'ü " $ \\ value',input:'Prompt ü Δ\nsecond line\n'});
     // Repeated physical launch/setup failures must not retain a private Job or pipe.
     for(let i=0;i<3;i++){
-      const failed=spawnWindowsOwnedProcess(path.join(root,'absent.exe'),[],{cwd:root,env:{...process.env}});
+      const failed=spawnWindowsOwnedProcess(path.join(root,'absent.exe'),[],{cwd:root,env:{...process.env},privateStdout:true});
       const done=completion(failed);failed.stdin.end();
       const result=await done;assert.notEqual(result.code,0);assert.match(result.stderr,/native process failed|Windows process owner failed/);
     }
@@ -160,3 +165,48 @@ test('Windows owner refuses shell launchers and invalid NUL inputs before spawni
   assert.throws(()=>spawnWindowsOwnedProcess('codex.cmd',[],{cwd:tmpdir(),env:process.env}),/native executable/);
   assert.throws(()=>spawnWindowsOwnedProcess(process.execPath,['bad\0argument'],{cwd:tmpdir(),env:process.env}),/NUL/);
 });
+
+for(const mode of ['wrong-nonce','cancel-before-handshake','owner-spawn-error'])test(`Windows private output: ${mode} retires its endpoint before teardown`,
+  {skip:!windows,timeout:20000},async()=>{
+    const {root,script}=await fixture("require('node:fs').writeFileSync('unexpected-server-start','started');setInterval(()=>{},1000);");
+    const childProcess=require('node:child_process'),originalSpawn=childProcess.spawn,originalSystemRoot=process.env.SystemRoot;
+    let endpoint,child,finished,outputError;
+    try{
+      childProcess.spawn=(executable,args,options)=>{
+        const changed=[...args];endpoint=changed[changed.indexOf('-OutputPipe')+1];assert(endpoint);
+        if(mode==='wrong-nonce'){
+          const index=changed.indexOf('-OutputNonce')+1,value=changed[index];
+          changed[index]=value.slice(0,-1)+(value.endsWith('0')?'1':'0');
+        }
+        return originalSpawn(executable,changed,options);
+      };
+      if(mode==='owner-spawn-error')process.env.SystemRoot=path.join(root,'absent-windows-root');
+      try{child=spawnWindowsOwnedProcess(process.execPath,[script],{cwd:root,env:{...process.env},privateStdout:true});}
+      finally{childProcess.spawn=originalSpawn;if(originalSystemRoot===undefined)delete process.env.SystemRoot;else process.env.SystemRoot=originalSystemRoot;}
+      finished=completion(child);child.protocolOutput.once('error',error=>{outputError=error;});
+      if(mode==='cancel-before-handshake')child.kill('SIGKILL');
+      let result;
+      if(mode==='owner-spawn-error'){
+        await assert.rejects(finished,error=>error.code==='ENOENT');
+        await until(()=>outputError&&child.protocolOutput.destroyed,'failed owner spawn retires its output reader',2000);
+      }else result=await finished;
+      assert(outputError,'An unauthenticated output channel fails explicitly');
+      if(mode==='owner-spawn-error')assert.equal(outputError.code,'ENOENT');
+      else{
+        assert.match(outputError.message,mode==='wrong-nonce'?/output owner could not be verified/:/owner stopped before its private output handshake/);
+        assert(result.code!==0||result.signal!==null);assert.equal(alive(child.pid),false);
+      }
+      await assert.rejects(readFile(path.join(root,'unexpected-server-start')),error=>error.code==='ENOENT');
+      assert(child.protocolOutput.destroyed,'The private reader is retired after failed launch/cancel');
+      await new Promise((resolve,reject)=>{
+        const connection=createConnection(endpoint);
+        connection.once('connect',()=>{connection.destroy();reject(new Error('The retired private output endpoint still accepts clients.'));});
+        connection.once('error',error=>['ENOENT','ECONNREFUSED'].includes(error.code)?resolve():reject(error));
+        connection.setTimeout(2000,()=>connection.destroy(new Error('The retired private output endpoint did not finish its connection check.')));
+      });
+    }finally{
+      childProcess.spawn=originalSpawn;
+      if(child?.pid&&alive(child.pid))child.kill('SIGKILL');
+      await finished?.catch(()=>{});await rm(root,{recursive:true,force:true});
+    }
+  });

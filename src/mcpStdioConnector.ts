@@ -3,9 +3,10 @@ import {createServer, Server, IncomingMessage, ServerResponse} from 'node:http';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
 import {readFile, readdir, realpath, stat} from 'node:fs/promises';
 import {StringDecoder} from 'node:string_decoder';
+import {Readable} from 'node:stream';
 import {promisify} from 'node:util';
 import * as path from 'node:path';
-import {spawnWindowsOwnedProcess} from './windowsOwnedProcess';
+import {spawnWindowsOwnedProcess, WindowsOwnedChild} from './windowsOwnedProcess';
 
 export type McpVersion = '2025-11-25' | '2026-07-28';
 export interface McpTool {name: string; description?: string; inputSchema: Record<string, unknown>}
@@ -29,6 +30,7 @@ export class McpStdioConnector {
   serverName = 'Local MCP server';
   tools: McpTool[] = [];
   private child?: ChildProcess;
+  private output?: Readable;
   private server?: Server;
   private sequence = 0;
   private pending = new Map<number, {method: string; resolve: (value: any) => void; reject: (error: Error) => void}>();
@@ -59,15 +61,16 @@ export class McpStdioConnector {
     const env = {...process.env};
     // Never give an external server the private tokens of another local bridge.
     for (const name of Object.keys(env)) if (/^PERFCHECKER_(MCP|CODEX)_TOKEN_/.test(name)) delete env[name];
-    this.child = process.platform === 'win32' ? spawnWindowsOwnedProcess(command, this.options.args, {cwd, env}) :
+    this.child = process.platform === 'win32' ? spawnWindowsOwnedProcess(command, this.options.args, {cwd, env, privateStdout: true}) :
       spawn(command, this.options.args, {cwd, env, detached: true, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
     const child = this.child, decoder = new StringDecoder('utf8');
+    const output = this.output = (child as WindowsOwnedChild).protocolOutput ?? child.stdout ?? undefined;
     let buffer = '', bufferedBytes = 0;
     child.stdin?.on('error', () => {if (!this.closing) this.fail(new Error('The local MCP input stream closed.'));});
     // stderr is deliberately drained without treating logs as failures or
     // exposing arbitrary server output (which may contain credentials).
     child.stderr?.on('data', () => {});
-    child.stdout?.on('data', (chunk: Buffer) => {
+    output?.on('data', (chunk: Buffer) => {
       bufferedBytes += chunk.length;
       if (bufferedBytes > MAX_BYTES) {this.fail(new Error('An MCP message exceeds 1 MB.')); return;}
       buffer += decoder.write(chunk);
@@ -85,9 +88,9 @@ export class McpStdioConnector {
         'The local MCP output stream ended with an incomplete protocol message.' :
         'The local MCP output stream closed. Connect again explicitly.'));
     };
-    child.stdout?.once('end', outputClosed);
-    child.stdout?.once('close', outputClosed);
-    child.stdout?.once('error', outputClosed);
+    output?.once('end', outputClosed);
+    output?.once('close', outputClosed);
+    output?.once('error', outputClosed);
     child.once('error', () => {this.childClosed = true; this.fail(new Error('The MCP server could not be launched. Check its executable and arguments.'));});
     child.once('close', () => {
       this.childClosed = true;
@@ -371,6 +374,9 @@ export class McpStdioConnector {
       await signal('SIGTERM');
       if (!await wait(2000)) {await signal('SIGKILL'); if (!await wait(5000)) throw new Error('Owned MCP server cleanup is incomplete.');}
     }
+    // A successful owned stop retires the private reader and its socket/timer.
+    // Failed process cleanup retains ownership and this handle for retry.
+    (child as WindowsOwnedChild | undefined)?.protocolOutput?.destroy();
     if (this.server) {this.server.closeAllConnections(); await new Promise<void>(resolve => this.server!.close(() => resolve())); this.server = undefined;}
     await Promise.allSettled([...this.requests]);
     this.options.onClosed?.();

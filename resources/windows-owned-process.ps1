@@ -2,7 +2,9 @@ param(
     [Parameter(Mandatory=$true)][string]$Executable,
     [Parameter(Mandatory=$true)][string]$WorkingDirectory,
     [Parameter(Mandatory=$true)][string]$ArgumentsBase64,
-    [Parameter(Mandatory=$true)][int]$ParentPid
+    [Parameter(Mandatory=$true)][int]$ParentPid,
+    [string]$OutputPipe = '',
+    [string]$OutputNonce = ''
 )
 $ErrorActionPreference = 'Stop'
 try {
@@ -49,6 +51,12 @@ public static class PerfCheckerOwnedProcess {
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetStdHandle(int kind,IntPtr handle);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetHandleInformation(IntPtr handle,uint mask,uint flags);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetHandleInformation(IntPtr handle,out uint flags);
+    [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] static extern IntPtr CreateFileW(string name,uint access,uint sharing,IntPtr security,uint disposition,uint flags,IntPtr template);
+    [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] static extern bool WaitNamedPipeW(string name,uint milliseconds);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetNamedPipeServerProcessId(IntPtr pipe,out uint processId);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool WriteFile(IntPtr handle,byte[] bytes,uint count,out uint written,IntPtr overlapped);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool ReadFile(IntPtr handle,byte[] bytes,uint count,out uint read,IntPtr overlapped);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool PeekNamedPipe(IntPtr pipe,IntPtr buffer,uint size,IntPtr read,out uint available,IntPtr remaining);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool InitializeProcThreadAttributeList(IntPtr attributes,int count,uint flags,ref IntPtr size);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool UpdateProcThreadAttribute(IntPtr attributes,uint flags,IntPtr kind,IntPtr value,IntPtr size,IntPtr oldValue,IntPtr returned);
     [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr attributes);
@@ -91,10 +99,57 @@ public static class PerfCheckerOwnedProcess {
             Thread.Sleep(10);
         }
     }
-    public static int Run(string executable,string[] arguments,string directory,int parentPid) {
+    static IntPtr OpenOutputPipe(string name,string nonce,int parentPid,IntPtr parent) {
+        const string prefix=@"\\.\pipe\perfchecker-";
+        if (!name.StartsWith(prefix,StringComparison.Ordinal) || name.Length!=prefix.Length+48 || nonce.Length!=64)
+            throw new ArgumentException("Invalid private output endpoint.");
+        foreach(char c in name.Substring(prefix.Length)+nonce)
+            if (!(c>='0'&&c<='9'||c>='a'&&c<='f')) throw new ArgumentException("Invalid private output endpoint.");
+        var deadline=Stopwatch.StartNew(); IntPtr pipe=IntPtr.Zero;
+        try {
+            while (true) {
+                if (WaitForSingleObject(parent,0)!=258) throw new InvalidOperationException("The private output parent stopped.");
+                if (deadline.ElapsedMilliseconds>=10000) throw new TimeoutException("Private output connection timed out.");
+                if (WaitNamedPipeW(name,50)) {
+                    pipe=CreateFileW(name,0xc0000000,0,IntPtr.Zero,3,0,IntPtr.Zero);
+                    if (pipe!=new IntPtr(-1)) break;
+                    pipe=IntPtr.Zero;
+                    if (Marshal.GetLastWin32Error()!=231) throw new Win32Exception(Marshal.GetLastWin32Error(),"Open private output pipe");
+                } else {
+                    int error=Marshal.GetLastWin32Error();
+                    if (error!=2&&error!=121&&error!=231) throw new Win32Exception(error,"Wait for private output pipe");
+                }
+                Thread.Sleep(10);
+            }
+            uint server;
+            Check(GetNamedPipeServerProcessId(pipe,out server),"Read private output server identity");
+            if (server!=(uint)parentPid) throw new InvalidOperationException("The private output server is not the owner parent.");
+            var header=Encoding.ASCII.GetBytes(nonce+" "+Process.GetCurrentProcess().Id+"\n"); uint written;
+            Check(WriteFile(pipe,header,(uint)header.Length,out written,IntPtr.Zero),"Write private output handshake");
+            if (written!=header.Length) throw new InvalidOperationException("Incomplete private output handshake.");
+            var response=new byte[128]; int length=0;
+            while (true) {
+                if (WaitForSingleObject(parent,0)!=258) throw new InvalidOperationException("The private output parent stopped during authentication.");
+                if (deadline.ElapsedMilliseconds>=10000) throw new TimeoutException("Private output authentication timed out.");
+                uint available;
+                Check(PeekNamedPipe(pipe,IntPtr.Zero,0,IntPtr.Zero,out available,IntPtr.Zero),"Inspect private output acknowledgement");
+                if (available==0) {Thread.Sleep(10);continue;}
+                uint read;var chunk=new byte[Math.Min((int)available,response.Length-length)];
+                if (chunk.Length==0) throw new InvalidOperationException("Invalid private output acknowledgement.");
+                Check(ReadFile(pipe,chunk,(uint)chunk.Length,out read,IntPtr.Zero),"Read private output acknowledgement");
+                Array.Copy(chunk,0,response,length,(int)read);length+=(int)read;
+                if (length>0&&response[length-1]==10) break;
+            }
+            if (Encoding.ASCII.GetString(response,0,length)!="READY "+nonce+"\n") throw new InvalidOperationException("Invalid private output acknowledgement.");
+            return pipe;
+        } catch {if (pipe!=IntPtr.Zero)CloseHandle(pipe);throw;}
+    }
+    public static int Run(string executable,string[] arguments,string directory,int parentPid,string outputPipe,string outputNonce) {
         IntPtr job=IntPtr.Zero,parent=IntPtr.Zero,attributes=IntPtr.Zero,handleList=IntPtr.Zero;
         var process=new ProcessInfo(); bool assigned=false,attributesInitialized=false;
-        var standard=new IntPtr[] { GetStdHandle(-10),GetStdHandle(-11),GetStdHandle(-12) };
+        bool privateOutput=!String.IsNullOrEmpty(outputPipe);
+        if (privateOutput!=!String.IsNullOrEmpty(outputNonce)) throw new ArgumentException("Private output requires both endpoint and nonce.");
+        var standard=new IntPtr[] { GetStdHandle(-10),privateOutput?IntPtr.Zero:GetStdHandle(-11),GetStdHandle(-12) };
         var originalFlags=new uint[3]; int marked=0;
         Exception primary=null,cleanup=null; int exit=1;
         try {
@@ -105,6 +160,9 @@ public static class PerfCheckerOwnedProcess {
             Check(GetProcessTimes(GetCurrentProcess(),out ownerCreated,out unusedExit,out unusedKernel,out unusedUser),"Read owner identity");
             if (parentCreated>ownerCreated) throw new InvalidOperationException("The owner parent PID was reused after this launcher started.");
             if (WaitForSingleObject(parent,0)!=258) throw new InvalidOperationException("The owner parent has already stopped.");
+            // This raw writer never enters a PowerShell/CLR standard-output
+            // table. Only the suspended server inherits it after authentication.
+            if (privateOutput) standard[1]=OpenOutputPipe(outputPipe,outputNonce,parentPid,parent);
             job=CreateJobObjectW(IntPtr.Zero,null);
             if (job==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),"Create private Job");
             var limits=new ExtendedLimits(); limits.basic.flags=0x00002000; // KILL_ON_JOB_CLOSE; no breakaway.
@@ -137,8 +195,10 @@ public static class PerfCheckerOwnedProcess {
             // stdin remains inherited for the protocol; stderr remains usable
             // for launch/Job cleanup errors. Never close an aliased channel.
             if (standard[1]==standard[0] || standard[1]==standard[2]) throw new InvalidOperationException("Owned stdout must be separate from stdin and stderr.");
-            Console.SetOut(System.IO.TextWriter.Null);
-            Check(SetStdHandle(-11,IntPtr.Zero),"Retire owner standard output");
+            if (!privateOutput) {
+                Console.SetOut(System.IO.TextWriter.Null);
+                Check(SetStdHandle(-11,IntPtr.Zero),"Retire owner standard output");
+            }
             Check(CloseHandle(standard[1]),"Close owner stdout copy"); standard[1]=IntPtr.Zero;
             if (WaitForSingleObject(parent,0)!=258) throw new InvalidOperationException("The owner parent stopped before process startup.");
             if (ResumeThread(process.thread)==0xffffffff) throw new Win32Exception(Marshal.GetLastWin32Error(),"Resume owned process");
@@ -165,6 +225,7 @@ public static class PerfCheckerOwnedProcess {
             if (attributes!=IntPtr.Zero) Marshal.FreeHGlobal(attributes);
             if (handleList!=IntPtr.Zero) Marshal.FreeHGlobal(handleList);
             for (int i=0;i<marked;i++) if (standard[i]!=IntPtr.Zero) SetHandleInformation(standard[i],1,originalFlags[i]&1);
+            if (privateOutput&&standard[1]!=IntPtr.Zero) CloseHandle(standard[1]);
         }
         if (primary!=null) Console.Error.WriteLine("PerfChecker native process failed: "+primary.Message);
         if (cleanup!=null) Console.Error.WriteLine("PerfChecker native process cleanup failed: "+cleanup.Message);
@@ -175,7 +236,7 @@ public static class PerfCheckerOwnedProcess {
     # Convert the JSON array directly. PowerShell 5.1 writes that array as one
     # pipeline object; wrapping it in @() before a string[] cast joins argv.
     $arguments = [string[]](ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ArgumentsBase64))))
-    $exitCode = [PerfCheckerOwnedProcess]::Run($Executable, $arguments, $WorkingDirectory, $ParentPid)
+    $exitCode = [PerfCheckerOwnedProcess]::Run($Executable, $arguments, $WorkingDirectory, $ParentPid, $OutputPipe, $OutputNonce)
     exit $exitCode
 } catch {
     [Console]::Error.WriteLine('PerfChecker Windows process owner failed: ' + $_.Exception.Message)
