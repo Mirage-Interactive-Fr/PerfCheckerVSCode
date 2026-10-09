@@ -33,7 +33,7 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['narrative','mcp','mcp-stdio','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 if(stage==='focused'&&caseGroup==='pluto-start-stop'&&process.platform!=='linux')throw new Error('The first prepared Pluto start/stop observation is explicitly Linux only.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 // The real game and SDKs are immutable fixtures, never development checkouts.
@@ -376,6 +376,14 @@ try {
   const runtime = JSON.parse((await execute(julia, ['--startup-file=no', '-e',
     "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
   julia = runtime.executable;
+  let nativeNode,nodeProvenance;
+  if(stage==='focused'&&caseGroup==='mcp-stdio'){
+    nativeNode=await fs.realpath(process.execPath);
+    const nodeRuntime=JSON.parse(await execute(nativeNode,['-e','console.log(JSON.stringify({executable:process.execPath,version:process.version,arch:process.arch,electron:Boolean(process.versions.electron)}))']));
+    assert.equal(nodeRuntime.electron,false,'Neutral stdio servers use setup-node, never the Electron extension-host executable');
+    assert.equal(await fs.realpath(nodeRuntime.executable),nativeNode);
+    nodeProvenance={...nodeRuntime,executable:nativeNode,sha256:createHash('sha256').update(await fs.readFile(nativeNode)).digest('hex')};
+  }
   const officialRuntime=JSON.parse((await execute(process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA||julia,['--startup-file=no','-e',
     "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
   const expectedVersion = mode === 'public' ? '1.0.0' : JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version;
@@ -498,6 +506,7 @@ try {
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         ...(phase==='pluto-start-stop'?{PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT:JSON.stringify(artifactRecord.plutoEnvironment)}:{}),
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
+        ...(nativeNode?{PERFCHECKER_NATIVE_NODE:nativeNode,PERFCHECKER_NATIVE_NODE_PROVENANCE:JSON.stringify(nodeProvenance)}:{}),
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
         PERFCHECKER_NATIVE_MODE: mode, PERFCHECKER_NATIVE_SHA: sha,
         PERFCHECKER_NATIVE_STAGE: process.env.PERFCHECKER_NATIVE_STAGE || 'smoke',
@@ -588,7 +597,7 @@ try {
     coreProvenance.diagnosticWorker={file:worker,sha256:createHash('sha256').update(await fs.readFile(worker)).digest('hex')};
   }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
-  if(stage==='targeted'||stage==='full'||stage==='focused'&&['mcp','mcp-pluto','advisor','narrative'].includes(caseGroup)){
+  if(stage==='targeted'||stage==='full'||stage==='focused'&&['mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)){
     const before=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
     const receipt={status:'running',startedAt:new Date().toISOString(),project:controller,hashesBefore:before,
       scope:'Explicit controller preparation before the native first Send; cache preparation, not a cold-start qualification'};
@@ -746,6 +755,18 @@ end
   }
 } catch(error){landscapePrimaryError=error;throw error;}
 finally {
+  if(stage==='focused'&&caseGroup==='mcp-stdio'){
+    // A missing or rejected post-Reload receipt cannot authorize deleting a
+    // session which may still contain a live/unknown server incarnation.
+    let qualified=false;
+    for(const [name,key,expected]of [['mcp-stdio-reload-handoff.json','status','passed'],['mcp-stdio-cleanup.json','qualified',true]]){
+      try{const value=JSON.parse(await fs.readFile(path.join(output,name),'utf8'));
+        if(value.session===session||name==='mcp-stdio-reload-handoff.json'&&value.connection?.root&&path.dirname(value.connection.root)===session)
+          qualified ||= value[key]===expected;
+      }catch(error){if(error.code!=='ENOENT')console.error('Stdio cleanup receipt could not be validated:',error.name);}
+    }
+    if(!qualified)sessionSafeToRemove=false;
+  }
   if(landscapeOnly){
     process.off('SIGINT',abortLandscape);process.off('SIGTERM',abortLandscape);
     await landscapeObserver?.sample();
@@ -782,7 +803,7 @@ finally {
     else await fs.rm(session,{recursive:true,force:true,maxRetries:12,retryDelay:500});
     if(errors.length)throw new AggregateError(landscapePrimaryError?[landscapePrimaryError,...errors]:errors,'Native Landscape or its owned failure cleanup failed');
   }else if(sessionSafeToRemove)await fs.rm(session, {recursive: true, force: true, maxRetries: 12, retryDelay: 500});
-  else console.error(`Private session preserved: controller preflight ownership cleanup is unqualified: ${session}`);
+  else console.error(`Private session preserved: owned process cleanup is unqualified: ${session}`);
 }
 
 function assertCI() {

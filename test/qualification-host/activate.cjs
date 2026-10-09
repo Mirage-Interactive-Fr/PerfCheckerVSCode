@@ -18,6 +18,7 @@ exports.activate = async () => {
   try {
     if(previous.some(item=>item.invocation===invocation)){
       if(phase==='reload')await require('../native-reload-host.cjs').validateHandoff(previous);
+      else if(phase==='mcp-stdio')await require('../native-mcp-controls.cjs').validateStdioReloadHandoff(previous);
       else throw new Error('The disposable extension host restarted during this campaign. Earlier evidence was preserved; the harness will not rerun actions against partially mutated fixtures. Inspect retained host logs.');
     }
     await require('../public-vsix-host.cjs').run();

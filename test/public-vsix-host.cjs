@@ -583,7 +583,7 @@ exports.run = async () => {
     const context = {vscode, browser, windowPage, workspace,
       controller: process.env.PERFCHECKER_NATIVE_CONTROLLER, target: process.env.PERFCHECKER_NATIVE_TARGET,
       results: path.join(workspace, 'perf', 'results', 'vscode'), log, proof, findFrame,
-      core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION};
+      core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION,flushReport:()=>persist()};
     nativeContext=context;
     if(process.platform==='darwin')context.processInventory=(stage,port,known)=>macProcessInventory(context,stage,port,known);
     if(['testitems-ready','suite','diagnosis','pluto'].includes(phase))context.observeWork=stage=>observeNativeWork(context,stage);
@@ -593,13 +593,15 @@ exports.run = async () => {
 
     if(phase==='narrative'||process.env.PERFCHECKER_NATIVE_STAGE==='focused'){
       const settings=vscode.workspace.getConfiguration('perfchecker',uri);
-      for(const [key,value] of Object.entries({juliaExecutable:process.env.PERFCHECKER_NATIVE_JULIA,runnerProject:context.controller,scenarioProject:context.controller,
+      const continuingStdio=phase==='mcp-stdio'&&await fs.stat(path.join(output,'mcp-stdio-reload-handoff.json')).then(stat=>stat.isFile()).catch(error=>{if(error.code==='ENOENT')return false;throw error;});
+      if(!continuingStdio)for(const [key,value] of Object.entries({juliaExecutable:process.env.PERFCHECKER_NATIVE_JULIA,runnerProject:context.controller,scenarioProject:context.controller,
         suite:'perf/suite.jl',profile:['studio','suite'].includes(phase)?'historical':'quick',reports:'perf/results/vscode',advisorEnabled:false,advisorConfig:'',scenarioSamples:2,analysisTools:[],plutoProject:'perf/pluto'}))
         await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
       if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
       else if(phase==='landscape')await runCase('native-landscape-controls',()=>require('./native-landscape-controls.cjs').run(context));
       else if(phase==='studio-color')await runCase('native-colour-picker-save-reload',()=>controls.runColour(context));
       else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
+      else if(phase==='mcp-stdio')await runCase('native-generic-mcp-stdio-controls',()=>mcp.run(context,{stdio:true,customArguments:true}));
       else if(phase==='pluto-plots')await runCase('native-pluto-rendered-plots',()=>pluto.runPlots(context));
       else if(phase==='pluto-start-stop')await runCase('native-pluto-first-prepared-start-stop',()=>pluto.runStartStop(context));
       else if(phase==='mcp-pluto'){
