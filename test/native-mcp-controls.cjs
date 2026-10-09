@@ -271,7 +271,7 @@ async function stdioHandoff(){
   assert.equal(value.persistedSettings.length,2);
   for(const [index,fixture]of value.persistedSettings.entries()){
     const label=index?'b':'a';
-    assert.deepEqual(Object.keys(fixture).sort(),['workspace','root','values']);
+    assert.deepEqual(Object.keys(fixture).sort(),['workspace','root','values'].sort());
     assert.equal(fixture.workspace,index?path.join(path.dirname(value.workspace),'chat-alternate-workspace'):value.workspace);
     assert.equal(fixture.root,path.join(session,'persisted-stdio-'+label));
     assert((await fs.lstat(fixture.root)).isDirectory()&&!(await fs.lstat(fixture.root)).isSymbolicLink());
