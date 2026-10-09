@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp, writeFile, readFile, rm, realpath} from 'node:fs/promises';
+import {mkdtemp, writeFile, readFile, readdir, rm, realpath} from 'node:fs/promises';
 import {execFile, spawn} from 'node:child_process';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
@@ -23,58 +23,95 @@ async function alive(pid) {
   try {process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}
 }
 async function windowsEofServer(root) {
-  // libuv deliberately does not close Windows fds 0–2. Use a real native
-  // server for output EOF, compiled only inside this disposable fixture.
+  // Bypass libuv fd 0–2 handling and managed/CRT startup entirely.
+  // The temporary executable imports kernel32 only, verified below.
+  // Windows EOF tests require installed MSVC x64 tools and Windows SDK,
+  // provided by the GitHub Windows runner; they install no build dependency.
   const source=String.raw`
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Threading;
-using System.Web.Script.Serialization;
-public static class NativeEofServer {
-  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int kind);
-  [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetStdHandle(int kind,IntPtr handle);
-  [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
-  [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetHandleInformation(IntPtr handle,out uint flags);
-  static object Tool(string name,string[] required) {
-    var properties=new Dictionary<string,object>();
-    foreach(var field in required)properties[field]=new {type="string"};
-    return new {name,inputSchema=new {type="object",properties,required,additionalProperties=false}};
-  }
-  public static void Main(string[] args) {
-    int pid=Process.GetCurrentProcess().Id;
-    File.WriteAllText("server.pid",pid.ToString());
-    Console.Error.WriteLine("Informational native EOF server log.");
-    var json=new JavaScriptSerializer();string line;
-    while((line=Console.ReadLine())!=null) {
-      var message=json.Deserialize<Dictionary<string,object>>(line);
-      string method=(string)message["method"];object result;
-      if(method=="server/discover")result=new {resultType="complete",ttlMs=0,cacheScope="private",
-        supportedVersions=new[]{"2026-07-28"},capabilities=new {tools=new {}},
-        _meta=new Dictionary<string,object>{{"io.modelcontextprotocol/serverInfo",new {name="Native EOF fixture",version="1"}}}};
-      else if(method=="tools/list")result=new {resultType="complete",ttlMs=0,cacheScope="private",
-        tools=new[]{Tool("consult",new[]{"question","flavour"}),Tool("modify",new[]{"request","directory","style"})}};
-      else if(method=="tools/call") {
-        if(args[0]=="partial-eof")Console.Write("incomplete-json");
-        Console.Out.Flush();IntPtr output=GetStdHandle(-11);
-        Console.SetOut(TextWriter.Null);
-        if(!SetStdHandle(-11,IntPtr.Zero)||!CloseHandle(output))throw new InvalidOperationException("Native stdout close failed.");
-        uint flags;bool valid=GetHandleInformation(output,out flags);int error=Marshal.GetLastWin32Error();
-        if(valid||error!=6)throw new InvalidOperationException("Closed stdout did not report ERROR_INVALID_HANDLE.");
-        File.WriteAllText("output-closed.json",json.Serialize(new {pid,stdoutClosed=true,aliveAfterClose=true,closureCheck="ERROR_INVALID_HANDLE"}));
-        Thread.Sleep(Timeout.Infinite);return;
-      } else throw new InvalidOperationException("Unexpected native fixture method.");
-      Console.WriteLine(json.Serialize(new {jsonrpc="2.0",id=message["id"],result}));Console.Out.Flush();
+typedef void* HANDLE;
+typedef unsigned long DWORD;
+typedef unsigned short WCHAR;
+typedef int BOOL;
+#define API(type) __declspec(dllimport) type __stdcall
+API(HANDLE) GetStdHandle(long);
+API(BOOL) SetStdHandle(long,HANDLE);
+API(BOOL) CloseHandle(HANDLE);
+API(BOOL) GetHandleInformation(HANDLE,DWORD*);
+API(DWORD) GetLastError(void);
+API(DWORD) GetCurrentProcessId(void);
+API(WCHAR*) GetCommandLineW(void);
+API(BOOL) ReadFile(HANDLE,void*,DWORD,DWORD*,void*);
+API(BOOL) WriteFile(HANDLE,const void*,DWORD,DWORD*,void*);
+API(HANDLE) CreateFileW(const WCHAR*,DWORD,DWORD,void*,DWORD,DWORD,HANDLE);
+API(void) Sleep(DWORD);
+__declspec(noreturn) API(void) ExitProcess(DWORD);
+static char request[8192],response[2048],marker[256],pidText[16];
+static DWORD length(const char* value){DWORD size=0;while(value[size])size++;return size;}
+static char* append(char* target,const char* value){while(*value)*target++=*value++;*target=0;return target;}
+static const char* find(const char* value,const char* key){
+  for(;*value;value++){const char* a=value;const char* b=key;while(*a&&*a==*b){a++;b++;}if(!*b)return value;}return 0;
+}
+static BOOL partial(void){
+  const WCHAR* value=GetCommandLineW();const WCHAR* key=L"partial-eof";
+  for(;*value;value++){const WCHAR* a=value;const WCHAR* b=key;while(*a&&*a==*b){a++;b++;}if(!*b)return 1;}return 0;
+}
+static void decimal(DWORD number,char* target){
+  char digits[16];DWORD size=0;do{digits[size++]=(char)('0'+number%10);number/=10;}while(number);
+  while(size)*target++=digits[--size];*target=0;
+}
+static void writeAll(HANDLE handle,const char* text){
+  DWORD remaining=length(text),written;while(remaining){if(!WriteFile(handle,text,remaining,&written,0)||!written)ExitProcess(11);text+=written;remaining-=written;}
+}
+static void publish(const WCHAR* name,const char* text){
+  HANDLE file=CreateFileW(name,0x40000000,0,0,2,0x80,0);if(file==(HANDLE)-1)ExitProcess(12);
+  writeAll(file,text);if(!CloseHandle(file))ExitProcess(13);
+}
+void fixture_main(void){
+  HANDLE input=GetStdHandle(-10),output=GetStdHandle(-11);DWORD size,read,flags,error;char* end;const char* id;const char* result;
+  decimal(GetCurrentProcessId(),pidText);publish(L"server.pid",pidText);
+  for(;;){
+    size=0;for(;;){if(!ReadFile(input,request+size,1,&read,0))ExitProcess(14);if(!read){Sleep(0xffffffff);ExitProcess(15);}
+      if(request[size]=='\n')break;if(++size>=sizeof(request)-1)ExitProcess(16);}
+    request[size]=0;
+    if(find(request,"\"tools/call\"")){
+      if(partial())writeAll(output,"incomplete-json");
+      if(!SetStdHandle(-11,0)||!CloseHandle(output))ExitProcess(17);
+      if(GetHandleInformation(output,&flags))ExitProcess(18);error=GetLastError();if(error!=6)ExitProcess(19);
+      end=append(marker,"{\"pid\":");end=append(end,pidText);
+      append(end,",\"stdoutClosed\":true,\"aliveAfterClose\":true,\"closureCheck\":\"ERROR_INVALID_HANDLE\"}");
+      publish(L"output-closed.json",marker);Sleep(0xffffffff);ExitProcess(20);
     }
+    if(find(request,"\"server/discover\""))result="{\"resultType\":\"complete\",\"ttlMs\":0,\"cacheScope\":\"private\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"tools\":{}},\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"Win32 EOF fixture\",\"version\":\"1\"}}}";
+    else if(find(request,"\"tools/list\""))result="{\"resultType\":\"complete\",\"ttlMs\":0,\"cacheScope\":\"private\",\"tools\":[{\"name\":\"consult\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\"},\"flavour\":{\"type\":\"string\"}},\"required\":[\"question\",\"flavour\"],\"additionalProperties\":false}},{\"name\":\"modify\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"type\":\"string\"},\"directory\":{\"type\":\"string\"},\"style\":{\"type\":\"string\"}},\"required\":[\"request\",\"directory\",\"style\"],\"additionalProperties\":false}}]}";
+    else ExitProcess(21);
+    id=find(request,"\"id\"");if(!id)ExitProcess(22);id+=4;while(*id==' ')id++;if(*id++!=':')ExitProcess(23);while(*id==' ')id++;
+    end=append(response,"{\"jsonrpc\":\"2.0\",\"id\":");if(*id<'0'||*id>'9')ExitProcess(24);
+    size=0;while(*id>='0'&&*id<='9'){if(++size>16)ExitProcess(25);*end++=*id++;}*end=0;
+    end=append(end,",\"result\":");end=append(end,result);append(end,"}\n");writeAll(output,response);
   }
-}`;
-  const executable=path.join(root,'native-eof-server.exe');
-  const powershell=path.join(process.env.SystemRoot??'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
-  const command=`$ErrorActionPreference='Stop'; Add-Type -TypeDefinition ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(source).toString('base64')}'))) -ReferencedAssemblies System.dll,System.Core.dll,System.Web.Extensions.dll -OutputAssembly '${executable.replaceAll("'","''")}' -OutputType ConsoleApplication`;
-  await new Promise((resolve,reject)=>execFile(powershell,['-NoLogo','-NoProfile','-NonInteractive','-Command',command],
-    {cwd:root,windowsHide:true,timeout:30000},error=>error?reject(error):resolve()));
+}
+`;
+  const execute=(command,args,env=process.env)=>new Promise((resolve,reject)=>execFile(command,args,
+    {cwd:root,windowsHide:true,timeout:30000,env},(error,stdout)=>error?reject(error):resolve(stdout)));
+  const programFiles=process.env['ProgramFiles(x86)']??'C:\\Program Files (x86)';
+  const installation=(await execute(path.join(programFiles,'Microsoft Visual Studio','Installer','vswhere.exe'),
+    ['-latest','-products','*','-requires','Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath'])).trim();
+  assert(installation,'The Windows runner must provide its installed native MSVC compiler');
+  const version=(await readFile(path.join(installation,'VC','Auxiliary','Build','Microsoft.VCToolsVersion.default.txt'),'utf8')).trim();
+  const binaryDirectory=path.join(installation,'VC','Tools','MSVC',version,'bin','Hostx64','x64');
+  const sdkRoot=path.join(programFiles,'Windows Kits','10','Lib');
+  const sdk=(await readdir(sdkRoot,{withFileTypes:true})).filter(entry=>entry.isDirectory()&&/^\d+\.\d+\.\d+\.\d+$/.test(entry.name))
+    .map(entry=>entry.name).sort((a,b)=>b.localeCompare(a,undefined,{numeric:true}))[0];
+  assert(sdk,'The Windows runner must provide its installed Windows SDK');
+  const kernel32=await realpath(path.join(sdkRoot,sdk,'um','x64','kernel32.lib'));
+  const file=path.join(root,'native-eof-server.c'),executable=path.join(root,'native-eof-server.exe');
+  await writeFile(file,source);
+  await execute(path.join(binaryDirectory,'cl.exe'),['/nologo','/TC','/Od','/GS-','/Zl','/Fo'+path.join(root,'native-eof-server.obj'),'/Fe'+executable,file,
+    '/link','/NODEFAULTLIB','/ENTRY:fixture_main','/SUBSYSTEM:CONSOLE','/MACHINE:X64','/INCREMENTAL:NO',kernel32],
+  {...process.env,PATH:binaryDirectory+path.delimiter+(process.env.PATH??'')});
+  const imports=await execute(path.join(binaryDirectory,'dumpbin.exe'),['/imports',executable]);
+  assert.deepEqual([...imports.matchAll(/^\s+([a-z0-9_.-]+\.dll)\s*$/gmi)].map(match=>match[1].toLowerCase()),['kernel32.dll'],
+    'The EOF fixture imports only kernel32, with no CLR or CRT startup/stdio');
   return executable;
 }
 async function fixture(run, mode = '') {
