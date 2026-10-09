@@ -194,8 +194,8 @@ jobs:
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '52a0d0cd12472606632645700781d02d650f6694' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || 'df1077cac855f04bd7f11b92b0732804ddb6f748' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || '52a0d0cd12472606632645700781d02d650f6694') || '' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || 'df1077cac855f04bd7f11b92b0732804ddb6f748') || '' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
