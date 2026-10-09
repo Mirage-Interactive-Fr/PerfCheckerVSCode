@@ -208,12 +208,27 @@ exports.run = async context => {
     await remoteConfiguration(context, fixture, cfg, keyEnvironment, token);
     const discovery = await action(context, root, 'Discover tests', 'discover');
     assert.equal(discovery.report.schema_version, 'perfchecker-discovery/1');
-    assert(discovery.report.declared.some(item => item.id === 'sum_squares' && item.implementation === 'allocating'));
+    const installed=context.vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');
+    assert(installed,'Canonical scenario keys come from the actual installed VSIX');
+    const {scenarioKey,selectedScenarios}=require(path.join(installed.extensionPath,'dist','investigationModel.js'));
+    const wanted={id:'sum_squares',implementation:'allocating'},wantedKey=scenarioKey(wanted);
+    const declared=discovery.report.declared.filter(item=>scenarioKey(item)===wantedKey);
+    assert.equal(declared.length,1,'Discovery identifies one exact narrative scenario');
+    assert.equal(declared[0].catalog,'perf/scenarios.toml');
+    assert.deepEqual(declared[0].collectors,['benchmark','chairmark','profile','profile_alloc']);
+    assert.equal(await fs.realpath(declared[0].source),await fs.realpath(path.join(context.workspace,'perf','cases.jl')));
+    assert.deepEqual(selectedScenarios(discovery.report.declared,[wantedKey]),declared);
     let frame = await tab(context, 'Scenarios');
     await frame.getByRole('button', {name: 'Clear selection', exact: true}).click();
-    const card = frame.locator('article.card').filter({has: frame.locator('.scenario-title strong', {hasText: 'sum_squares'})})
-      .filter({has: frame.locator('.implementation', {hasText: 'allocating'})}).first();
+    const card = frame.locator('article.card').filter({has: frame.locator('.scenario-title strong', {hasText: /^sum_squares$/})})
+      .filter({has: frame.locator('.implementation', {hasText: /^allocating$/})});
+    assert.equal(await card.count(),1,'Only the exact narrative scenario card is selected');
     await card.locator('.scenario-title input').check();
+    const selected=await frame.locator('article.card').evaluateAll(cards=>cards.filter(card=>card.querySelector('.scenario-title input')?.checked)
+      .map(card=>({id:card.querySelector('.scenario-title strong')?.textContent,implementation:card.querySelector('.implementation')?.textContent})));
+    assert.deepEqual(selected.map(scenarioKey),[wantedKey],'The native checkbox selects exactly the canonical narrative scenario');
+    context.proof('native-narrative-exact-scenario-selection',{scenarioKey:wantedKey,catalog:declared[0].catalog,source:declared[0].source,
+      collectors:declared[0].collectors,selectedKeys:selected.map(scenarioKey),assertedBeforeMeasurement:true});
     const measured = await action(context, root, 'Measure selected', 'run');
     assert.equal(measured.report.schema_version, 'perfchecker-scenario-run/1');
     assert(measured.report.runs.length > 0);

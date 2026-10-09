@@ -231,7 +231,7 @@ jobs:
         with:
           name: native-candidate-${{ github.sha }}
       - name: Add the browser protocol client (no browser installation)
-        run: npm install --no-save --ignore-scripts playwright@1.62.1
+        run: npm install --no-save --ignore-scripts --package-lock=false playwright@1.62.1 @iarna/toml@2.2.5
       - name: Install the disposable default-browser fixture runtime
         if: runner.os == 'Linux' && matrix.vscode == 'stable' && (env.PERFCHECKER_NATIVE_STAGE == 'full' || env.PERFCHECKER_NATIVE_CASE_GROUP == 'mcp-pluto')
         run: npx playwright install chromium

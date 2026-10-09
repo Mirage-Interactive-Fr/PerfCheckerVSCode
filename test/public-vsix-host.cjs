@@ -186,11 +186,56 @@ async function eventually(read, description, timeout = 120000) {
 
 // Read only the runner-owned process tree. Arguments help diagnose phases;
 // they never establish ownership or executable identity.
-async function macProcessInventory(context,stage,port,knownIdentities=[]){
+async function readDiagnosticRequest(context,argumentsText,deadline){
+  const withinDeadline=()=>assert(deadline===undefined||Date.now()<deadline,'Request observation stays inside the existing diagnosis report deadline');
+  withinDeadline();
+  const worker=context.core.diagnosticWorker,root=process.env.PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP;
+  assert(worker&&root,'Diagnostic request observation requires qualified Core and a private temporary root');
+  assert.equal(await fs.realpath(root),root);assert.equal(await fs.realpath(worker.file),worker.file);
+  const rootStat=await fs.lstat(root);assert(rootStat.isDirectory()&&!rootStat.isSymbolicLink());
+  assert(!/[\s"']/.test(worker.file+root),'The controlled argv paths have an unambiguous ps representation');
+  const escape=value=>value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const suffix=new RegExp(`(?:^|\\s)${escape(worker.file)}\\s+(${escape(root)}/[^/\\s]+/request\\.toml)\\s+(${escape(root)}/[^/\\s]+/response\\.toml)$`);
+  const match=suffix.exec(argumentsText);if(!match)return {status:'arguments-unavailable',scope:'Exact Core script and private request/response suffix were not observed'};
+  const request=match[1],response=match[2],directory=path.dirname(request);
+  assert.equal(path.dirname(directory),root);assert.equal(path.dirname(response),directory);
+  assert.equal(await fs.realpath(directory),directory);const directoryStat=await fs.lstat(directory);assert(directoryStat.isDirectory()&&!directoryStat.isSymbolicLink());
+  assert.equal(await fs.realpath(request),request);const initial=await fs.lstat(request);assert(initial.isFile()&&!initial.isSymbolicLink());
+  assert(initial.size>0&&initial.size<=256*1024,'Request observation has a fixed 256 KiB bound');
+  const handle=await fs.open(request,require('node:fs').constants.O_RDONLY|require('node:fs').constants.O_NOFOLLOW);
+  let bytes;
+  try{const opened=await handle.stat();assert(opened.dev===initial.dev&&opened.ino===initial.ino&&opened.size===initial.size);
+    bytes=Buffer.alloc(initial.size);const read=await handle.read(bytes,0,bytes.length,0);assert.equal(read.bytesRead,bytes.length);
+    const after=await handle.stat();assert(after.dev===opened.dev&&after.ino===opened.ino&&after.size===opened.size&&after.mtimeMs===opened.mtimeMs);
+  }finally{await handle.close();}
+  const final=await fs.lstat(request);assert(final.isFile()&&!final.isSymbolicLink()&&final.dev===initial.dev&&final.ino===initial.ino&&final.size===initial.size&&final.mtimeMs===initial.mtimeMs);
+  assert.equal(await fs.realpath(directory),directory);const directoryAfter=await fs.lstat(directory);
+  assert(directoryAfter.isDirectory()&&!directoryAfter.isSymbolicLink()&&directoryAfter.dev===directoryStat.dev&&directoryAfter.ino===directoryStat.ino);
+  assert.equal(await fs.realpath(root),root);const rootAfter=await fs.lstat(root);
+  assert(rootAfter.isDirectory()&&!rootAfter.isSymbolicLink()&&rootAfter.dev===rootStat.dev&&rootAfter.ino===rootStat.ino);
+  assert.equal(createHash('sha256').update(await fs.readFile(worker.file)).digest('hex'),worker.sha256);
+  withinDeadline();
+  assert.equal(require('@iarna/toml/package.json').version,'2.2.5');
+  let value;
+  try{value=require('@iarna/toml/parse-string')(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}
+  catch(error){return {status:'parse-error',errorClass:error.name==='TomlError'?'TomlError':'ParseError',
+    line:Number.isFinite(error.line)?error.line:undefined,column:Number.isFinite(error.col)?error.col:undefined};}
+  assert(['jet','aqua','alloccheck','snoopcompile','latency','gc','memory','heap','locks'].includes(value.tool),'Only selected analyzer names are retained');
+  if(value.tool!=='aqua')assert(value.scenario?.id==='ui_adopted'&&value.scenario?.implementation==='ui','Only the exact selected bank scenario is retained');
+  const responseStat=await fs.lstat(response).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
+  if(responseStat)assert(responseStat.isFile()&&!responseStat.isSymbolicLink());
+  withinDeadline();
+  return {status:'observed',tool:value.tool,scenario:value.tool==='aqua'?'package':'ui_adopted',implementation:value.tool==='aqua'?'package':'ui',
+    requestBytes:initial.size,requestInode:initial.ino,requestDevice:initial.dev,responsePresent:!!responseStat,
+    scope:'Whitelisted request fields and response existence only; no import/analysis phase or log payload inferred'};
+}
+
+async function macProcessInventory(context,stage,port,knownIdentities=[],deadline){
   assert.equal(process.platform,'darwin');
+  const bounded=maximum=>{if(deadline===undefined)return maximum;const remaining=deadline-Date.now();assert(remaining>0,'Observation stays inside the existing diagnosis report deadline');return Math.min(maximum,remaining);};
   const expectedExecutable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
-  const survey=execute('ps',['-eo','pid=,ppid=,args='],{timeout:10000,maxBuffer:4*1024*1024});
-  const observerPid=survey.child.pid,{stdout}=await survey;
+  const survey=execute('ps',['-eo','pid=,ppid=,args='],{timeout:bounded(10000),maxBuffer:4*1024*1024});
+  const observerPid=survey.child.pid,{stdout,stderr}=await survey;assert(!stderr.trim(),'Process survey has no stderr inspection error');
   const all=stdout.split('\n').flatMap(line=>{const match=/^\s*(\d+)\s+(\d+)(?:\s+(.*))?$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),arguments:match[3]||''}]:[];});
   const observer=all.find(row=>row.pid===observerPid);
   if(observer)assert.equal(observer.parent,process.pid,'Only the actual ps observer owned by this host is excluded');
@@ -205,17 +250,30 @@ async function macProcessInventory(context,stage,port,knownIdentities=[]){
     let before;
     try{
       const identity=async()=>{
-        const value=(await execute('ps',['-p',String(row.pid),'-o','ppid=','-o','lstart='],{timeout:3000})).stdout.trim();
+        const observed=await execute('ps',['-p',String(row.pid),'-o','ppid=','-o','lstart='],{timeout:bounded(3000)});
+        assert(!observed.stderr.trim(),'Process identity has no stderr inspection error');const value=observed.stdout.trim();
         const match=/^(\d+)\s+(.+)$/.exec(value);assert(match&&Number.isFinite(Date.parse(match[2])),'macOS supplies a real parent and lstart');
         return {parent:Number(match[1]),started:match[2],createdAt:new Date(Date.parse(match[2])).toISOString()};
       };
       before=await identity();assert.equal(before.parent,row.parent);
-      const mappings=(await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:3000})).stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+      const observedMappings=await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:bounded(3000)});
+      assert(!observedMappings.stderr.trim(),'Executable inspection has no stderr error');
+      const mappings=observedMappings.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
       const canonicalMappings=await Promise.all(mappings.map(value=>fs.realpath(value).catch(()=>value)));
       assert.deepEqual(await identity(),before,'The observed process retains its parent and start identity while its executable is inspected');
       const projects=[...row.arguments.matchAll(/--project(?:=|\s+)([^\s]+)/g)].map(match=>match[1]).filter(value=>value.startsWith(process.env.PERFCHECKER_NATIVE_SESSION+path.sep));
+      let diagnosticRequest;
+      if(process.env.PERFCHECKER_NATIVE_PHASE==='diagnosis'&&canonicalMappings.includes(expectedExecutable)&&row.arguments.includes('diagnostic_worker.jl')){
+        try{diagnosticRequest=await readDiagnosticRequest(context,row.arguments,deadline);
+          const observedAfter=await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:bounded(3000)});
+          assert(!observedAfter.stderr.trim(),'Post-read executable inspection has no stderr error');
+          const afterMappings=observedAfter.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+          assert((await Promise.all(afterMappings.map(value=>fs.realpath(value).catch(()=>value)))).includes(expectedExecutable),'The observed worker retains its canonical executable after request reading');
+          assert.deepEqual(await identity(),before,'The observed worker retains its parent and incarnation after request reading');
+        }catch(error){diagnosticRequest={status:'inspection-error',errorClass:error.name||'Error',code:typeof error.code==='string'?error.code:undefined};}
+      }
       rows.push({pid:row.pid,...before,canonicalExecutable:canonicalMappings.includes(expectedExecutable)?expectedExecutable:undefined,
-        executableMappings:canonicalMappings.slice(0,8),projects,argumentsCharacters:row.arguments.length});
+        executableMappings:canonicalMappings.slice(0,8),projects,argumentsCharacters:row.arguments.length,...(diagnosticRequest?{diagnosticRequest}: {})});
     }catch(error){if(before)rows.push({pid:row.pid,...before,identityOnly:true});errors.push({pid:row.pid,parent:row.parent,error:redact(error)});}
   }));
   let listeners=[];
@@ -529,6 +587,7 @@ exports.run = async () => {
     nativeContext=context;
     if(process.platform==='darwin')context.processInventory=(stage,port,known)=>macProcessInventory(context,stage,port,known);
     if(['testitems-ready','suite','diagnosis','pluto'].includes(phase))context.observeWork=stage=>observeNativeWork(context,stage);
+    if(phase==='diagnosis'&&process.platform==='darwin'&&process.env.PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP)context.observeDiagnosisRequest=(stage,deadline)=>macProcessInventory(context,stage,undefined,[],deadline);
     context.measureTestItem=options=>measureNativeTestItem(context,true,options);
     log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 

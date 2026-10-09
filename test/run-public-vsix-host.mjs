@@ -484,7 +484,16 @@ try {
         recorded=new Promise(resolve=>{recording.once('close',code=>resolve(code));recording.once('error',error=>{recordingError=String(error);resolve(-1);});});
         console.log(`NATIVE_VIDEO_START ${phase} ${videoStartedAt}`);
       }
-      const environment={...runnerEnvironment,...externalBrowser?.environment,...(phase==='landscape'?landscapeFixture.environment:{}),PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
+      let diagnosticTemporaryRoot;
+      if(stage==='focused'&&caseGroup==='diagnosis'&&phase==='diagnosis'&&process.platform==='darwin'){
+        diagnosticTemporaryRoot=path.join(session,'diagnosis-worker-temp');await fs.mkdir(diagnosticTemporaryRoot);
+        diagnosticTemporaryRoot=await fs.realpath(diagnosticTemporaryRoot);
+        assert.equal(path.dirname(diagnosticTemporaryRoot),await fs.realpath(session));
+        assert(coreProvenance.diagnosticWorker,'The qualified Core preparation supplies its exact diagnostic worker');
+      }
+      const environment={...runnerEnvironment,...externalBrowser?.environment,...(phase==='landscape'?landscapeFixture.environment:{}),
+        ...(diagnosticTemporaryRoot?{TMPDIR:diagnosticTemporaryRoot,PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP:diagnosticTemporaryRoot}:{}),
+        PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
@@ -568,6 +577,14 @@ try {
   if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode==='general'&&!installed.registered)
     throw new Error('The actual Core installation must match its version and registry/candidate provenance.');
   Object.assign(coreProvenance,installed);
+  if(stage==='focused'&&caseGroup==='diagnosis'&&process.platform==='darwin'){
+    const sourceLine=installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_CORE_MODE=')&&line.includes(' SOURCE='));
+    assert(sourceLine,'The actual qualified Core installation records pathof(PerfChecker)');
+    const source=await fs.realpath(sourceLine.slice(sourceLine.indexOf(' SOURCE=')+8));
+    assert.equal(path.basename(source),'PerfChecker.jl');
+    const worker=await fs.realpath(path.join(path.dirname(source),'diagnostic_worker.jl'));
+    coreProvenance.diagnosticWorker={file:worker,sha256:createHash('sha256').update(await fs.readFile(worker)).digest('hex')};
+  }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   if(stage==='targeted'||stage==='full'||stage==='focused'&&['mcp','mcp-pluto','advisor','narrative'].includes(caseGroup)){
     const before=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));

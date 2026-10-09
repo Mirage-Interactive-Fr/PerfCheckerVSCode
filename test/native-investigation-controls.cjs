@@ -48,11 +48,19 @@ function reportRoot(context) {
 
 async function reportAfter(context, before, action, timeout = 360000) {
   const root = reportRoot(context);
+  const observationDeadline=Date.now()+timeout;let nextObservation=0;
   const found = await eventually(async () => {
+    if(action==='diagnose'&&context.observeDiagnosisRequest&&Date.now()>=nextObservation){
+      nextObservation=Date.now()+2000;
+      await context.observeDiagnosisRequest('awaiting-final-diagnosis-report',observationDeadline);
+      assert(Date.now()<observationDeadline,'A diagnosis observation never accepts a report after its existing deadline');
+    }
     for (const name of await directories(root)) {
       if (before.has(name)) continue;
       const location = path.join(root, name, `${reportNames[action]}.json`);
-      try {return {report: JSON.parse(await fs.readFile(location, 'utf8')), location, directory: path.dirname(location)};}
+      try {const report=JSON.parse(await fs.readFile(location, 'utf8'));
+        if(action==='diagnose'&&context.observeDiagnosisRequest)assert(Date.now()<observationDeadline,'The diagnosis scan never accepts a final report after its existing deadline');
+        return {report, location, directory: path.dirname(location)};}
       catch (error) {if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;}
     }
     return false;
