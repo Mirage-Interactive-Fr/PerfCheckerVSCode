@@ -535,7 +535,7 @@ exports.run = async () => {
     if(phase==='narrative'||process.env.PERFCHECKER_NATIVE_STAGE==='focused'){
       const settings=vscode.workspace.getConfiguration('perfchecker',uri);
       for(const [key,value] of Object.entries({juliaExecutable:process.env.PERFCHECKER_NATIVE_JULIA,runnerProject:context.controller,scenarioProject:context.controller,
-        suite:'perf/suite.jl',profile:phase==='studio'?'historical':'quick',reports:'perf/results/vscode',advisorEnabled:false,advisorConfig:'',scenarioSamples:2,analysisTools:[],plutoProject:'perf/pluto'}))
+        suite:'perf/suite.jl',profile:['studio','suite'].includes(phase)?'historical':'quick',reports:'perf/results/vscode',advisorEnabled:false,advisorConfig:'',scenarioSamples:2,analysisTools:[],plutoProject:'perf/pluto'}))
         await settings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
       if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
       else if(phase==='landscape')await runCase('native-landscape-controls',()=>require('./native-landscape-controls.cjs').run(context));

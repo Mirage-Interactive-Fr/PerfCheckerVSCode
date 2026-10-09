@@ -84,6 +84,15 @@ async function executeControllerPreflight(executable,args,receipt){
   child.stdout.on('data',chunk=>{text+=chunk;process.stdout.write(chunk);const ready=/^CONTROLLER_PREFLIGHT_READY (\d+)\r?$/m.exec(text);if(ready)readyPid=Number(ready[1]);});
   child.stderr.on('data',chunk=>{text+=chunk;process.stderr.write(chunk);});child.stdin.on('error',error=>errors.push({stage:'stdin',error:String(error)}));
   const canonical=value=>windows?value.toLowerCase():value;
+  const macCurrent=async pid=>{
+    let value;
+    try{value=(await inspectCommand('ps',['-p',String(pid),'-o','pid=,ppid=,pgid=,lstart=,stat='],{timeout:limit(3000)})).stdout.trim();}
+    catch(error){if(error.code===1&&!String(error.stdout||'').trim()&&!String(error.stderr||'').trim())return undefined;throw error;}
+    const match=/^(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+(\S+)$/.exec(value);
+    assert(match,'An existing macOS process has a complete current identity');assert.equal(Number(match[1]),pid);
+    if(/^[ZX]/.test(match[5]))return undefined;
+    return {pid,parent:Number(match[2]),group:Number(match[3]),started:match[4],state:match[5]};
+  };
   const inspect=async row=>{
     if(windows){assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));return {...row,executable:await fs.realpath(row.executable)};}
     if(process.platform==='linux'){
@@ -94,14 +103,14 @@ async function executeControllerPreflight(executable,args,receipt){
     }
     if(/^Z/.test(row.state))return undefined;
     assert(Number.isFinite(Date.parse(row.started)),'macOS supplies a real process start date');
-    const after=async()=>{try{const value=(await inspectCommand('ps',['-p',String(row.pid),'-o','ppid=','-o','lstart='],{timeout:limit(3000)})).stdout.trim();return /^(\d+)\s+(.+)$/.exec(value);}catch(error){if(error.code===1&&!String(error.stdout||'').trim())return undefined;throw error;}};
-    const before=await after();if(!before)return undefined;assert.equal(Number(before[1]),row.parent);assert.equal(before[2],row.started);
+    const before=await macCurrent(row.pid);if(!before)return undefined;assert.equal(before.parent,row.parent);assert.equal(before.group,row.group);assert.equal(before.started,row.started);
     let mappings;
     try{mappings=(await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)})).stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
-    catch(error){if(!await after())return undefined;throw error;}
+    catch(error){if(!await macCurrent(row.pid))return undefined;throw error;}
+    const after=await macCurrent(row.pid);if(!after)return undefined;
+    for(const key of ['parent','group','started'])assert.equal(after[key],before[key],'The process keeps its real identity while mapped executable paths are read');
     mappings=await Promise.all(mappings.map(file=>fs.realpath(file).catch(()=>file)));assert(mappings.length);
-    assert.deepEqual(await after(),before,'The process keeps its real parent and lstart while mapped executable paths are read');
-    return {...row,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
+    return {...after,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
   };
   const survey=async()=>{
     let rows;
@@ -124,7 +133,13 @@ async function executeControllerPreflight(executable,args,receipt){
       if(records.has(row.pid)||!(live.has(row.parent)||groupAnchored&&row.group===child.pid))continue;
       const current=await read(row);if(current){records.set(current.pid,current);live.add(current.pid);changed=true;}
     }}
-    const unknown=rows.filter(row=>!windows&&row.group===child.pid&&!/^[ZX]/.test(row.state)&&!live.has(row.pid));
+    const unknown=[];
+    for(const row of rows.filter(row=>!windows&&row.group===child.pid&&!/^[ZX]/.test(row.state)&&!live.has(row.pid))){
+      // ps may have captured a compilation child immediately before it exits.
+      // Revalidate absence/zombie state; a current unqualified incarnation still fails.
+      if(process.platform==='darwin'){const current=await macCurrent(row.pid);if(!current)continue;unknown.push(current);}
+      else unknown.push(row);
+    }
     if(unknown.length)errors.push({stage:'unanchored-private-group',pids:unknown.map(row=>row.pid)});
     receipt.ownership.identities=[...records.values()];
     const observation={observedAt:new Date().toISOString(),alive:[...live],unknown:unknown.map(row=>row.pid)};
