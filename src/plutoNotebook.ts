@@ -234,11 +234,13 @@ try
         sleep(0.1)
     end
 finally
+    println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN enter"); flush(stderr)
     if server !== nothing || !isempty(session.notebooks)
         # Core workers are detached from the Pluto/Malt worker. Cancel only the
         # typed jobs owned by each notebook and await their cleanup first.
         lock(cleanup_lock) do
             try
+                println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN jobs-begin"); flush(stderr)
                 shutdown_errors = Any[]
                 for notebook in values(session.notebooks)
                     try
@@ -248,12 +250,16 @@ finally
                     end
                 end
                 isempty(shutdown_errors) || throw(CompositeException(shutdown_errors))
+                println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN jobs-complete"); flush(stderr)
             finally
                 try
+                    println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN clients-begin"); flush(stderr)
                     for client in collect(values(session.connected_clients))
                         try close(client.stream) catch end
                     end
                     empty!(session.connected_clients)
+                    println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN clients-complete"); flush(stderr)
+                    println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN notebooks-begin"); flush(stderr)
                     notebook_errors = Any[]
                     for notebook in collect(values(session.notebooks))
                         try
@@ -263,12 +269,18 @@ finally
                         end
                     end
                     isempty(notebook_errors) || throw(CompositeException(notebook_errors))
+                    println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN notebooks-complete"); flush(stderr)
                 finally
-                    server === nothing || close(server)
+                    println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN http-begin"); flush(stderr)
+                    # This follows the owned-job and Malt cleanup attempts.
+                    # Graceful HTTP close can wait indefinitely for active requests.
+                    server === nothing || HTTP.forceclose(server)
+                    println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN http-complete"); flush(stderr)
                 end
             end
         end
     end
+    println(stderr, "PERFCHECKER_PLUTO_SHUTDOWN complete"); flush(stderr)
 end
 `;
 
