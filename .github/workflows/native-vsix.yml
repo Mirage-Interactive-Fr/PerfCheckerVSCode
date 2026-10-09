@@ -16,7 +16,7 @@ on:
       case_group:
         description: Native controls to exercise on a clean fixture (focused stage only)
         type: choice
-        options: [narrative, mcp, mcp-pluto, pluto-plots, pluto, workbench, advisor, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
+        options: [narrative, mcp, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
         default: narrative
       backend_julia:
         description: Core runtime for a manual qualification; automatic PR coverage remains latest
@@ -120,7 +120,7 @@ jobs:
           }
           if(newOrigin&&(e.NATIVE_EVENT!=='workflow_dispatch'||requested))throw Error('A new candidate origin requires an explicit manual run without archive-reuse inputs');
           if(JSON.parse(fs.readFileSync('package.json')).version==='1.0.1'&&!requested&&!newOrigin){
-            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=37829448084\nREUSE_NAME=native-candidate-86adabf2db29b585ead84f42515428b9978d18cb\nREUSE_SHA=aa1d19b2a666b0ccd3990dc3c2ef69336165a7dfa0ac292def39b8e6c8163b32\n');
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=37869228448\nREUSE_NAME=native-candidate-369bc4f01cacf3dfd71f85555557195a3352d28f\nREUSE_SHA=022f9d6313c843af60f583a04ca695c2dfdfa63b786e8dd8fd2ae5fed5c4fd2b\n');
             console.log('Release 1.0.1 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
           }
           NODE
@@ -193,8 +193,8 @@ jobs:
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '7e9c380f0b6f08676c73658743661dcc5f826162' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '5c133dbafd6110e54cfbec330614bc42ae3d6ffd' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '7fe5a07457c9f4a980b4afa64b62db7fc7847b89' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '09abb71369469e8aba4578e5397a3232f88c5bbb' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
@@ -231,7 +231,7 @@ jobs:
         with:
           name: native-candidate-${{ github.sha }}
       - name: Add the browser protocol client (no browser installation)
-        run: npm install --no-save --ignore-scripts playwright@1.62.1
+        run: npm install --no-save --ignore-scripts --package-lock=false playwright@1.62.1 @iarna/toml@2.2.5
       - name: Install the disposable default-browser fixture runtime
         if: runner.os == 'Linux' && matrix.vscode == 'stable' && (env.PERFCHECKER_NATIVE_STAGE == 'full' || env.PERFCHECKER_NATIVE_CASE_GROUP == 'mcp-pluto')
         run: npx playwright install chromium

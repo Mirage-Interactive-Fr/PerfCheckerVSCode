@@ -33,7 +33,8 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','pluto','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&caseGroup==='pluto-start-stop'&&process.platform!=='linux')throw new Error('The first prepared Pluto start/stop observation is explicitly Linux only.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 // The real game and SDKs are immutable fixtures, never development checkouts.
 // A trailing delimiter expands only Julia's system depots, excluding the human depot.
@@ -84,6 +85,15 @@ async function executeControllerPreflight(executable,args,receipt){
   child.stdout.on('data',chunk=>{text+=chunk;process.stdout.write(chunk);const ready=/^CONTROLLER_PREFLIGHT_READY (\d+)\r?$/m.exec(text);if(ready)readyPid=Number(ready[1]);});
   child.stderr.on('data',chunk=>{text+=chunk;process.stderr.write(chunk);});child.stdin.on('error',error=>errors.push({stage:'stdin',error:String(error)}));
   const canonical=value=>windows?value.toLowerCase():value;
+  const macCurrent=async(pid,maximum=3000)=>{
+    let value;
+    try{const current=await inspectCommand('ps',['-p',String(pid),'-o','pid=,ppid=,pgid=,lstart=,stat='],{timeout:limit(maximum)});assert(!current.stderr.trim(),'Current process inspection has no stderr error');value=current.stdout.trim();}
+    catch(error){if(error.code===1&&!String(error.stdout||'').trim()&&!String(error.stderr||'').trim())return undefined;throw error;}
+    const match=/^(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+(\S+)$/.exec(value);
+    assert(match,'An existing macOS process has a complete current identity');assert.equal(Number(match[1]),pid);
+    if(/^[ZX]/.test(match[5]))return undefined;
+    return {pid,parent:Number(match[2]),group:Number(match[3]),started:match[4],state:match[5]};
+  };
   const inspect=async row=>{
     if(windows){assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));return {...row,executable:await fs.realpath(row.executable)};}
     if(process.platform==='linux'){
@@ -94,14 +104,42 @@ async function executeControllerPreflight(executable,args,receipt){
     }
     if(/^Z/.test(row.state))return undefined;
     assert(Number.isFinite(Date.parse(row.started)),'macOS supplies a real process start date');
-    const after=async()=>{try{const value=(await inspectCommand('ps',['-p',String(row.pid),'-o','ppid=','-o','lstart='],{timeout:limit(3000)})).stdout.trim();return /^(\d+)\s+(.+)$/.exec(value);}catch(error){if(error.code===1&&!String(error.stdout||'').trim())return undefined;throw error;}};
-    const before=await after();if(!before)return undefined;assert.equal(Number(before[1]),row.parent);assert.equal(before[2],row.started);
+    const before=await macCurrent(row.pid);if(!before)return undefined;assert.equal(before.parent,row.parent);assert.equal(before.group,row.group);assert.equal(before.started,row.started);
     let mappings;
-    try{mappings=(await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)})).stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
-    catch(error){if(!await after())return undefined;throw error;}
+    try{const current=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)});assert(!current.stderr.trim(),'Mapped-executable inspection has no stderr error');mappings=current.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
+    catch(error){
+      if(error.code!==1||String(error.stdout||'').trim()||String(error.stderr||'').trim())throw error;
+      if(!await macCurrent(row.pid))return undefined;throw error;
+    }
+    const after=await macCurrent(row.pid);if(!after)return undefined;
+    for(const key of ['parent','group','started'])assert.equal(after[key],before[key],'The process keeps its real identity while mapped executable paths are read');
+    if(!mappings.length){
+      const observation={stage:'mapped-executable-empty',pid:row.pid,before,after,startedAt:new Date().toISOString(),rechecks:[]};
+      (receipt.ownership.inconclusive??=[]).push(observation);
+      const until=Math.min(cleanupUntil,Date.now()+200);
+      try{
+      while(Date.now()<until){
+        await new Promise(resolve=>setTimeout(resolve,Math.min(10,Math.max(0,until-Date.now()))));
+        if(Date.now()>=until)break;
+        const current=await macCurrent(row.pid,Math.max(1,until-Date.now()));
+        observation.rechecks.push({at:new Date().toISOString(),current:current??null});
+        if(!current){observation.resolution='proved-absent-or-zombie';return undefined;}
+        for(const key of ['parent','group','started'])assert.equal(current[key],before[key],'An inconclusive mapped-executable observation must retain the same incarnation');
+        const value=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(Math.max(1,until-Date.now()))});
+        assert(!value.stderr.trim(),'Mapped-executable revalidation must not hide an inspection error');
+        mappings=value.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+        const checked=await macCurrent(row.pid,Math.max(1,until-Date.now()));
+        observation.rechecks.at(-1).after=checked??null;observation.rechecks.at(-1).mappings=mappings;
+        if(!checked){observation.resolution='proved-absent-or-zombie';return undefined;}
+        for(const key of ['parent','group','started'])assert.equal(checked[key],before[key],'Mapped paths still belong to the original incarnation');
+        if(mappings.length){observation.resolution='mapped-executable-restored';break;}
+      }
+      if(!mappings.length)observation.resolution='live-executable-unqualified';
+      }catch(error){observation.resolution='inspection-failed';observation.error=String(error);throw error;}
+      finally{observation.finishedAt=new Date().toISOString();}
+    }
     mappings=await Promise.all(mappings.map(file=>fs.realpath(file).catch(()=>file)));assert(mappings.length);
-    assert.deepEqual(await after(),before,'The process keeps its real parent and lstart while mapped executable paths are read');
-    return {...row,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
+    return {...after,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
   };
   const survey=async()=>{
     let rows;
@@ -124,7 +162,13 @@ async function executeControllerPreflight(executable,args,receipt){
       if(records.has(row.pid)||!(live.has(row.parent)||groupAnchored&&row.group===child.pid))continue;
       const current=await read(row);if(current){records.set(current.pid,current);live.add(current.pid);changed=true;}
     }}
-    const unknown=rows.filter(row=>!windows&&row.group===child.pid&&!/^[ZX]/.test(row.state)&&!live.has(row.pid));
+    const unknown=[];
+    for(const row of rows.filter(row=>!windows&&row.group===child.pid&&!/^[ZX]/.test(row.state)&&!live.has(row.pid))){
+      // ps may have captured a compilation child immediately before it exits.
+      // Revalidate absence/zombie state; a current unqualified incarnation still fails.
+      if(process.platform==='darwin'){const current=await macCurrent(row.pid);if(!current)continue;unknown.push(current);}
+      else unknown.push(row);
+    }
     if(unknown.length)errors.push({stage:'unanchored-private-group',pids:unknown.map(row=>row.pid)});
     receipt.ownership.identities=[...records.values()];
     const observation={observedAt:new Date().toISOString(),alive:[...live],unknown:unknown.map(row=>row.pid)};
@@ -441,8 +485,18 @@ try {
         recorded=new Promise(resolve=>{recording.once('close',code=>resolve(code));recording.once('error',error=>{recordingError=String(error);resolve(-1);});});
         console.log(`NATIVE_VIDEO_START ${phase} ${videoStartedAt}`);
       }
-      const environment={...runnerEnvironment,...externalBrowser?.environment,...(phase==='landscape'?landscapeFixture.environment:{}),PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
+      let diagnosticTemporaryRoot;
+      if(stage==='focused'&&caseGroup==='diagnosis'&&phase==='diagnosis'&&process.platform==='darwin'){
+        diagnosticTemporaryRoot=path.join(session,'diagnosis-worker-temp');await fs.mkdir(diagnosticTemporaryRoot);
+        diagnosticTemporaryRoot=await fs.realpath(diagnosticTemporaryRoot);
+        assert.equal(path.dirname(diagnosticTemporaryRoot),await fs.realpath(session));
+        assert(coreProvenance.diagnosticWorker,'The qualified Core preparation supplies its exact diagnostic worker');
+      }
+      const environment={...runnerEnvironment,...externalBrowser?.environment,...(phase==='landscape'?landscapeFixture.environment:{}),
+        ...(diagnosticTemporaryRoot?{TMPDIR:diagnosticTemporaryRoot,PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP:diagnosticTemporaryRoot}:{}),
+        PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
+        ...(phase==='pluto-start-stop'?{PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT:JSON.stringify(artifactRecord.plutoEnvironment)}:{}),
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
         PERFCHECKER_NATIVE_MODE: mode, PERFCHECKER_NATIVE_SHA: sha,
@@ -525,6 +579,14 @@ try {
   if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode==='general'&&!installed.registered)
     throw new Error('The actual Core installation must match its version and registry/candidate provenance.');
   Object.assign(coreProvenance,installed);
+  if(stage==='focused'&&caseGroup==='diagnosis'&&process.platform==='darwin'){
+    const sourceLine=installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_CORE_MODE=')&&line.includes(' SOURCE='));
+    assert(sourceLine,'The actual qualified Core installation records pathof(PerfChecker)');
+    const source=await fs.realpath(sourceLine.slice(sourceLine.indexOf(' SOURCE=')+8));
+    assert.equal(path.basename(source),'PerfChecker.jl');
+    const worker=await fs.realpath(path.join(path.dirname(source),'diagnostic_worker.jl'));
+    coreProvenance.diagnosticWorker={file:worker,sha256:createHash('sha256').update(await fs.readFile(worker)).digest('hex')};
+  }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   if(stage==='targeted'||stage==='full'||stage==='focused'&&['mcp','mcp-pluto','advisor','narrative'].includes(caseGroup)){
     const before=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
@@ -639,7 +701,7 @@ end
   await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': officialRuntime.executable, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
-  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots','pluto'].includes(caseGroup))){
+  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots','pluto','pluto-start-stop'].includes(caseGroup))){
     const companion={commit:'7fe5a07457c9f4a980b4afa64b62db7fc7847b89',tree:'9bc464202aa5b60262be9483bda5968bacd2960a',version:'1.0.1'};
     const revision=coreMode==='candidate'?companion.commit:'v1.0.1';
     const text=await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev=ARGS[7]);preserve=Pkg.PRESERVE_ALL); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid];@assert string(info.tree_hash)==ARGS[6];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[8];if ARGS[5]=="general";@assert info.is_tracking_registry;end;print("PLUTO_ENV_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerPluto,Pluto,PlutoUI)));println()`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode,coreProvenance.tree,revision,companion.tree]);
