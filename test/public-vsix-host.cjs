@@ -78,6 +78,7 @@ function buttonCoverage(checks){
     'Designer · Run selected and native backend':['native-run-selection'],
     'Designer · native colour picker / group labels / save / reload':['native-colour-picker-save-reload'],
     'Results · filters / reports / keyboard navigation':['result-controls'],
+    'Results · metric visibility / measured version range / Reset':['native-results-comparison-controls'],
     'Investigation · adoption / validation / duplicate rejection':['investigation-adoption-types-and-duplicate-rejected'],
     'Editor · real proposal and diagnosis CodeLens / quick fix':['native-codelens-and-quickfix'],
     'Investigation · real collectors / profile filters / raw evidence':['investigation-real-collectors-and-profile-controls'],
@@ -150,7 +151,7 @@ function configurationCoverage(properties,checks){
     uiConfiguration:['save-palette-command','native-suite-save-palette'],gitTargets:['git-reference-controls'],comparisonPolicies:['computed-reference-aggregation'],
     advisorImplementationMcpTool:['native-mcp-advice-implementation-restore'],advisorImplementationMcpPromptArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],
     advisorImplementationMcpWorkspaceArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],codexExecutable:['codex-missing-native-prerequisite'],
-    advisorImplementationMcpArguments:[],advisorMcpStdioCommand:[],advisorMcpStdioArguments:[],advisorMcpStdioDirectory:[],
+    ...Object.fromEntries(['advisorImplementationMcpArguments','advisorMcpStdioCommand','advisorMcpStdioArguments','advisorMcpStdioDirectory'].map(key=>[key,['native-mcp-persisted-stdio-settings-after-reload']])),
     plutoProject:['native-pluto-without-jupyter','pluto-investigation-real-run','pluto-stop-active-owned-worker'],
   };
   const pathOnly=new Set(['advisorTimeout','advisorInvestigates','investigationBudgetSeconds','analysisTimeout','suite','factory','profile']);
@@ -166,7 +167,7 @@ function configurationCoverage(properties,checks){
     profile:'The actual quick profile is run; every alternate profile is not native-qualified.',
     codexExecutable:'The unavailable executable diagnostic is native-tested; authenticated Codex is a separate local opt-in proof.',
     ...Object.fromEntries(['advisorImplementationMcpArguments','advisorMcpStdioCommand','advisorMcpStdioArguments','advisorMcpStdioDirectory'].map(key=>[key,
-      'Native session fields are exercised separately; reading saved settings or prefilling them from this option is unverified.'])),
+      'This proof covers controlled saved values and actual form prefill for two workspace folders after a real host restart; external commands and authenticated agents are outside its scope.'])),
   };
   return Object.keys(properties).map(option=>{
     const key=option.replace(/^perfchecker\./,''),evidence=checks.filter(check=>check.assertionsCompleted===true&&(paths[key]||[]).includes(check.name));

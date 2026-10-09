@@ -64,14 +64,28 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await writeFile(path.join(reports,'suite-result.json'),JSON.stringify({schema_version:'perfchecker-suite-result/1',suite:'Example',profile:'quick',finished_at:'2026-10-03',runs:runs.map(run=>({...run,status:'pass',elapsed_seconds:.02,summary:{median_time:120,memory_bytes:64},message:''}))}));
     const overlay={kind:'normalized_metrics',title:'Time and allocations',description:'Minimum of each metric = 1',options:{package:'Example',feature:'sort',workload:'sort',collector:'benchmarktools-v1',versions:['1.0.0','1.1.0'],reference_version:'minimum'},
       data:['julia.wall.time','julia.alloc.bytes'].flatMap(metric=>[{version:'1.0.0',metric,value:20,unit:'ns',ratio:2,normalization_status:'ratio'},{version:'1.1.0',metric,value:10,unit:'ns',ratio:1,normalization_status:'ratio'}])};
-    await writeFile(path.join(reports,'version-series.json'),JSON.stringify({schema_version:'perfchecker-version-series/1',series:[{package:'Example',feature:'sort',workload:'sort',metric:'julia.wall.time',unit:'ns',measurement_definition:'julia.wall.time/benchmarktools-v1',points:[{version:'1.0.0',median:20,samples:10},{version:'1.1.0',median:10,samples:10}]}],plots:[overlay]}));
+    // Nine synthetic versions qualify the real viewer's controls; these are not measured media data.
+    const versionFixture=Array.from({length:9},(_,index)=>String(index+1).repeat(40));
+    versionFixture[8]='<img src=x onerror=alert(1)>';
+    const metricFixture=['julia.wall.time','julia.<script>alert(1)</script>'];
+    const interactive={...overlay,title:'Nine-version control fixture',options:{...overlay.options,versions:versionFixture},
+      data:metricFixture.flatMap((metric,metricIndex)=>versionFixture.map((version,index)=>({version,metric,value:index+1,unit:'ns',ratio:metricIndex===1&&index===4?null:index+1,normalization_status:metricIndex===1&&index===4?'unavailable':'ratio'})))};
+    await writeFile(path.join(reports,'version-series.json'),JSON.stringify({schema_version:'perfchecker-version-series/1',series:[{package:'Example',feature:'sort',workload:'sort',metric:'julia.wall.time',unit:'ns',measurement_definition:'julia.wall.time/benchmarktools-v1',points:[{version:'1.0.0',median:20,samples:10},{version:'1.1.0',median:10,samples:10}]}],plots:[overlay,interactive]}));
     const base={record_type:'observation',case_id:'sort|with-pipe',target_id:'1.0.0',attributes:{package:'Example',feature:'sort',workload:'sort',version:'1.0.0'}};
-    const observations=[...[10,11,12,20].map(value=>({...base,metric:'julia.wall.time',measurement_definition:'julia.wall.time/benchmarktools-v1',unit:'ns',value})),
+    const numeric=(value,extra={})=>({...base,comparison_key:'sort/v1',metric:'julia.wall.time',measurement_definition:'julia.wall.time/benchmarktools-v1',unit:'ns',value,...extra});
+    const observations=[...[10,11,12,20].map(value=>numeric(value)),
+      ...[20,30,40,...Array(321).fill(25)].map(value=>numeric(value,{case_id:'sort|compatible-variant',target_id:'1.1.0',attributes:{...base.attributes,version:'1.1.0'}})),
+      ...[20,200].map(value=>numeric(value,{comparison_key:'different-implementation'})),
+      ...[20,100].map(value=>numeric(value,{measurement_definition:'julia.wall.time/chairmarks-v1'})),
+      ...[20,50].map(value=>numeric(value,{metric:'other.metric'})),
+      ...[20,60].map(value=>numeric(value,{unit:'s'})),
+      ...[...Array.from({length:10000},(_,index)=>index),1e9].map(value=>numeric(value,{comparison_key:'huge-separate-series'})),
       {...base,metric:'julia.alloc.bytes',measurement_definition:'julia.alloc.bytes/profile-allocs-v1',unit:'By',value:64,attributes:{...base.attributes,source_file:'sort.jl',source_line:12,stack:['sort','allocate']}},
       {...base,metric:'julia.cpu.samples',measurement_definition:'julia.cpu.samples/profile-v1',unit:'1',value:3,attributes:{...base.attributes,stack:['sort','partition'],runtime_dispatch:[false,true]}},
     ];
     await mkdir(path.join(reports,'bundles','run-fixture'),{recursive:true});
-    await writeFile(path.join(reports,'bundles','run-fixture','observations.jsonl'),observations.map(value=>JSON.stringify(value)).join('\n'));
+    const observationFile=path.join(reports,'bundles','run-fixture','observations.jsonl'),observationBytes=observations.map(value=>JSON.stringify(value)).join('\n');
+    await writeFile(observationFile,observationBytes);
     const original=Module._load;Module._load=function(name,...args){return name==='vscode'?vscode:name==='./investigation'?{registerInvestigations(){}}:name==='./testitems'?{registerNativeTestItems(){}}:name==='node:child_process'?{...original.call(this,name,...args),spawn}:original.call(this,name,...args);};
     try{require('../dist/extension.js').activate({subscriptions:[],extensionUri:uri(path.resolve('.')),globalStorageUri:uri(path.join(temporary,'storage'))});}finally{Module._load=original;}
     await commands.get('perfchecker.openDesignerForWorkspace')(folder.uri);
@@ -237,10 +251,57 @@ test('real webviews preserve full selection, handle Git targets and render inter
     assert.deepEqual(dragConfiguration.selection.run_ids.slice(0,3),[dragIds[1],dragIds[0],dragIds[2]],'The saved order reflects the real browser drop');
     assert.equal(dragConfiguration.selection.run_ids.length,1000);
     await page.setViewportSize({width:420,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
-    await load('perfchecker.output');assert.equal(await page.locator('.distribution .sample').count(),4);assert.equal(await page.locator('.pie-slice').count(),1);
+    await load('perfchecker.output');assert.equal(await page.locator('.distribution .sample').count(),848);assert.equal(await page.locator('.pie-slice').count(),1);
     assert.equal(await page.locator('.pie-slice').getAttribute('fill'),'#4f8cff');assert.match(await page.locator('.pie-slice').getAttribute('d'),/A82 82 0 1 1 100 182/);
     await page.locator('.pie-slice').focus();assert.match(await page.locator('#allocation-0').innerText(),/64 B · 100.00%/);
-    assert.equal(await page.locator('.normalized-chart .hover-value').count(),4);await page.locator('.normalized-chart .hover-value').first().focus();assert.match(await page.locator('#normalized-0').innerText(),/ratio 2/);
+    const charts=page.locator('.normalized-plot'),firstChart=charts.nth(0),chart=charts.nth(1);
+    assert.equal(await firstChart.locator('.hover-value').count(),4);await firstChart.locator('.hover-value').first().focus();assert.match(await page.locator('#normalized-0').innerText(),/ratio 2/);
+    assert.equal(await chart.locator('.hover-value').count(),17);assert.equal(await chart.locator('img,script').count(),0);
+    assert.equal(await chart.locator('.normalized-labels text').first().getAttribute('aria-label'),versionFixture[0]);
+    assert.match(await chart.locator('.normalized-labels text').first().textContent(),/1111111$/);
+    const point=chart.locator('[data-metric="0"][data-version="'+versionFixture[2]+'"]');
+    const originalY=await point.getAttribute('cy');
+    await chart.locator('[data-normalized-from]').selectOption('2');await chart.locator('[data-normalized-to]').selectOption('6');
+    assert.equal(await chart.locator('.hover-value').count(),9);assert.equal(await point.getAttribute('cy'),originalY,'Filtering never renormalizes or changes Y');
+    assert.equal(await chart.locator('.normalized-series path').count(),3,'The missing ratio still splits its metric into two paths');
+    assert.match(await point.getAttribute('data-detail'),/ratio 3/);
+    assert.equal(await firstChart.locator('.hover-value').count(),4,'Each chart has independent controls');
+    await point.focus();await chart.locator('[data-normalized-metric="0"]').uncheck();
+    assert.match(await chart.locator('.plot-detail').innerText(),/^Hover or focus/,'Hiding the inspected metric clears stale detail');
+    assert.equal(await chart.locator('.hover-value').count(),4);
+    // A redraw with point focus retains focus when possible and falls back to its metric control otherwise.
+    await chart.locator('[data-metric="1"]').first().focus();
+    await chart.locator('[data-normalized-to]').evaluate(control=>{control.value='5';control.dispatchEvent(new Event('change',{bubbles:true}));});
+    assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('data-metric')),'1');
+    await chart.locator('[data-normalized-from]').evaluate(control=>{control.value='5';control.dispatchEvent(new Event('change',{bubbles:true}));});
+    assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('data-normalized-metric')),'1');
+    assert.equal(await chart.locator('.normalized-chart .hover-value').first().getAttribute('cx'),'465','A single selected version is centered');
+    await chart.locator('[data-normalized-reset]').click();
+    assert.equal(await chart.locator('.hover-value').count(),17);assert.equal(await chart.locator('[data-normalized-from]').inputValue(),'0');assert.equal(await chart.locator('[data-normalized-to]').inputValue(),'8');
+    assert.match(await chart.locator('.plot-detail').innerText(),/^Hover or focus/);
+    assert.equal(await chart.locator('img,script').count(),0,'Escaped labels remain inert after reconstruction');
+    const distributions=await page.locator('.distribution').evaluateAll(svgs=>svgs.map(svg=>({
+      values:[...svg.querySelectorAll('.sample')].map(node=>Number(node.dataset.value)),
+      ranks:[...svg.querySelectorAll('.sample')].map(node=>Number(node.dataset.rank)),
+      x20:svg.querySelector('[data-value="20"]')?.getAttribute('cx'),scale:svg.parentElement.querySelector('.distribution-scale').textContent,
+      sampling:svg.parentElement.querySelector('.distribution-sampling')?.textContent,
+    })));
+    const baseline=distributions.find(row=>row.values.includes(11)),candidate=distributions.find(row=>row.values.length===324);
+    assert(baseline&&candidate,'Every sample remains present above the former 320-point sampling threshold');
+    assert.equal(baseline.x20,candidate.x20,'The same sample has the same X in compatible versions');
+    for(const row of distributions.filter(row=>row!==baseline&&row!==candidate))assert.notEqual(row.x20,baseline.x20,'Different identity, collector, metric or unit retains a separate scale');
+    assert.match(baseline.scale,/10 ns.*40 ns.*\(ns\)/);assert.deepEqual(baseline.values,[10,11,12,20]);
+    assert.equal(candidate.values.filter(value=>value===40).length,1,'The largest outlier is retained');
+    assert.equal(baseline.sampling,undefined);assert.equal(candidate.sampling,undefined,'Ordinary sample sets remain fully visible');
+    const largeDistribution=distributions.find(row=>row.values.includes(1e9));assert(largeDistribution);
+    assert.equal(largeDistribution.values.length,512,'Large distributions have a bounded SVG point count');
+    assert.deepEqual(largeDistribution.ranks,Array.from({length:512},(_,index)=>Math.round(index*10000/511)+1));
+    assert.equal(largeDistribution.values[0],0);assert.equal(largeDistribution.values.at(-1),1e9);
+    assert.equal(largeDistribution.sampling,'512 of 10001 samples plotted; all samples in JSON.');
+    const outlier=page.locator('.distribution .sample[data-value="1000000000"]');await outlier.focus();
+    assert.match(await page.locator('#'+await outlier.getAttribute('data-target')).innerText(),/sorted sample 10001\/10001/);
+    assert.equal(await readFile(observationFile,'utf8'),observationBytes,'Presentation preserves every original JSON sample');
+    await page.setViewportSize({width:390,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     await page.locator('.flame-node.dynamic').focus();assert.match(await page.locator('#flame-1').innerText(),/Runtime dispatch detected/);
     await page.locator('#result-kind').selectOption('allocation');assert.equal(await page.locator('[data-result-item]:visible').count(),1);
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);

@@ -565,6 +565,41 @@ async function testResults(context) {
     if (target) assert((await view.locator(`[id="${target}"]`).innerText()).trim(), `${name} keyboard focus shows its evidence`);
   }
   assert(chartFamilies.flame>0,'The actual profile reports render nonempty, focusable flame frames');
+  const overlay=view.locator('.normalized-plot').first();
+  assert.equal(await overlay.count(),1,'Measured version series supplies the real comparison controls');
+  const seriesFile=path.join(context.results,'version-series.json'),seriesBytes=await fs.readFile(seriesFile);
+  const payload=await overlay.getAttribute('data-normalized'),data=JSON.parse(payload);
+  const inspected=overlay.locator('.normalized-chart .hover-value').first();
+  const metric=await inspected.getAttribute('data-metric'),detailTarget=await inspected.getAttribute('data-target');
+  const beforeCount=await overlay.locator('.normalized-chart .hover-value').count();assert(beforeCount>0);
+  await inspected.focus();assert.match(await view.locator(`[id="${detailTarget}"]`).innerText(),/ratio/);
+  await overlay.locator(`[data-normalized-metric="${metric}"]`).uncheck();
+  assert.equal(await overlay.locator(`[data-metric="${metric}"]`).count(),0);
+  assert.match(await view.locator(`[id="${detailTarget}"]`).innerText(),/^Hover or focus/);
+  await overlay.getByRole('button',{name:'Reset chart',exact:true}).click();
+  assert.equal(await overlay.locator('.normalized-chart .hover-value').count(),beforeCount);
+  const retained=await overlay.locator('.normalized-chart .hover-value').evaluateAll((points,versions)=>{
+    const point=points.find(point=>versions.indexOf(point.dataset.version)>0);
+    return point&&{version:point.dataset.version,metric:point.dataset.metric,y:point.getAttribute('cy'),detail:point.dataset.detail};
+  },data.versions);
+  assert(retained,'The actual measured series has a finite point beyond its first version');
+  const index=String(data.versions.indexOf(retained.version));
+  await overlay.locator('[data-normalized-from]').selectOption(index);await overlay.locator('[data-normalized-to]').selectOption(index);
+  const filtered=await overlay.locator('.normalized-chart .hover-value').evaluateAll(points=>points.map(point=>({
+    version:point.dataset.version,metric:point.dataset.metric,y:point.getAttribute('cy'),detail:point.dataset.detail,
+  })));
+  assert(filtered.length>0&&filtered.every(point=>point.version===retained.version));
+  assert.deepEqual(filtered.find(point=>point.metric===retained.metric),retained,'View filtering preserves the original ratio, raw value and Y');
+  assert.equal(await overlay.getAttribute('data-normalized'),payload);
+  await overlay.getByRole('button',{name:'Reset chart',exact:true}).click();
+  assert.equal(await overlay.locator('[data-normalized-from]').inputValue(),'0');
+  assert.equal(await overlay.locator('[data-normalized-to]').inputValue(),String(data.versions.length-1));
+  assert.equal(await overlay.locator('.normalized-chart .hover-value').count(),beforeCount);
+  assert.match(await view.locator(`[id="${detailTarget}"]`).innerText(),/^Hover or focus/);
+  assert.deepEqual(await fs.readFile(seriesFile),seriesBytes,'Comparison gestures do not rewrite measured reports');
+  context.proof('native-results-comparison-controls',{actualMeasuredVersions:data.versions.length,visibleMetrics:data.metrics.length,
+    metricCheckbox:true,measuredVersionRange:true,reset:true,staleReadoutCleared:true,
+    fixedYAndOriginalRatioPreserved:true,measurementFileUnchanged:true});
   context.proof('result-controls', {items: total, filters: 7, chartFamilies});
   const chart=view.locator('.normalized-chart,.distribution,.spark').first();
   if(await chart.count())await chart.scrollIntoViewIfNeeded();

@@ -211,6 +211,42 @@ async function bridgeClosed(tuple){
     socket.once('connect',()=>{socket.destroy();resolve(false);});socket.once('error',error=>error.code==='ECONNREFUSED'?resolve(true):reject(error));});
 }
 const stdioHandoffFile=()=>path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'mcp-stdio-reload-handoff.json');
+const persistedStdioKeys=['advisorImplementationMcpArguments','advisorMcpStdioCommand','advisorMcpStdioArguments','advisorMcpStdioDirectory'];
+function persistedStdioValues(command,endpoint,root,label){return {
+  advisorImplementationMcpArguments:{nativePersistedFixture:label},advisorMcpStdioCommand:command,
+  advisorMcpStdioArguments:[__filename,'--neutral-stdio',endpoint,root,'2026-07-28'],advisorMcpStdioDirectory:root,
+};}
+const persistedStdioCommand=(command,root,label)=>label==='a'?command:path.join(root,'saved-scope-node'+path.extname(command));
+async function verifyPersistedStdioSettings(context,fixture,stage){
+  const {vscode,findFrame}=context,uri=vscode.Uri.file(fixture.workspace);
+  const settings=vscode.workspace.getConfiguration('perfchecker',uri);
+  for(const key of persistedStdioKeys){
+    assert.deepEqual(settings.inspect(key).workspaceFolderValue,fixture.values[key]);
+    assert.deepEqual(settings.get(key),fixture.values[key],'Read the exact selected folder scope');
+  }
+  await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',uri);
+  await vscode.commands.executeCommand('perfchecker.openChat');let chat=await findFrame('#chat-root');
+  const state=await vscode.commands.executeCommand('perfchecker.chatState');
+  assert.equal(state.workspace,vscode.workspace.getWorkspaceFolder(uri).name);
+  assert.equal(state.connectionKind,undefined);assert.equal(state.busy,false);
+  assert.deepEqual(state.implementation.arguments,fixture.values.advisorImplementationMcpArguments);
+  await chat.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
+  await chat.getByText('Configure the MCP implementation tool',{exact:true}).click();
+  await eventually(async()=>JSON.stringify(JSON.parse(await chat.getByLabel('Other implementation tool arguments (JSON)',{exact:true}).inputValue()))===JSON.stringify(fixture.values.advisorImplementationMcpArguments),
+    'The real Chat UI receives the selected folder implementation arguments',15000);
+  await chat.getByRole('button',{name:'Connect local MCP server',exact:true}).click();
+  const setup=await findFrame('#advisor-root');
+  assert.equal(await setup.getByLabel('Absolute MCP server executable',{exact:true}).inputValue(),fixture.values.advisorMcpStdioCommand);
+  assert.deepEqual(JSON.parse(await setup.getByLabel('Executable arguments (JSON array)',{exact:true}).inputValue()),fixture.values.advisorMcpStdioArguments);
+  assert.equal(await setup.getByLabel('Absolute server working directory',{exact:true}).inputValue(),fixture.values.advisorMcpStdioDirectory);
+  assert.equal(await setup.locator('#advisor-root').getAttribute('aria-busy'),'false');
+  // Inspect and close the actual form without discovering or connecting.
+  await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+  await vscode.commands.executeCommand('perfchecker.openChat');
+  assert.equal((await vscode.commands.executeCommand('perfchecker.chatState')).connectionKind,undefined);
+  await assert.rejects(fs.access(path.join(fixture.root,'server.pid')),error=>error.code==='ENOENT');
+  context.log('native-mcp-persisted-stdio-read',{stage,workspace:fixture.workspace,keys:persistedStdioKeys,formPrefilled:true,noAutomaticLaunch:true});
+}
 async function stdioHandoff(){
   let stat;try{stat=await fs.lstat(stdioHandoffFile());}catch(error){if(error.code==='ENOENT')return;throw error;}
   assert(stat.isFile()&&!stat.isSymbolicLink()&&stat.size<128000);
@@ -220,13 +256,30 @@ async function stdioHandoff(){
   assert.deepEqual(value.core,JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE));
   assert.equal(value.qualifierSourceSha256,hash(await fs.readFile(__filename)));
   assert.deepEqual(Object.keys(value).sort(),['status','invocation','vsixSha256','workspace','oldHostPid','core','connection','files','head',
-    'beforeReportSha256','qualifierSourceSha256','reloadRequestedAt','savedMeasurement'].sort());
+    'beforeReportSha256','qualifierSourceSha256','reloadRequestedAt','savedMeasurement','persistedSettings'].sort());
   assert.deepEqual(Object.keys(value.connection).sort(),['root','identity','command','version',...(value.connection.windowsJobOwner?['windowsJobOwner']:[])].sort());
   const root=value.connection.root,session=await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION);
   assert.equal(path.dirname(await fs.realpath(root)),session);assert(path.basename(root).startsWith('neutral-mcp-'));
   assert((await fs.lstat(root)).isDirectory()&&!(await fs.lstat(root)).isSymbolicLink());
   assert.equal(value.connection.command,await fs.realpath(process.env.PERFCHECKER_NATIVE_NODE));assert.equal(value.connection.version,'2026-07-28');
+  assert.equal(value.persistedSettings.length,2);
+  for(const [index,fixture]of value.persistedSettings.entries()){
+    const label=index?'b':'a';
+    assert.deepEqual(Object.keys(fixture).sort(),['workspace','root','values']);
+    assert.equal(fixture.workspace,index?path.join(path.dirname(value.workspace),'chat-alternate-workspace'):value.workspace);
+    assert.equal(fixture.root,path.join(session,'persisted-stdio-'+label));
+    assert((await fs.lstat(fixture.root)).isDirectory()&&!(await fs.lstat(fixture.root)).isSymbolicLink());
+    const endpoint=fixture.values.advisorMcpStdioArguments[2],url=new URL(endpoint);
+    assert.equal(url.protocol,'http:');assert.equal(url.hostname,'127.0.0.1');assert(url.port);
+    assert.equal(url.pathname,'/mcp');assert.equal(url.username+url.password+url.search+url.hash,'');
+    const command=persistedStdioCommand(value.connection.command,fixture.root,label);
+    assert.equal(await fs.realpath(command),command);assert((await fs.lstat(command)).isFile()&&!(await fs.lstat(command)).isSymbolicLink());
+    if(index)assert.equal(hash(await fs.readFile(command)),hash(await fs.readFile(value.connection.command)),
+      'B uses a distinct real native executable path with the same controlled Node bytes');
+    assert.deepEqual(fixture.values,persistedStdioValues(command,endpoint,fixture.root,label));
+  }
   const expectedFiles=[path.join(value.workspace,'src','PerfCheckerNativeFixture.jl'),path.join(value.workspace,'.git','index'),path.join(value.workspace,'.vscode','settings.json'),
+    path.join(value.persistedSettings[1].workspace,'.vscode','settings.json'),
     ...[process.env.PERFCHECKER_NATIVE_CONTROLLER,path.join(value.workspace,'worker-environment')].flatMap(directory=>['Project.toml','Manifest.toml'].map(name=>path.join(directory,name))),
     value.savedMeasurement.file,value.savedMeasurement.adviceFile];
   assert.deepEqual(Object.keys(value.files).sort(),expectedFiles.sort());
@@ -262,12 +315,21 @@ async function resumeStdioReload(context,value){
   await vscode.commands.executeCommand('perfchecker.openChat');const state=await vscode.commands.executeCommand('perfchecker.chatState');
   assert.equal(state.workspace,selected.name,'The restarted host opens the explicitly selected owning workspace');
   assert.equal(state.connectionKind,undefined);assert.equal(state.busy,false);assert.deepEqual(state.messages,[]);
+  // B then A proves scope separation after a real host restart; finish on A.
+  for(const fixture of [...value.persistedSettings].reverse())await verifyPersistedStdioSettings(context,fixture,'after-official-reload');
+  const finalState=await vscode.commands.executeCommand('perfchecker.chatState');
+  assert.equal(finalState.workspace,selected.name);assert.equal(finalState.connectionKind,undefined);
+  assert.equal(finalState.busy,false);assert.deepEqual(finalState.messages,[]);
   for(const [file,digest] of Object.entries(value.files))assert.equal(hash(await fs.readFile(file)),digest,'Reload preserves source, Git index, settings, result and project/manifest bytes');
   assert.equal((await execute('git',['rev-parse','HEAD'],{cwd:workspace,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout,value.head);
   const records=(await fs.readFile(path.join(value.connection.root,'stdio-requests.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
   assert(records.some(row=>row.method==='stdin/eof'));
   const activations=(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'mcp-stdio-activations.jsonl'),'utf8')).trim().split('\n').map(JSON.parse).filter(row=>row.invocation===value.invocation);
   assert.equal(activations.length,2);assert.deepEqual(activations.map(row=>row.pid),[value.oldHostPid,process.pid]);
+  proof('native-mcp-persisted-stdio-settings-after-reload',{keys:persistedStdioKeys,
+    distinctWorkspaceScopes:true,exactSavedReadsAndActualFormPrefill:true,survivedActualHostRestart:true,
+    noAutomaticServerLaunch:true,noPersistedActiveConnection:true,settingsHashesPreserved:true,
+    fixtureWorkspaces:value.persistedSettings.map(fixture=>fixture.workspace)});
   proof('native-mcp-stdio-official-editor-reload',{oldHostPid:value.oldHostPid,newHostPid:process.pid,activations,
     oldHostAbsentBeforeTeardown:true,explicitWorkspaceSelectionAfterReload:true,
     server:value.connection.identity,windowsJobOwner:value.connection.windowsJobOwner,observedAbsentBeforeTeardown:true,
@@ -578,6 +640,12 @@ exports.run = async (context,options={}) => {
     advisorImplementationMcpPromptArgument:implementationArgument,advisorImplementationMcpWorkspaceArgument:workspaceArgument,
     codexExecutable: path.join(workspace, 'not-installed-codex')};
   values.scenarioSamples=100;
+  const persistedSettings=[];
+  if(stdio){
+    const root=path.join(await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION),'persisted-stdio-a');await fs.mkdir(root);
+    const fixture={workspace,root,values:persistedStdioValues(await fs.realpath(nativeNode),values.advisorEndpoint,root,'a')};
+    persistedSettings.push(fixture);Object.assign(values,fixture.values);
+  }
   const previous = Object.fromEntries(Object.keys(values).map(key => [key, settings().inspect(key)?.workspaceFolderValue]));
   const state = () => vscode.commands.executeCommand('perfchecker.chatState');
   const stdioConnections=[];let activeStdio,reloading=false,primaryError;
@@ -742,6 +810,7 @@ exports.run = async (context,options={}) => {
     savedEvidence=await measuredEvidence(context);
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#chat-root');
     if(stdio){
+      await verifyPersistedStdioSettings(context,persistedSettings[0],'initial-folder-a');
       view=await connectStdio('2025-11-25');
       await send('native legacy transport probe: inspect the intermediate allocation without editing or attaching the saved report.',2);
       assert(legacyJulia);await eventually(async()=>await sameNativeIdentityGone(legacyJulia.cliIdentity)&&await sameNativeIdentityGone(legacyJulia.workerIdentity),
@@ -872,6 +941,17 @@ exports.run = async (context,options={}) => {
     assert(vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length,0,{uri:alternateFolder,name:'Chat alternate folder'}));
     await eventually(()=>vscode.workspace.workspaceFolders.some(folder=>folder.uri.toString()===alternateFolder.toString()),
       'The real workspace has added the independent alternate folder');
+    if(stdio){
+      const root=path.join(await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION),'persisted-stdio-b');await fs.mkdir(root);
+      // A second real executable path distinguishes command scope too; this
+      // owned fixture binary is removed with the disposable native session.
+      const command=persistedStdioCommand(await fs.realpath(nativeNode),root,'b');
+      await fs.copyFile(nativeNode,command);await fs.chmod(command,0o700);
+      const fixture={workspace:alternate,root,values:persistedStdioValues(command,values.advisorEndpoint,root,'b')};
+      persistedSettings.push(fixture);
+      const alternateSettings=vscode.workspace.getConfiguration('perfchecker',alternateFolder);
+      for(const [key,value]of Object.entries(fixture.values))await alternateSettings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
+    }
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',alternateFolder);
     const alternateStudio=await findFrame('#studio-root');
     await eventually(async()=>await alternateStudio.locator('.workspace strong').innerText()==='Chat alternate folder',
@@ -942,6 +1022,7 @@ exports.run = async (context,options={}) => {
       proof('native-mcp-custom-arguments',{adviceArgument,implementationArgument,workspaceArgument,additionalArgumentsVerified:true,
         actualHttpCalls:calls.length,measuredEvidenceIds:attached.evidence.map(row=>row.id),configurationRestoredInFinally:true});}
     if(stdio){
+      for(const fixture of [...persistedSettings].reverse())await verifyPersistedStdioSettings(context,fixture,'after-cancel-before-reload');
       assert.deepEqual(await readSavedConfiguration(),savedConfig);
       view=await connectStdio('2026-07-28');const disconnected=activeStdio;
       const disconnectUntil=Date.now()+60000;
@@ -962,13 +1043,15 @@ exports.run = async (context,options={}) => {
       assert.deepEqual(await nativeIdentity(foreign.pid,nativeNode),foreignIdentity);foreign.kill();await foreignFinished;
       assert(await sameNativeIdentityGone(foreignIdentity));
       // Restore the original resource settings while the first host still owns
-      // their values. The handoff carries hashes only, never arbitrary settings
-      // (which could contain provider endpoints, instructions or token names).
-      for(const [key,value] of Object.entries(previous))await settings().update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
+      // their values, except the four controlled persistence fixtures. The
+      // handoff validates those synthetic values exactly; arbitrary prior
+      // settings, provider instructions and token names are never serialized.
+      for(const [key,value] of Object.entries(previous))if(!persistedStdioKeys.includes(key))await settings().update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
       assert.deepEqual(await nativeIdentity(activeStdio.identity.pid,nativeNode),activeStdio.identity,'Restoring saved settings keeps the connected server alive');
       if(activeStdio.windowsJobOwner)assert.deepEqual(await nativeIdentity(activeStdio.windowsJobOwner.pid,activeStdio.windowsJobOwner.executable),activeStdio.windowsJobOwner);
       const files={};
       for(const file of [source,path.join(workspace,'.git','index'),path.join(workspace,'.vscode','settings.json'),
+        path.join(alternate,'.vscode','settings.json'),
         ...[controllerProject,measurementProject].flatMap(root=>['Project.toml','Manifest.toml'].map(name=>path.join(root,name))),attached.file,attached.adviceFile])
         files[file]=hash(await fs.readFile(file));
       proof('native-mcp-stdio-before-official-reload',{server:activeStdio.identity,windowsJobOwner:activeStdio.windowsJobOwner,
@@ -981,7 +1064,7 @@ exports.run = async (context,options={}) => {
       const handoff={status:'awaiting-reload',invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,vsixSha256:process.env.PERFCHECKER_NATIVE_SHA,
         workspace,oldHostPid:process.pid,core:context.core,connection:{root:activeStdio.root,identity:activeStdio.identity,
           ...(activeStdio.windowsJobOwner?{windowsJobOwner:activeStdio.windowsJobOwner}:{}),command:activeStdio.command,version:activeStdio.version},files,head,
-        beforeReportSha256:hash(report),qualifierSourceSha256:hash(await fs.readFile(__filename)),reloadRequestedAt:new Date().toISOString(),savedMeasurement:{file:attached.file,adviceFile:attached.adviceFile}};
+        beforeReportSha256:hash(report),qualifierSourceSha256:hash(await fs.readFile(__filename)),reloadRequestedAt:new Date().toISOString(),savedMeasurement:{file:attached.file,adviceFile:attached.adviceFile},persistedSettings};
       await fs.writeFile(stdioHandoffFile(),JSON.stringify(handoff,null,2));
       reloading=true;
       let reloadWatchdog;
