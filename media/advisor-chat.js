@@ -38,7 +38,7 @@ function mountAdvisorChat(root, send, logo) {
   evidence.addEventListener('change', () => send({type: 'chatClear', evidenceId: evidence.value}));
   const clear = button('New conversation', () => send({type: 'chatClear', evidenceId: evidence.value}), 'secondary');
   controls.append(evidenceLabel, clear); root.append(controls);
-  const privacy = node('p', 'Messages and bounded saved recommendations are sent only when requested. Conversation stays in memory for this VS Code session.', 'subtle privacy'); root.append(privacy);
+  const privacy = node('p', 'Messages and a short summary of the selected result are sent only when requested. The conversation stays in memory for this VS Code session.', 'subtle privacy'); root.append(privacy);
   const transcript = node('section', '', 'transcript'); transcript.setAttribute('role', 'log'); transcript.setAttribute('aria-label', 'Conversation'); transcript.setAttribute('aria-live', 'polite'); root.append(transcript);
   const form = node('form', '', 'composer');
   const questionLabel = node('label', 'Ask about configuration, results or improvements');
