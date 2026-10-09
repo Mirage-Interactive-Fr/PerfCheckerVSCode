@@ -234,12 +234,18 @@ async function verifyPersistedStdioSettings(context,fixture,stage){
   await chat.getByText('Configure the MCP implementation tool',{exact:true}).click();
   await eventually(async()=>JSON.stringify(JSON.parse(await chat.getByLabel('Other implementation tool arguments (JSON)',{exact:true}).inputValue()))===JSON.stringify(fixture.values.advisorImplementationMcpArguments),
     'The real Chat UI receives the selected folder implementation arguments',15000);
+  await chat.getByRole('tab',{name:'01 · Advice',exact:true}).click();
+  assert.equal(await chat.getByRole('tab',{name:'01 · Advice',exact:true}).getAttribute('aria-selected'),'true');
   await chat.getByRole('button',{name:'Connect local MCP server',exact:true}).click();
   const setup=await findFrame('#advisor-root');
   assert.equal(await setup.getByLabel('Absolute MCP server executable',{exact:true}).inputValue(),fixture.values.advisorMcpStdioCommand);
   assert.deepEqual(JSON.parse(await setup.getByLabel('Executable arguments (JSON array)',{exact:true}).inputValue()),fixture.values.advisorMcpStdioArguments);
   assert.equal(await setup.getByLabel('Absolute server working directory',{exact:true}).inputValue(),fixture.values.advisorMcpStdioDirectory);
-  assert.equal(await setup.locator('#advisor-root').getAttribute('aria-busy'),'false');
+  // The untouched form has not called state(), so aria-busy is absent until
+  // its first explicit operation. Assert the actual initial controls instead.
+  assert.equal(await setup.getByRole('button',{name:'Test connection / discover',exact:true}).isEnabled(),true);
+  assert.equal(await setup.getByRole('button',{name:'Cancel operation',exact:true}).isDisabled(),true);
+  assert.equal(await setup.getByRole('status').innerText(),'Ready.');
   // Inspect and close the actual form without discovering or connecting.
   await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   await vscode.commands.executeCommand('perfchecker.openChat');
