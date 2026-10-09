@@ -46,6 +46,7 @@ public static class PerfCheckerOwnedProcess {
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint code);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int kind);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetStdHandle(int kind,IntPtr handle);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetHandleInformation(IntPtr handle,uint mask,uint flags);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetHandleInformation(IntPtr handle,out uint flags);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool InitializeProcThreadAttributeList(IntPtr attributes,int count,uint flags,ref IntPtr size);
@@ -129,6 +130,16 @@ public static class PerfCheckerOwnedProcess {
             // Inherit this owner's exact environment; the private Job handle is not inherited.
             Check(CreateProcessW(application,command,IntPtr.Zero,IntPtr.Zero,true,0x00080004,IntPtr.Zero,directory,ref startup,out process),"Create suspended native process");
             Check(AssignProcessToJobObject(job,process.process),"Assign native process to private Job"); assigned=true;
+            // The child now owns its inherited stdout copy. Keeping our copy
+            // open would hide a live server's stdout EOF from the Node reader.
+            // .NET Console uses a non-owning GetStdHandle reference, not a CRT
+            // descriptor: retire its writer/table entry before CloseHandle.
+            // stdin remains inherited for the protocol; stderr remains usable
+            // for launch/Job cleanup errors. Never close an aliased channel.
+            if (standard[1]==standard[0] || standard[1]==standard[2]) throw new InvalidOperationException("Owned stdout must be separate from stdin and stderr.");
+            Console.SetOut(System.IO.TextWriter.Null);
+            Check(SetStdHandle(-11,IntPtr.Zero),"Retire owner standard output");
+            Check(CloseHandle(standard[1]),"Close owner stdout copy"); standard[1]=IntPtr.Zero;
             if (WaitForSingleObject(parent,0)!=258) throw new InvalidOperationException("The owner parent stopped before process startup.");
             if (ResumeThread(process.thread)==0xffffffff) throw new Win32Exception(Marshal.GetLastWin32Error(),"Resume owned process");
             uint wait=WaitForMultipleObjects(2,new IntPtr[] {process.process,parent},false,0xffffffff);
@@ -153,7 +164,7 @@ public static class PerfCheckerOwnedProcess {
             if (attributesInitialized) DeleteProcThreadAttributeList(attributes);
             if (attributes!=IntPtr.Zero) Marshal.FreeHGlobal(attributes);
             if (handleList!=IntPtr.Zero) Marshal.FreeHGlobal(handleList);
-            for (int i=0;i<marked;i++) SetHandleInformation(standard[i],1,originalFlags[i]&1);
+            for (int i=0;i<marked;i++) if (standard[i]!=IntPtr.Zero) SetHandleInformation(standard[i],1,originalFlags[i]&1);
         }
         if (primary!=null) Console.Error.WriteLine("PerfChecker native process failed: "+primary.Message);
         if (cleanup!=null) Console.Error.WriteLine("PerfChecker native process cleanup failed: "+cleanup.Message);

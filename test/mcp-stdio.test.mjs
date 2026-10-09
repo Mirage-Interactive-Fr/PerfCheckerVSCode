@@ -32,7 +32,9 @@ const mode=process.argv[2],root=process.cwd();let initialized=false,owned;
 fs.writeFileSync('server.pid',String(process.pid));
 const schemas=[{name:'consult',inputSchema:{type:'object',properties:{question:{type:'string'},flavour:{type:'string'}},required:['question','flavour'],additionalProperties:false}},
 {name:'modify',inputSchema:{type:'object',properties:{request:{type:'string'},directory:{type:'string'},style:{type:'string'}},required:['request','directory','style'],additionalProperties:false}}];
-const send=(id,result)=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id,result:{...(initialized?{}:{resultType:'complete',...(Object.hasOwn(result,'tools')?{ttlMs:0,cacheScope:'private'}:{})}),...result}})+'\\n');
+// Keep stdout on its original fd: Node's Windows process.stdout pipe would
+// duplicate fd 1 and retain another writer after fs.closeSync(1).
+const send=(id,result)=>fs.writeSync(1,JSON.stringify({jsonrpc:'2.0',id,result:{...(initialized?{}:{resultType:'complete',...(Object.hasOwn(result,'tools')?{ttlMs:0,cacheScope:'private'}:{})}),...result}})+'\\n');
 const log=m=>fs.appendFileSync('requests.jsonl',JSON.stringify(m)+'\\n');
 process.stderr.write('Informational server log; stderr does not imply failure.\\n');
 readline.createInterface({input:process.stdin}).on('line',line=>{
@@ -49,8 +51,11 @@ if(m.method==='tools/list'){
  if(mode==='bad-cursor'){send(m.id,{tools:[],nextCursor:'same'});return}
  send(m.id,{...(m.params._meta?{resultType:'complete',ttlMs:0,cacheScope:'private'}:{}),...(m.params.cursor?{tools:[schemas[1]]}:{tools:[schemas[0]],nextCursor:'second'})});return}
 if(m.method==='tools/call'){
- if(mode==='eof'||mode==='partial-eof'){process.stdout.end(mode==='partial-eof'?'incomplete-json':'');setInterval(()=>{},1000);return}
- if(mode==='invalid'){process.stdout.write('not-json\\n');return}
+ if(mode==='eof'||mode==='partial-eof'){
+  if(mode==='partial-eof')fs.writeSync(1,'incomplete-json');
+  fs.closeSync(1);fs.writeFileSync('output-closed.json',JSON.stringify({pid:process.pid,stdoutClosed:true,aliveAfterClose:true}));
+  setInterval(()=>{},1000);return}
+ if(mode==='invalid'){fs.writeSync(1,'not-json\\n');return}
  if(mode==='wrong-id'){send(m.id+1,{});return}
  if(mode==='interactive'){send(m.id,{resultType:'input_required',inputRequests:{test:{method:'elicitation/create'}}});return}
  if(mode==='slow'||mode==='orphan'||mode==='detached'){
@@ -61,7 +66,7 @@ if(m.method==='tools/call'){
  if(m.params.name==='modify')fs.writeFileSync(require('node:path').join(m.params.arguments.directory,'edited.txt'),m.params.arguments.style);
  send(m.id,{content:[{type:'text',text:'Neutral fixture response'}]});return}
 throw Error('Unsupported fixture method');});
-process.stdin.on('end',()=>{if(mode==='ignore-eof')setInterval(()=>{},1000);else process.exit(0)});
+process.stdin.on('end',()=>{if(['ignore-eof','eof','partial-eof'].includes(mode))setInterval(()=>{},1000);else process.exit(0)});
 `);
   const options = {command: process.execPath, args: [file, mode], cwd: root, version:'2026-07-28',timeoutMs:5000};
   const connectors = [];
@@ -139,14 +144,26 @@ for(const mode of ['duplicate','bad-cursor','invalid','wrong-id','interactive'])
 for(const mode of ['eof','partial-eof'])test(`stdio ${mode}: output EOF retires a still-live server without waiting for the tool timeout`,()=>fixture(async({root,create})=>{
   const connector=await create().start(),pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));
   assert(await alive(pid));
+  // Observe EOF while the real server is alive before allowing the product's
+  // automatic cleanup to start. Otherwise its two-second kill can race this
+  // observation on a busy host and turn a genuine EOF into an exit-only proof.
+  let releaseCleanup;
+  const readyForCleanup=new Promise(resolve=>{releaseCleanup=resolve;}),stop=connector.stop.bind(connector);
+  connector.stop=async()=>{await readyForCleanup;await stop();};
+  const evidenceDeadline=Date.now()+5000;
   const response=post(connector,'tools/call',{name:'consult',arguments:{question:'Close output',flavour:'fixture'}}).catch(error=>error);
-  await until(()=>connector.failure);
-  assert.match(connector.failure.message,mode==='partial-eof'?/incomplete protocol message/:/output stream closed/);
-  await connector.dispose();await response;
+  try {
+    await until(()=>connector.failure,Math.max(1,evidenceDeadline-Date.now()));
+    assert.match(connector.failure.message,mode==='partial-eof'?/incomplete protocol message/:/output stream closed/);
+    const closed=await until(async()=>JSON.parse(await readFile(path.join(root,'output-closed.json'),'utf8')),Math.max(1,evidenceDeadline-Date.now()));
+    assert.deepEqual(closed,{pid,stdoutClosed:true,aliveAfterClose:true});
+    assert(await alive(pid),'The server remains alive after verified output closure and before owned cleanup');
+    assert(connector.closing instanceof Promise,'EOF schedules automatic owned cleanup before the test releases it');
+  }finally{releaseCleanup();await connector.dispose();await response;}
   assert.equal(await alive(pid),false,'EOF cleans the still-live process before harness teardown');
 },mode));
 
-test('real owned server retries cleanup after a transient identity observation failure',()=>fixture(async({root,create})=>{
+test('real owned server retries cleanup after a transient identity observation failure',{skip:process.platform==='win32'?'Unix process observer; Windows Job retry has a separate real-process contract':false},()=>fixture(async({root,create})=>{
   const connector=await create().start(),pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));
   const foreign=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
   clearInterval(connector.observer);await connector.observation;
@@ -158,6 +175,21 @@ test('real owned server retries cleanup after a transient identity observation f
     assert(await alive(pid));assert(await alive(foreign.pid));
     await connector.dispose();assert.equal(await alive(pid),false);assert(await alive(foreign.pid));
   }finally{foreign.kill('SIGKILL');await new Promise(resolve=>foreign.once('close',resolve));}
+},'ignore-eof'));
+
+test('Windows owned Job retries a failed owner stop while childClosed is false',{skip:process.platform!=='win32'},()=>fixture(async({root,create})=>{
+  const connector=await create().start(),pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));
+  const owner=connector.child,kill=owner.kill.bind(owner),foreign=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+  let first=true;
+  owner.kill=(...args)=>{if(first){first=false;throw new Error('Transient fixture owner stop failure');}return kill(...args);};
+  try {
+    await assert.rejects(connector.dispose(),/Transient fixture owner stop failure/);
+    assert.equal(connector.closing,undefined,'Failed Job cleanup remains explicitly retryable');
+    assert.equal(connector.childClosed,false);assert(await alive(owner.pid));assert(await alive(pid));assert(await alive(foreign.pid));
+    await connector.dispose();
+    assert.equal(connector.childClosed,true);assert.equal(await alive(owner.pid),false);assert.equal(await alive(pid),false);
+    assert(await alive(foreign.pid),'Retry stops only the private Job, before test teardown');
+  }finally{owner.kill=kill;foreign.kill('SIGKILL');await new Promise(resolve=>foreign.once('close',resolve));}
 },'ignore-eof'));
 
 test('one bounded discovery deadline includes all actual tool pages',()=>fixture(async({root,create})=>{

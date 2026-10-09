@@ -130,7 +130,7 @@ function mountAdvisorChat(root, send, logo) {
     }
     for (const message of [...state.messages, ...(state.pending ? [{role: 'user', content: state.pending, pending: true}] : [])]) {
       const article = node('article', '', `message ${message.role}`);
-      article.append(node('div', message.role === 'user' ? 'YOU' : 'MCP AGENT · UNVERIFIED ADVICE', 'eyebrow'), node('div', message.content, 'message-text'));
+      article.append(node('div', message.role === 'user' ? 'YOU' : 'ADVISOR · UNVERIFIED ADVICE', 'eyebrow'), node('div', message.content, 'message-text'));
       if (message.pending) article.append(node('small', state.busy ? 'Awaiting reply…' : 'Not sent successfully. Edit or resend your question.'));
       transcript.append(article);
     }

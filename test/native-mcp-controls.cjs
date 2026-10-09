@@ -901,6 +901,10 @@ exports.run = async (context,options={}) => {
       return idle&&localGone&&juliaGone&&adapterGone&&Date.now()<cancelUntil;
     }, 'Cancel stops the real local Julia worker and captured stdio owner',Math.max(1,cancelUntil-Date.now()));
     await eventually(()=>pending.size===0,'The cancelled provider connection closes before the harness destroys any socket',15000);
+    assert.equal((await state()).workspace,owner.name,'Connector cleanup preserves the owning conversation while the alternate Studio remains selected');
+    assert.deepEqual((await state()).evidence,owningEvidence,'Connector cleanup preserves the owning conversation’s evidence');
+    assert.equal((await state()).evidenceId,attached.id);
+    assert.equal(await owningChatTab().count(),1,'The original owning Chat panel survives connector cleanup');
     assert.equal(processAlive(owned.cli),false,'The CLI is gone before harness teardown');
     assert.equal(processAlive(owned.worker),false,'The detached advisor worker is gone before harness teardown');
     assert(processAlive(foreign.pid),'Cancellation preserves an unrelated process');

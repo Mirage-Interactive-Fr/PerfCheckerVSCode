@@ -73,7 +73,14 @@ export class AdvisorChat implements vscode.Disposable {
       implementationSummary: this.implementationSummary, backupRef: this.proposal?.backupRef ?? this.backupRef};
   }
   isBusy() {return this.busy;}
-  connectionChanged() {const local = localAdvisorConnection(this.folder().uri.toString()); this.status = local ? `${local.label} connected for this editor session. Advice is requested explicitly; implementation requires review. Tool permissions are managed by the server.` : 'Local connector disconnected. Saved provider configuration is active again. Reconnect after an editor restart.'; this.publish();}
+  connectionChanged() {
+    // Connector cleanup may finish after another Studio selects a different
+    // folder. Keep the displayed conversation and its history with its owner.
+    const workspace = this.panel ? this.workspace : this.folder().uri.toString();
+    const local = workspace ? localAdvisorConnection(workspace) : undefined;
+    this.status = local ? `${local.label} connected for this editor session. Advice is requested explicitly; implementation requires review. Tool permissions are managed by the server.` : 'Local connector disconnected. Saved provider configuration is active again. Reconnect after an editor restart.';
+    this.publish();
+  }
   private publish() {
     if (this.disposed) return;
     try {void this.panel?.webview.postMessage(this.state());} catch {/* selected folder was closed */}

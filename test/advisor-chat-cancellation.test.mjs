@@ -138,6 +138,7 @@ test('Cancel in the owning chat webview still stops its controller after another
   try{({AdvisorChat}=require('../dist/advisorChat.js'));}
   finally{Module._load=original;if(cached)require.cache[source]=cached;else delete require.cache[source];}
   const roots=require('../dist/workspace-root.js');roots.selectWorkspaceFolder([a,b],a);
+  const connections=require('../dist/advisorConnection.js');
   const evidenceCalls=[];
   const chat=new AdvisorChat({extensionUri:uri(root),subscriptions:[],workspaceState:{get:()=>undefined,update:async()=>undefined}},()=>{
     const selected=roots.currentWorkspaceFolder([a,b]);evidenceCalls.push(selected.name);
@@ -161,7 +162,24 @@ test('Cancel in the owning chat webview still stops its controller after another
     assert.deepEqual(panel.messages.at(-1).evidence,[{id:'report-A',label:'Measured report A'}]);
     assert(!evidenceCalls.includes('B'),'Publishing A must not call the selected-folder evidence provider for B');
     assert.equal(roots.currentWorkspaceFolder([a,b]),b,'Cancelling A must not change the selected folder B');
+    const ownerPanel=panel,history=structuredClone(chat.state().messages);
+    connections.setLocalAdvisorConnection(a.uri.toString(),{kind:'stdio',label:'Owned A transport',config:{},
+      implementation:{tool:'',promptArgument:'prompt',workspaceArgument:'workspace'}});
+    chat.connectionChanged();
+    assert.equal(ownerPanel.closed,undefined,'A connection callback keeps the idle owning panel open while B is selected');
+    assert.equal(panel,ownerPanel);
+    assert.equal(chat.state().connection,'Owned A transport');
+    connections.setLocalAdvisorConnection(a.uri.toString());
+    chat.connectionChanged();
+    assert.equal(ownerPanel.closed,undefined,'Completing A’s connector cleanup must not dispose A’s conversation');
+    assert.equal(chat.state().workspace,'A');
+    assert.equal(chat.state().connection,undefined);
+    assert.deepEqual(chat.state().messages,history);
+    assert.deepEqual(chat.state().evidence,[{id:'report-A',label:'Measured report A'}]);
+    assert(!evidenceCalls.includes('B'),'Connector callbacks keep using A’s displayed evidence');
+    assert.equal(roots.currentWorkspaceFolder([a,b]),b);
   }finally{
+    connections.setLocalAdvisorConnection(a.uri.toString());
     chat.dispose();await request;
     if(child&&alive(child.pid))child.kill('SIGKILL');
     roots.selectWorkspaceFolder([a,b],a);

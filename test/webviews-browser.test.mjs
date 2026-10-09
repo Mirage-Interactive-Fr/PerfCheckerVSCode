@@ -72,7 +72,7 @@ test('real webviews preserve full selection, handle Git targets and render inter
     ];
     await mkdir(path.join(reports,'bundles','run-fixture'),{recursive:true});
     await writeFile(path.join(reports,'bundles','run-fixture','observations.jsonl'),observations.map(value=>JSON.stringify(value)).join('\n'));
-    const original=Module._load;Module._load=function(name,...args){return name==='vscode'?vscode:name==='./investigation'?{registerInvestigations(){}}:name==='./testitems'?{registerNativeTestItems(){}}:name==='node:child_process'?{spawn}:original.call(this,name,...args);};
+    const original=Module._load;Module._load=function(name,...args){return name==='vscode'?vscode:name==='./investigation'?{registerInvestigations(){}}:name==='./testitems'?{registerNativeTestItems(){}}:name==='node:child_process'?{...original.call(this,name,...args),spawn}:original.call(this,name,...args);};
     try{require('../dist/extension.js').activate({subscriptions:[],extensionUri:uri(path.resolve('.')),globalStorageUri:uri(path.join(temporary,'storage'))});}finally{Module._load=original;}
     await commands.get('perfchecker.openDesignerForWorkspace')(folder.uri);
     await commands.get('perfchecker.openOutput')();
