@@ -251,7 +251,7 @@ async function resumeStdioReload(context,value){
   const sameNativeIdentityGone=identity=>observeNativeIdentityGone(identity,observation=>context.log('native-mcp-stdio-identity-observation',observation));
   const deadline=Date.parse(value.reloadRequestedAt)+60000;
   assert(Date.now()<deadline,'The new extension host must resume inside the existing 60-second shutdown bound');
-  await eventually(async()=>await sameNativeIdentityGone(value.connection.identity)&&
+  await eventually(async()=>!processAlive(value.oldHostPid)&&await sameNativeIdentityGone(value.connection.identity)&&
     (!value.connection.windowsJobOwner||await sameNativeIdentityGone(value.connection.windowsJobOwner))&&Date.now()<deadline,
   'Official Reload finishes owned stdio cleanup before final teardown',Math.max(1,deadline-Date.now()));
   assert.equal(Number(await fs.readFile(path.join(value.connection.root,'server.pid'),'utf8')),value.connection.identity.pid,
@@ -265,6 +265,7 @@ async function resumeStdioReload(context,value){
   const activations=(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'mcp-stdio-activations.jsonl'),'utf8')).trim().split('\n').map(JSON.parse).filter(row=>row.invocation===value.invocation);
   assert.equal(activations.length,2);assert.deepEqual(activations.map(row=>row.pid),[value.oldHostPid,process.pid]);
   proof('native-mcp-stdio-official-editor-reload',{oldHostPid:value.oldHostPid,newHostPid:process.pid,activations,
+    oldHostAbsentBeforeTeardown:true,
     server:value.connection.identity,windowsJobOwner:value.connection.windowsJobOwner,observedAbsentBeforeTeardown:true,
     sourceProjectManifestSettingsAndMeasuredResultPreserved:true,noAutomaticServerLaunch:true,sessionConnectionEmpty:true,
     newMeasurement:false,newAgent:false,priorReportSha256:value.beforeReportSha256,priorReport:'mcp-stdio-before-host-restart.json',
@@ -979,15 +980,23 @@ exports.run = async (context,options={}) => {
         beforeReportSha256:hash(report),qualifierSourceSha256:hash(await fs.readFile(__filename)),reloadRequestedAt:new Date().toISOString(),savedMeasurement:{file:attached.file,adviceFile:attached.adviceFile}};
       await fs.writeFile(stdioHandoffFile(),JSON.stringify(handoff,null,2));
       reloading=true;
+      let reloadWatchdog;
       try{
-        await vscode.commands.executeCommand('workbench.action.reloadWindow');
-        await new Promise((resolve,reject)=>setTimeout(()=>reject(new Error('The official Reload Window did not restart the extension host within 30 seconds')),30000));
+        const watchdog=new Promise((resolve,reject)=>{reloadWatchdog=setTimeout(()=>reject(new Error('The official Reload Window did not restart the extension host within 30 seconds')),30000);});
+        const command=Promise.resolve(vscode.commands.executeCommand('workbench.action.reloadWindow')).catch(error=>{
+          // This RPC can lose its channel during the actual host shutdown.
+          // Only this command's observed Canceled leaves the handoff intact.
+          if(error?.name!=='Canceled')throw error;
+        });
+        // Neither resolution nor channel cancellation proves a restart. Keep
+        // the watchdog active even if the command never settles: only this
+        // host's termination permits the new host's independent cleanup oracle.
+        await Promise.race([watchdog,command.then(()=>new Promise(()=>{}))]);
       }catch(error){
-        // A rejected command or a still-running old host must take ordinary
-        // failure teardown. Only termination of this host hands off cleanup.
+        // Every other command error and a surviving old host fail normally.
         reloading=false;handoff.status='reload-failed';handoff.failureClass=error.name;
         await fs.writeFile(stdioHandoffFile(),JSON.stringify(handoff,null,2));throw error;
-      }
+      }finally{clearTimeout(reloadWatchdog);}
     }
   } catch(error){primaryError=error;throw error;}
   finally {
