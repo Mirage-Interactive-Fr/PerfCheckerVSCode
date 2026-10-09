@@ -143,6 +143,7 @@ if(m.method==='tools/list'){
  if(mode==='bad-cursor'){send(m.id,{tools:[],nextCursor:'same'});return}
  send(m.id,{...(m.params._meta?{resultType:'complete',ttlMs:0,cacheScope:'private'}:{}),...(m.params.cursor?{tools:[schemas[1]]}:{tools:[schemas[0]],nextCursor:'second'})});return}
 if(m.method==='tools/call'){
+ if(mode==='complete-exit'){send(m.id,{content:[{type:'text',text:'Final complete response'}]});process.exit(0);return}
  if(mode==='eof'||mode==='partial-eof'){
   if(mode==='partial-eof')fs.writeSync(1,'incomplete-json');
   fs.closeSync(1);let closureCheck;
@@ -316,6 +317,28 @@ for(const mode of ['eof','partial-eof'])test(`stdio ${mode}: output EOF retires 
   }finally{releaseCleanup();await connector.dispose();await response;}
   assert.equal(await alive(pid),false,'EOF cleans the still-live process before harness teardown');
 },mode));
+
+test('Windows private output drains a final complete reply after the actual owner closes',
+  {skip:process.platform!=='win32'},()=>fixture(async({root,create})=>{
+    const connector=await create().start(),pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));
+    assert(connector.child.protocolOutput===connector.output,'The test pauses the actual private protocol reader');
+    connector.output.pause();
+    const response=post(connector,'tools/call',{name:'consult',arguments:{question:'Final reply',flavour:'fixture'}});
+    void response.catch(()=>{}); // Observe early transport failure; the awaited original still fails the contract.
+    try{
+      await until(()=>connector.childClosed,5000);
+      assert.equal(connector.child.exitCode,0,'The real owner completes normal server exit');
+      assert.equal(await alive(pid),false,'The server exited before the private reader resumes');
+      assert.equal(connector.failure,undefined,'Owner close cannot reject a reply still buffered in the independent reader');
+      connector.output.resume();
+      const reply=await response;
+      assert.equal(reply.result.content[0].text,'Final complete response');
+      await until(()=>connector.failure,5000);
+      assert.match(connector.failure.message,/output stream closed/);
+      await connector.dispose();
+      assert.equal(await alive(pid),false,'Natural exit leaves no server before fixture teardown');
+    }finally{connector.output.resume();await connector.dispose();await response.catch(()=>{});}
+  },'complete-exit'));
 
 test('real owned server retries cleanup after a transient identity observation failure',{skip:process.platform==='win32'?'Unix process observer; Windows Job retry has a separate real-process contract':false},()=>fixture(async({root,create})=>{
   const connector=await create().start(),pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));

@@ -94,9 +94,16 @@ export class McpStdioConnector {
     child.once('error', () => {this.childClosed = true; this.fail(new Error('The MCP server could not be launched. Check its executable and arguments.'));});
     child.once('close', () => {
       this.childClosed = true;
-      if (!this.closing) this.fail(new Error('The MCP server exited. Connect again explicitly.'));
+      // The private Windows reader can still contain a final complete reply
+      // after its Job owner closes. Its real EOF (or bounded reader failure)
+      // retires the connection after those protocol bytes have been consumed.
+      if (!this.closing && !(child as WindowsOwnedChild).protocolOutput)
+        this.fail(new Error('The MCP server exited. Connect again explicitly.'));
     });
-    child.once('exit', () => {if (!this.closing) this.fail(new Error('The MCP server exited. Connect again explicitly.'));});
+    child.once('exit', () => {
+      if (!this.closing && !(child as WindowsOwnedChild).protocolOutput)
+        this.fail(new Error('The MCP server exited. Connect again explicitly.'));
+    });
     try {
       if (process.platform !== 'win32') {
         // The detached spawn creates a new session/group. Qualify its actual
