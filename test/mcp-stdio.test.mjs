@@ -209,9 +209,12 @@ for(const version of ['2025-11-25','2026-07-28'])test(`neutral stdio ${version}:
   assert.equal(process.env[connector.keyEnvironment],undefined);await assert.rejects(fetch(connector.endpoint));
 }));
 
-for(const mode of ['slow','orphan','detached'])test(`stdio ${mode}: owned descendants stop before teardown; foreign process survives`,()=>fixture(async({root,create})=>{
+for(const mode of ['slow','orphan','detached'])test(`stdio ${mode}: owned descendants stop before teardown; foreign process survives`,t=>fixture(async({root,create})=>{
   const foreign=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
   const connector=await create().start();
+  let cleanupFailure;
+  const stop=connector.stop.bind(connector);
+  connector.stop=async()=>{try{await stop();}catch(error){cleanupFailure={name:error.name,message:error.message};throw error;}};
   let result;
   const controller=new AbortController();
   const request=post(connector,'tools/call',{name:'consult',arguments:{question:'Wait',flavour:'slow'}},controller.signal).catch(error=>error);
@@ -221,7 +224,21 @@ for(const mode of ['slow','orphan','detached'])test(`stdio ${mode}: owned descen
     if(process.platform!=='win32')await until(()=>connector.known.has(owned.descendant));
     if(mode==='slow')controller.abort();
     result=await request;
-    await until(async()=>!await alive(owned.descendant),12000);
+    try{await until(async()=>!await alive(owned.descendant),12000);}
+    catch(error){
+      const identities=[...connector.known.values()];
+      const processes=await Promise.all([...new Set([owned.leader,owned.descendant,...identities.map(row=>row.pid)])].map(async pid=>({
+        pid,alive:await alive(pid),...(process.platform==='linux'?{
+          stat:await readFile(`/proc/${pid}/stat`,'utf8').catch(value=>({code:value.code})),
+          executable:await realpath(`/proc/${pid}/exe`).catch(value=>({code:value.code})),
+        }:{}),
+      })));
+      t.diagnostic(JSON.stringify({stage:'owned-descendant-still-present-before-teardown',mode,
+        failure:connector.failure?.message,closing:!!connector.closing,closed:connector.closed,
+        childClosed:connector.childClosed,cleanupFailure,identities,processes,
+        requestResult:result instanceof Error?{name:result.name,message:result.message}:result}));
+      throw error;
+    }
     await connector.dispose();
     assert.equal(await alive(owned.leader),false);assert.equal(await alive(owned.descendant),false);
     assert.equal(await alive(foreign.pid),true,'Only the owned server group/Job is stopped');
