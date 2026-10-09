@@ -545,6 +545,7 @@ exports.run = async (context,options={}) => {
     assert.equal(await input.locator('..').locator(':scope > span').innerText(),caption);return input;
   };
   const connectStdio=async(version)=>{
+    assert.equal((await state()).connectionKind,undefined,'A new native connection starts from a disconnected chat');
     const root=await fs.mkdtemp(path.join(process.env.PERFCHECKER_NATIVE_SESSION,'neutral-mcp-'));
     const command=await fs.realpath(nativeNode),serverFile=await fs.realpath(__filename),args=[serverFile,'--neutral-stdio',values.advisorEndpoint,root,version];
     assert.equal(await fs.realpath(path.dirname(root)),await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION));
@@ -697,7 +698,8 @@ exports.run = async (context,options={}) => {
         'The completed legacy request releases its actual Julia client processes while the stdio server remains available',60000);
       const connection=activeStdio;
       assert.deepEqual(await nativeIdentity(connection.identity.pid,nativeNode),connection.identity);
-      await view.getByRole('button',{name:'Connect local MCP server',exact:true}).click();
+      assert.equal((await state()).connectionKind,'stdio','The completed legacy advice retains its existing stdio connection');
+      await view.getByRole('button',{name:'Configure MCP connection',exact:true}).click();
       const panel=await findFrame('#advisor-root');
       assert.equal(await(await stdioSelect(panel,'advisor-protocol','Mode')).inputValue(),'mcp_stdio');
       assert.equal(await(await stdioSelect(panel,'advisor-mcp_version','MCP version')).inputValue(),'2025-11-25',
@@ -952,6 +954,11 @@ exports.run = async (context,options={}) => {
         if(connection.windowsJobOwner)assert(await sameNativeIdentityGone(connection.windowsJobOwner));
         if(connection.observedDescendant)assert(await sameNativeIdentityGone(connection.observedDescendant));
         if(connection.observedJulia)for(const identity of [connection.observedJulia.cliIdentity,connection.observedJulia.workerIdentity])assert(await sameNativeIdentityGone(identity));
+        observations.push({stage:'observe-owned-stdio',version:connection.version,server:connection.identity,
+          ...(connection.windowsJobOwner?{windowsJobOwner:connection.windowsJobOwner}:{}),
+          ...(connection.observedDescendant?{descendant:connection.observedDescendant}:{}),
+          ...(connection.observedJulia?{juliaClient:connection.observedJulia.cliIdentity,juliaWorker:connection.observedJulia.workerIdentity}:{}),
+          allListedIdentitiesAbsent:true,observedAt:new Date().toISOString()});
         log('native-mcp-stdio-final-ledger',{version:connection.version,records:await stdioRecords(connection)});
       });
       for(const response of pending)response.destroy();
