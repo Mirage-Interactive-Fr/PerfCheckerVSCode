@@ -170,6 +170,40 @@ test('manual implementation arguments preserve unset providers, replace explicit
     assert.throws(()=>assertSavedAdvisorConfiguration({api_key_env}),/temporary local connector/);
 });
 
+test('implementation arguments snapshot configuration proxies without modifying their saved JSON values',()=>{
+  const {implementationMcpArguments}=require('../dist/advisorConnection.js');
+  // WorkspaceConfiguration.get returns recursive clone-on-write proxies whose
+  // toJSON getter exposes a plain snapshot (extHostConfiguration.ts).
+  const configurationProxy=target=>new Proxy(target,{get(value,key){
+    if(key==='toJSON')return ()=>JSON.parse(JSON.stringify(value));
+    const result=Reflect.get(value,key);
+    return result&&typeof result==='object'?configurationProxy(result):result;
+  }});
+  for(const wrap of [value=>new Proxy(value,{}),configurationProxy]) {
+    const saved={model_options:{temperature:0,stops:['end']},flavour:'advice'};
+    const original=JSON.stringify(saved),proxy=wrap(saved);
+    for(const [previous,override] of [[proxy,undefined],[{unused:true},proxy]]) {
+      const result=implementationMcpArguments(previous,override,'request','directory');
+      assert.deepEqual(result,saved);
+      assert.doesNotThrow(()=>structuredClone(result));
+      result.model_options.temperature=1;result.model_options.stops.push('changed');
+      assert.equal(JSON.stringify(saved),original);
+    }
+    for(const value of [{request:'unexpected'},{directory:'/foreign'},{large:'x'.repeat(12001)}])
+      assert.throws(()=>implementationMcpArguments({},wrap(value),'request','directory'),/Implementation arguments/);
+  }
+  const nested={options:new Proxy({stops:new Proxy(['end'],{})},{})};
+  assert.deepEqual(implementationMcpArguments(nested,undefined,'request','directory'),{options:{stops:['end']}});
+});
+
+test('implementation argument JSON snapshots retain shape, reserved-field and size checks',()=>{
+  const {implementationMcpArguments}=require('../dist/advisorConnection.js');
+  for(const projected of [null,[],42,undefined,{request:'unexpected'},{directory:'/foreign'},{large:'x'.repeat(12001)}])
+    assert.throws(()=>implementationMcpArguments({}, {toJSON:()=>projected},'request','directory'),/Implementation arguments/);
+  const cyclic={};cyclic.self=cyclic;
+  assert.throws(()=>implementationMcpArguments({},cyclic,'request','directory'),/Implementation arguments/);
+});
+
 test('failed Disconnect retains the exact owner and cleanup handle for an explicit retry',async()=>{
   const {disconnectLocalAdvisorConnection}=require('../dist/advisorConnection.js');
   const key='file:///retry-private-fixture';let attempts=0;

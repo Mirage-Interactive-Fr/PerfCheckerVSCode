@@ -19,11 +19,20 @@ export function beginLocalAdvisorConnectionOperation(workspace: string) {
 /** An unset implementation override preserves the existing provider arguments. */
 export function implementationMcpArguments(previous: unknown, override: unknown, prompt: string, workspace: string) {
   const value = override === undefined ? (previous ?? {}) : override;
+  const invalid = 'Implementation arguments must be a JSON object of at most 12 KB without the prompt or workspace argument.';
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
-    Object.hasOwn(value, prompt) || Object.hasOwn(value, workspace) ||
-    Buffer.byteLength(JSON.stringify(value), 'utf8') > 12000)
-    throw new Error('Implementation arguments must be a JSON object of at most 12 KB without the prompt or workspace argument.');
-  return structuredClone(value) as Record<string, unknown>;
+    Object.hasOwn(value, prompt) || Object.hasOwn(value, workspace)) throw new Error(invalid);
+  let snapshot: unknown;
+  try {
+    // VS Code configuration values are clone-on-write proxies with a JSON view.
+    // Snapshot that view once for both the byte limit and the worker payload.
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined || Buffer.byteLength(serialized, 'utf8') > 12000) throw new Error(invalid);
+    snapshot = JSON.parse(serialized);
+  } catch { throw new Error(invalid); }
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) ||
+    Object.hasOwn(snapshot, prompt) || Object.hasOwn(snapshot, workspace)) throw new Error(invalid);
+  return snapshot as Record<string, unknown>;
 }
 export function onLocalAdvisorConnectionChanged(listener: (workspace: string) => void) {
   listeners.add(listener);
