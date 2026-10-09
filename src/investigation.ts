@@ -8,6 +8,7 @@ import {registerAdvisorSetup} from './advisorSetup';
 import {registerCodexConnections} from './codexIntegration';
 import {registerMcpStdioConnections} from './mcpStdioIntegration';
 import {AdvisorChat, ChatEvidence} from './advisorChat';
+import {SuiteChatEvidence} from './suiteChatEvidence';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {cancellableJulia, controllerCancellation} from './controllerCancellation';
 import {InvestigationReport, Proposal, Scenario, draftCase, parseInvestigation,
@@ -551,7 +552,12 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
 export function registerInvestigations(context: vscode.ExtensionContext): void {
   registerAdvisorSetup(context);
   const controller = new InvestigationController(context);
-  const chat = new AdvisorChat(context, () => controller.chatEvidence(), id => controller.readChatEvidence(id));
+  const suiteEvidence = new SuiteChatEvidence();
+  const selected = () => currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);
+  const chat = new AdvisorChat(context, () => [...controller.chatEvidence(), ...suiteEvidence.options(selected().uri.toString())],
+    id => id.startsWith('suite:') ? suiteEvidence.read(id, selected().uri.toString()) : controller.readChatEvidence(id),
+    folder => suiteEvidence.refresh(folder.uri.toString(), folder.uri.fsPath,
+      vscode.workspace.getConfiguration('perfchecker', folder.uri).get('reports', 'perf/results/vscode')));
   registerCodexConnections(context, () => chat.isBusy(), () => chat.connectionChanged());
   registerMcpStdioConnections(context, () => chat.isBusy(), () => chat.connectionChanged());
   const command = (name: string, callback: (...args: any[]) => unknown) => vscode.commands.registerCommand(name, async (...args) => {

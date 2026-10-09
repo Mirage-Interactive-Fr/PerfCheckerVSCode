@@ -143,7 +143,7 @@ function mountAdvisorChat(root, send, logo) {
     workspace.textContent = `${value.workspace} · ${value.connection || 'Configured MCP conversation'}`;
     evidence.replaceChildren();
     for (const item of [{id: '', label: 'No saved evidence · usage and configuration questions'}, ...value.evidence]) {
-      const option = node('option', item.label); option.value = item.id; evidence.append(option);
+      const option = node('option', item.label); option.value = item.id; option.disabled = Boolean(item.unavailable); evidence.append(option);
     }
     evidence.value = value.evidenceId;
     for (const [key, field] of Object.entries(fields)) if (document.activeElement !== field)

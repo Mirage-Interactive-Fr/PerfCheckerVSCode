@@ -12,8 +12,9 @@ import {ChatMessage, prepareChatMessages, completeChatMessages, chatReply} from 
 import {InvestigationReport} from './investigationModel';
 import {createImplementationCheckout, applyImplementation, recoverImplementationProposal, recoverActiveImplementationProposal, saveActiveImplementationProposal, ImplementationProposal} from './implementation';
 import {cancellableJulia, controllerCancellation} from './controllerCancellation';
+import {SuiteChatSource, validateSuiteChatSource} from './suiteChatEvidence';
 
-export interface ChatEvidence {id: string; label: string}
+export interface ChatEvidence {id: string; label: string; unavailable?: boolean}
 export class AdvisorChat implements vscode.Disposable {
   private panel?: vscode.WebviewPanel;
   private workspace?: string;
@@ -33,7 +34,8 @@ export class AdvisorChat implements vscode.Disposable {
   private recoveredWorkspace?: string;
   constructor(private context: vscode.ExtensionContext,
     private evidenceOptions: () => ChatEvidence[],
-    private readEvidence: (id: string) => Promise<InvestigationReport>) {}
+    private readEvidence: (id: string) => Promise<InvestigationReport | SuiteChatSource>,
+    private refreshEvidence?: (folder: vscode.WorkspaceFolder) => Promise<void>) {}
 
   private folder() {
     const folder = currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);
@@ -86,7 +88,8 @@ export class AdvisorChat implements vscode.Disposable {
     try {void this.panel?.webview.postMessage(this.state());} catch {/* selected folder was closed */}
   }
   async open() {
-    const workspace = this.folder().uri.toString();
+    const folder = this.folder(), workspace = folder.uri.toString();
+    if (!this.busy) await this.refreshEvidence?.(folder);
     await this.recoverProposal();
     if (this.panel) {this.panel.reveal(); this.publish(); return;}
     this.panel = vscode.window.createWebviewPanel('perfchecker.advisorChat', 'PerfChecker · Chat', vscode.ViewColumn.One,
@@ -126,7 +129,7 @@ export class AdvisorChat implements vscode.Disposable {
   clear(evidenceId: unknown = '') {
     this.folder();
     if (this.busy) throw new Error('Cancel or finish the current request before starting a new conversation.');
-    if (typeof evidenceId !== 'string' || (evidenceId && !this.evidenceOptions().some(item => item.id === evidenceId))) throw new Error('Saved evidence is no longer available.');
+    if (typeof evidenceId !== 'string' || (evidenceId && !this.evidenceOptions().some(item => item.id === evidenceId && !item.unavailable))) throw new Error('Saved evidence is no longer available.');
     this.messages = []; this.pending = ''; this.evidenceId = evidenceId;
     this.status = 'New conversation. Only the selected saved evidence and your messages will be sent.';
     this.publish();
@@ -137,7 +140,7 @@ export class AdvisorChat implements vscode.Disposable {
     if (this.busy) throw new Error('An advisor request is already running.');
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
     if (!settings.get('advisorEnabled', true) && !localAdvisorConnection(folder.uri.toString())) throw new Error('Optional advisor is disabled. Open Advisor settings to configure it.');
-    if (typeof evidenceId !== 'string' || (evidenceId && !this.evidenceOptions().some(item => item.id === evidenceId))) throw new Error('Saved evidence is no longer available.');
+    if (typeof evidenceId !== 'string' || (evidenceId && !this.evidenceOptions().some(item => item.id === evidenceId && !item.unavailable))) throw new Error('Saved evidence is no longer available.');
     const prepared = prepareChatMessages(evidenceId === this.evidenceId ? this.messages : [], question);
     // Lock before any asynchronous read so double submissions cannot overlap.
     this.busy = true; this.cancelled = false;
@@ -149,7 +152,7 @@ export class AdvisorChat implements vscode.Disposable {
       if (config.protocol !== 'mcp_http' || (config.mcp_response ?? 'text') !== 'text' || !config.mcp_tool) {
         throw new Error('Chat requires an MCP advice tool in text mode. Open Advisor settings, select mcp_http, discover a tool and save.');
       }
-      const advice = evidenceId ? await this.readEvidence(evidenceId) : undefined;
+      const advice = evidenceId ? await this.selectedEvidence(folder, evidenceId) : undefined;
       if (this.cancelled) throw new Error('Request cancelled.');
       const result = await this.invoke(folder, config, {messages: prepared.messages, ...(advice ? {advice} : {})});
       if (this.cancelled) throw new Error('Request cancelled. The remote server may still finish its work.');
@@ -163,6 +166,26 @@ export class AdvisorChat implements vscode.Disposable {
       return result;
     } catch (error) {this.status = String(error); throw error;}
     finally {this.busy = false; this.child = undefined; this.publish();}
+  }
+  private async selectedEvidence(folder: vscode.WorkspaceFolder, id: string): Promise<InvestigationReport> {
+    const evidence = await this.readEvidence(id);
+    if (!('kind' in evidence) || evidence.kind !== 'suite-bundle') return evidence as InvestigationReport;
+    const source = evidence as SuiteChatSource;
+    if (source.workspace !== folder.uri.toString() || source.root !== await fs.realpath(folder.uri.fsPath))
+      throw new Error('Saved suite evidence belongs to another workspace.');
+    await validateSuiteChatSource(source, true);
+    if (this.cancelled) throw new Error('Request cancelled before projecting saved suite evidence.');
+    this.status = 'Reading saved suite measurements locally; no benchmarks or provider request…'; this.publish();
+    const advice = await this.invoke(folder, {}, undefined, 'advise', source.directory) as InvestigationReport;
+    if (this.cancelled) throw new Error('Request cancelled before sending saved suite evidence.');
+    await validateSuiteChatSource(source, true);
+    if (advice?.schema_version !== 'perfchecker-advice/1' || !Array.isArray(advice.recommendations))
+      throw new Error('The controller returned invalid saved suite evidence. No measurements were sent.');
+    if (!Array.isArray(advice.measurement_summaries))
+      throw new Error('Suite evidence requires PerfChecker 1.0.1 or later with canonical measurement summaries. Core 1.0.0 does not provide them. Update the controller, or ask without suite evidence. No measurements were sent.');
+    if (!advice.measurement_summaries.length)
+      throw new Error('This saved bundle has no supported canonical measurement summaries. No measurements were sent.');
+    return advice;
   }
   private async saveImplementationSettings(input: any) {
     const folder = this.folder();
@@ -217,7 +240,7 @@ export class AdvisorChat implements vscode.Disposable {
       await this.persistProposal();
       if (this.cancelled) throw new Error('Implementation cancelled; checkpoint retained.');
       this.status = 'Agent is implementing in an isolated checkout. Your project awaits diff review.'; this.publish();
-      const advice = this.evidenceId ? await this.readEvidence(this.evidenceId) : undefined;
+      const advice = this.evidenceId ? await this.selectedEvidence(folder, this.evidenceId) : undefined;
       const prepared = prepareChatMessages(this.messages, 'Implement the recommendations in the latest assistant reply. Inspect the code and verify the changes.');
       const result = await this.invoke(folder, config, {messages: prepared.messages, ...(advice ? {advice} : {}),
         workspace: checkout.workspace, workspace_argument: workspaceArgument}, 'implement');
@@ -271,19 +294,19 @@ export class AdvisorChat implements vscode.Disposable {
       if (this.proposal) {this.backupRef = this.proposal.backupRef; this.status = 'Previous implementation recovered from Git. Review the diff or restore previous code.';}
     } catch (error) {this.status = `Git recovery needs attention: ${String(error)}. Checkpoint references are retained.`;}
   }
-  private async invoke(folder: vscode.WorkspaceFolder, config: Record<string, unknown>, request: unknown, command = 'chat'): Promise<unknown> {
+  private async invoke(folder: vscode.WorkspaceFolder, config: Record<string, unknown>, request: unknown, command = 'chat', bundle?: string): Promise<unknown> {
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
     const project = resolveControllerProject(folder.uri.fsPath, settings).project;
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'perfchecker-chat-'));
     try {
-      const source = path.join(directory, 'request.json'), configuration = path.join(directory, 'advisor.json');
-      await fs.writeFile(source, JSON.stringify(request), {flag: 'wx', mode: 0o600});
-      await fs.writeFile(configuration, JSON.stringify(config), {flag: 'wx', mode: 0o600});
+      const source = bundle ?? path.join(directory, 'request.json'), configuration = path.join(directory, 'advisor.json');
+      if (!bundle) await fs.writeFile(source, JSON.stringify(request), {flag: 'wx', mode: 0o600});
+      if (command !== 'advise') await fs.writeFile(configuration, JSON.stringify(config), {flag: 'wx', mode: 0o600});
       if (this.cancelled) throw new Error('Request cancelled.');
       return await new Promise((resolve, reject) => {
         const child = spawn(settings.get('juliaExecutable', 'julia'), ['--startup-file=no', `--project=${project}`,
           '-e', cancellableJulia('using PerfChecker; exit(perfchecker_main(ARGS))'), '--', command, `--source=${source}`,
-          `--advisor-config=${configuration}`, `--project=${project}`],
+          ...(command === 'advise' ? [] : [`--advisor-config=${configuration}`]), `--project=${project}`],
         {cwd: folder.uri.fsPath, windowsHide: true, detached: process.platform !== 'win32',
           env: {...process.env, JULIA_LOAD_PATH: process.env.PERFCHECKER_LOAD_PATH || `@${path.delimiter}@stdlib`}});
         this.child = child;

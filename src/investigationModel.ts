@@ -14,6 +14,7 @@ export interface InvestigationReport {
   ci?: any[]; corpora?: any[]; fingerprints?: Record<string, string>;
   analyzers?: {tool: string; scope: string; installation?: string}[];
   records?: any[]; recommendations?: any[]; configurations?: any[]; runs?: any[];
+  measurement_summaries?: any[];
   tools?: any[]; cards?: any[]; experiments?: any[]; unexecuted?: any[]; results?: any[]; coverage?: any[];
   status?: string; advice?: InvestigationReport; fallback?: InvestigationReport; discovery?: InvestigationReport;
   external_review?: string;
