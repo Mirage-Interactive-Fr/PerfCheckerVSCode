@@ -261,6 +261,11 @@ export class McpStdioConnector {
     this.pending.clear();
     if (!this.closed) void this.dispose().catch(() => {}); // An explicit retry retains ownership after cleanup errors.
   }
+  private knownReparent(row: Omit<Identity, 'exe'>, exe: string, parent: string, initial: boolean) {
+    const known = initial ? undefined : this.known.get(row.pid);
+    return /^\d+$/.test(parent) && Number.isSafeInteger(Number(parent)) &&
+      known?.start === row.start && known.exe === exe && known.group === row.group && this.groups.has(row.group);
+  }
   private async group(initial = false): Promise<Identity[]> {
     const group = this.child?.pid;
     if (!group || this.groupGone) return [];
@@ -312,8 +317,9 @@ export class McpStdioConnector {
             throw new Error('A live private MCP process has no observable executable.');
           }
           const after = await readFile(`/proc/${pid}/stat`, 'utf8'), fields = after.slice(after.lastIndexOf(')') + 2).trim().split(/\s+/);
-          if (fields[19] !== row.start || Number(fields[1]) !== row.parent || Number(fields[2]) !== row.group) throw new Error('Process identity changed while inspecting.');
-          if (!['Z','X'].includes(fields[0])) rows.push({...row, exe});
+          if (fields[19] !== row.start || Number(fields[2]) !== row.group ||
+            (Number(fields[1]) !== row.parent && !this.knownReparent(row, exe, fields[1], initial))) throw new Error('Process identity changed while inspecting.');
+          if (!['Z','X'].includes(fields[0])) rows.push({...row, parent: Number(fields[1]), exe});
         } catch (error) {if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;}
         continue;
       }
@@ -324,8 +330,9 @@ export class McpStdioConnector {
         const exe = await realpath(filename);
         const after = await execute('/bin/ps', ['-p', String(pid), '-o', 'pid=,ppid=,pgid=,stat=,lstart='], {timeout: 2000});
         const again = after.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
-        if (!again || Number(again[1]) !== row.pid || Number(again[2]) !== row.parent || Number(again[3]) !== row.group || again[5] !== row.start) throw new Error('MCP process identity changed while inspecting its executable.');
-        if (!/^[ZX]/.test(again[4])) rows.push({...row, exe});
+        if (!again || Number(again[1]) !== row.pid || Number(again[3]) !== row.group || again[5] !== row.start ||
+          (Number(again[2]) !== row.parent && !this.knownReparent(row, exe, again[2], initial))) throw new Error('MCP process identity changed while inspecting its executable.');
+        if (!/^[ZX]/.test(again[4])) rows.push({...row, parent: Number(again[2]), exe});
       } catch (error) {
         const current = await execute('/bin/ps', ['-p', String(pid), '-o', 'pid=,stat=,lstart='], {timeout: 2000}).catch(error => {
           if (error.code === 1 && !String(error.stdout ?? '').trim() && !String(error.stderr ?? '').trim()) return {stdout: ''}; throw error;

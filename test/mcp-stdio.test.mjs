@@ -154,7 +154,7 @@ if(m.method==='tools/call'){
  if(mode==='invalid'){fs.writeSync(1,'not-json\\n');return}
  if(mode==='wrong-id'){send(m.id+1,{});return}
  if(mode==='interactive'){send(m.id,{resultType:'input_required',inputRequests:{test:{method:'elicitation/create'}}});return}
- if(mode==='slow'||mode==='orphan'||mode==='detached'){
+ if(mode==='slow'||mode==='orphan'||mode==='detached'||mode==='reparent-race'){
   owned=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:mode==='detached',stdio:['ignore','inherit','inherit']});
   fs.writeFileSync('owned.json',JSON.stringify({leader:process.pid,descendant:owned.pid}));
   if(mode==='orphan'||mode==='detached')setTimeout(()=>process.exit(0),1000);
@@ -162,7 +162,8 @@ if(m.method==='tools/call'){
  if(m.params.name==='modify')fs.writeFileSync(require('node:path').join(m.params.arguments.directory,'edited.txt'),m.params.arguments.style);
  send(m.id,{content:[{type:'text',text:'Neutral fixture response'}]});return}
 throw Error('Unsupported fixture method');});
-process.stdin.on('end',()=>{if(['ignore-eof','eof','partial-eof'].includes(mode))setInterval(()=>{},1000);else process.exit(0)});
+process.stdin.on('end',()=>{if(mode==='reparent-race'){setInterval(()=>{if(fs.existsSync('release-parent'))process.exit(0)},10)}
+ else if(['ignore-eof','eof','partial-eof'].includes(mode))setInterval(()=>{},1000);else process.exit(0)});
 `);
   const nativeEof=process.platform==='win32'&&['eof','partial-eof'].includes(mode);
   const connectors = [];
@@ -249,6 +250,86 @@ for(const mode of ['slow','orphan','detached'])test(`stdio ${mode}: owned descen
     }
   }finally{foreign.kill('SIGKILL');await new Promise(resolve=>foreign.once('close',resolve));await request;}
 },mode));
+
+test('Linux cancellation keeps a qualified child owned when its real parent exits between identity reads',
+  {skip:process.platform!=='linux'},t=>fixture(async({root,create})=>{
+  const foreign=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+  const connector=await create().start(),controller=new AbortController();
+  const request=post(connector,'tools/call',{name:'consult',arguments:{question:'Wait',flavour:'slow'}},controller.signal).catch(error=>error);
+  const filesystem=require('node:fs/promises'),nativeRealpath=filesystem.realpath;
+  let triggered=false,reparented,cleanupFailure;
+  const stop=connector.stop.bind(connector);
+  connector.stop=async()=>{try{await stop();}catch(error){cleanupFailure=error;throw error;}};
+  try{
+    const owned=await until(async()=>JSON.parse(await readFile(path.join(root,'owned.json'),'utf8')));
+    await until(()=>connector.known.has(owned.descendant));
+    clearInterval(connector.observer);await connector.observation;
+    const known={...connector.known.get(owned.descendant)};
+    assert.equal(known.parent,owned.leader);assert(connector.groups.has(known.group));
+    filesystem.realpath=async value=>{
+      if(value===`/proc/${known.pid}/exe`&&!triggered){
+        triggered=true;
+        // group() has read the old PPID. Release the real parent only now,
+        // before executable resolution and the second kernel stat.
+        await writeFile(path.join(root,'release-parent'),'release');
+        reparented=await until(async()=>{
+          const raw=await readFile(`/proc/${known.pid}/stat`,'utf8'),fields=raw.slice(raw.lastIndexOf(')')+2).trim().split(/\s+/);
+          return !await alive(owned.leader)&&Number(fields[1])!==known.parent?{parent:Number(fields[1]),group:Number(fields[2]),start:fields[19]}:undefined;
+        });
+        assert.equal(reparented.group,known.group);assert.equal(reparented.start,known.start);
+        assert.equal(await nativeRealpath(value),known.exe);assert(await alive(known.pid));
+      }
+      return nativeRealpath(value);
+    };
+    controller.abort();await request;
+    await until(()=>!!connector.closing||!!cleanupFailure);
+    if(cleanupFailure)throw cleanupFailure;
+    await connector.closing;
+    assert(triggered);assert(reparented);assert.equal(cleanupFailure,undefined);
+    assert.equal(await alive(owned.leader),false);assert.equal(await alive(owned.descendant),false);
+    assert.equal(await alive(foreign.pid),true,'The foreign process survives before fixture teardown');
+    assert.equal(connector.known.get(known.pid).parent,reparented.parent,'The latest qualified PPID is retained');
+    const cancellation=JSON.parse(await readFile(path.join(root,'cancel.json'),'utf8'));
+    const call=(await readFile(path.join(root,'requests.jsonl'),'utf8')).trim().split('\n').map(JSON.parse).find(row=>row.method==='tools/call');
+    assert.equal(cancellation.requestId,call.id);
+    t.diagnostic(JSON.stringify({stage:'real-reparent-cleanup-before-teardown',known,reparented,ownedAbsent:true,foreignAlive:true}));
+  }finally{
+    filesystem.realpath=nativeRealpath;controller.abort();await request;
+    foreign.kill('SIGKILL');await new Promise(resolve=>foreign.once('close',resolve));
+  }
+},'reparent-race'));
+
+for(const change of ['start','executable','group','unseen','unqualified-group','invalid-parent','initial'])
+test(`Linux reparent guard rejects ${change} before signalling`,{skip:process.platform!=='linux'},()=>fixture(async({create})=>{
+  const connector=await create().start();
+  clearInterval(connector.observer);await connector.observation;
+  const pid=connector.child.pid,known={...connector.known.get(pid)},groups=new Set(connector.groups);
+  const raw=await readFile(`/proc/${pid}/stat`,'utf8'),cut=raw.lastIndexOf(')')+2,fields=raw.slice(cut).trim().split(/\s+/);
+  assert.equal(fields[19],known.start);assert.equal(Number(fields[2]),known.group);
+  const filesystem=require('node:fs/promises'),original={readFile:filesystem.readFile,readdir:filesystem.readdir,realpath:filesystem.realpath};
+  const nativeKill=process.kill,nativeChildKill=connector.child.kill;let reads=0;const signals=[];
+  try{
+    if(change==='unseen')connector.known.delete(pid);
+    if(change==='unqualified-group')connector.groups.clear();
+    filesystem.readdir=async value=>value==='/proc'?[String(pid)]:original.readdir(value);
+    filesystem.readFile=async(value,...args)=>{
+      if(value!==`/proc/${pid}/stat`)return original.readFile(value,...args);
+      const current=[...fields];
+      if(++reads>1){current[1]=change==='invalid-parent'?'invalid':'1';
+        if(change==='start')current[19]=String(BigInt(known.start)+1n);
+        if(change==='group')current[2]=String(known.group+1);}
+      return raw.slice(0,cut)+current.join(' ')+'\n';
+    };
+    filesystem.realpath=async value=>value===`/proc/${pid}/exe`?(change==='executable'?known.exe+'-changed':known.exe):original.realpath(value);
+    process.kill=(...args)=>{signals.push(args);return nativeKill(...args);};
+    connector.child.kill=function(...args){signals.push(args);return nativeChildKill.apply(this,args);};
+    await assert.rejects(change==='initial'?connector.group(true):connector.stop(),/identity|incarnation/);
+    assert.deepEqual(signals,[],'Unqualified ownership must fail before any PID or group signal');
+  }finally{
+    Object.assign(filesystem,original);process.kill=nativeKill;connector.child.kill=nativeChildKill;
+    connector.known.set(pid,known);connector.groups=groups;
+  }
+}));
 
 for(const mode of ['duplicate','bad-cursor','invalid','wrong-id','interactive'])test(`stdio ${mode} fails explicitly without an orphan server`,()=>fixture(async({root,create})=>{
   const connector=create();
