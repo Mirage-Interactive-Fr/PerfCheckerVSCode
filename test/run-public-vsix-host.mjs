@@ -94,6 +94,17 @@ async function executeControllerPreflight(executable,args,receipt){
     if(/^[ZX]/.test(match[5]))return undefined;
     return {pid,parent:Number(match[2]),group:Number(match[3]),started:match[4],state:match[5]};
   };
+  const linuxCurrent=async pid=>{
+    let value;
+    try{value=await fs.readFile(`/proc/${pid}/stat`,{encoding:'utf8',signal:AbortSignal.timeout(limit(3000))});}
+    catch(error){if(['ENOENT','ESRCH'].includes(error.code))return undefined;throw error;}
+    const end=value.lastIndexOf(')'),fields=value.slice(end+2).trim().split(/\s+/);
+    assert(end>0&&Number(value.slice(0,value.indexOf(' ')))===pid&&fields.length>19&&/^[A-Za-z]$/.test(fields[0]));
+    assert([fields[1],fields[2],fields[19]].every(field=>/^\d+$/.test(field)));
+    const current={pid,parent:Number(fields[1]),group:Number(fields[2]),started:fields[19],state:fields[0]};
+    assert(Number.isSafeInteger(current.pid)&&current.pid>0&&Number.isSafeInteger(current.parent)&&current.parent>=0&&Number.isSafeInteger(current.group)&&current.group>=0);
+    return current;
+  };
   const inspect=async row=>{
     if(windows){assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));return {...row,executable:await fs.realpath(row.executable)};}
     if(process.platform==='linux'){
@@ -167,6 +178,19 @@ async function executeControllerPreflight(executable,args,receipt){
       // ps may have captured a compilation child immediately before it exits.
       // Revalidate absence/zombie state; a current unqualified incarnation still fails.
       if(process.platform==='darwin'){const current=await macCurrent(row.pid);if(!current)continue;unknown.push(current);}
+      else if(process.platform==='linux'){
+        const observation={stage:'unqualified-private-group-revalidation',pid:row.pid,observedAt:new Date().toISOString(),
+          initial:{parent:row.parent,group:row.group,started:row.started,state:row.state}};
+        (receipt.ownership.revalidations??=[]).push(observation);
+        try{
+          const current=await linuxCurrent(row.pid);observation.current=current??null;
+          observation.resolution=!current?'proved-absent':['Z','X'].includes(current.state)?'proved-zombie-or-exited':'live-unqualified';
+          if(!current||['Z','X'].includes(current.state))continue;
+          // The ps member has no qualified incarnation yet. Even a reparented
+          // or reused PID that is now alive remains unknown, never a gone proof.
+          unknown.push(current);
+        }catch(error){observation.resolution='inspection-failed';observation.errorClass=error.code||error.name;throw error;}
+      }
       else unknown.push(row);
     }
     if(unknown.length)errors.push({stage:'unanchored-private-group',pids:unknown.map(row=>row.pid)});

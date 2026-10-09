@@ -36,6 +36,7 @@ function commandCoverage(commands,checks){
     openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save','pluto-studio-file-dialog-buttons'],openNotebook:['pluto-reactive-save-reload-close','pluto-studio-file-dialog-buttons'],
     debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],applyImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],
     restoreImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
+    connectMcpStdio:['native-mcp-stdio-connected-session'],disconnectMcpStdio:['native-mcp-stdio-modern-disconnect'],
     stopNotebookSession:['native-pluto-without-jupyter','pluto-stop-active-owned-worker'],
   };
   return commands.map(command=>{
@@ -100,6 +101,12 @@ function buttonCoverage(checks){
     'MCP · two advice turns / diff / Apply / oracle / Restore':['native-mcp-advice-implementation-restore'],
     'MCP · select measured evidence / exact IDs / bounded context':['native-mcp-selected-measured-evidence'],
     'MCP · configuration-only conversation':['native-mcp-configuration-only-conversation'],
+    'MCP stdio · paginated discovery / displayed tool schemas':['native-mcp-stdio-discovered-schema'],
+    'MCP stdio · newline JSON-RPC / explicit session Connect':['native-mcp-stdio-connected-session'],
+    'MCP stdio · separate advice / implementation tools and arguments':['native-mcp-stdio-connected-session','native-mcp-custom-arguments'],
+    'MCP stdio · Cancel / pending request notification / EOF / owned cleanup':['native-mcp-stdio-cancel-before-teardown'],
+    'MCP stdio · Disconnect / owned cleanup':['native-mcp-stdio-modern-disconnect'],
+    'MCP stdio · official Reload / no automatic server restart':['native-mcp-stdio-official-editor-reload'],
     'Coordination3D · physical renderer prerequisites':['landscape-live-prerequisite'],
     'Coordination3D · real software Landscape command / complete opened bundle':['native-landscape-command-completed'],
     'Coordination3D · native Cancel / owned renderer cleanup':['native-landscape-cancel-owned-renderer'],
@@ -143,6 +150,7 @@ function configurationCoverage(properties,checks){
     uiConfiguration:['save-palette-command','native-suite-save-palette'],gitTargets:['git-reference-controls'],comparisonPolicies:['computed-reference-aggregation'],
     advisorImplementationMcpTool:['native-mcp-advice-implementation-restore'],advisorImplementationMcpPromptArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],
     advisorImplementationMcpWorkspaceArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],codexExecutable:['codex-missing-native-prerequisite'],
+    advisorImplementationMcpArguments:[],advisorMcpStdioCommand:[],advisorMcpStdioArguments:[],advisorMcpStdioDirectory:[],
     plutoProject:['native-pluto-without-jupyter','pluto-investigation-real-run','pluto-stop-active-owned-worker'],
   };
   const pathOnly=new Set(['advisorTimeout','advisorInvestigates','investigationBudgetSeconds','analysisTimeout','suite','factory','profile']);
@@ -157,6 +165,8 @@ function configurationCoverage(properties,checks){
     factory:'The actual build_suite factory is used; alternate factory names are not native-qualified.',
     profile:'The actual quick profile is run; every alternate profile is not native-qualified.',
     codexExecutable:'The unavailable executable diagnostic is native-tested; authenticated Codex is a separate local opt-in proof.',
+    ...Object.fromEntries(['advisorImplementationMcpArguments','advisorMcpStdioCommand','advisorMcpStdioArguments','advisorMcpStdioDirectory'].map(key=>[key,
+      'Native session fields are exercised separately; reading saved settings or prefilling them from this option is unverified.'])),
   };
   return Object.keys(properties).map(option=>{
     const key=option.replace(/^perfchecker\./,''),evidence=checks.filter(check=>check.assertionsCompleted===true&&(paths[key]||[]).includes(check.name));

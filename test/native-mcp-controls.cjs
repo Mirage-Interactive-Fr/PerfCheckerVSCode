@@ -623,6 +623,12 @@ exports.run = async (context,options={}) => {
       'Discovery and Connect retain exactly the same native server');
     assert.deepEqual((await state()).implementation.arguments,implementationAdditional);
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
+    const connectedRecords=await stdioRecords(activeStdio);
+    assert(connectedRecords.filter(record=>record.method==='tools/list').length>=2,'The real paginated discovery completed before Connect');
+    proof('native-mcp-stdio-connected-session',{version,server:identity,windowsJobOwner,connectionKind:'stdio',
+      sameServerAfterDiscovery:true,nativeConnectClick:true,paginatedSchemaNames:schemas.map(schema=>schema.name),
+      adviceTool,implementationTool,adviceArgument,implementationArgument,workspaceArgument,
+      independentImplementationArguments:implementationAdditional,sessionOnly:true,savedSettingsNotQualified:true,provider:providerLabel});
     await vscode.commands.executeCommand('perfchecker.openChat');chat=await findFrame('#chat-root');
     await chat.getByRole('button',{name:'New conversation',exact:true}).click();
     return chat;
