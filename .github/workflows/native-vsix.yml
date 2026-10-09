@@ -120,7 +120,8 @@ jobs:
           }
           if(newOrigin&&(e.NATIVE_EVENT!=='workflow_dispatch'||requested))throw Error('A new candidate origin requires an explicit manual run without archive-reuse inputs');
           if(JSON.parse(fs.readFileSync('package.json')).version==='1.0.1'&&!requested&&!newOrigin){
-            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=37869228448\nREUSE_NAME=native-candidate-369bc4f01cacf3dfd71f85555557195a3352d28f\nREUSE_SHA=022f9d6313c843af60f583a04ca695c2dfdfa63b786e8dd8fd2ae5fed5c4fd2b\n');
+            // Product commit 1b85c323911bc75a9d05109017a9a131f7f31f22, tree bf52b4da07bc77a8ea47e4a1dbdeef55b5e6cf76.
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=37911260825\nREUSE_NAME=native-candidate-1b85c323911bc75a9d05109017a9a131f7f31f22\nREUSE_SHA=9ac2837ebf0d3da06ab9025547152a2ce8f45f8de990e09ccaab97500a918652\n');
             console.log('Release 1.0.1 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
           }
           NODE
@@ -193,8 +194,8 @@ jobs:
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '7fe5a07457c9f4a980b4afa64b62db7fc7847b89' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || '09abb71369469e8aba4578e5397a3232f88c5bbb' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ inputs.core_commit || '52a0d0cd12472606632645700781d02d650f6694' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ inputs.core_tree || 'df1077cac855f04bd7f11b92b0732804ddb6f748' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
