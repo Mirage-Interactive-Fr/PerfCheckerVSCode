@@ -1,12 +1,12 @@
 import { normalizedChart, normalizedChartScript, type NormalizedPlot } from './normalized-plot';
 import {distributionChartScript} from './distribution-plot';
+import {flameGraph, flameChartScript, flameChartStyle, profileGroups, type ProfileObservation} from './flame-plot';
+import {readProfileObservations} from './observation-reader';
 import * as vscode from 'vscode';
 import {randomUUID} from 'node:crypto';
 import { spawn } from 'node:child_process';
 import * as path from 'node:path';
-import { createReadStream } from 'node:fs';
 import { promises as fs } from 'node:fs';
-import * as readline from 'node:readline';
 import {registerInvestigations} from './investigation';
 import {registerNativeTestItems} from './testitems';
 import {registerStudio} from './studio';
@@ -134,30 +134,6 @@ function sparkline(series: VersionSeries, highlightedVersions: Set<string>, id: 
   return `<svg class="spark" viewBox="0 0 ${width} ${height}" role="img" aria-label="${html(series.metric)} by version"><polyline points="${coordinates}"></polyline>${circles}</svg><pre class="plot-detail" id="${html(id)}">Hover or focus a point to inspect it.</pre>`;
 }
 
-interface ProfileObservation {
-  case_id: string;
-  target_id: string;
-  comparison_key?: string;
-  metric: string;
-  measurement_definition: string;
-  unit: string;
-  value: number;
-  aggregation?: string;
-  attributes: {
-    package?: string;
-    feature?: string;
-    workload?: string;
-    version?: string;
-    stack?: string[];
-    runtime_dispatch?: boolean[];
-    inference_status?: string[];
-    inferred_return_type?: string[];
-    gc_event?: boolean[];
-    source_file?: string;
-    source_line?: number;
-  };
-}
-
 function quantile(sorted: number[], fraction: number): number {
   if (!sorted.length) return Number.NaN;
   const position = (sorted.length - 1) * fraction;
@@ -220,74 +196,6 @@ function allocationPlot(observations: ProfileObservation[], id: string): string 
   }).join('');
   const legend = entries.map(([label, value], index) => `<li><svg width="12" height="12" aria-hidden="true"><rect width="12" height="12" fill="${palette[index % palette.length]}"/></svg><span title="${html(label)}">${html(path.basename(label))}</span><b>${(100 * value / total).toFixed(1)}%</b></li>`).join('');
   return `<div class="allocation-layout"><svg class="pie" viewBox="0 0 200 200" role="img" aria-label="Allocation share">${wedges}</svg><ol class="allocation-legend">${legend}</ol></div><pre class="plot-detail" id="${html(id)}">Hover or focus a slice to inspect its source line.</pre>`;
-}
-
-interface FlameNode {
-  name: string;
-  value: number;
-  children: Map<string, FlameNode>;
-  dynamic: boolean;
-  unstable: boolean;
-  gc: boolean;
-  inferredTypes: Set<string>;
-}
-
-function flameGraph(observations: ProfileObservation[], id: string): string {
-  if (!observations.length) return '';
-  const root: FlameNode = {name: 'root', value: 0, children: new Map(), dynamic: false,
-    unstable: false, gc: false, inferredTypes: new Set()};
-  for (const observation of observations) {
-    if (!finite(observation.value) || observation.value <= 0) continue;
-    root.value += observation.value;
-    let parent = root;
-    const stack = observation.attributes.stack ?? [];
-    for (let index = 0; index < stack.length; index += 1) {
-      const name = stack[index];
-      let node = parent.children.get(name);
-      if (!node) {
-        node = {name, value: 0, children: new Map(), dynamic: false, unstable: false,
-          gc: false, inferredTypes: new Set()};
-        parent.children.set(name, node);
-      }
-      node.value += observation.value;
-      node.dynamic ||= observation.attributes.runtime_dispatch?.[index] === true;
-      const inference = observation.attributes.inference_status?.[index];
-      node.unstable ||= Boolean(inference && inference !== 'concrete');
-      node.gc ||= observation.attributes.gc_event?.[index] === true;
-      const inferred = observation.attributes.inferred_return_type?.[index];
-      if (inferred) node.inferredTypes.add(inferred);
-      parent = node;
-    }
-  }
-  if (!root.value) return '<p class="muted">No positive profile weights are available for this call stack.</p>';
-  const rows: string[] = [];
-  let maximumDepth = 0; let rendered = 0;
-  const width = 1000; const rowHeight = 25;
-  const visit = (node: FlameNode, left: number, span: number, depth: number) => {
-    if (rendered >= 1800 || span < 0.12) return;
-    maximumDepth = Math.max(maximumDepth, depth); rendered += 1;
-    const state = node.gc ? 'gc' : node.dynamic ? 'dynamic' : node.unstable ? 'unstable' : 'normal';
-    const percent = 100 * node.value / root.value;
-    const inferred = [...node.inferredTypes].slice(0, 4).join(' | ');
-    const detail = `${node.name}\n${formatValue(node.value, '', observations[0].unit)} · ${percent.toFixed(2)}%` +
-      `${node.dynamic ? '\nRuntime dispatch detected' : ''}${node.unstable ? '\nNon-concrete inferred return' : ''}` +
-      `${node.gc ? '\nGC frame' : ''}${inferred ? `\nInferred: ${inferred}` : ''}`;
-    rows.push(`<g class="flame-node ${state}" tabindex="0" data-detail="${html(detail)}" data-target="${html(id)}"><rect x="${left}" y="${depth * rowHeight}" width="${Math.max(span - 0.7, 0.2)}" height="${rowHeight - 1}"></rect>${span > 70 ? `<text x="${left + 4}" y="${depth * rowHeight + 17}">${html(node.name)}</text>` : ''}<title>${html(detail)}</title></g>`);
-    let cursor = left;
-    const children = [...node.children.values()].sort((a, b) => b.value - a.value);
-    for (const child of children) {
-      const childSpan = span * child.value / node.value;
-      visit(child, cursor, childSpan, depth + 1);
-      cursor += childSpan;
-    }
-  };
-  let cursor = 0;
-  for (const child of [...root.children.values()].sort((a, b) => b.value - a.value)) {
-    const span = width * child.value / root.value;
-    visit(child, cursor, span, 0); cursor += span;
-  }
-  const truncated = rendered >= 1800 ? '<p class="notice">View limited to 1,800 frames. Open a single test for full detail.</p>' : '';
-  return `<div class="flame-wrap"><svg class="flame" viewBox="0 0 ${width} ${(maximumDepth + 1) * rowHeight}" role="img" aria-label="Profile call stacks weighted by ${html(observations[0].metric)}">${rows.join('')}</svg></div><pre class="flame-detail" id="${html(id)}">Hover or focus a frame to inspect it.</pre>${truncated}`;
 }
 
 class PerfNode {
@@ -820,21 +728,7 @@ class Controller {
     if (!bundle) return [];
     const source = path.join(bundle, 'observations.jsonl');
     try { await fs.access(source); } catch { return []; }
-    const result: ProfileObservation[] = [];
-    const stream = createReadStream(source, {encoding: 'utf8'});
-    const lines = readline.createInterface({input: stream, crlfDelay: Infinity});
-    for await (const line of lines) {
-      if (!line.includes('"record_type":"observation"')) continue;
-      try {
-        const observation = JSON.parse(line) as ProfileObservation;
-        const attributes = observation.attributes ?? {};
-        const matched = runs.some(run => run.package === attributes.package && run.feature === attributes.feature &&
-          (run.version === observation.target_id || run.version === attributes.version));
-        if (matched) result.push(observation);
-        if (result.length >= 250_000) { lines.close(); stream.destroy(); break; }
-      } catch { /* diagnostics remain available in the raw report */ }
-    }
-    return result;
+    return readProfileObservations(source, runs);
   }
 
   private async openReportFile(name: string): Promise<void> {
@@ -907,12 +801,8 @@ class Controller {
         `${record.package} ${workload} ${record.metric} ${record.baseline_version} ${record.candidate_version} ${record.status}`);
       return `<tr ${attributes}><td>${html(record.package)} · ${html(workload)}</td><td>${html(record.metric)}</td><td>${html(record.baseline_version)} → ${html(record.candidate_version)}</td><td>${html(formatValue(record.baseline_median, '', record.unit))}</td><td>${html(formatValue(record.candidate_median, '', record.unit))}</td><td class="delta ${record.relative_delta !== null && record.relative_delta > 0 ? 'worse' : 'better'}">${html(delta)}</td><td><span class="status ${html(record.status)}">${html(record.status)}</span></td></tr>`;
     }).join('');
-    const groups = new Map<string, ProfileObservation[]>();
-    for (const observation of observations.filter(item => Array.isArray(item.attributes.stack))) {
-      const key = JSON.stringify([observation.case_id, observation.target_id, observation.measurement_definition]);
-      const group = groups.get(key) ?? []; group.push(observation); groups.set(key, group);
-    }
-    const flames = [...groups.entries()].slice(0, 24).map(([key, group], index) => {
+    const groups = profileGroups(observations, 'flame');
+    const flames = [...groups.entries()].map(([key, group], index) => {
       const [caseId, version, definition] = JSON.parse(key) as string[];
       const label = definition.includes('profile-allocs') ? 'Allocation flame graph' :
         definition.includes('walltime') ? 'Wall-time flame graph' : 'CPU flame graph';
@@ -946,12 +836,8 @@ class Controller {
       const attributes = filterAttributes('distribution', packageName, workload, backend, version, '', `${caseId} ${version} ${collector} ${group[0].metric}`);
       return `<article class="chart-card" ${attributes}><header><div><strong>${html(group[0].metric)} distribution</strong><small>${html(packageName)} · ${html(workload)} · ${html(version)} · ${collector}</small></div><span class="distribution-unit">${html(group[0].unit)}</span></header>${distributionPlot(group, `distribution-${index}`, distributionDomains.get(distributionIdentity(group[0])) ?? [0, 0], distributionIdentity(group[0]))}</article>`;
     }).join('');
-    const allocationGroups = new Map<string, ProfileObservation[]>();
-    for (const observation of observations.filter(item => item.metric === 'julia.alloc.bytes' && (item.measurement_definition.includes('profile-allocs') || item.measurement_definition.includes('line-tracking')))) {
-      const key = JSON.stringify([observation.case_id, observation.target_id, observation.measurement_definition]);
-      const group = allocationGroups.get(key) ?? []; group.push(observation); allocationGroups.set(key, group);
-    }
-    const allocations = [...allocationGroups.entries()].slice(0, 24).map(([key, group], index) => {
+    const allocationGroups = profileGroups(observations, 'allocation');
+    const allocations = [...allocationGroups.entries()].map(([key, group], index) => {
       const [caseId, version, definition] = JSON.parse(key) as string[];
       const packageName = group[0].attributes.package ?? '';
       const backend = definitionBackend(definition);
@@ -968,7 +854,7 @@ class Controller {
       !outputs.length ? `<section class="empty"><h2>No matching output</h2><p>The report exists, but it does not contain this package, feature or version. Run this node to refresh it.</p></section>` : '';
     return `<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${this.resultsPanel!.webview.cspSource}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'"><style nonce="${nonce}">
       :root{color-scheme:light dark;font-family:var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-editor-background)}body{margin:0;padding:28px;max-width:1560px;margin:auto}*{box-sizing:border-box}.brand-heading{display:flex;align-items:center;gap:18px}.brand-heading>img{width:72px;height:72px;object-fit:contain}.normalized-legend{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px}.normalized-chart{display:block}.normalized-controls{display:grid;gap:10px}.normalized-legend{min-width:0;margin:0;padding:8px;border:1px solid var(--vscode-panel-border)}.normalized-legend label{display:inline-flex;align-items:center;gap:5px;overflow-wrap:anywhere}.normalized-range{display:flex;flex-wrap:wrap;gap:8px;align-items:end}.normalized-range label{display:grid;gap:4px;min-width:0;flex:1 1 160px;font-size:12px}.normalized-range select{width:100%;min-width:0;max-width:100%;padding:6px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border)}.normalized-scope{font-size:12px;color:var(--vscode-descriptionForeground)}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--vscode-focusBorder);outline-offset:2px}.top,.toolbar,.summary,.result-card header,.chart-card header,.flame-card header{display:flex;align-items:center}.top{justify-content:space-between;gap:20px}.top h1{margin:.2rem 0}.eyebrow{letter-spacing:.15em;color:var(--vscode-descriptionForeground);font-size:11px}.toolbar{gap:8px;flex-wrap:wrap}button{cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;border-radius:4px;padding:7px 10px}.meta,.muted,small{color:var(--vscode-descriptionForeground)}.summary{gap:10px;margin:20px 0;flex-wrap:wrap}.stat{min-width:72px;padding:10px 14px;border:1px solid var(--vscode-panel-border);border-radius:6px;display:grid}.stat strong{font-size:20px}.result-filters{position:sticky;top:0;z-index:5;display:grid;grid-template-columns:minmax(190px,2fr) repeat(6,minmax(110px,1fr));gap:8px;align-items:end;margin:18px 0;padding:12px;border:1px solid var(--vscode-panel-border);border-radius:7px;background:var(--vscode-editor-background)}.result-filters label{display:grid;gap:4px;font-size:11px;color:var(--vscode-descriptionForeground)}.result-filters input,.result-filters select{min-width:0;padding:6px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border)}#visible-count{padding:7px;white-space:nowrap;grid-column:1/-1;font-size:11px;font-weight:normal;color:var(--vscode-descriptionForeground)}.result-list,.chart-grid,.flame-grid{display:grid;gap:12px}.chart-grid{grid-template-columns:repeat(auto-fit,minmax(min(350px,100%),1fr))}.result-card,.chart-card,.flame-card,.empty{min-width:0;overflow-wrap:anywhere;border:1px solid var(--vscode-panel-border);border-radius:7px;padding:14px;background:var(--vscode-sideBar-background)}.result-card header,.chart-card header,.flame-card header{justify-content:space-between;gap:12px}.result-card header>div,.chart-card header>div,.flame-card header>div{display:grid;gap:3px}.status{font-size:11px;padding:3px 7px;border-radius:999px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground)}.status.pass,.stat.pass{border-color:var(--vscode-testing-iconPassed)}.status.error,.status.fail,.stat.error{border-color:var(--vscode-testing-iconFailed)}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin-top:12px}.metrics>div{display:grid;border-left:2px solid var(--vscode-focusBorder);padding-left:8px}.metrics span{color:var(--vscode-descriptionForeground);font-size:11px;text-transform:capitalize}.message,.notice{padding:8px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-textBlockQuote-border)}section h2{margin-top:28px}.spark{width:100%;height:110px;overflow:visible}.distribution{display:block;width:100%;height:auto;aspect-ratio:7/1;overflow:hidden}.distribution-unit{white-space:nowrap;flex:none}.distribution-view{min-width:0}.distribution-toolbar{display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin:12px 0 4px}.distribution-toolbar button{font-size:12px;min-height:36px;padding:6px 8px}.distribution-toolbar button:disabled{opacity:.5;cursor:default}.distribution-range{flex:1 0 100%;font-size:12px}.distribution-range summary{cursor:pointer;padding:7px 0}.distribution-range>div{display:grid;grid-template-columns:1fr 1fr;gap:8px}.distribution-range label{display:grid;min-width:0;gap:4px}.distribution-range input{width:100%;min-width:0;max-width:100%;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border);padding:5px}.distribution-range input[type=range]{padding:0;min-height:30px;touch-action:pan-y}.distribution-scale,.distribution-visible,.distribution-sampling{font-size:12px;line-height:1.5;margin:7px 0}.distribution-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(85px,1fr));gap:8px;margin:12px 0}.distribution-stats>div{min-width:0}.distribution-stats dt{font-size:11px;color:var(--vscode-descriptionForeground)}.distribution-stats dd{margin:2px 0 0;white-space:nowrap;font-size:12px;font-variant-numeric:tabular-nums}.distribution-view .plot-detail{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}@media(max-width:400px){.distribution-toolbar button{min-height:44px}.distribution-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}.spark polyline{fill:none;stroke:var(--vscode-charts-blue);stroke-width:2}.spark .point,.sample{fill:var(--vscode-charts-blue)}.spark .point.current{fill:var(--vscode-charts-orange);stroke:var(--vscode-editor-background);stroke-width:2}.hover-value{outline:none;cursor:crosshair}.hover-value:hover,.hover-value:focus{stroke:var(--vscode-focusBorder);stroke-width:3;filter:brightness(1.18)}.distribution .whisker,.distribution .median{stroke:var(--vscode-foreground);stroke-width:2}.distribution .box{fill:var(--vscode-charts-blue);fill-opacity:.28;stroke:var(--vscode-charts-blue)}.plot-detail,.flame-detail{white-space:pre-wrap;min-height:34px;padding:7px;background:var(--vscode-textCodeBlock-background);border-radius:4px}.version-values{display:flex;gap:6px;flex-wrap:wrap}.version-values span{font-size:11px;padding:3px 6px;background:var(--vscode-badge-background);border-radius:4px}.version-values .current{outline:2px solid var(--vscode-focusBorder)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--vscode-panel-border)}.table-wrap,.flame-wrap{overflow:auto}.delta.worse{color:var(--vscode-testing-iconFailed)}.delta.better{color:var(--vscode-testing-iconPassed)}.flame-card{margin-bottom:12px}.flame{min-width:800px;width:100%;height:auto}.flame-node{outline:none}.flame-node rect{fill:var(--vscode-charts-blue);stroke:var(--vscode-editor-background);stroke-width:.6}.flame-node.dynamic rect{fill:var(--vscode-charts-red)}.flame-node.unstable rect{fill:var(--vscode-charts-purple)}.flame-node.gc rect{fill:var(--vscode-charts-orange)}.flame-node:hover rect,.flame-node:focus rect{stroke:var(--vscode-focusBorder);stroke-width:2;filter:brightness(1.2)}.flame-node text{font-size:11px;fill:var(--vscode-editor-foreground);pointer-events:none}.legend{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 16px}.legend i,.allocation-legend i{display:inline-block;width:12px;height:12px;margin-right:5px;vertical-align:-2px}.legend .normal{background:var(--vscode-charts-blue)}.legend .dynamic{background:var(--vscode-charts-red)}.legend .unstable{background:var(--vscode-charts-purple)}.legend .gc{background:var(--vscode-charts-orange)}.allocation-layout{display:grid;grid-template-columns:190px 1fr;gap:12px;align-items:center}.pie{width:190px;height:190px}.allocation-legend{list-style:none;margin:0;padding:0;display:grid;gap:5px}.allocation-legend li{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:5px;align-items:center}.allocation-legend span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}[hidden]{display:none!important}code{user-select:all}@media(max-width:1100px){.result-filters{grid-template-columns:repeat(4,minmax(120px,1fr))}}@media(max-width:700px){body{padding:14px}.top{align-items:flex-start;flex-direction:column}.result-filters{position:static;grid-template-columns:1fr 1fr}.chart-grid{grid-template-columns:1fr}.allocation-layout{grid-template-columns:1fr}}
-    </style></head><body><header class="top"><div class="brand-heading"><img src="${html(logo)}" alt="PerfChecker"><div><div class="eyebrow">PERFCHECKER OUTPUT</div><h1>${html(title)}</h1><div class="meta">${suite ? `${html(suite.suite)} · ${html(suite.profile)} · ${html(suite.finished_at)}` : html(this.absolute('reports'))}</div></div></div><div class="toolbar"><button data-report="suite-report.md">Summary</button><button data-report="suite-result.json">JSON</button><button data-report="version-comparison.md">Comparisons</button><button data-report="version-series.json">Series JSON</button></div></header>${empty}${suite ? filters : ''}${suite ? `<div class="summary">${countCards}<div class="stat"><strong>${outputs.length}</strong><span>runs</span></div></div>` : ''}${overlayCards ? `<section><h2>Overlaid measurements · minimum = 1</h2>${overlayCards}</section>` : ''}${distributionCards ? `<section><h2>Benchmark and measurement distributions</h2><div class="chart-grid">${distributionCards}</div></section>` : ''}${allocations ? `<section><h2>Allocation views</h2><div class="chart-grid">${allocations}</div></section>` : ''}${flames ? `<section><h2>Flame graphs</h2><div class="legend"><span><i class="normal"></i>Normal</span><span><i class="dynamic"></i>Runtime dispatch</span><span><i class="unstable"></i>Non-concrete inference</span><span><i class="gc"></i>GC</span></div><div class="flame-grid">${flames}</div></section>` : ''}${runCards ? `<section><h2>Run output</h2><div class="result-list">${runCards}</div></section>` : ''}${seriesCards ? `<section><h2>Version series</h2><div class="chart-grid">${seriesCards}</div></section>` : ''}${comparisonRows ? `<section><h2>Version comparisons</h2>${comparisons.length > visibleComparisons.length ? `<p class="notice">Showing ${visibleComparisons.length} of ${comparisons.length} comparisons. Open the Markdown report for all records.</p>` : ''}<div class="table-wrap"><table><thead><tr><th>Check</th><th>Metric</th><th>Versions</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Status</th></tr></thead><tbody>${comparisonRows}</tbody></table></div></section>` : ''}<script nonce="${nonce}">const vscode=acquireVsCodeApi();${normalizedChartScript}${distributionChartScript}document.querySelectorAll('[data-report]').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:'report',name:button.dataset.report})));document.querySelectorAll('.flame-node,.hover-value').forEach(node=>{const show=()=>{const target=document.getElementById(node.dataset.target);if(target)target.textContent=node.dataset.detail};node.addEventListener('mouseenter',show);node.addEventListener('focus',show)});const controls=['result-search','result-package','result-workload','result-backend','result-kind','result-status','result-sort'].map(id=>document.getElementById(id)).filter(Boolean);const apply=()=>{const value=id=>document.getElementById(id)?.value||'';const query=value('result-search').trim().toLowerCase();const fields={package:value('result-package'),workload:value('result-workload'),backend:value('result-backend'),kind:value('result-kind'),status:value('result-status')};const items=[...document.querySelectorAll('[data-result-item]')];for(const item of items){const matches=(!query||item.dataset.search.includes(query))&&Object.entries(fields).every(([key,expected])=>!expected||item.dataset[key]===expected);item.hidden=!matches}const mode=value('result-sort');for(const container of document.querySelectorAll('.result-list,.chart-grid,.flame-grid,tbody')){[...container.children].sort((a,b)=>{const key=mode==='version'?'version':mode==='status'?'status':'search';return(a.dataset[key]||'').localeCompare(b.dataset[key]||'',undefined,{numeric:true})}).forEach(item=>container.appendChild(item))}const sections=new Set(items.map(item=>item.closest('section')).filter(Boolean));for(const section of sections)section.hidden=![...section.querySelectorAll('[data-result-item]')].some(item=>!item.hidden);const visible=items.filter(item=>!item.hidden).length;const counter=document.getElementById('visible-count');if(counter)counter.textContent=visible+' / '+items.length};controls.forEach(control=>control.addEventListener('input',apply));apply();</script></body></html>`;
+    ${flameChartStyle}</style></head><body><header class="top"><div class="brand-heading"><img src="${html(logo)}" alt="PerfChecker"><div><div class="eyebrow">PERFCHECKER OUTPUT</div><h1>${html(title)}</h1><div class="meta">${suite ? `${html(suite.suite)} · ${html(suite.profile)} · ${html(suite.finished_at)}` : html(this.absolute('reports'))}</div></div></div><div class="toolbar"><button data-report="suite-report.md">Summary</button><button data-report="suite-result.json">JSON</button><button data-report="version-comparison.md">Comparisons</button><button data-report="version-series.json">Series JSON</button></div></header>${empty}${suite ? filters : ''}${suite ? `<div class="summary">${countCards}<div class="stat"><strong>${outputs.length}</strong><span>runs</span></div></div>` : ''}${overlayCards ? `<section><h2>Overlaid measurements · minimum = 1</h2>${overlayCards}</section>` : ''}${distributionCards ? `<section><h2>Benchmark and measurement distributions</h2><div class="chart-grid">${distributionCards}</div></section>` : ''}${allocations ? `<section><h2>Allocation views</h2><div class="chart-grid">${allocations}</div></section>` : ''}${flames ? `<section><h2>Flame graphs</h2><div class="legend"><span><i class="normal"></i>Normal</span><span><i class="dynamic"></i>Runtime dispatch</span><span><i class="unstable"></i>Non-concrete inference</span><span><i class="gc"></i>GC</span></div><div class="flame-grid">${flames}</div></section>` : ''}${runCards ? `<section><h2>Run output</h2><div class="result-list">${runCards}</div></section>` : ''}${seriesCards ? `<section><h2>Version series</h2><div class="chart-grid">${seriesCards}</div></section>` : ''}${comparisonRows ? `<section><h2>Version comparisons</h2>${comparisons.length > visibleComparisons.length ? `<p class="notice">Showing ${visibleComparisons.length} of ${comparisons.length} comparisons. Open the Markdown report for all records.</p>` : ''}<div class="table-wrap"><table><thead><tr><th>Check</th><th>Metric</th><th>Versions</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Status</th></tr></thead><tbody>${comparisonRows}</tbody></table></div></section>` : ''}<script nonce="${nonce}">const vscode=acquireVsCodeApi();${normalizedChartScript}${distributionChartScript}${flameChartScript}document.querySelectorAll('[data-report]').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:'report',name:button.dataset.report})));document.querySelectorAll('.hover-value').forEach(node=>{const show=()=>{const target=document.getElementById(node.dataset.target);if(target)target.textContent=node.dataset.detail};node.addEventListener('mouseenter',show);node.addEventListener('focus',show)});const controls=['result-search','result-package','result-workload','result-backend','result-kind','result-status','result-sort'].map(id=>document.getElementById(id)).filter(Boolean);const apply=()=>{const value=id=>document.getElementById(id)?.value||'';const query=value('result-search').trim().toLowerCase();const fields={package:value('result-package'),workload:value('result-workload'),backend:value('result-backend'),kind:value('result-kind'),status:value('result-status')};const items=[...document.querySelectorAll('[data-result-item]')];for(const item of items){const matches=(!query||item.dataset.search.includes(query))&&Object.entries(fields).every(([key,expected])=>!expected||item.dataset[key]===expected);item.hidden=!matches}const mode=value('result-sort');for(const container of document.querySelectorAll('.result-list,.chart-grid,.flame-grid,tbody')){[...container.children].sort((a,b)=>{const key=mode==='version'?'version':mode==='status'?'status':'search';return(a.dataset[key]||'').localeCompare(b.dataset[key]||'',undefined,{numeric:true})}).forEach(item=>container.appendChild(item))}const sections=new Set(items.map(item=>item.closest('section')).filter(Boolean));for(const section of sections)section.hidden=![...section.querySelectorAll('[data-result-item]')].some(item=>!item.hidden);const visible=items.filter(item=>!item.hidden).length;const counter=document.getElementById('visible-count');if(counter)counter.textContent=visible+' / '+items.length};controls.forEach(control=>control.addEventListener('input',apply));apply();</script></body></html>`;
   }
 
   async openOutput(nodeOrRun?: PerfNode | PlanRun, explicitRuns?: PlanRun[]): Promise<void> {

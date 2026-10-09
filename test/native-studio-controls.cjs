@@ -514,6 +514,141 @@ async function testCancelGitDiscovery(context){
   }
 }
 
+async function testFlameControls(context,view) {
+  const graphs=view.locator('.flame-view');assert((await graphs.count())>0);
+  for(let index=0;index<await graphs.count();index++){
+    const graph=graphs.nth(index),model=JSON.parse(await graph.getAttribute('data-flame'));
+    assert.equal(await graph.locator('.flame-node').count(),model.frames.length,
+      'Every frame from the actual measured profile model remains in the native SVG');
+  }
+  const graph=graphs.first(),payload=await graph.getAttribute('data-flame'),model=JSON.parse(payload);
+  const svg=graph.locator('svg.flame'),indexInput=graph.getByRole('spinbutton',{name:'Inspect frame',exact:true});
+  const expectedGeometry=async()=>{
+    const actual=await svg.evaluate(svg=>({width:svg.viewBox.baseVal.width,
+      from:Number(svg.dataset.currentMin),to:Number(svg.dataset.currentMax),
+      frames:[...svg.querySelectorAll('.flame-node')].map(node=>({index:Number(node.dataset.frameIndex),
+        x:Number(node.querySelector('rect').getAttribute('x')),width:Number(node.querySelector('rect').getAttribute('width'))}))}));
+    for(const frame of actual.frames){const saved=model.frames[frame.index-1],span=actual.to-actual.from;
+      assert(Math.abs(frame.x-(saved.x0-actual.from)*actual.width/span)<1e-8);
+      assert(Math.abs(frame.width-(saved.x1-saved.x0)*actual.width/span)<1e-8,
+        'Frame width must follow its complete measured weight, without a minimum or decorative subtraction');
+    }
+    return actual;
+  };
+  const original=await expectedGeometry();
+  const narrow=model.frames.reduce((best,frame)=>frame.x1-frame.x0<best.x1-best.x0?frame:best);
+  await indexInput.fill(String(narrow.index));await indexInput.press('Tab');
+  const detailId=await graph.getAttribute('data-detail-target'),detail=view.locator(`[id="${detailId}"]`);
+  await eventually(async()=>(await detail.innerText()).startsWith(`Frame ${narrow.index} /`),'Native frame index updates the real readout');
+  const callPath=[];for(let frame=narrow;frame;frame=frame.parent===null?undefined:model.frames[frame.parent-1])callPath.push(frame.name);
+  const text=await detail.innerText();assert(text.includes(callPath.reverse().join(' → ')));
+  assert(text.includes(`Inclusive weight: ${narrow.value} ${model.unit}`));
+  await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click();
+  await eventually(async()=>Number(await svg.getAttribute('data-current-max'))-Number(await svg.getAttribute('data-current-min'))<1,'Native flame Zoom narrows only the viewport');
+  await expectedGeometry();
+  const pan=graph.getByRole('button',{name:'Pan flame graph left',exact:true});
+  const otherPan=graph.getByRole('button',{name:'Pan flame graph right',exact:true});
+  if(await pan.isEnabled())await pan.click();else await otherPan.click();
+  await expectedGeometry();await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
+  await eventually(async()=>await svg.getAttribute('data-current-min')==='0'&&await svg.getAttribute('data-current-max')==='1','Native flame Fit restores the complete original range');
+  const restored=await expectedGeometry();assert.deepEqual(restored,original);
+  await graph.locator('.flame-range summary').click();
+  const start=graph.locator('[data-flame-bound="min"]'),end=graph.locator('[data-flame-bound="max"]');
+  for(const [input,value]of [[start,'-1'],[end,'101'],[start,'100'],[start,'']]){
+    await input.fill(value);await input.press('Tab');
+    assert.match(await graph.locator('[role="alert"]').innerText(),/from 0 to 100/);
+    assert.deepEqual(await expectedGeometry(),original,'Invalid percentage input must not silently move the viewport');
+  }
+  await start.fill('90');await start.press('Tab');const beforeReversed=await expectedGeometry();
+  await end.fill('10');await end.press('Tab');
+  assert.match(await graph.locator('[role="alert"]').innerText(),/from 0 to 100/);
+  assert.deepEqual(await expectedGeometry(),beforeReversed,'Reversed user bounds leave the previous valid viewport unchanged');
+  await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
+  await start.fill('10');await end.fill('90');await end.press('Tab');
+  await eventually(async()=>await svg.getAttribute('data-current-min')==='0.1'&&await svg.getAttribute('data-current-max')==='0.9',
+    'A valid explicit percentage range changes only the viewport');
+  await expectedGeometry();await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
+  await graph.locator('.flame-range summary').click();
+  assert.equal(await graph.getAttribute('data-flame'),payload,'Flame interaction leaves the measured model byte-exact');
+  const labels=await svg.evaluate(svg=>[...svg.querySelectorAll('.flame-node text')].filter(text=>text.style.display!=='none').map(text=>{
+    const rect=text.parentElement.querySelector('rect'),left=Number(rect.getAttribute('x')),width=Number(rect.getAttribute('width'));
+    return {length:text.getComputedTextLength(),available:Math.min(svg.viewBox.baseVal.width,left+width)-Math.max(0,left)-8};
+  }));assert(labels.every(label=>label.length<=label.available+1e-6),'Native frame labels fit their visible weighted rectangle');
+  context.proof('native-flame-exact-geometry-and-controls',{graphs:await graphs.count(),frames:model.frames.length,
+    inspected:narrow.index,fullCallPath:true,exactWeights:true,noFrameWidthFloor:true,nativeZoomPanFit:true,
+    modelSha256:createHash('sha256').update(payload).digest('hex'),fittingLabels:labels.length,invalidPercentageRangesRejected:5});
+  await testFlamePresentation(context,view,graph);
+}
+
+async function testFlamePresentation(context,view,graph){
+  assertDisposable(context);
+  const themes=context.vscode.extensions.getExtension('vscode.theme-defaults')?.packageJSON.contributes.themes;
+  assert(Array.isArray(themes),'Read actual built-in theme contributions from this installed VS Code host');
+  const workbench=context.vscode.workspace.getConfiguration('workbench');
+  const previousTheme=workbench.inspect('colorTheme')?.globalValue;
+  const previousViewport=await context.windowPage.evaluate(()=>({width:innerWidth,height:innerHeight}));
+  const audits=[];
+  const audit=async()=>{
+    const labels=await graph.locator('svg.flame').evaluate(svg=>[...svg.querySelectorAll('.flame-node text')]
+      .filter(text=>getComputedStyle(text).display!=='none').map(text=>{
+        const rect=text.parentElement.querySelector('rect'),x=Number(rect.getAttribute('x')),width=Number(rect.getAttribute('width'));
+        return {name:text.textContent,foreground:getComputedStyle(text).fill,background:getComputedStyle(rect).fill,
+          filter:getComputedStyle(rect).filter,length:text.getComputedTextLength(),available:Math.min(svg.viewBox.baseVal.width,x+width)-Math.max(0,x)-8};
+      }));
+    assert(labels.length,'Real native profile labels remain visible');
+    const rgb=value=>{const match=/^rgba?\(([^)]+)\)$/.exec(value);assert(match,`Inspect actual computed RGB colors: ${value}`);
+      const values=match[1].split(',').map(Number);assert(values.length===3||values[3]===1,'The qualified built-in palette uses opaque frame colors');return values.slice(0,3);};
+    const luminance=channels=>channels.map(channel=>channel/255).map(value=>value<=.04045?value/12.92:((value+.055)/1.055)**2.4)
+      .reduce((sum,value,index)=>sum+value*[.2126,.7152,.0722][index],0);
+    const contrasts=labels.map(label=>{
+      assert(label.length<=label.available+1e-6,`Measured label fits its visible frame: ${label.name}`);
+      const brightness=label.filter==='none'?1:Number(/^brightness\(([^)]+)\)$/.exec(label.filter)?.[1]);
+      assert(Number.isFinite(brightness),'The audit accounts for the actual native hover/focus brightness');
+      const background=luminance(rgb(label.background).map(value=>Math.min(255,value*brightness))),foreground=luminance(rgb(label.foreground));
+      const ratio=(Math.max(background,foreground)+.05)/(Math.min(background,foreground)+.05);
+      assert(ratio>=4.5,`Actual rendered label contrast ${ratio}: ${label.name}`);return ratio;
+    });
+    return {visibleLabels:labels.length,minimumContrast:Math.min(...contrasts),measuredWidthsFit:true};
+  };
+  try{
+    for(const [uiTheme,kind,bodyClass]of [['vs',context.vscode.ColorThemeKind.Light,'vscode-light'],['vs-dark',context.vscode.ColorThemeKind.Dark,'vscode-dark']]){
+      const candidates=themes.filter(theme=>theme.uiTheme===uiTheme),theme=candidates.find(theme=>/Modern/.test(theme.id))||candidates[0];
+      assert(theme?.id,'The installed host provides an actual light and dark theme identifier');
+      await workbench.update('colorTheme',theme.id,context.vscode.ConfigurationTarget.Global);
+      await eventually(async()=>context.vscode.window.activeColorTheme.kind===kind&&await view.locator('body').evaluate((body,name)=>body.classList.contains(name),bodyClass),
+        `The real webview receives the ${theme.id} theme`);
+      await eventually(audit,'The rendered flame labels update their actual contrast after the theme changes');
+      const desktop=await audit();
+      await graph.locator('.flame-node').first().focus();const focused=await audit();
+      await graph.locator('.flame-node').first().hover();const hovered=await audit();
+      const commands=await context.vscode.commands.getCommands(true);
+      for(const command of ['workbench.action.closeSidebar','workbench.action.closeAuxiliaryBar','workbench.action.closePanel']){
+        if(commands.includes(command))await context.vscode.commands.executeCommand(command);
+      }
+      await context.windowPage.setViewportSize({width:390,height:844});
+      await eventually(async()=>await view.evaluate(()=>innerWidth)<=390,'The actual webview adopts the narrow workbench viewport');
+      const geometry=await graph.evaluate(node=>({viewport:innerWidth,width:node.getBoundingClientRect().width,
+        scrollWidth:node.scrollWidth,clientWidth:node.clientWidth,
+        buttons:[...node.querySelectorAll('.flame-toolbar button')].map(button=>({label:button.getAttribute('aria-label'),height:button.getBoundingClientRect().height}))}));
+      assert(geometry.width>=230&&geometry.width<=390,'The narrow qualification uses a readable editor after hiding disposable side panels');assert(geometry.scrollWidth<=geometry.clientWidth);
+      assert(geometry.buttons.every(button=>button.height>=44),'The narrow native flame controls retain touch-sized targets');
+      const mobile=await audit();
+      await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click();
+      await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
+      await graph.locator('.flame-toolbar').scrollIntoViewIfNeeded();
+      await capture(context,`flame-mobile-${uiTheme}-controls`);
+      await graph.locator('.flame-detail').scrollIntoViewIfNeeded();
+      await capture(context,`flame-mobile-${uiTheme}-readout`);
+      audits.push({theme:theme.id,desktop,focused,hovered,mobile,geometry});
+      await context.windowPage.setViewportSize(previousViewport);
+    }
+    context.proof('native-flame-theme-and-mobile-presentation',{source:'actual-installed-VSIX-and-built-in-VSCode-themes',audits});
+  }finally{
+    await context.windowPage.setViewportSize(previousViewport);
+    await workbench.update('colorTheme',previousTheme,context.vscode.ConfigurationTarget.Global);
+  }
+}
+
 async function testResults(context) {
   const commands=await context.vscode.commands.getCommands(true);
   if(commands.includes('workbench.action.closePanel'))await context.vscode.commands.executeCommand('workbench.action.closePanel');
@@ -565,6 +700,7 @@ async function testResults(context) {
     if (target) assert((await view.locator(`[id="${target}"]`).innerText()).trim(), `${name} keyboard focus shows its evidence`);
   }
   assert(chartFamilies.flame>0,'The actual profile reports render nonempty, focusable flame frames');
+  await testFlameControls(context,view);
   const overlay=view.locator('.normalized-plot').first();
   assert.equal(await overlay.count(),1,'Measured version series supplies the real comparison controls');
   const seriesFile=path.join(context.results,'version-series.json'),seriesBytes=await fs.readFile(seriesFile);
