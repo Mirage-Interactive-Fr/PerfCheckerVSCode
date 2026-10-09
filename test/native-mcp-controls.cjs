@@ -617,7 +617,9 @@ exports.run = async (context,options={}) => {
           if(!general100&&name!==implementationTool&&!prompt.includes('native suite evidence probe'))assert(prompt.includes('No recommendations does not mean no measurements'));
         }else{
           assert.deepEqual(projection.evidence,[],'No saved measurement reaches the server without explicit Attach');
-          assert(prompt.includes('No saved report was attached.'));
+          assert(prompt.includes(general100
+            ? 'If evidence is empty, explain that no saved measurements were attached.'
+            : 'No saved report was attached.'));
           assert(savedEvidence,'A real saved report already exists before testing the absence of implicit attachment');
         }
         // Keep the additional Suite request recorded separately, preserving all
