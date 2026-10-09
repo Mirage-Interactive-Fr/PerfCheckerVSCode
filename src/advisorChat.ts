@@ -7,7 +7,7 @@ import {StringDecoder} from 'node:string_decoder';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {readAdvisorConfiguration} from './advisorSetup';
-import {localAdvisorConnection} from './advisorConnection';
+import {localAdvisorConnection, implementationMcpArguments} from './advisorConnection';
 import {ChatMessage, prepareChatMessages, completeChatMessages, chatReply} from './advisorChatModel';
 import {InvestigationReport} from './investigationModel';
 import {createImplementationCheckout, applyImplementation, recoverImplementationProposal, recoverActiveImplementationProposal, saveActiveImplementationProposal, ImplementationProposal} from './implementation';
@@ -64,14 +64,16 @@ export class AdvisorChat implements vscode.Disposable {
     return {type: 'chatState', workspace: folder.name, messages: this.messages, evidenceId: this.evidenceId,
       evidence: this.displayedEvidence, busy: this.busy, status: this.status, pending: this.pending,
       connection: localAdvisorConnection(folder.uri.toString())?.label,
+      connectionKind: localAdvisorConnection(folder.uri.toString())?.kind,
       implementation: localAdvisorConnection(folder.uri.toString())?.implementation ?? {tool: settings.get('advisorImplementationMcpTool', ''),
         promptArgument: settings.get('advisorImplementationMcpPromptArgument', 'prompt'),
-        workspaceArgument: settings.get('advisorImplementationMcpWorkspaceArgument', 'workspace')},
+        workspaceArgument: settings.get('advisorImplementationMcpWorkspaceArgument', 'workspace'),
+        arguments: settings.get('advisorImplementationMcpArguments', {})},
       proposal: this.proposal ? {patch: this.proposal.patch, lossyPreview: this.proposal.lossyPreview, files: this.proposal.files, applied: this.proposal.applied} : undefined,
       implementationSummary: this.implementationSummary, backupRef: this.proposal?.backupRef ?? this.backupRef};
   }
   isBusy() {return this.busy;}
-  connectionChanged() {this.status = localAdvisorConnection(this.folder().uri.toString()) ? 'Codex connected for this editor session. Advice is read-only; implementation requires review.' : 'Local Codex disconnected. Saved provider configuration is active again. Reconnect after an editor restart.'; this.publish();}
+  connectionChanged() {const local = localAdvisorConnection(this.folder().uri.toString()); this.status = local ? `${local.label} connected for this editor session. Advice is requested explicitly; implementation requires review. Tool permissions are managed by the server.` : 'Local connector disconnected. Saved provider configuration is active again. Reconnect after an editor restart.'; this.publish();}
   private publish() {
     if (this.disposed) return;
     try {void this.panel?.webview.postMessage(this.state());} catch {/* selected folder was closed */}
@@ -87,7 +89,7 @@ export class AdvisorChat implements vscode.Disposable {
     this.panel.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
       dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
     webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('advisor-chat.css')}"><title>PerfChecker chat</title></head><body><main id="chat-root"></main><script nonce="${nonce}" src="${resource('advisor-chat.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorChat(document.getElementById('chat-root'),m=>api.postMessage(m),${JSON.stringify(String(resource('perfchecker.png')))});window.addEventListener('message',e=>panel.receive(e.data));api.postMessage({type:'chatReady'});</script></body></html>`;
-    panel.onDidDispose(() => {if (this.panel===panel) {this.cancel();this.panel=undefined;}});
+    panel.onDidDispose(() => {if (this.panel===panel) {this.cancel(true);this.panel=undefined;}});
     webview.onDidReceiveMessage(async message => {
       try {
         if (this.panel!==panel || this.workspace!==workspace) return;
@@ -99,6 +101,8 @@ export class AdvisorChat implements vscode.Disposable {
         else if (message?.type === 'chatSettings') await vscode.commands.executeCommand('perfchecker.configureAdvisor');
         else if (message?.type === 'chatConnectCodex') await vscode.commands.executeCommand('perfchecker.connectCodex');
         else if (message?.type === 'chatDisconnectCodex') await vscode.commands.executeCommand('perfchecker.disconnectCodex');
+        else if (message?.type === 'chatConnectMcpStdio') await vscode.commands.executeCommand('perfchecker.connectMcpStdio');
+        else if (message?.type === 'chatDisconnectMcpStdio') await vscode.commands.executeCommand('perfchecker.disconnectMcpStdio');
         else if (message?.type === 'implementationSettings') await this.saveImplementationSettings(message);
         else if (message?.type === 'chatImplement') await this.implement(true);
         else if (message?.type === 'chatApply') await this.apply();
@@ -156,15 +160,18 @@ export class AdvisorChat implements vscode.Disposable {
   private async saveImplementationSettings(input: any) {
     const folder = this.folder();
     if (this.busy) throw new Error('Wait for the current request.');
-    if (localAdvisorConnection(folder.uri.toString())) throw new Error('The local Codex connector supplies its implementation tool. Disconnect it to configure your saved provider.');
+    const local = localAdvisorConnection(folder.uri.toString());
+    if (local) throw new Error(`Disconnect ${local.label} before changing its tool selection or configuring your saved provider.`);
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before configuring implementation.');
     if (typeof input.tool !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(input.tool) ||
       ![input.promptArgument, input.workspaceArgument].every(value => typeof value === 'string' && /^[A-Za-z_][A-Za-z_0-9.-]{0,127}$/.test(value)) ||
       input.promptArgument === input.workspaceArgument) throw new Error('Enter an implementation tool and two different argument names.');
+    const argumentsValue = implementationMcpArguments({}, input.arguments, input.promptArgument, input.workspaceArgument);
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
     await settings.update('advisorImplementationMcpTool', input.tool, vscode.ConfigurationTarget.WorkspaceFolder);
     await settings.update('advisorImplementationMcpPromptArgument', input.promptArgument, vscode.ConfigurationTarget.WorkspaceFolder);
     await settings.update('advisorImplementationMcpWorkspaceArgument', input.workspaceArgument, vscode.ConfigurationTarget.WorkspaceFolder);
+    await settings.update('advisorImplementationMcpArguments', argumentsValue, vscode.ConfigurationTarget.WorkspaceFolder);
     this.status = 'Implementation tool saved. Review advice before preparing changes.'; this.publish();
   }
   async implement(warningShown = false) {
@@ -193,6 +200,11 @@ export class AdvisorChat implements vscode.Disposable {
       if (config.protocol !== 'mcp_http') throw new Error('Implementation requires an MCP endpoint.');
       config.mcp_tool = tool; config.mcp_response = 'text';
       config.mcp_prompt_argument = promptArgument;
+      // Existing configurations retain their arguments until the user saves a
+      // separate implementation configuration. Advice and editing tools may
+      // require different arguments even when they share an MCP server.
+      config.mcp_arguments = implementationMcpArguments(config.mcp_arguments,
+        local ? local.implementation.arguments : settings.get('advisorImplementationMcpArguments'), promptArgument, workspaceArgument);
       checkout = await createImplementationCheckout(folder.uri.fsPath);
       this.backupRef = checkout.backupRef;
       await this.persistProposal();
@@ -298,11 +310,17 @@ export class AdvisorChat implements vscode.Disposable {
       });
     } finally {await fs.rm(directory, {recursive: true, force: true});}
   }
-  cancel() {
-    if (!this.busy) return;
-    this.cancelled = true; this.status = 'Cancelling advisor request…';
-    this.cancellation?.request();
+  cancel(closeConnection = false) {
+    if (!this.busy && !closeConnection) return;
+    if (this.busy) {
+      this.cancelled = true; this.status = 'Cancelling advisor request…';
+      this.cancellation?.request();
+    }
+    const workspace = this.workspace;
+    if (workspace && localAdvisorConnection(workspace)?.kind === 'stdio')
+      void vscode.commands.executeCommand('perfchecker.cancelMcpStdio', workspace)
+        .then(undefined, error => {void vscode.window.showErrorMessage(`PerfChecker: ${error}`);});
     this.publish();
   }
-  dispose() {this.disposed = true; this.cancel(); this.panel?.dispose();}
+  dispose() {this.disposed = true; this.cancel(true); this.panel?.dispose();}
 }

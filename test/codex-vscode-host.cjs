@@ -121,6 +121,7 @@ exports.run=async()=>{
     browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.PERFCHECKER_HOST_CDP_PORT}`);
     observer=setInterval(()=>{void observe().catch(error=>{result.observationError=String(error);});},200);
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
+    await view.locator('summary').filter({hasText:'Optional Codex CLI connector'}).click();
     const beforeServers=new Set(loopbackServers());await click('Connect Codex CLI');
     await eventually(async()=>Boolean((await state()).connection),'The actual Connect button authenticates the existing CLI',60000);
     const connected=await state();assert.match(connected.connection,/^codex-cli\s+\S+/);assert.equal(connected.implementation.tool,'implement_perfchecker');

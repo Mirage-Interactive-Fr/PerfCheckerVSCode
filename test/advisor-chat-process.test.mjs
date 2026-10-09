@@ -31,9 +31,10 @@ const configuredProjects = {runnerProject: 'perf', scenarioProject: 'perf'};
 const settings = {get: (name, fallback) => configuredProjects[name] ?? fallback};
 const vscode = {workspace: {getConfiguration: () => settings}};
 const original = Module._load, require = createRequire(import.meta.url);
+const nativeChildProcess = require('node:child_process');
 Module._load = function (name, ...args) {
   if (name === 'vscode') return vscode;
-  if (name === 'node:child_process') return {spawn};
+  if (name === 'node:child_process') return {...nativeChildProcess, spawn};
   return original.call(this, name, ...args);
 };
 let AdvisorChat, InvestigationController;

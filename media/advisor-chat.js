@@ -12,10 +12,15 @@ function mountAdvisorChat(root, send, logo) {
   if (logo) {const image = node('img'); image.src = logo; image.alt = 'PerfChecker'; header.append(image);}
   const title = node('div'); title.append(node('p', 'PERFCHECKER / ASSISTANT', 'eyebrow'), node('h1', 'From evidence to better code.'));
   const workspace = node('p', 'Workspace conversation', 'subtle'); title.append(workspace); header.append(title);
-  const settings = button('Advisor settings', () => send({type: 'chatSettings'}), 'secondary');
+  const settings = button('Configure MCP connection', () => send({type: 'chatSettings'}), 'primary');
+  const connectStdio = button('Connect local MCP server', () => send({type: 'chatConnectMcpStdio'}), 'secondary');
+  const disconnectStdio = button('Disconnect local MCP server', () => send({type: 'chatDisconnectMcpStdio'}), 'secondary');
   const connectCodex = button('Connect Codex CLI', () => send({type: 'chatConnectCodex'}), 'secondary');
   const disconnectCodex = button('Disconnect Codex', () => send({type: 'chatDisconnectCodex'}), 'secondary');
-  header.append(connectCodex, disconnectCodex, settings); root.append(header);
+  const optionalConnector = node('details', '', 'tool-settings');
+  optionalConnector.append(node('summary', 'Optional Codex CLI connector'), connectCodex, disconnectCodex);
+  header.append(settings, connectStdio, disconnectStdio, optionalConnector); root.append(header);
+  root.append(node('p', 'Choose a server and an advice tool in MCP connection settings. Implementation uses a separately configured tool that can edit the supplied local checkout.', 'subtle'));
   const tabs = node('div', '', 'tabs'); tabs.setAttribute('role', 'tablist'); tabs.setAttribute('aria-label', 'Assistant mode');
   const adviceTab = button('01 · Advice', () => setMode('advice'));
   const implementationTab = button('02 · Implementation', () => setMode('implementation'));
@@ -75,8 +80,16 @@ function mountAdvisorChat(root, send, logo) {
   for (const [key, label, fallback] of [['tool', 'Implementation tool name', ''], ['promptArgument', 'Prompt argument', 'prompt'], ['workspaceArgument', 'Isolated workspace argument', 'workspace']]) {
     const field = node('label', label); const input = node('input'); input.value = fallback; input.setAttribute('aria-label', label); fields[key] = input; field.append(input); details.append(field);
   }
-  details.append(node('p', 'Use a tool on the same MCP endpoint that can edit a supplied checkout path. Discover its name and argument schema in Advisor settings. The tool must be able to access this filesystem.', 'subtle'));
-  const saveTool = button('Save implementation tool', () => send({type: 'implementationSettings', tool: fields.tool.value, promptArgument: fields.promptArgument.value, workspaceArgument: fields.workspaceArgument.value}), 'secondary'); details.append(saveTool); implementation.append(details);
+  const argumentsLabel = node('label', 'Other implementation tool arguments (JSON)');
+  fields.arguments = node('textarea'); fields.arguments.rows = 3; fields.arguments.value = '{}';
+  fields.arguments.setAttribute('aria-label', 'Other implementation tool arguments (JSON)');
+  argumentsLabel.append(fields.arguments); details.append(argumentsLabel);
+  details.append(node('p', 'Use a tool on the same MCP endpoint that can edit a supplied checkout path. Discover its name and argument schema in MCP connection settings. The tool must be able to access this filesystem.', 'subtle'));
+  const saveTool = button('Save implementation tool', () => {
+    try {send({type: 'implementationSettings', tool: fields.tool.value, promptArgument: fields.promptArgument.value,
+      workspaceArgument: fields.workspaceArgument.value, arguments: JSON.parse(fields.arguments.value || '{}')});}
+    catch {status.textContent = 'Enter valid JSON for the implementation tool arguments.';}
+  }, 'secondary'); details.append(saveTool); implementation.append(details);
   const implement = button('I reviewed the advice · Prepare implementation', () => {send({type: 'chatImplement'}); state.busy = true; renderControls();}, 'primary'); implementation.append(implement);
   implementation.append(implementationCancel);
   const backup = node('p', '', 'checkpoint'); implementation.append(backup);
@@ -92,8 +105,9 @@ function mountAdvisorChat(root, send, logo) {
   const status = node('p', '', 'status'); status.setAttribute('role', 'status'); root.append(status);
   function setMode(value) {mode = value; renderControls();}
   function renderControls() {
-    for (const element of [evidence, clear, settings, connectCodex, disconnectCodex, saveTool, ...Object.values(fields), question, discard, verify]) element.disabled = state.busy;
-    connectCodex.hidden = Boolean(state.connection); disconnectCodex.hidden = !state.connection;
+    for (const element of [evidence, clear, settings, connectStdio, disconnectStdio, connectCodex, disconnectCodex, saveTool, ...Object.values(fields), question, discard, verify]) element.disabled = state.busy;
+    connectCodex.hidden = Boolean(state.connection); disconnectCodex.hidden = !state.connection || state.connectionKind === 'stdio';
+    connectStdio.hidden = Boolean(state.connection); disconnectStdio.hidden = state.connectionKind !== 'stdio';
     if (state.connection) for (const element of [saveTool, ...Object.values(fields)]) element.disabled = true;
     sendButton.disabled = state.busy || !question.value.trim(); cancel.hidden = !state.busy; implementationCancel.hidden = !state.busy;
     implementation.hidden = mode !== 'implementation';
@@ -132,7 +146,8 @@ function mountAdvisorChat(root, send, logo) {
       const option = node('option', item.label); option.value = item.id; evidence.append(option);
     }
     evidence.value = value.evidenceId;
-    for (const [key, field] of Object.entries(fields)) if (document.activeElement !== field) field.value = value.implementation?.[key] ?? '';
+    for (const [key, field] of Object.entries(fields)) if (document.activeElement !== field)
+      field.value = key === 'arguments' ? JSON.stringify(value.implementation?.arguments ?? {}, null, 2) : value.implementation?.[key] ?? '';
     status.textContent = value.status;
     backup.textContent = value.backupRef ? `Recovery checkpoint: ${value.backupRef}` : '';
     summary.textContent = value.implementationSummary || '';

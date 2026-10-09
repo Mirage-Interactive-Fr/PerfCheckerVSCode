@@ -15,6 +15,7 @@ import {discoverGitReferences, resolveGitRevision} from './gitReferences';
 import {shutdownPlutoSessions} from './plutoNotebook';
 import {prepareWorkspaceController, shutdownWorkspaceSetup} from './workspaceSetup';
 import {shutdownCodexConnections} from './codexIntegration';
+import {shutdownMcpStdioConnections} from './mcpStdioIntegration';
 import {currentWorkspaceFolder, resolveControllerProject, resolveWorkspaceFolder,
   selectWorkspaceFolder} from './workspace-root';
 import {
@@ -1259,5 +1260,5 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
-  await Promise.all([shutdownCodexConnections(),shutdownPlutoSessions(),shutdownWorkspaceSetup(),shutdownControllerProcesses()]);
+  await Promise.all([shutdownCodexConnections(),shutdownMcpStdioConnections(),shutdownPlutoSessions(),shutdownWorkspaceSetup(),shutdownControllerProcesses()]);
 }

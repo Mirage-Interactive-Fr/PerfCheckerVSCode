@@ -62,7 +62,7 @@
       },
       {
         "command": "perfchecker.configureAdvisor",
-        "title": "PerfChecker: Configure advisor and manage models",
+        "title": "PerfChecker: Configure MCP connection and models",
         "icon": "$(settings-gear)"
       },
       {
@@ -225,6 +225,16 @@
         "command": "perfchecker.restoreImplementation",
         "title": "PerfChecker: Restore implementation checkpoint",
         "icon": "$(discard)"
+      },
+      {
+        "command": "perfchecker.connectMcpStdio",
+        "title": "PerfChecker: Connect local MCP server (stdio)",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "perfchecker.disconnectMcpStdio",
+        "title": "PerfChecker: Disconnect local MCP server",
+        "icon": "$(debug-disconnect)"
       },
       {
         "command": "perfchecker.connectCodex",
@@ -713,6 +723,30 @@
           "default": "workspace",
           "scope": "resource",
           "description": "Name of the MCP implementation tool argument receiving the isolated checkout path. The agent must honor this path."
+        },
+        "perfchecker.advisorImplementationMcpArguments": {
+          "type": "object",
+          "scope": "resource",
+          "description": "Additional JSON arguments for the selected MCP implementation tool, independent of the advice tool. Omit the reserved prompt and workspace arguments and never include secrets. When unset, existing advice arguments remain in use."
+        },
+        "perfchecker.advisorMcpStdioCommand": {
+          "type": "string",
+          "scope": "resource",
+          "default": "",
+          "description": "Optional initial absolute native executable for the local MCP stdio connection form. Servers launch only after explicit Discover or Connect; arguments are passed without shell interpretation or expansion."
+        },
+        "perfchecker.advisorMcpStdioArguments": {
+          "type": "array",
+          "items": {"type": "string"},
+          "scope": "resource",
+          "default": [],
+          "description": "Initial argument array for the local MCP server form. Never put secrets here; the server inherits the extension host environment except private connector tokens."
+        },
+        "perfchecker.advisorMcpStdioDirectory": {
+          "type": "string",
+          "scope": "resource",
+          "default": "",
+          "description": "Initial absolute working directory for an explicitly launched local MCP server. Empty initializes the form to the selected workspace. The live connection remains session-only."
         },
         "perfchecker.codexExecutable": {
           "type": "string",

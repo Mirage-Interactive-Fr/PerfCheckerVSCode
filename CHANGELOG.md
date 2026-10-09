@@ -2,6 +2,14 @@
 
 ## 1.0.1 — Pluto notebooks and first-use fixes
 
+- MCP connection settings now lead with generic HTTP and local stdio servers.
+  Local servers use an explicit executable, argument array, working directory and
+  protocol revision; discovered tool schemas guide independent advice and
+  implementation selections. Session-only bridges preserve saved providers and
+  stop their owned server on cancellation or disconnect. Codex CLI remains an
+  optional connector. MCP tools alone do not imply an LLM or filesystem-editing
+  capability; interactive OAuth, roots, sampling, tasks and input requests are
+  not supported by the local adapter.
 - Reloading the suite editor restores its saved selection, order and group colours,
   and reflects an action already in progress without starting another worker.
 - Version sorting and target selectors use a consistent order: numeric versions

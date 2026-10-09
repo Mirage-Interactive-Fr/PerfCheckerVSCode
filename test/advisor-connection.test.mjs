@@ -69,7 +69,7 @@ test('disconnect closes a temporary configuration form and stale Save preserves 
     assert.equal(opened.disposed,false);
     setLocalAdvisorConnection(key);assert.equal(opened.disposed,true);
     setup.invoke=()=>{throw new Error('A retired endpoint must be rejected before a worker starts.');};
-    await assert.rejects(setup.action({action:'save',config:stale}),/temporary Codex endpoint must not be saved/);
+    await assert.rejects(setup.action({action:'save',config:stale}),/temporary local connector endpoint must not be saved/);
     assert.equal(await readFile(path.join(root,'advisor.json'),'utf8'),bytes);
     assert.equal((await readAdvisorConfiguration(folder)).mcp_tool,'previous_advice');
   } finally {setLocalAdvisorConnection(key);setup.dispose();await rm(root,{recursive:true,force:true});}
@@ -126,4 +126,31 @@ test('ordinary validated Save still persists the chosen provider and only its ca
     assert.ok(updates.some(update=>update.name==='advisorConfig'&&update.value==='advisor.json'));
     assert.ok(updates.some(update=>update.name==='advisorEnabled'&&update.value===true));
   } finally {vscode.workspace.getConfiguration=originalConfiguration;setup.dispose();await rm(root,{recursive:true,force:true});}
+});
+
+test('manual implementation arguments preserve unset providers, replace explicitly and reject reserved collisions before edits',()=>{
+  const {implementationMcpArguments,assertSavedAdvisorConfiguration}=require('../dist/advisorConnection.js');
+  const previous={model_options:{temperature:0},flavour:'advice'};
+  const inherited=implementationMcpArguments(previous,undefined,'request','directory');
+  assert.deepEqual(inherited,previous);inherited.model_options.temperature=1;assert.equal(previous.model_options.temperature,0);
+  assert.deepEqual(implementationMcpArguments(previous,{},'request','directory'),{});
+  assert.deepEqual(implementationMcpArguments(previous,{style:'patch'},'request','directory'),{style:'patch'});
+  for(const value of [{request:'unexpected'}, {directory:'/foreign'}, [], null, {large:'x'.repeat(12001)}])
+    assert.throws(()=>implementationMcpArguments(previous,value,'request','directory'),/Implementation arguments/);
+  assert.throws(()=>implementationMcpArguments({directory:'/foreign'},undefined,'request','directory'),/Implementation arguments/);
+  for(const api_key_env of ['PERFCHECKER_MCP_TOKEN_RETIRED','PERFCHECKER_CODEX_TOKEN_RETIRED'])
+    assert.throws(()=>assertSavedAdvisorConfiguration({api_key_env}),/temporary local connector/);
+});
+
+test('failed Disconnect retains the exact owner and cleanup handle for an explicit retry',async()=>{
+  const {disconnectLocalAdvisorConnection}=require('../dist/advisorConnection.js');
+  const key='file:///retry-private-fixture';let attempts=0;
+  setLocalAdvisorConnection(key,{kind:'stdio',label:'Neutral fixture',config:{endpoint:'http://127.0.0.1:1/mcp'},
+    implementation:{tool:'modify',promptArgument:'request',workspaceArgument:'directory'}},async()=>{
+    if(++attempts===1)throw new Error('Observed cleanup failure');
+  });
+  await assert.rejects(disconnectLocalAdvisorConnection(key),/Observed cleanup failure/);
+  assert.equal(localAdvisorConnection(key).label,'Neutral fixture');
+  await disconnectLocalAdvisorConnection(key);
+  assert.equal(attempts,2);assert.equal(localAdvisorConnection(key),undefined);
 });

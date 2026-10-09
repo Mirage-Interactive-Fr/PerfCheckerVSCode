@@ -23,7 +23,7 @@ Use **Create controller environment**, **Use an existing controller**, or **Read
 as appropriate. A controller needs registered PerfChecker.jl 1.0.1 or later.
 The starter installs measurement dependencies; add your package and its test
 dependencies explicitly to the selected controller before measuring test items.
-Add `HTTP` there for an MCP HTTP provider or the local Codex bridge. Optional
+Add `HTTP` there for an MCP HTTP provider, a local MCP stdio server or the optional Codex connector. Optional
 analyzers and Julia debugging have their own prerequisites.
 
 The official Julia extension uses `julia.executablePath`, independently of
@@ -107,7 +107,9 @@ the Julia package or enter measured workers.
   Review the diff before applying; restore the checkpoint if the repository has
   not changed. Conversation is kept in memory; Git recovery survives editor restarts.
   Starting a new conversation preserves the current proposal and its restore action.
-- Connect an already authenticated Codex CLI from Chat for the same advice and
+- Connect an explicit local MCP server with its command, arguments and directory;
+  discover its tool schemas and choose separate advice and implementation tools.
+- Optionally connect an already authenticated Codex CLI from Chat for advice and
   reviewed implementation workflow. The temporary local connection preserves
   your saved provider configuration and ends when disconnected or the editor closes.
 - Open a folder-scoped Julia terminal and interactive Pluto notebooks inside VS Code.
@@ -384,8 +386,9 @@ MIT. See [LICENSE](LICENSE).
 
 ## Optional MCP advice
 
-Open **PerfChecker: Configure advisor and manage models** for the guided panel.
-Discover and configure an MCP HTTP advice tool in text mode, then open
+Open **PerfChecker: Configure MCP connection and models** for the guided panel.
+Choose an MCP HTTP endpoint or an explicit local MCP stdio server. Discover its
+tool schemas and select an advice tool in text mode, then open
 **PerfChecker: Chat with performance advisor**. Nothing is generated on opening.
 Source files are not attached automatically; typed messages and explicitly selected
 bounded evidence are sent when requested. Replies remain unverified advice.
@@ -397,19 +400,52 @@ Preparation creates a checkpoint; application requires a separate reviewed actio
 The extension uses the controller's public `chat` and `implement` commands, which
 are supplied by PerfChecker.jl 1.0.1 or later; an older controller fails
 visibly instead of providing an implementation fallback. The extension does not
-install an agent backend. Its explicit **Connect Codex CLI** action starts an
-authenticated installed CLI on demand through a temporary local MCP endpoint;
-generic external MCP agents remain supported.
+install an agent backend. An MCP server may supply ordinary tools without an LLM
+or an implementation tool. Choose tools whose documented inputs and capabilities
+match the requested operation. Codex CLI is an optional connector, not a prerequisite
+for MCP.
 
 See the canonical [MCP guide](https://perfchecker.mirageinteractive.fr/mcp-advisor.html)
 for provider configuration, credentials, supported revisions, transmission,
-cancellation and recovery. Stdio and OAuth login are not supported by this adapter.
+cancellation and recovery. Interactive OAuth login, roots, sampling, tasks and
+interactive `input_required` responses are not supported by the local adapter.
+
+### Connect a local MCP stdio server
+
+Choose **Local MCP server · stdio** in connection settings, or **Connect local MCP
+server** in Chat. Supply the absolute path of a native executable, its JSON array
+of arguments, and an absolute working directory. Arguments are passed directly,
+without shell interpretation or expansion. No agent name, installation or login
+command is inferred. The server inherits
+the extension host's environment, excluding private connector tokens. Windows
+requires a native executable rather than a `.cmd` or `.bat` launcher.
+
+Select revision **2025-11-25** (initialize handshake) or **2026-07-28** (server
+discovery); an unsupported revision fails without an automatic fallback. **Discover
+tools** displays the actual paginated inventory and schemas without calling a tool.
+Choose the advice tool and prompt argument, then optionally an implementation tool
+with its own prompt/workspace arguments and separate JSON arguments. A tool must
+actually support editing the supplied local checkout for implementation to work.
+
+**Connect for this editor session** starts one owned server. Probing that connection
+retains the same server. The command, selections, private HTTP bridge and token are
+session-only; saved provider settings are preserved. Optional
+`perfchecker.advisorMcpStdioCommand`, `perfchecker.advisorMcpStdioArguments` and
+`perfchecker.advisorMcpStdioDirectory` settings only prefill the form and never
+launch a server automatically. Reconnect explicitly after editor reload, server
+exit, timeout or cancellation. Closing the configuration panel after Connect keeps
+the connection active. Closing an unconnected discovery panel retires its server.
+Closing Chat also closes its local stdio connection; reconnect explicitly to use
+it again. Disconnect, cancellation and editor shutdown close the owned server and
+its observed descendants; this does not promise to reclaim an unseen daemon that
+escapes observation. External implementation tools remain responsible for respecting
+the supplied checkout path; it is not an operating-system sandbox.
 
 ### Connect an installed Codex CLI
 
 Authenticate your CLI using `codex login` in your own terminal. Set
 `perfchecker.codexExecutable` if `codex` is not on VS Code's PATH, open Chat, then
-choose **Connect Codex CLI**. Version, supported flags and login status are checked
+expand **Optional Codex CLI connector** and choose **Connect Codex CLI**. Version, supported flags and login status are checked
 without starting a model turn. This requires `--no-daemon`, `--ignore-user-config`
 and `--ignore-rules`, in addition to the standard `exec` sandbox/ephemeral/output
 flags; Codex CLI 0.162.0-alpha.2 was qualified with a real authenticated local

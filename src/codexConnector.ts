@@ -164,7 +164,7 @@ export class CodexConnector {
     };
     try {
       const chunks: Buffer[] = []; let bytes = 0;
-      for await (const chunk of request) {bytes += chunk.length; if (bytes > 250000) throw new Error('Codex MCP request exceeded 250 KB.'); chunks.push(Buffer.from(chunk));}
+      for await (const chunk of request) {bytes += chunk.length; if (bytes > 250000) throw new Error('Local Codex connector request exceeded 250 KB.'); chunks.push(Buffer.from(chunk));}
       clearTimeout(bodyDeadline);
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8')); id = body.id;
       if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') throw new Error('Invalid MCP request.');

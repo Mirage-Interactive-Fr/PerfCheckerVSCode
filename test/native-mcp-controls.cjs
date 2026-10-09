@@ -318,6 +318,7 @@ exports.run = async (context,options={}) => {
     const savedConfig=await readSavedConfiguration();
     await clickStudioAction(context,'chat');
     let view = await findFrame('#chat-root');
+    await view.locator('summary').filter({hasText: 'Optional Codex CLI connector'}).click();
     await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click();
     await eventually(async () => /ENOENT|executable|could not|launch/i.test(await view.locator('[role="status"]').innerText()), 'Missing Codex explains its executable prerequisite');
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected, false);

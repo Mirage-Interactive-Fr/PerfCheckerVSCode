@@ -95,12 +95,13 @@ test('multi-root activation does not plan; explicit designer plans only the sele
       ProgressLocation: {Window: 1, Notification: 2},
     };
     const Module = require('node:module');
+    const nativeChildProcess = require('node:child_process');
     const originalLoad = Module._load;
     Module._load = function (id, parent, isMain) {
       if (id === 'vscode') return vscode;
       if (id === './investigation') return {registerInvestigations() {}};
       if (id === './testitems') return {registerNativeTestItems() {}};
-      if (id === 'node:child_process') return {spawn: (executable, args, options) => {
+      if (id === 'node:child_process') return {...nativeChildProcess, spawn: (executable, args, options) => {
         spawned.push({executable, args, options});
         const child = new EventEmitter();
         child.stdout = new EventEmitter(); child.stdout.setEncoding = () => undefined;

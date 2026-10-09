@@ -20,6 +20,7 @@ test('investigation and advisor commands fail closed, then use the selected B fo
       workspaceFolders: [first, second], isTrusted: true,
       textDocuments: [],
       onDidChangeTextDocument: () => ({dispose() {}}),
+      onDidChangeWorkspaceFolders: () => ({dispose() {}}),
       getConfiguration: (_section, resource) => {
         scopes.push(resource?.toString());
         return {get: (_key, fallback) => fallback, update: async (key, value, target) => updates.push({key, value, target})};
@@ -48,11 +49,12 @@ test('investigation and advisor commands fail closed, then use the selected B fo
     EventEmitter: class {event = () => undefined; fire() {} dispose() {}},
   };
   const Module = require('node:module');
+  const nativeChildProcess = require('node:child_process');
   const originalLoad = Module._load;
   Module._load = function (id, parent, isMain) {
     if (id === 'vscode') return vscode;
     if (id === './advisorSetup') return {registerAdvisorSetup() {}};
-    if (id === 'node:child_process') return {spawn: () => {throw new Error('Julia must not run in this test');}};
+    if (id === 'node:child_process') return {...nativeChildProcess, spawn: () => {throw new Error('Julia must not run in this test');}};
     return originalLoad.call(this, id, parent, isMain);
   };
   let investigation, advisor, roots;

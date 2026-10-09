@@ -13,6 +13,7 @@ const path=require('node:path');
     await page.evaluate(()=>{globalThis.requests=[];globalThis.panel=mountAdvisorChat(document.getElementById('chat-root'),message=>requests.push(message));});
     await page.evaluate(value=>panel.receive(value),state);
     assert.equal((await page.evaluate(()=>requests)).length,0);
+    await page.locator('summary').filter({hasText:'Optional Codex CLI connector'}).click();
     await page.getByRole('button',{name:'Connect Codex CLI',exact:true}).click();
     assert.equal((await page.evaluate(()=>requests.at(-1))).type,'chatConnectCodex');
     state.connection='codex-cli 0.159.2 · local connector';await page.evaluate(value=>panel.receive(value),state);

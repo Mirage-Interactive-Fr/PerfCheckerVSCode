@@ -6,6 +6,7 @@ import {StringDecoder} from 'node:string_decoder';
 import {createHash, randomUUID} from 'node:crypto';
 import {registerAdvisorSetup} from './advisorSetup';
 import {registerCodexConnections} from './codexIntegration';
+import {registerMcpStdioConnections} from './mcpStdioIntegration';
 import {AdvisorChat, ChatEvidence} from './advisorChat';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {cancellableJulia, controllerCancellation} from './controllerCancellation';
@@ -552,6 +553,7 @@ export function registerInvestigations(context: vscode.ExtensionContext): void {
   const controller = new InvestigationController(context);
   const chat = new AdvisorChat(context, () => controller.chatEvidence(), id => controller.readChatEvidence(id));
   registerCodexConnections(context, () => chat.isBusy(), () => chat.connectionChanged());
+  registerMcpStdioConnections(context, () => chat.isBusy(), () => chat.connectionChanged());
   const command = (name: string, callback: (...args: any[]) => unknown) => vscode.commands.registerCommand(name, async (...args) => {
     try {return await callback(...args);} catch (error) {controller.error(error); throw error;}
   });
