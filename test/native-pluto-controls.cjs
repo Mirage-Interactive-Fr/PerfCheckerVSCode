@@ -944,6 +944,137 @@ exports.run = async context => {
   if (failures.length) throw new AggregateError(failures, 'Actual Pluto controls failed');
 };
 
+// First server in an explicitly prepared environment, not a virgin package cache.
+exports.runStartStop = async context => {
+  assert.equal(process.env.CI,'true');assert.equal(process.platform,'linux');
+  const session=await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION),profile=await fs.realpath(process.env.PERFCHECKER_NATIVE_PROFILE);
+  assert.equal(await fs.realpath(context.workspace),path.join(session,'workspace'));assert(profile.startsWith(session+path.sep));
+  const executable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA),known=new Map(),groups=new Set(),errors=[];let inventorySignature;
+  const provenance=JSON.parse(process.env.PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT);
+  assert.equal(provenance.packages.PerfChecker.tree,context.core.tree);assert.equal(provenance.companion.tree,'9bc464202aa5b60262be9483bda5968bacd2960a');
+  const project=await fs.realpath(path.resolve(context.workspace,context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace)).get('plutoProject','perf/pluto')));
+  const environmentDigest=async()=>Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async leaf=>[leaf,createHash('sha256').update(await fs.readFile(path.join(project,leaf))).digest('hex')])));
+  const environmentHashes=await environmentDigest();
+  const memory=async()=>Object.fromEntries(await Promise.all((await files(context.workspace)).filter(file=>file.endsWith('.mem')).map(async file=>[path.relative(context.workspace,file),createHash('sha256').update(await fs.readFile(file)).digest('hex')])));
+  const beforeMemory=await memory(),logBaselines=new Map();
+  const outputLogs=()=>files(path.join(profile,'logs')).then(names=>names.filter(file=>/PerfChecker Pluto\.log$/.test(file)));
+  for(const file of await outputLogs()){const stat=await fs.lstat(file);assert(stat.isFile()&&!stat.isSymbolicLink());logBaselines.set(file,{ino:stat.ino,dev:stat.dev,bytes:stat.size});}
+  const observeLogs=async stage=>{
+    const summaries=[];
+    for(const file of await outputLogs()){
+      const stat=await fs.lstat(file);assert(stat.isFile()&&!stat.isSymbolicLink()&&stat.size<=16*1024*1024);
+      const before=logBaselines.get(file)||{ino:stat.ino,dev:stat.dev,bytes:0};assert(stat.ino===before.ino&&stat.dev===before.dev&&stat.size>=before.bytes,'The native output baseline is not replaced or truncated');
+      const bytes=await fs.readFile(file),delta=bytes.subarray(before.bytes).toString('utf8');
+      summaries.push({file:path.relative(profile,file),bytesBefore:before.bytes,bytesObserved:bytes.length,deltaSha256:createHash('sha256').update(bytes.subarray(before.bytes)).digest('hex'),
+        forcedStops:(delta.match(/Forced stop: controller cleanup did not finish within one minute\./g)||[]).length,
+        classes:[...new Set(delta.match(/\b(?:InterruptException|CompositeException|TaskFailedException|DiscardedWorkspaceException|UndefVarError|MethodError|IOError|EOFError)\b/g)||[])],
+        pkgObserved:/\bPkg\b/.test(delta),precompileObserved:/precompil/i.test(delta),workspaceManagerObserved:/WorkspaceManager/.test(delta)});
+    }
+    context.log('pluto-first-start-output-observation',{stage,observedAt:new Date().toISOString(),summaries,rawOutputRetained:false});
+    assert(summaries.every(row=>row.forcedStops===0),'A new native Forced stop leaves first-start cleanup unqualified');return summaries;
+  };
+  const stat=async pid=>{
+    try{const text=await fs.readFile(`/proc/${pid}/stat`,'utf8'),close=text.lastIndexOf(')'),fields=text.slice(close+2).trim().split(/\s+/);
+      assert(close>0&&fields.length>19&&[fields[1],fields[2],fields[19]].every(value=>/^\d+$/.test(value)));
+      const parent=Number(fields[1]),group=Number(fields[2]);assert(Number.isSafeInteger(pid)&&pid>0&&Number.isSafeInteger(parent)&&parent>=0&&Number.isSafeInteger(group)&&group>=0);
+      return {pid,parent,group,started:fields[19],state:fields[0]};
+    }catch(error){if(error.code==='ENOENT'||error.code==='ESRCH')return undefined;throw error;}
+  };
+  const inspect=async(stage,port,deadline)=>{
+    assert(deadline===undefined||Date.now()<deadline);const current=[],observedErrors=[];
+    for(const name of await fs.readdir('/proc'))if(/^\d+$/.test(name))try{const row=await stat(Number(name));if(row)current.push(row);}catch(error){observedErrors.push({pid:Number(name),kind:'stat-unknown',code:error.code||error.name});}
+    const owned=new Set(current.filter(row=>known.has(`${row.pid}/${row.started}`)).map(row=>row.pid));
+    for(const row of current.filter(row=>row.parent===process.pid&&!['Z','X'].includes(row.state)))try{
+      if(await fs.realpath(`/proc/${row.pid}/exe`)===executable){assert.equal(row.group,row.pid,'A directly owned detached Julia anchors only its own private process group');owned.add(row.pid);groups.add(row.group);}
+    }catch(error){const after=await stat(row.pid);if(!['ENOENT','ESRCH'].includes(error.code)||after&&!['Z','X'].includes(after.state))observedErrors.push({pid:row.pid,kind:'direct-executable-unknown',code:error.code||error.name});}
+    for(let changed=true;changed;){changed=false;for(const row of current)if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
+    for(const row of current.filter(row=>groups.has(row.group)&&!owned.has(row.pid)&&!['Z','X'].includes(row.state)))observedErrors.push({pid:row.pid,kind:'unqualified-private-group-member'});
+    const rows=[];
+    for(const row of current.filter(row=>owned.has(row.pid)))try{
+      if(['Z','X'].includes(row.state)){rows.push({...row,gone:true});continue;}
+      const actual=await fs.realpath(`/proc/${row.pid}/exe`),args=await fs.readFile(`/proc/${row.pid}/cmdline`);assert(args.length<=1024*1024);
+      if(row.parent===process.pid)assert.equal(actual,executable,'The directly owned Julia does not change executable while inspected');
+      const after=await stat(row.pid);if(!after||['Z','X'].includes(after.state)){rows.push({...row,gone:true});continue;}
+      assert(after.parent===row.parent&&after.group===row.group&&after.started===row.started,'The Linux incarnation remains exact while inspected');
+      const key=`${row.pid}/${row.started}`,previous=known.get(key);assert(!previous||previous.canonicalExecutable===actual,'An executable change does not qualify cleanup');
+      const argv=args.toString().split('\0'),index=argv.indexOf('-e'),code=index>=0?argv[index+1]:undefined;
+      const projectArguments=argv.filter(arg=>arg.startsWith('--project=')).map(arg=>arg.slice(10)),projects=[];
+      for(const value of projectArguments)if(value.startsWith(session+path.sep))projects.push(await fs.realpath(value));
+      const value={...after,canonicalExecutable:actual,...(code===undefined?{}:{codeBytes:Buffer.byteLength(code),codeSha256:createHash('sha256').update(code).digest('hex'),
+        stdinCancellationMarker:code.includes('PERFCHECKER_CANCEL/1'),serverReadyMarker:code.includes('PERFCHECKER_PLUTO_READY')}),projects,externalProjectArgumentsOmitted:projectArguments.length-projects.length};
+      known.set(key,value);rows.push(value);
+    }catch(error){let after;try{after=await stat(row.pid);}catch(observation){observedErrors.push({pid:row.pid,kind:'revalidation-unknown',code:observation.code||observation.name});}
+      if(['ENOENT','ESRCH'].includes(error.code)&&(!after||['Z','X'].includes(after.state))&&!observedErrors.some(value=>value.pid===row.pid)){rows.push({...row,gone:true});continue;}
+      observedErrors.push({pid:row.pid,kind:'identity-unknown',code:error.code||error.name});}
+    const listeners=[];
+    if(port!==undefined)for(const leaf of ['tcp','tcp6']){
+      const table=await fs.readFile(`/proc/net/${leaf}`,'utf8');
+      for(const line of table.trim().split('\n').slice(1)){const columns=line.trim().split(/\s+/),local=columns[1]?.split(':');
+        assert(local?.length===2&&columns.length>9&&/^(?:[A-Fa-f0-9]{8}|[A-Fa-f0-9]{32})$/.test(local[0])&&/^[A-Fa-f0-9]{4}$/.test(local[1])&&/^[A-Fa-f0-9]{2}$/.test(columns[3])&&/^\d+$/.test(columns[9]),'The real Linux TCP table is strictly parseable');
+        if(parseInt(local[1],16)!==port||columns[3]!=='0A')continue;
+        const inode=columns[9],owners=[];
+        for(const row of rows.filter(row=>!row.gone))try{for(const fd of await fs.readdir(`/proc/${row.pid}/fd`)){
+          try{if(await fs.readlink(`/proc/${row.pid}/fd/${fd}`)===`socket:[${inode}]`)owners.push(row.pid);}catch(error){if(error.code!=='ENOENT')throw error;}
+        }}catch(error){const after=await stat(row.pid);if(!['ENOENT','ESRCH'].includes(error.code)||after&&!['Z','X'].includes(after.state))observedErrors.push({pid:row.pid,kind:'socket-owner-unknown',code:error.code||error.name});}
+        listeners.push({port,addressHex:local[0],family:leaf,inode,owners:[...new Set(owners)]});
+      }
+    }
+    for(const prior of known.values())if(current.some(row=>row.pid===prior.pid&&row.started!==prior.started))observedErrors.push({pid:prior.pid,kind:'pid-reused'});
+    errors.push(...observedErrors);const inventory={stage,observedAt:new Date().toISOString(),hostPid:process.pid,rows,known:[...known.values()],listeners,errors:observedErrors};
+    const signature=JSON.stringify({stage,rows:rows.map(row=>({...row,state:row.gone?row.state:'alive'})),listeners,errors:observedErrors});
+    if(signature!==inventorySignature){context.log('pluto-first-start-linux-inventory',inventory);inventorySignature=signature;}
+    assert.equal(observedErrors.length,0,'Process and listener errors are UNKNOWN, never shutdown proof');
+    assert(deadline===undefined||Date.now()<deadline);return inventory;
+  };
+  const baseline=await inspect('before-first-open');assert.equal(baseline.rows.filter(row=>!row.gone).length,0);
+  const file=path.join(context.workspace,'perf','notebooks','FirstPreparedStart.jl');await fs.mkdir(path.dirname(file),{recursive:true});
+  let observing=true,observer,port,owner,state,stopDeadline,observationFailure,primaryFailure;const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  let uiSignature;
+  const observeUI=async()=>{for(const frame of context.windowPage.frames()){
+    if(frame.isDetached()||!await frame.locator('#pluto-stop').count())continue;
+    const state=await frame.evaluate(()=>({starting:document.querySelector('.status')?.textContent?.includes('Starting Pluto')||false,
+      stopped:document.querySelector('.status')?.textContent?.includes('Pluto session stopped')||false,iframeAttached:!!document.querySelector('iframe.perfchecker-pluto-frame')}));
+    const signature=JSON.stringify(state);if(signature!==uiSignature){context.log('pluto-first-start-ui',{observedAt:new Date().toISOString(),...state});uiSignature=signature;}
+  }};
+  observer=(async()=>{while(observing){try{await inspect('first-open-live',port);await observeLogs('first-open-live');await observeUI();}catch(error){observationFailure ||= error;observing=false;}if(observing)await wait(500);}})();
+  try{
+    const created=await context.vscode.commands.executeCommand('perfchecker.newNotebook',context.vscode.Uri.file(file),{kind:'suite'});assert.equal(created.fsPath,file);
+    state=await view(context);port=Number(new URL(state.frame.url()).port);assert(Number.isInteger(port)&&port>0&&port<65536);
+    context.log('pluto-first-start-ready-iframe',{observedAt:new Date().toISOString(),port,notebookSha256:createHash('sha256').update(await fs.readFile(file)).digest('hex'),sessionCredentialsOmitted:true});
+    await eventually(async()=>/idle/.test(await state.frame.locator('[data-suite-state]').innerText()),'The first prepared dashboard is idle without launching checks',180000);
+    observing=false;await observer;if(observationFailure)throw observationFailure;
+    const active=await inspect('idle-before-first-stop',port);assert.equal(active.listeners.length,1);assert.equal(active.listeners[0].owners.length,1);
+    owner=active.rows.find(row=>row.pid===active.listeners[0].owners[0]);assert(owner&&owner.parent===process.pid&&owner.canonicalExecutable===executable&&owner.serverReadyMarker&&owner.projects.includes(project));
+    await observeLogs('before-first-stop');await capture(context,'pluto-first-prepared-before-stop');
+    stopDeadline=Date.now()+60000;
+    context.log('pluto-first-start-stop-request',{observedAt:new Date().toISOString(),deadlineAt:new Date(stopDeadline).toISOString(),owner,port,environmentHashes,provenance,measurementRequested:false});
+    context.log('native-ui-action',{surface:'First prepared Pluto session',action:'Stop session',deadlineAt:new Date(stopDeadline).toISOString()});
+    await state.parent.locator('#pluto-stop').click({timeout:Math.min(30000,stopDeadline-Date.now())});
+    while(Date.now()<stopDeadline){
+      const current=await inspect('first-stop-before-teardown',port,stopDeadline);await observeLogs('first-stop-before-teardown');
+      const status=state.parent.locator('.status'),completed=await status.count()>0&&/^(?:Pluto session stopped|Session stopped\.)/.test(await status.textContent({timeout:Math.min(1000,Math.max(1,stopDeadline-Date.now()))}));
+      if(completed&&current.known.every(prior=>!current.rows.some(row=>row.pid===prior.pid&&row.started===prior.started&&!row.gone))&&current.listeners.length===0){
+        const remaining=stopDeadline-Date.now();assert(remaining>0);
+        const closed=await new Promise((resolve,reject)=>{const socket=net.createConnection({host:'127.0.0.1',port});socket.setTimeout(Math.min(1000,remaining));
+          socket.once('connect',()=>{socket.destroy();resolve(false);});socket.once('error',error=>{socket.destroy();error.code==='ECONNREFUSED'?resolve(true):reject(error);});
+          socket.once('timeout',()=>{socket.destroy();reject(new Error('The exact listener probe is UNKNOWN after timeout'));});});
+        if(closed){assert(Date.now()<stopDeadline);assert.deepEqual(await memory(),beforeMemory);assert.deepEqual(await environmentDigest(),environmentHashes);assert.equal(errors.length,0);assert(Date.now()<stopDeadline);
+          context.proof('pluto-first-prepared-start-stop',{firstServerInPreparedEnvironment:true,virginPkgCacheQualified:false,measurementRequested:false,owner,port,
+            deadlineAt:new Date(stopDeadline).toISOString(),nativeStopClick:true,stoppedUiObserved:true,observedIdentitiesGone:true,exactListenerEmpty:true,connectionRefused:true,newForcedStop:false,errors:[],
+            memoryFilesBefore:beforeMemory,memoryFilesUnchanged:true,allocationCleanupQualified:false,environmentHashes,environmentUnchanged:true,provenance,observedBeforeHarnessCleanup:true});
+          await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');return;}
+      }
+      await wait(Math.min(150,Math.max(0,stopDeadline-Date.now())));
+    }
+    throw new Error('The existing 60 second stop grace expired without positive process and listener cleanup');
+  }catch(error){primaryFailure=error;throw error;}
+  finally{observing=false;await observer;let finalLogError;
+    try{await observeLogs('first-start-final');}catch(error){finalLogError=error;context.log('pluto-first-start-observation-error',{kind:'output-inspection-unknown',errorClass:error.name});}
+    context.log('pluto-first-start-final-state',{observedAt:new Date().toISOString(),owner,port,stopDeadlineAt:stopDeadline?new Date(stopDeadline).toISOString():undefined,
+      known:[...known.values()],errors,observationErrorClass:observationFailure?.name,scope:'Observed descendants and anchored private process groups only; no raw code, environment or secrets'});
+    if(finalLogError)throw primaryFailure?new AggregateError([primaryFailure,finalLogError],'First-start behavior and final output inspection remain failed'):finalLogError;}
+};
+
 exports.runPlots = async context => {
   assert.equal(process.env.CI,'true','Never use a human VS Code installation');
   const session=process.env.PERFCHECKER_NATIVE_SESSION;

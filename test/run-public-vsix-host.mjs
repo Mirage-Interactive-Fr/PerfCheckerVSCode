@@ -33,7 +33,8 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','pluto','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&caseGroup==='pluto-start-stop'&&process.platform!=='linux')throw new Error('The first prepared Pluto start/stop observation is explicitly Linux only.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 // The real game and SDKs are immutable fixtures, never development checkouts.
 // A trailing delimiter expands only Julia's system depots, excluding the human depot.
@@ -495,6 +496,7 @@ try {
         ...(diagnosticTemporaryRoot?{TMPDIR:diagnosticTemporaryRoot,PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP:diagnosticTemporaryRoot}:{}),
         PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
+        ...(phase==='pluto-start-stop'?{PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT:JSON.stringify(artifactRecord.plutoEnvironment)}:{}),
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
         PERFCHECKER_NATIVE_MODE: mode, PERFCHECKER_NATIVE_SHA: sha,
@@ -699,7 +701,7 @@ end
   await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': officialRuntime.executable, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
-  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots','pluto'].includes(caseGroup))){
+  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots','pluto','pluto-start-stop'].includes(caseGroup))){
     const companion={commit:'7fe5a07457c9f4a980b4afa64b62db7fc7847b89',tree:'9bc464202aa5b60262be9483bda5968bacd2960a',version:'1.0.1'};
     const revision=coreMode==='candidate'?companion.commit:'v1.0.1';
     const text=await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev=ARGS[7]);preserve=Pkg.PRESERVE_ALL); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid];@assert string(info.tree_hash)==ARGS[6];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[8];if ARGS[5]=="general";@assert info.is_tracking_registry;end;print("PLUTO_ENV_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerPluto,Pluto,PlutoUI)));println()`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode,coreProvenance.tree,revision,companion.tree]);

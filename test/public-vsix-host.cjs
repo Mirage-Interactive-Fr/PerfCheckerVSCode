@@ -601,6 +601,7 @@ exports.run = async () => {
       else if(phase==='studio-color')await runCase('native-colour-picker-save-reload',()=>controls.runColour(context));
       else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
       else if(phase==='pluto-plots')await runCase('native-pluto-rendered-plots',()=>pluto.runPlots(context));
+      else if(phase==='pluto-start-stop')await runCase('native-pluto-first-prepared-start-stop',()=>pluto.runStartStop(context));
       else if(phase==='mcp-pluto'){
         await runCase('native-mcp-controls',()=>mcp.run(context));
         await runCase('native-pluto-controls',()=>pluto.run(context));
