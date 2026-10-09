@@ -505,6 +505,7 @@ try {
         PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         ...(phase==='pluto-start-stop'?{PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT:JSON.stringify(artifactRecord.plutoEnvironment)}:{}),
+        ...(phase==='editor'&&process.platform==='linux'?{PERFCHECKER_NATIVE_EDITOR_DEADLINE_AT:new Date(Date.now()+40*60*1000).toISOString()}:{}),
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         ...(nativeNode?{PERFCHECKER_NATIVE_NODE:nativeNode,PERFCHECKER_NATIVE_NODE_PROVENANCE:JSON.stringify(nodeProvenance)}:{}),
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
@@ -597,7 +598,7 @@ try {
     coreProvenance.diagnosticWorker={file:worker,sha256:createHash('sha256').update(await fs.readFile(worker)).digest('hex')};
   }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
-  if(stage==='targeted'||stage==='full'||stage==='focused'&&['mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)){
+  if(stage==='targeted'||stage==='full'||stage==='focused'&&(['mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
     const before=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
     const receipt={status:'running',startedAt:new Date().toISOString(),project:controller,hashesBefore:before,
       scope:'Explicit controller preparation before the native first Send; cache preparation, not a cold-start qualification'};

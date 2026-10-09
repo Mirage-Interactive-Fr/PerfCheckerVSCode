@@ -628,6 +628,7 @@ exports.run = async (context,options={}) => {
     return chat;
   };
   try {
+    await context.editorQualification?.port(server.address().port);
     for (const [key, value] of Object.entries(values)) await settings().update(key, value, vscode.ConfigurationTarget.WorkspaceFolder);
     assert.equal(await fs.realpath(settings().get('runnerProject')),controllerProject);
     assert.equal(await fs.realpath(settings().get('scenarioProject')),measurementProject);
@@ -639,6 +640,7 @@ exports.run = async (context,options={}) => {
     const savedConfig=await readSavedConfiguration();
     await clickStudioAction(context,'chat');
     let view = await findFrame('#chat-root');
+    await context.editorQualification?.surface('custom-mcp-before-connect',view);
     if(!stdio){
     await view.locator('summary').filter({hasText: 'Optional Codex CLI connector'}).click();
     await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click();

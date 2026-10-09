@@ -385,6 +385,9 @@ async function measureNativeTestItem(context,expectedPassed,options={}){
   const filename=options.file||'test/performance.jl',name=options.name||'Vector reduction';
   const row=windowPage.locator(`.monaco-list-row[aria-label*="${filename}"]`).filter({hasText:name}).first();
   await row.waitFor({state:'visible',timeout:120000});await row.hover();
+  if(context.editorQualification)context.log('native-editor-visible-testing-item',{name,file:filename,matchingRows:await windowPage.locator(`.monaco-list-row[aria-label*="${filename}"]`).filter({hasText:name}).count(),
+    visible:await row.isVisible(),ariaLabel:await row.getAttribute('aria-label'),runButtons:await row.locator('.action-label[title="Run Test"],.action-label[aria-label="Run Test"],.action-label.codicon-testing-run-icon').count()});
+  await context.editorQualification?.surface('tagged-testing-before-run');
   await context.observeWork?.('testitems-real-tree-ready');
   const button=row.locator('.action-label[title="Run Test"],.action-label[aria-label="Run Test"],.action-label.codicon-testing-run-icon').first();
   const storage=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','native-testitems');
@@ -626,11 +629,17 @@ exports.run = async () => {
       else if(phase==='investigation-limits')await runCase('native-investigation-limits',()=>require('./native-investigation-limits.cjs').run(context));
       else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
       else if(phase==='editor'){
-        await runCase('native-suite-worker-output',()=>require('./native-editor-actions.cjs').runSuiteLog(context));
-        await runCase('native-testitem-tag-selection-and-samples',()=>require('./native-editor-actions.cjs').runTestItems(context));
-        await runCase('native-codelens-and-quickfix',()=>require('./native-editor-actions.cjs').run(context));
-        await runCase('native-active-controller-runtime-settings',()=>require('./native-editor-actions.cjs').runActiveSettings(context));
-        await runCase('native-mcp-custom-arguments',()=>mcp.run(context,{customArguments:true}));
+        const editor=require('./native-editor-actions.cjs');
+        const qualification=process.platform==='linux'?await editor.beginQualification(context):undefined;
+        let effectsCompleted=true;
+        const editorCase=async(name,run)=>{const completed=await runCase(name,run);effectsCompleted&&=completed;};
+        try{
+          await editorCase('native-suite-worker-output',()=>editor.runSuiteLog(context));
+          await editorCase('native-testitem-tag-selection-and-samples',()=>editor.runTestItems(context));
+          await editorCase('native-codelens-and-quickfix',()=>editor.run(context));
+          await editorCase('native-active-controller-runtime-settings',()=>editor.runActiveSettings(context));
+          await editorCase('native-mcp-custom-arguments',()=>mcp.run(context,{customArguments:true}));
+        }finally{if(qualification)await runCase('native-editor-effects-and-cleanup',()=>qualification.finish(effectsCompleted));}
       }
       else if(phase==='studio'){
         await runCase('native-suite-run-button',async()=>{context.results=await controls.runSelection(context);});
