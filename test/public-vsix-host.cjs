@@ -221,12 +221,12 @@ async function macProcessInventory(context,stage,port,knownIdentities=[]){
   let listeners=[];
   if(port!==undefined){
     assert(Number.isInteger(port)&&port>0&&port<65536);
-    try{const value=await execute('lsof',['-nP',`-iTCP:${port}`,'-sTCP:LISTEN','-Fpn'],{timeout:3000});
+    try{const value=await execute('lsof',['-nP',`-iTCP:${port}`,'-sTCP:LISTEN','-Fpn'],{timeout:3000});assert(!value.stderr.trim(),'Exact listener inspection has no stderr error');
       let pid;for(const line of value.stdout.split('\n')){
         if(/^p\d+$/.test(line))pid=Number(line.slice(1));
-        else if(line===`n127.0.0.1:${port}`&&pid)listeners.push({pid,port,address:'127.0.0.1',state:'Listen'});
+        else{const endpoint=/^n(.+):(\d+)$/.exec(line);if(endpoint&&Number(endpoint[2])===port&&pid)listeners.push({pid,port,address:endpoint[1],state:'Listen'});}
       }
-    }catch(error){if(error.code!==1)errors.push({port,error:redact(error)});}
+    }catch(error){if(error.code!==1||String(error.stdout||'').trim()||String(error.stderr||'').trim())errors.push({port,error:redact(error)});}
   }
   rows.sort((a,b)=>a.pid-b.pid);errors.sort((a,b)=>(a.pid||0)-(b.pid||0));
   const inventory={stage,observedAt:new Date().toISOString(),hostPid:process.pid,expectedExecutable,observerPid,

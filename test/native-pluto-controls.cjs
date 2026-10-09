@@ -133,13 +133,14 @@ const portOpen = port => new Promise(resolve => {
   socket.once('timeout', () => {socket.destroy(); resolve(false);});
 });
 
-async function stop(context, state, closePanel = false) {
+async function stop(context, state, closePanel = false,deadline) {
   const port = Number(new URL(state.frame.url()).port);
   assert(port > 0, 'This disposable desktop test has a real loopback Pluto server');
   context.log('native-ui-action',{surface:'Pluto session',action:closePanel?'Close notebook view':'Stop session'});
   if (closePanel) await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   else await state.parent.locator('#pluto-stop').click();
-  await eventually(async () => !await portOpen(port), 'Closing Pluto also closes its server and workers', 45000);
+  const remaining=deadline===undefined?45000:deadline-Date.now();assert(remaining>0,'The existing 45 second Close budget remains available');
+  await eventually(async () => !await portOpen(port), 'Closing Pluto also closes its server and workers', remaining);
   if(!closePanel)await eventually(async()=>{
     const parent=await context.findFrame('#pluto-restart');
     return await parent.locator('iframe.perfchecker-pluto-frame').count()===0&&
@@ -757,7 +758,12 @@ end`;
   await ready(state.frame,'Launch selected checks');
   const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent();return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',360000);
   const data=await evidence();assert.equal(data.kind,'distribution');assert(data.selected.startsWith('distribution-'));assert.equal(data.selectedLabel,distribution.label);assert(data.values.length>=2);
-  for(const [name,version] of Object.entries({PerfCheckerMakie:'1.0.0',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'}))assert.equal(data.providers[name].version,version);
+  const providerProvenance=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'pluto-plot-provider-provenance.json'),'utf8'));
+  assert.equal(providerProvenance.pins.makieCommit,context.core.commit);
+  assert.equal(providerProvenance.providers.PerfCheckerMakie.tree,'cd36865103120518bd036cb7abe366114df13aaf');
+  assert.equal(providerProvenance.pins.makieTree,providerProvenance.providers.PerfCheckerMakie.tree);
+  assert.equal(providerProvenance.providers.PerfCheckerMakie.version,'1.0.1');
+  for(const [name,version] of Object.entries({PerfCheckerMakie:providerProvenance.providers.PerfCheckerMakie.version,WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'}))assert.equal(data.providers[name].version,version);
   const diagnosticViewport=stage=>cell.evaluate((node,stage)=>({stage,classes:node.className,
     focusedWithin:node.contains(document.activeElement),rectangle:node.getBoundingClientRect().toJSON(),
     plots:[...document.querySelectorAll('iframe[data-perfchecker-plot-frame]')].map(frame=>({token:frame.dataset.perfcheckerPlotFrame,rectangle:frame.getBoundingClientRect().toJSON()}))}),stage);
@@ -839,11 +845,12 @@ end`;
   }
 }
 
-async function suite(context, directory, requirePlots=false) {
+async function suite(context, directory, requirePlots=false,observation) {
   const root = path.resolve(context.workspace, context.vscode.workspace.getConfiguration('perfchecker',
     context.vscode.Uri.file(context.workspace)).get('reports', 'perf/results/vscode'));
   const before = await fingerprint(root);
   const state = await create(context, path.join(directory, 'NativeSuite.jl'), 'suite');
+  await observation?.created?.(state);
   for (const name of ['Launch selected checks', 'Cancel active job', 'Refresh status', 'Save completed reports']) {
     assert(await state.frame.getByRole('button', {name, exact: true}).isVisible(), `Real suite control: ${name}`);
   }
@@ -899,7 +906,10 @@ async function suite(context, directory, requirePlots=false) {
   await state.frame.locator('bond[def="samples"] input').press('Tab');
   await idle(state.frame);
   assert.deepEqual(await fingerprint(root), completed, 'Changing a completed suite does not rerun or resave results');
-  await stop(context, state, true);
+  const closeDeadline=observation?Date.now()+45000:undefined;
+  await observation?.beforeClose?.(closeDeadline);
+  await stop(context, state, true,closeDeadline);
+  await observation?.afterClose?.(closeDeadline);
   context.proof('pluto-suite-select-launch-save', {checks: saved.data.runs.length, report: path.relative(context.workspace, saved.file)});
 }
 
@@ -940,7 +950,60 @@ exports.runPlots = async context => {
   assert(session&&path.isAbsolute(session));
   assert.equal(await fs.realpath(context.workspace),path.join(await fs.realpath(session),'workspace'));
   const directory=path.join(context.workspace,'perf','notebooks');await fs.mkdir(directory,{recursive:true});
-  try{await suite(context,directory,true);}
-  catch(error){await capture(context,'pluto-rendered-plots-failed');throw error;}
-  finally{await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));}
+  let owner,port,known=[];const failures=[];
+  const collectBefore=async stage=>{
+    const before=await sessionInventory(context,stage,port,known);
+    const owned=new Set(known.filter(prior=>before.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt)).map(row=>row.pid));
+    for(let changed=true;changed;){changed=false;for(const row of before.rows)if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
+    const identities=new Map(known.map(row=>[`${row.pid}/${row.createdAt}`,row]));
+    for(const row of before.rows.filter(row=>owned.has(row.pid)))identities.set(`${row.pid}/${row.createdAt}`,row);
+    known=[...identities.values()];assert.equal(before.errors?.length||0,0,'Before Close/Stop, owned plot process inspection is qualified');
+  };
+  const inspectAfter=async(stage,deadline)=>{
+    while(Date.now()<deadline){
+      const after=await sessionInventory(context,stage,port,known);
+      const gone=known.every(prior=>identityGone(after,prior)),listeners=after.listeners.filter(row=>row.port===port);
+      context.log('pluto-plot-shutdown-observation',{stage,port,originalIdentitiesGone:gone,listeners,errors:after.errors||[],deadlineAt:new Date(deadline).toISOString()});
+      assert.equal(after.errors?.length||0,0,'No intermediate process or listener inspection error proves shutdown');
+      if(gone&&!listeners.length){
+        const timeout=Math.min(1000,deadline-Date.now());assert(timeout>0);
+        const closed=await new Promise((resolve,reject)=>{
+          const socket=net.createConnection({host:'127.0.0.1',port});socket.setTimeout(timeout);
+          socket.once('connect',()=>{socket.destroy();resolve(false);});
+          socket.once('error',error=>{socket.destroy();if(error.code==='ECONNREFUSED')resolve(true);else reject(error);});
+          socket.once('timeout',()=>{socket.destroy();reject(new Error('The plot listener probe timed out; shutdown is unqualified'));});
+        });
+        if(closed){context.log('pluto-plot-owned-shutdown',{stage,port,identities:known.map(({pid,parent,createdAt})=>({pid,parent,createdAt})),originalIdentitiesGone:true,listenerInventoryEmpty:true,connectionRefused:true});return;}
+      }
+      await new Promise(resolve=>setTimeout(resolve,Math.min(150,Math.max(0,deadline-Date.now()))));
+    }
+    throw new Error('The existing 45 second Close/Stop budget expired before positive plot shutdown evidence');
+  };
+  try{await suite(context,directory,true,process.platform==='darwin'?{
+    created:async state=>{port=Number(new URL(state.frame.url()).port);owner=await sessionOwner(context,state);known=owner.descendants;},
+    beforeClose:()=>collectBefore('plots-before-native-close'),
+    afterClose:deadline=>inspectAfter('plots-after-native-close-before-teardown',deadline)
+  }:undefined);}
+  catch(error){failures.push(error);await capture(context,'pluto-rendered-plots-failed').catch(diagnostic=>context.log('pluto-plot-capture-error',{message:String(diagnostic)}));}
+  finally{
+    const stopDeadline=Date.now()+45000;
+    if(owner)try{
+      await collectBefore('plots-before-stop');
+    }catch(error){failures.push(error);context.log('pluto-plot-ownership-error',{stage:'before-stop',message:String(error)});}
+    try{await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));}
+    catch(error){failures.push(error);}
+    if(owner)try{
+      await inspectAfter('plots-after-stop-before-teardown',stopDeadline);
+    }catch(error){failures.push(error);context.log('pluto-plot-ownership-error',{stage:'after-stop',message:String(error)});}
+    try{
+      const profile=await fs.realpath(process.env.PERFCHECKER_NATIVE_PROFILE),session=await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION);
+      assert(profile.startsWith(session+path.sep));
+      const logs=(await files(path.join(profile,'logs'))).filter(file=>/PerfChecker Pluto\.log$/.test(file));assert(logs.length>0);
+      for(const file of logs){const text=await fs.readFile(file,'utf8');if(text.includes('Forced stop:')){
+        context.log('pluto-plot-forced-stop',{file:path.relative(profile,file),tail:text.slice(-3000).replace(/([?&]secret=)[^&\s"<>]+/g,'$1[redacted]')});
+        throw new Error('The actual Pluto output reports Forced stop; plot cleanup is unqualified');
+      }}
+    }catch(error){failures.push(error);}
+  }
+  if(failures.length)throw new AggregateError(failures,'Actual rendered plots or owned cleanup failed');
 };

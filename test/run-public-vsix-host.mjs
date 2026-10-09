@@ -84,9 +84,9 @@ async function executeControllerPreflight(executable,args,receipt){
   child.stdout.on('data',chunk=>{text+=chunk;process.stdout.write(chunk);const ready=/^CONTROLLER_PREFLIGHT_READY (\d+)\r?$/m.exec(text);if(ready)readyPid=Number(ready[1]);});
   child.stderr.on('data',chunk=>{text+=chunk;process.stderr.write(chunk);});child.stdin.on('error',error=>errors.push({stage:'stdin',error:String(error)}));
   const canonical=value=>windows?value.toLowerCase():value;
-  const macCurrent=async pid=>{
+  const macCurrent=async(pid,maximum=3000)=>{
     let value;
-    try{value=(await inspectCommand('ps',['-p',String(pid),'-o','pid=,ppid=,pgid=,lstart=,stat='],{timeout:limit(3000)})).stdout.trim();}
+    try{const current=await inspectCommand('ps',['-p',String(pid),'-o','pid=,ppid=,pgid=,lstart=,stat='],{timeout:limit(maximum)});assert(!current.stderr.trim(),'Current process inspection has no stderr error');value=current.stdout.trim();}
     catch(error){if(error.code===1&&!String(error.stdout||'').trim()&&!String(error.stderr||'').trim())return undefined;throw error;}
     const match=/^(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+(\S+)$/.exec(value);
     assert(match,'An existing macOS process has a complete current identity');assert.equal(Number(match[1]),pid);
@@ -105,10 +105,38 @@ async function executeControllerPreflight(executable,args,receipt){
     assert(Number.isFinite(Date.parse(row.started)),'macOS supplies a real process start date');
     const before=await macCurrent(row.pid);if(!before)return undefined;assert.equal(before.parent,row.parent);assert.equal(before.group,row.group);assert.equal(before.started,row.started);
     let mappings;
-    try{mappings=(await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)})).stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
-    catch(error){if(!await macCurrent(row.pid))return undefined;throw error;}
+    try{const current=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)});assert(!current.stderr.trim(),'Mapped-executable inspection has no stderr error');mappings=current.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
+    catch(error){
+      if(error.code!==1||String(error.stdout||'').trim()||String(error.stderr||'').trim())throw error;
+      if(!await macCurrent(row.pid))return undefined;throw error;
+    }
     const after=await macCurrent(row.pid);if(!after)return undefined;
     for(const key of ['parent','group','started'])assert.equal(after[key],before[key],'The process keeps its real identity while mapped executable paths are read');
+    if(!mappings.length){
+      const observation={stage:'mapped-executable-empty',pid:row.pid,before,after,startedAt:new Date().toISOString(),rechecks:[]};
+      (receipt.ownership.inconclusive??=[]).push(observation);
+      const until=Math.min(cleanupUntil,Date.now()+200);
+      try{
+      while(Date.now()<until){
+        await new Promise(resolve=>setTimeout(resolve,Math.min(10,Math.max(0,until-Date.now()))));
+        if(Date.now()>=until)break;
+        const current=await macCurrent(row.pid,Math.max(1,until-Date.now()));
+        observation.rechecks.push({at:new Date().toISOString(),current:current??null});
+        if(!current){observation.resolution='proved-absent-or-zombie';return undefined;}
+        for(const key of ['parent','group','started'])assert.equal(current[key],before[key],'An inconclusive mapped-executable observation must retain the same incarnation');
+        const value=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(Math.max(1,until-Date.now()))});
+        assert(!value.stderr.trim(),'Mapped-executable revalidation must not hide an inspection error');
+        mappings=value.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+        const checked=await macCurrent(row.pid,Math.max(1,until-Date.now()));
+        observation.rechecks.at(-1).after=checked??null;observation.rechecks.at(-1).mappings=mappings;
+        if(!checked){observation.resolution='proved-absent-or-zombie';return undefined;}
+        for(const key of ['parent','group','started'])assert.equal(checked[key],before[key],'Mapped paths still belong to the original incarnation');
+        if(mappings.length){observation.resolution='mapped-executable-restored';break;}
+      }
+      if(!mappings.length)observation.resolution='live-executable-unqualified';
+      }catch(error){observation.resolution='inspection-failed';observation.error=String(error);throw error;}
+      finally{observation.finishedAt=new Date().toISOString();}
+    }
     mappings=await Promise.all(mappings.map(file=>fs.realpath(file).catch(()=>file)));assert(mappings.length);
     return {...after,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
   };
