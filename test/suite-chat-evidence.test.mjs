@@ -6,7 +6,8 @@ import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import http from 'node:http';
-import {spawn} from 'node:child_process';
+import {spawn,execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 
 const require=createRequire(import.meta.url),{SuiteChatEvidence,validateSuiteChatSource}=require('../dist/suiteChatEvidence.js');
 const runId='12345678-1234-4234-8234-123456789abc';
@@ -215,4 +216,51 @@ test('real candidate Core projects the original Oxygen suite bundle into control
       t.diagnostic(JSON.stringify({runId:source.runId,measurementSummaries:projection.measurement_summaries.length,
         actualMcpCall:true,noRemeasurement:true,provider:'controlled HTTP fixture; no inference',allProtocolBytesUnchanged:true}));
     } finally {chat?.dispose();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));}
+  });
+
+// This separate integration uses an explicitly supplied, already resolved
+// General1.0.0 controller. It is not native-host coverage and installs nothing.
+const legacyProject=process.env.PERFCHECKER_TEST_LEGACY_JULIA_PROJECT;
+test('real registered Core1.0.0 refuses the original Oxygen suite before any provider request',
+  {skip:!julia||!legacyProject||!suiteWorkspace||!suiteReports,timeout:240000},async t=>{
+    const value={root:suiteWorkspace,workspace:`file://${suiteWorkspace}`};select(value);
+    const inventory=new SuiteChatEvidence();await inventory.refresh(value.workspace,value.root,suiteReports);
+    const entry=inventory.options(value.workspace)[0];assert(entry&&!entry.unavailable);
+    const source=await inventory.read(entry.id,value.workspace);
+    assert.equal(JSON.parse(await readFile(path.join(source.directory,'manifest.json'))).suite,'oxygen_http_features');
+    const suite=JSON.parse(await readFile(path.join(source.reports,'suite-result.json')));
+    assert.deepEqual(suite.runs.map(run=>[run.feature,run.version]).sort(),[['plain_benchmark','1.10.2'],['plain_benchmark','1.11.0']]);
+    const documents=['manifest.json','measurement-definitions.json','observations.jsonl','diagnostics.jsonl','artifacts.json','integrity.json'];
+    const sourceHashes=async()=>Promise.all(documents.map(async name=>[name,hash(await readFile(path.join(source.directory,name)))]));
+    const controllerHashes=async()=>Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,hash(await readFile(path.join(legacyProject,name)))]));
+    const before=await sourceHashes(),controllerBefore=await controllerHashes();
+    const actual=await promisify(execFile)(julia,['--startup-file=no',`--project=${legacyProject}`,'-e',
+      'using PerfChecker,Pkg; info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry))'],
+      {windowsHide:true,timeout:180000,env:{...process.env,JULIA_LOAD_PATH:'@'+path.delimiter+'@stdlib'}});
+    const provenance=JSON.parse(actual.stdout);
+    assert.deepEqual(provenance,{version:'1.0.0',tree:'7af0cc74194b953c5e998efd7523f0c5f455e395',registered:true});
+    // An actual endpoint catches even initialization/discovery, not just tools/call.
+    const requests=[],sockets=new Set();let chat,projection;const commands=[];
+    const server=http.createServer((request,response)=>{requests.push(request.url);request.resume();response.writeHead(500);response.end('No provider contact is permitted for this legacy projection.');});
+    server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    try{
+      values={juliaExecutable:julia,runnerProject:legacyProject,advisorConfig:'',advisorEnabled:true,advisorProtocol:'mcp_http',
+        advisorMcpTool:'ask',advisorMcpResponse:'text',advisorEndpoint:`http://127.0.0.1:${server.address().port}/mcp`,advisorTimeout:120};
+      chat=new AdvisorChat(context,()=>inventory.options(value.workspace),id=>inventory.read(id,value.workspace));chat.recoverProposal=async()=>{};
+      const invoke=chat.invoke.bind(chat);chat.invoke=async(...args)=>{
+        commands.push(args[3]);assert.equal(args[3],'advise','No chat/provider worker is launched');
+        assert.deepEqual(args[1],{});assert.equal(args[2],undefined);assert.equal(args[4],source.directory);
+        projection=await invoke(...args);return projection;
+      };
+      chat.clear(entry.id);assert.deepEqual(commands,[]);assert.deepEqual(requests,[]);
+      await assert.rejects(chat.send('Explain only this unchanged saved Oxygen suite.',entry.id),/Core 1\.0\.0.*No measurements were sent/);
+      assert.deepEqual(commands,['advise']);assert.equal(projection.schema_version,'perfchecker-advice/1');
+      assert(Array.isArray(projection.recommendations));assert.equal(Object.hasOwn(projection,'measurement_summaries'),false);
+      assert.deepEqual(requests,[]);assert.equal(chat.state().busy,false);assert.deepEqual(chat.state().messages,[]);
+      assert.deepEqual(await sourceHashes(),before);assert.deepEqual(await controllerHashes(),controllerBefore);
+      t.diagnostic(JSON.stringify({core:provenance,runId:source.runId,realCliAdvise:true,canonicalSummariesAvailable:false,
+        explicitRefusalBeforeProvider:true,providerRequests:0,originalProtocolBytesUnchanged:true,controllerBytesUnchanged:true,
+        scope:'CLI integration; not native-host coverage or successful measurement transmission'}));
+    }finally{chat?.dispose();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));}
   });

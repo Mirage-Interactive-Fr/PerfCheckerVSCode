@@ -547,7 +547,7 @@ exports.run = async (context,options={}) => {
         env: {...process.env, UV_THREADPOOL_SIZE: '1'}})).stdout.trim());
   };
   const baselineBytes = await probe(workspace);
-  const calls = [], pending = new Set(), pendingSockets=new Map(), providerErrors=[],receipts=[];
+  const calls = [], suiteCalls=[], pending = new Set(), pendingSockets=new Map(), providerErrors=[],receipts=[];
   let alternateFolder;
   const stdio=options.stdio===true;
   const nativeNode=stdio?await fs.realpath(process.env.PERFCHECKER_NATIVE_NODE):undefined;
@@ -594,16 +594,20 @@ exports.run = async (context,options={}) => {
         if(attached){
           assert.deepEqual(projection.evidence,attached.evidence,'The explicitly attached canonical measured IDs and content reach tools/call before the reply');
           assert([...JSON.stringify(projection.evidence)].length<=attached.evidenceBudget,'The actual request remains inside the serialized evidence budget');
-          if(name!==implementationTool)assert(prompt.includes('No recommendations does not mean no measurements'));
+          attached.inspectPayload?.(body,projection);
+          if(name!==implementationTool&&!prompt.includes('native suite evidence probe'))assert(prompt.includes('No recommendations does not mean no measurements'));
         }else{
           assert.deepEqual(projection.evidence,[],'No saved measurement reaches the server without explicit Attach');
           assert(prompt.includes('No saved report was attached.'));
           assert(savedEvidence,'A real saved report already exists before testing the absence of implicit attachment');
         }
-        calls.push({name,prompt,promptArgument,workspaceArgument:name===implementationTool?workspaceArgument:undefined,additionalArgumentsVerified:custom,revision:req.headers['mcp-protocol-version'],
+        // Keep the additional Suite request recorded separately, preserving all
+        // original Investigation turn/count oracles without deleting a receipt.
+        (prompt.includes('native suite evidence probe')?suiteCalls:calls).push({name,prompt,promptArgument,workspaceArgument:name===implementationTool?workspaceArgument:undefined,additionalArgumentsVerified:custom,revision:req.headers['mcp-protocol-version'],
           evidenceIds:projection.evidence.map(row=>row.id),projectionSha256:hash(JSON.stringify(canonical(projection.evidence))),
           evidenceInspectedBeforeReply:true,savedReportPresent:!!savedEvidence,explicitAttachment:!!attached});
         let answer = 'Consider a generator to remove the intermediate squared array. Verify empty inputs and signed floating-point values, then measure allocations; speed is not yet qualified.';
+        if(prompt.includes('native suite evidence probe'))answer='Controlled transport reply: these saved quantities come from a small, unpaired fixture. No performance improvement is established; inspect their units, scope and correctness qualification.';
         if (prompt.includes('native cancellation probe')) {
           pending.add(res);pendingSockets.set(res,req.socket); res.on('close', () => {pending.delete(res);pendingSockets.delete(res);}); return;
         }
@@ -854,6 +858,8 @@ exports.run = async (context,options={}) => {
     assert.deepEqual(calls[0].evidenceIds,[],'The configuration-only path remains valid without saved measurements');
     proof('native-mcp-configuration-only-conversation',{adviceTurns:1,noSavedEvidence:true,savedReportPresent:true,
       historyId:savedEvidence.id,evidenceInspectedBeforeReply:calls[0].evidenceInspectedBeforeReply,sourceUnchanged:await fs.readFile(source,'utf8')===original});
+    view=await require('./native-suite-chat-evidence.cjs').run(context,{calls:suiteCalls,receipts,providerErrors,state,
+      setAttached:value=>{attached=value;}});
     attached=savedEvidence;
     await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(attached.id);
     await eventually(async()=>{const value=await state();return value.evidenceId===attached.id&&value.messages.length===0;},'The real evidence selector starts a conversation with the selected measured bundle');
