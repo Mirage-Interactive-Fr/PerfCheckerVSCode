@@ -957,6 +957,7 @@ exports.runStartStop = async context => {
   const environmentHashes=await environmentDigest();
   const memory=async()=>Object.fromEntries(await Promise.all((await files(context.workspace)).filter(file=>file.endsWith('.mem')).map(async file=>[path.relative(context.workspace,file),createHash('sha256').update(await fs.readFile(file)).digest('hex')])));
   const beforeMemory=await memory(),logBaselines=new Map();
+  const expectedShutdownPhases=['enter','jobs-begin','jobs-complete','clients-begin','clients-complete','notebooks-begin','notebooks-complete','http-begin','http-complete','complete'];
   const outputLogs=()=>files(path.join(profile,'logs')).then(names=>names.filter(file=>/PerfChecker Pluto\.log$/.test(file)));
   for(const file of await outputLogs()){const stat=await fs.lstat(file);assert(stat.isFile()&&!stat.isSymbolicLink());logBaselines.set(file,{ino:stat.ino,dev:stat.dev,bytes:stat.size});}
   const observeLogs=async stage=>{
@@ -967,6 +968,7 @@ exports.runStartStop = async context => {
       const bytes=await fs.readFile(file),delta=bytes.subarray(before.bytes).toString('utf8');
       summaries.push({file:path.relative(profile,file),bytesBefore:before.bytes,bytesObserved:bytes.length,deltaSha256:createHash('sha256').update(bytes.subarray(before.bytes)).digest('hex'),
         forcedStops:(delta.match(/Forced stop: controller cleanup did not finish within one minute\./g)||[]).length,
+        shutdownPhases:[...delta.matchAll(/^PERFCHECKER_PLUTO_SHUTDOWN (enter|jobs-begin|jobs-complete|clients-begin|clients-complete|notebooks-begin|notebooks-complete|http-begin|http-complete|complete)\r?$/gm)].map(match=>match[1]),
         classes:[...new Set(delta.match(/\b(?:InterruptException|CompositeException|TaskFailedException|DiscardedWorkspaceException|UndefVarError|MethodError|IOError|EOFError)\b/g)||[])],
         pkgObserved:/\bPkg\b/.test(delta),precompileObserved:/precompil/i.test(delta),workspaceManagerObserved:/WorkspaceManager/.test(delta)});
     }
@@ -1051,22 +1053,25 @@ exports.runStartStop = async context => {
     context.log('native-ui-action',{surface:'First prepared Pluto session',action:'Stop session',deadlineAt:new Date(stopDeadline).toISOString()});
     await state.parent.locator('#pluto-stop').click({timeout:Math.min(30000,stopDeadline-Date.now())});
     while(Date.now()<stopDeadline){
-      const current=await inspect('first-stop-before-teardown',port,stopDeadline);await observeLogs('first-stop-before-teardown');
+      const current=await inspect('first-stop-before-teardown',port,stopDeadline),output=await observeLogs('first-stop-before-teardown');
       const status=state.parent.locator('.status'),completed=await status.count()>0&&/^(?:Pluto session stopped|Session stopped\.)/.test(await status.textContent({timeout:Math.min(1000,Math.max(1,stopDeadline-Date.now()))}));
       if(completed&&current.known.every(prior=>!current.rows.some(row=>row.pid===prior.pid&&row.started===prior.started&&!row.gone))&&current.listeners.length===0){
         const remaining=stopDeadline-Date.now();assert(remaining>0);
         const closed=await new Promise((resolve,reject)=>{const socket=net.createConnection({host:'127.0.0.1',port});socket.setTimeout(Math.min(1000,remaining));
           socket.once('connect',()=>{socket.destroy();resolve(false);});socket.once('error',error=>{socket.destroy();error.code==='ECONNREFUSED'?resolve(true):reject(error);});
           socket.once('timeout',()=>{socket.destroy();reject(new Error('The exact listener probe is UNKNOWN after timeout'));});});
-        if(closed){assert(Date.now()<stopDeadline);assert.deepEqual(await memory(),beforeMemory);assert.deepEqual(await environmentDigest(),environmentHashes);assert.equal(errors.length,0);assert(Date.now()<stopDeadline);
+        const shutdownPhases=output.flatMap(summary=>summary.shutdownPhases);
+        if(closed&&shutdownPhases.length===expectedShutdownPhases.length&&shutdownPhases.every((phase,index)=>phase===expectedShutdownPhases[index])){assert(Date.now()<stopDeadline);
+          assert.deepEqual(await memory(),beforeMemory);assert.deepEqual(await environmentDigest(),environmentHashes);assert.equal(errors.length,0);assert(Date.now()<stopDeadline);
           context.proof('pluto-first-prepared-start-stop',{firstServerInPreparedEnvironment:true,virginPkgCacheQualified:false,measurementRequested:false,owner,port,
             deadlineAt:new Date(stopDeadline).toISOString(),nativeStopClick:true,stoppedUiObserved:true,observedIdentitiesGone:true,exactListenerEmpty:true,connectionRefused:true,newForcedStop:false,errors:[],
+            shutdownPhases,shutdownPhasesCompleteBeforeDeadline:true,
             memoryFilesBefore:beforeMemory,memoryFilesUnchanged:true,allocationCleanupQualified:false,environmentHashes,environmentUnchanged:true,provenance,observedBeforeHarnessCleanup:true});
           await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');return;}
       }
       await wait(Math.min(150,Math.max(0,stopDeadline-Date.now())));
     }
-    throw new Error('The existing 60 second stop grace expired without positive process and listener cleanup');
+    throw new Error('The existing 60 second stop grace expired without positive process, listener and cleanup-phase completion');
   }catch(error){primaryFailure=error;throw error;}
   finally{observing=false;await observer;let finalLogError;
     try{await observeLogs('first-start-final');}catch(error){finalLogError=error;context.log('pluto-first-start-observation-error',{kind:'output-inspection-unknown',errorClass:error.name});}
