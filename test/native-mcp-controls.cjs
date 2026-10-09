@@ -540,6 +540,10 @@ exports.run = async (context,options={}) => {
   const state = () => vscode.commands.executeCommand('perfchecker.chatState');
   const stdioConnections=[];let activeStdio,reloading=false,primaryError;
   const stdioRecords=async connection=>(await fs.readFile(path.join(connection.root,'stdio-requests.jsonl'),'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
+  const stdioSelect=async(panel,id,caption)=>{
+    const input=panel.locator('select#'+id);assert.equal(await input.count(),1);
+    assert.equal(await input.locator('..').locator(':scope > span').innerText(),caption);return input;
+  };
   const connectStdio=async(version)=>{
     const root=await fs.mkdtemp(path.join(process.env.PERFCHECKER_NATIVE_SESSION,'neutral-mcp-'));
     const command=await fs.realpath(nativeNode),serverFile=await fs.realpath(__filename),args=[serverFile,'--neutral-stdio',values.advisorEndpoint,root,version];
@@ -548,11 +552,11 @@ exports.run = async (context,options={}) => {
     await vscode.commands.executeCommand('perfchecker.openChat');let chat=await findFrame('#chat-root');
     await chat.getByRole('button',{name:'Connect local MCP server',exact:true}).click();
     const panel=await findFrame('#advisor-root');
-    await panel.getByLabel('Mode',{exact:true}).selectOption('mcp_stdio');
+    await(await stdioSelect(panel,'advisor-protocol','Mode')).selectOption('mcp_stdio');
     await panel.getByLabel('Absolute MCP server executable',{exact:true}).fill(command);
     await panel.getByLabel('Executable arguments (JSON array)',{exact:true}).fill(JSON.stringify(args));
     await panel.getByLabel('Absolute server working directory',{exact:true}).fill(root);
-    await panel.getByLabel('MCP version',{exact:true}).selectOption(version);
+    await(await stdioSelect(panel,'advisor-mcp_version','MCP version')).selectOption(version);
     await panel.getByLabel('Connection / download timeout (seconds)',{exact:true}).fill(String(values.advisorTimeout));
     await panel.getByRole('button',{name:'Test connection / discover',exact:true}).click();
     await eventually(async()=>await panel.getByRole('heading',{name:adviceTool,exact:true}).count()===1&&await panel.getByRole('heading',{name:implementationTool,exact:true}).count()===1&&
@@ -695,8 +699,8 @@ exports.run = async (context,options={}) => {
       assert.deepEqual(await nativeIdentity(connection.identity.pid,nativeNode),connection.identity);
       await view.getByRole('button',{name:'Connect local MCP server',exact:true}).click();
       const panel=await findFrame('#advisor-root');
-      assert.equal(await panel.getByLabel('Mode',{exact:true}).inputValue(),'mcp_stdio');
-      assert.equal(await panel.getByLabel('MCP version',{exact:true}).inputValue(),'2025-11-25',
+      assert.equal(await(await stdioSelect(panel,'advisor-protocol','Mode')).inputValue(),'mcp_stdio');
+      assert.equal(await(await stdioSelect(panel,'advisor-mcp_version','MCP version')).inputValue(),'2025-11-25',
         'Reopening configuration reads the connected legacy revision from memory, rather than the modern saved settings');
       await panel.getByRole('button',{name:'Test connection / discover',exact:true}).click();
       await eventually(async()=>await panel.locator('#advisor-root').getAttribute('aria-busy')==='false'&&
