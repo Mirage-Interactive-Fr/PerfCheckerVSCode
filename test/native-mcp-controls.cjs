@@ -86,17 +86,34 @@ async function nativeIdentity(pid,expectedExecutable,observe=()=>{},expectedIden
     const same=after=>{assert.equal(after.start,before.start,'PID reuse during executable inspection remains a failure');assert.equal(after.group,before.group);};
     if(expectedIdentity){assert.equal(before.start,expectedIdentity.start);assert.equal(before.group,expectedIdentity.group);}
     if(['Z','X'].includes(before.state))return;
-    let executable;
-    try{executable=await fs.realpath(`/proc/${pid}/exe`);}
-    catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;
-      const current=await linuxNativeStat(pid);if(!current)return;same(current);
-      if(['Z','X'].includes(current.state))return;throw error;}
-    const after=await linuxNativeStat(pid);if(!after)return;same(after);
-    if(['Z','X'].includes(after.state))return;
-    assert.equal(executable,expectedExecutable);
-    if(after.parent!==before.parent||after.state!==before.state)observe({kind:'mutable-process-fields',pid,start:after.start,executable,group:after.group,
-      beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
-    return {pid,parent:after.parent,group:after.group,start:after.start,executable};
+    let unavailableUntil,unavailableError;
+    for(;;){
+      if(unavailableUntil!==undefined&&Date.now()>=unavailableUntil)throw unavailableError;
+      const reading=await linuxNativeStat(pid);if(!reading)return;same(reading);
+      if(['Z','X'].includes(reading.state))return;
+      let executable;
+      try{executable=await fs.realpath(`/proc/${pid}/exe`);}
+      catch(error){
+        if(!['ENOENT','ESRCH'].includes(error.code))throw error;
+        if(error.code==='ENOENT'&&unavailableUntil===undefined){unavailableUntil=Date.now()+200;unavailableError=error;}
+        const current=await linuxNativeStat(pid);if(current)same(current);
+        observe({kind:'unavailable-executable',pid,expectedExecutable,before,reading,current:current??null,
+          errorClass:error.name,code:error.code,observedAt:new Date().toISOString()});
+        if(!current||['Z','X'].includes(current.state))return;
+        // ENOENT alone proves neither absence nor a valid executable. Re-read
+        // only this same incarnation; persistent uncertainty remains a failure.
+        if(error.code!=='ENOENT'||Date.now()>=unavailableUntil)throw error;
+        await delay(Math.min(10,unavailableUntil-Date.now()));continue;
+      }
+      const after=await linuxNativeStat(pid);if(!after)return;same(after);
+      if(['Z','X'].includes(after.state))return;
+      assert.equal(executable,expectedExecutable);
+      if(unavailableUntil!==undefined)observe({kind:'executable-reobserved',pid,start:after.start,executable,group:after.group,
+        currentParent:after.parent,currentState:after.state,observedAt:new Date().toISOString()});
+      if(after.parent!==before.parent||after.state!==before.state)observe({kind:'mutable-process-fields',pid,start:after.start,executable,group:after.group,
+        beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
+      return {pid,parent:after.parent,group:after.group,start:after.start,executable};
+    }
   }
   if(process.platform==='win32'){
     const text=(await execute('powershell.exe',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}' -ErrorAction Stop;if($p){@{pid=$p.ProcessId;parent=$p.ParentProcessId;start=$p.CreationDate.ToUniversalTime().ToString('o');executable=$p.ExecutablePath}|ConvertTo-Json -Compress}`],{timeout:5000})).stdout.trim();
@@ -658,7 +675,15 @@ exports.run = async (context,options={}) => {
   }
   const previous = Object.fromEntries(Object.keys(values).map(key => [key, settings().inspect(key)?.workspaceFolderValue]));
   const state = () => vscode.commands.executeCommand('perfchecker.chatState');
-  const stdioConnections=[];let activeStdio,reloading=false,primaryError;
+  const stdioConnections=[];let activeStdio,reloading=false,primaryError,legacyStage;
+  const legacyMarker=(stage,detail={})=>{legacyStage=stage;log('native-mcp-stdio-legacy-stage',{stage,...detail});};
+  const legacyIdentity=async(connection,stage)=>{
+    legacyMarker(stage+'-before',{server:connection.identity});
+    const identity=await nativeIdentity(connection.identity.pid,nativeNode,
+      observation=>log('native-mcp-stdio-identity-observation',{stage,...observation}),connection.identity);
+    assert.deepEqual(identity,connection.identity);
+    legacyMarker(stage+'-after',{server:identity});
+  };
   const stdioRecords=async connection=>(await fs.readFile(path.join(connection.root,'stdio-requests.jsonl'),'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
   const stdioSelect=async(panel,id,caption)=>{
     const input=panel.locator('select#'+id);assert.equal(await input.count(),1);
@@ -826,31 +851,36 @@ exports.run = async (context,options={}) => {
       assert(legacyJulia);await eventually(async()=>await sameNativeIdentityGone(legacyJulia.cliIdentity)&&await sameNativeIdentityGone(legacyJulia.workerIdentity),
         'The completed legacy request releases its actual Julia client processes while the stdio server remains available',60000);
       const connection=activeStdio;
-      assert.deepEqual(await nativeIdentity(connection.identity.pid,nativeNode),connection.identity);
+      await legacyIdentity(connection,'after-completed-advice');
       assert.equal((await state()).connectionKind,'stdio','The completed legacy advice retains its existing stdio connection');
       await view.getByRole('button',{name:'Configure MCP connection',exact:true}).click();
       const panel=await findFrame('#advisor-root');
       assert.equal(await(await stdioSelect(panel,'advisor-protocol','Mode')).inputValue(),'mcp_stdio');
       assert.equal(await(await stdioSelect(panel,'advisor-mcp_version','MCP version')).inputValue(),'2025-11-25',
         'Reopening configuration reads the connected legacy revision from memory, rather than the modern saved settings');
+      legacyMarker('probe-before',{server:connection.identity});
       await panel.getByRole('button',{name:'Test connection / discover',exact:true}).click();
       await eventually(async()=>await panel.locator('#advisor-root').getAttribute('aria-busy')==='false'&&
         await panel.getByRole('heading',{name:adviceTool,exact:true}).count()===1,'Probe after a completed legacy conversation keeps the existing server usable');
-      assert.deepEqual(await nativeIdentity(connection.identity.pid,nativeNode),connection.identity);
+      legacyMarker('probe-after',{server:connection.identity});
+      await legacyIdentity(connection,'after-probe');
       const records=await stdioRecords(connection);
       for(const method of ['initialize','notifications/initialized','tools/list','tools/call'])assert(records.some(row=>row.method===method));
       assert(records.every(row=>row.version==='2025-11-25'));assert.equal(records.some(row=>row.method==='server/discover'),false);
       const disconnectUntil=Date.now()+60000;
+      legacyMarker('disconnect-before-click',{server:connection.identity});
       await panel.getByRole('button',{name:'Disconnect local MCP server',exact:true}).click();
+      legacyMarker('disconnect-after-click',{server:connection.identity});
       await eventually(async()=>await sameNativeIdentityGone(connection.identity)&&
         (!connection.windowsJobOwner||await sameNativeIdentityGone(connection.windowsJobOwner))&&!(await state()).connectionKind&&
         await bridgeClosed(legacyJulia.bridgeTuple)&&Date.now()<disconnectUntil,
       'Explicit legacy Disconnect closes the same server after its real advice turn',Math.max(1,disconnectUntil-Date.now()));
+      legacyMarker('disconnect-identities-absent-before-teardown',{server:connection.identity});
       proof('native-mcp-stdio-legacy-real-advice',{version:'2025-11-25',records,actualCoreConversation:true,legacyJulia,
         sameServerAvailableAfterCompletedRequest:true,probeReusesIdentity:true,explicitDisconnect:true,ownedServerAbsentBeforeTeardown:true,
         httpSessionIdEmitted:false,httpSessionMode:'stateless; no session DELETE required',adapterExactListenerAbsentAndTcpRefused:true,
         timeoutSeconds:values.advisorTimeout,provider:providerLabel});
-      calls.splice(0);
+      calls.splice(0);legacyStage=undefined;
       view=await connectStdio('2026-07-28');
     }
     assert.equal((await state()).evidenceId,'','Saving a real report does not attach it to the conversation');
@@ -1097,7 +1127,10 @@ exports.run = async (context,options={}) => {
         await fs.writeFile(stdioHandoffFile(),JSON.stringify(handoff,null,2));throw error;
       }finally{clearTimeout(reloadWatchdog);}
     }
-  } catch(error){primaryError=error;throw error;}
+  } catch(error){primaryError=error;
+    if(stdio)log('native-mcp-stdio-primary-failure-before-cleanup',{stage:legacyStage??'outside-legacy',
+      errorClass:error.name,code:error.code,message:String(error),stack:error.stack});
+    throw error;}
   finally {
     if(stdio&&!reloading){
       const errors=[],observations=[];

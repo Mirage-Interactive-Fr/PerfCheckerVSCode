@@ -1,13 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import Module, {createRequire} from 'node:module';
-import {mkdtemp,mkdir,writeFile,readFile,rm,truncate,rename,symlink} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,truncate,rename,symlink,realpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import http from 'node:http';
 import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {pathToFileURL} from 'node:url';
 
 const require=createRequire(import.meta.url),{SuiteChatEvidence,validateSuiteChatSource}=require('../dist/suiteChatEvidence.js');
 const runId='12345678-1234-4234-8234-123456789abc';
@@ -25,7 +26,8 @@ async function fixture(root) {
   for(const [name,bytes]of Object.entries(files))await writeFile(path.join(directory,name),bytes);
   await writeFile(path.join(directory,'integrity.json'),JSON.stringify({schema_version:'perfchecker-bundle-integrity/1',algorithm:'sha256',
     files:Object.entries(files).map(([name,bytes])=>({path:name,bytes:Buffer.byteLength(bytes),sha256:hash(bytes)}))}));
-  return {root,reports,directory,workspace:`file://${root}`};
+  const physicalRoot=await realpath(root),physicalReports=await realpath(reports),physicalDirectory=await realpath(directory);
+  return {root:physicalRoot,reports:physicalReports,directory:physicalDirectory,workspace:pathToFileURL(physicalRoot).href};
 }
 
 test('suite picker retains an explicit workspace/run identity and never selects a newer unrelated bundle',async()=>{
@@ -35,7 +37,8 @@ test('suite picker retains an explicit workspace/run identity and never selects 
     await mkdir(path.join(a.reports,'bundles/run-newer-unrelated'));
     await inventory.refresh(a.workspace,a.root,'perf/results/vscode');await inventory.refresh(b.workspace,b.root,'perf/results/vscode');
     const entry=inventory.options(a.workspace)[0],source=await inventory.read(entry.id,a.workspace);
-    assert.match(entry.id,/^suite:/);assert(entry.id.includes(a.workspace));assert(entry.id.includes(runId));
+    assert.match(entry.id,/^suite:/);const identity=JSON.parse(entry.id.slice('suite:'.length));
+    assert.equal(identity.length,3);assert.equal(identity[0],a.workspace);assert.equal(identity[1],runId);assert.match(identity[2],/^[a-f0-9]{64}$/);
     assert.equal(source.directory,a.directory);assert.equal(source.runId,runId);assert.equal(entry.unavailable,undefined);
     await assert.rejects(inventory.read(entry.id,b.workspace),/workspace/);
     const before=await readFile(path.join(a.reports,'suite-result.json'));
@@ -161,7 +164,7 @@ const julia=process.env.PERFCHECKER_TEST_JULIA,project=process.env.PERFCHECKER_T
 const suiteWorkspace=process.env.PERFCHECKER_TEST_SUITE_WORKSPACE,suiteReports=process.env.PERFCHECKER_TEST_SUITE_REPORTS;
 test('real candidate Core projects the original Oxygen suite bundle into controlled HTTP MCP',
   {skip:!julia||!project||!suiteWorkspace||!suiteReports,timeout:240000},async t=>{
-    const value={root:suiteWorkspace,workspace:`file://${suiteWorkspace}`};select(value);
+    const value={root:suiteWorkspace,workspace:pathToFileURL(suiteWorkspace).href};select(value);
     const inventory=new SuiteChatEvidence();await inventory.refresh(value.workspace,value.root,suiteReports);
     const entry=inventory.options(value.workspace)[0];assert(entry&&!entry.unavailable,'Qualification supplies a real saved suite bundle');
     const source=await inventory.read(entry.id,value.workspace);
@@ -223,7 +226,7 @@ test('real candidate Core projects the original Oxygen suite bundle into control
 const legacyProject=process.env.PERFCHECKER_TEST_LEGACY_JULIA_PROJECT;
 test('real registered Core1.0.0 refuses the original Oxygen suite before any provider request',
   {skip:!julia||!legacyProject||!suiteWorkspace||!suiteReports,timeout:240000},async t=>{
-    const value={root:suiteWorkspace,workspace:`file://${suiteWorkspace}`};select(value);
+    const value={root:suiteWorkspace,workspace:pathToFileURL(suiteWorkspace).href};select(value);
     const inventory=new SuiteChatEvidence();await inventory.refresh(value.workspace,value.root,suiteReports);
     const entry=inventory.options(value.workspace)[0];assert(entry&&!entry.unavailable);
     const source=await inventory.read(entry.id,value.workspace);
