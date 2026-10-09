@@ -17,7 +17,7 @@ test('real webviews preserve full selection, handle Git targets and render inter
   const root=path.join(temporary,'workspace'),reports=path.join(root,'perf','results','vscode');
   const uri=fsPath=>({scheme:'file',fsPath,toString:()=>`file://${fsPath}`});
   const folder={name:'Example',uri:uri(root)};
-  const commands=new Map(),panels=[],spawned=[];
+  const commands=new Map(),panels=[],spawned=[],advisorSettings={};
   let heldPlan;
   const disposable=()=>({dispose(){}});
   const items=()=>({add(){},replace(){},forEach(){}});
@@ -31,7 +31,8 @@ test('real webviews preserve full selection, handle Git targets and render inter
   const vscode={EventEmitter:class{event=()=>disposable();fire(){}dispose(){}},Uri:{file:uri,joinPath:(value,...parts)=>uri(path.join(value.fsPath,...parts))},
     TestTag:class{constructor(id){this.id=id;}},TestRunProfileKind:{Run:1},ProgressLocation:{Window:1,Notification:2},ViewColumn:{One:1},
     workspace:{onDidChangeWorkspaceFolders:()=>disposable(),onDidChangeConfiguration:()=>disposable(),isTrusted:true,workspaceFolders:[folder],getConfiguration:()=>({get:(key,fallback)=>({juliaExecutable:'julia',runnerProject:'perf',suite:'perf/suite.jl',
-      factory:'build_suite',profile:'quick',reports:'perf/results/vscode',uiConfiguration:'perf/perfchecker-ui.json'})[key]??fallback,inspect:()=>undefined}),
+      factory:'build_suite',profile:'quick',reports:'perf/results/vscode',uiConfiguration:'perf/perfchecker-ui.json',...advisorSettings})[key]??fallback,inspect:()=>undefined,
+      update:()=>{throw new Error('Opening a connection form must not write settings.');}}),
       textDocuments:[],getWorkspaceFolder:()=>folder,asRelativePath:value=>path.relative(root,value)},
     window:{onDidCloseTerminal:()=>disposable(),onDidChangeActiveTextEditor:()=>disposable(),
       createOutputChannel:()=>({...disposable(),show(){},append(){},appendLine(){}}),
@@ -43,7 +44,9 @@ test('real webviews preserve full selection, handle Git targets and render inter
         panels.push(panel);return panel;
       }},
     tests:{createTestController:()=>({...disposable(),items:items(),createRunProfile(){},createTestItem:(id,label)=>({id,label,children:items()})})},
-    commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();}},
+    commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async(name,...args)=>{
+      assert(commands.has(name),`Unexpected command: ${name}`);return commands.get(name)(...args);
+    }},
     extensions:{getExtension:()=>undefined},
   };
   const spawn=(_executable,args)=>{
@@ -86,7 +89,10 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await mkdir(path.join(reports,'bundles','run-fixture'),{recursive:true});
     const observationFile=path.join(reports,'bundles','run-fixture','observations.jsonl'),observationBytes=observations.map(value=>JSON.stringify(value)).join('\n');
     await writeFile(observationFile,observationBytes);
-    const original=Module._load;Module._load=function(name,...args){return name==='vscode'?vscode:name==='./investigation'?{registerInvestigations(){}}:name==='./testitems'?{registerNativeTestItems(){}}:name==='node:child_process'?{...original.call(this,name,...args),spawn}:original.call(this,name,...args);};
+    const original=Module._load;Module._load=function(name,...args){return name==='vscode'?vscode:name==='./investigation'?{registerInvestigations(context){
+      require('../dist/advisorSetup.js').registerAdvisorSetup(context);
+      require('../dist/mcpStdioIntegration.js').registerMcpStdioConnections(context,()=>false,()=>{});
+    }}:name==='./testitems'?{registerNativeTestItems(){}}:name==='node:child_process'?{...original.call(this,name,...args),spawn}:original.call(this,name,...args);};
     try{require('../dist/extension.js').activate({subscriptions:[],extensionUri:uri(path.resolve('.')),globalStorageUri:uri(path.join(temporary,'storage'))});}finally{Module._load=original;}
     await commands.get('perfchecker.openDesignerForWorkspace')(folder.uri);
     await commands.get('perfchecker.openOutput')();
@@ -113,7 +119,7 @@ test('real webviews preserve full selection, handle Git targets and render inter
       const name=path.basename(pathname);const contentType=name.endsWith('.js')?'application/javascript':name.endsWith('.css')?'text/css':'image/png';
       await route.fulfill({contentType,body:await readFile(path.resolve('media',name))});
     });
-    const load=async type=>{html=panels.find(panel=>panel.type===type).webview.html;await page.goto('http://perfchecker.test/view');};
+    const load=async type=>{html=panels.findLast(panel=>panel.type===type&&!panel.disposed).webview.html;await page.goto('http://perfchecker.test/view');};
     const send=message=>page.evaluate(value=>{
       if(value.type==='targetOptions' && value.requestId===undefined)value.requestId=window.messages.findLast(item=>item.type==='discoverTargets').requestId;
       window.dispatchEvent(new MessageEvent('message',{data:value}));
@@ -310,6 +316,38 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await page.locator('[data-action="chat"]').focus();await page.keyboard.press('Enter');assert.equal((await page.evaluate(()=>window.messages.at(-1))).action,'chat');
     if(process.env.PERFCHECKER_QA_DIR)await page.screenshot({path:path.join(process.env.PERFCHECKER_QA_DIR,'studio.png'),fullPage:true});
     await page.setViewportSize({width:420,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+    const advisorFile=path.join(root,'perf','advisor.json');
+    const advisorBytes=JSON.stringify({protocol:'mcp_http',endpoint:'https://previous.example.test/mcp',mcp_tool:'previous_advice'})+'\n';
+    await writeFile(advisorFile,advisorBytes);
+    Object.assign(advisorSettings,{advisorEnabled:false,advisorConfig:'perf/advisor.json',advisorMcpStdioCommand:process.execPath,
+      advisorMcpStdioArguments:['server fixture.js','--label=<fixture>'],advisorMcpStdioDirectory:root});
+    const savedAdvisorSettings=JSON.stringify(advisorSettings),beforeOpen=spawned.length;
+    const {localAdvisorConnection}=require('../dist/advisorConnection.js');
+    await commands.get('perfchecker.configureAdvisor')();await load('perfchecker.advisorSetup');
+    assert.equal(await page.locator('#advisor-protocol').inputValue(),'none');
+    assert.equal(await page.getByRole('button',{name:'Test connection / discover',exact:true}).isDisabled(),true);
+    // Exercise the real explicit command -> AdvisorSetup.open -> generated HTML under its CSP.
+    await commands.get('perfchecker.connectMcpStdio')();
+    const stdioPanel=panels.findLast(panel=>panel.type==='perfchecker.advisorSetup'&&!panel.disposed);
+    const stdioInitial=JSON.parse(stdioPanel.webview.html.match(/m=>api\.postMessage\(m\),(\{.*\})\);window\.addEventListener/)[1]);
+    assert.equal(stdioInitial.enabled,true);assert.equal(stdioInitial.config.protocol,'mcp_stdio');
+    await load('perfchecker.advisorSetup');
+    assert.equal(await page.locator('#advisor-protocol').inputValue(),'mcp_stdio');
+    assert.equal(await page.locator('#advisor-stdio_command').inputValue(),process.execPath);
+    assert.deepEqual(JSON.parse(await page.locator('#advisor-stdio_args').inputValue()),advisorSettings.advisorMcpStdioArguments);
+    assert.equal(await page.locator('#advisor-stdio_cwd').inputValue(),root);
+    assert.equal(await page.locator('#advisor-stdio_command').isVisible(),true);
+    assert.equal(await page.getByRole('button',{name:'Test connection / discover',exact:true}).isEnabled(),true);
+    assert.equal(await page.getByRole('button',{name:'Cancel operation',exact:true}).isDisabled(),true);
+    assert.equal(await page.getByRole('status').innerText(),'Ready.');
+    assert.deepEqual(await page.evaluate(()=>window.messages),[],'Opening the form sends no discovery or connection request');
+    assert.equal(spawned.length,beforeOpen);assert.equal(JSON.stringify(advisorSettings),savedAdvisorSettings);
+    assert.equal(await readFile(advisorFile,'utf8'),advisorBytes);assert.equal(localAdvisorConnection(folder.uri.toString()),undefined);
+    stdioPanel.dispose();await commands.get('perfchecker.configureAdvisor')();await load('perfchecker.advisorSetup');
+    assert.equal(await page.locator('#advisor-protocol').inputValue(),'none','Closing the explicit draft preserves the disabled saved provider');
+    assert.equal(spawned.length,beforeOpen);assert.equal(await readFile(advisorFile,'utf8'),advisorBytes);
+    assert.equal(localAdvisorConnection(folder.uri.toString()),undefined);
+    panels.findLast(panel=>panel.type==='perfchecker.advisorSetup'&&!panel.disposed).dispose();
     assert.deepEqual(errors,[]);
     const other={name:'other',uri:uri(path.join(temporary,'other'))};vscode.workspace.workspaceFolders.push(other);
     await commands.get('perfchecker.openStudioForWorkspace')(other.uri);

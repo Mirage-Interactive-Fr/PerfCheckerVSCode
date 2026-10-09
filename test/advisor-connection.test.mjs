@@ -30,6 +30,34 @@ let readAdvisorConfiguration,AdvisorSetup,AdvisorChat;
 try{({readAdvisorConfiguration,AdvisorSetup}=require('../dist/advisorSetup.js'));({AdvisorChat}=require('../dist/advisorChat.js'));}finally{Module._load=original;}
 const {setLocalAdvisorConnection,localAdvisorConnection}=require('../dist/advisorConnection.js');
 
+test('explicit stdio Open activates only its draft when the saved advisor is disabled',async()=>{
+  const root=await mkdtemp(path.join(tmpdir(),'perfchecker-disabled-advisor-')),key=`file://${root}`;
+  const folder={uri:{fsPath:root,toString:()=>key}},context={extensionUri:folder.uri,subscriptions:[]};
+  const bytes=JSON.stringify({protocol:'mcp_http',endpoint:'https://previous.example.test/mcp',mcp_tool:'previous_advice'})+'\n';
+  await writeFile(path.join(root,'advisor.json'),bytes);
+  const previous={...saved},beforeSpawn=spawned;
+  Object.assign(saved,{advisorEnabled:false,advisorMcpStdioCommand:process.execPath,
+    advisorMcpStdioArguments:['server fixture.js','--label=<fixture>'],advisorMcpStdioDirectory:root});
+  const settingsBefore=JSON.stringify(saved),setup=new AdvisorSetup(context);setup.folder=()=>folder;
+  const formData=()=>JSON.parse(panel.webview.html.match(/m=>api\.postMessage\(m\),(\{.*\})\);window\.addEventListener/)[1]);
+  try {
+    await setup.open();const ordinary=formData();
+    assert.equal(ordinary.enabled,false);assert.equal(ordinary.config.protocol,'mcp_http');
+    await setup.open({stdio:true});const explicit=formData();
+    assert.equal(explicit.enabled,true);assert.equal(explicit.config.protocol,'mcp_stdio');
+    assert.equal(explicit.config.stdio_command,process.execPath);
+    assert.deepEqual(explicit.config.stdio_args,saved.advisorMcpStdioArguments);assert.equal(explicit.config.stdio_cwd,root);
+    assert.equal(ordinary.config.protocol,'mcp_http','Opening stdio never mutates the saved-provider draft');
+    assert.equal(JSON.stringify(saved),settingsBefore);assert.equal(spawned,beforeSpawn);
+    assert.equal(localAdvisorConnection(key),undefined);assert.equal(await readFile(path.join(root,'advisor.json'),'utf8'),bytes);
+    assert.deepEqual(await readdir(root),['advisor.json']);
+    panel.dispose();await setup.open();assert.equal(formData().enabled,false,'Normal settings remain disabled after closing the stdio draft');
+  } finally {
+    setup.dispose();for(const name of Object.keys(saved))delete saved[name];Object.assign(saved,previous);
+    await rm(root,{recursive:true,force:true});
+  }
+});
+
 test('explicit local connection overrides a saved file in memory and restores it byte for byte',async()=>{
   const root=await mkdtemp(path.join(tmpdir(),'perfchecker-connection-')), key=`file://${root}`;
   const folder={name:'fixture',uri:{fsPath:root,toString:()=>key}};

@@ -80,9 +80,12 @@ export class AdvisorSetup implements vscode.Disposable {
     }
     const generation = this.connectionGeneration(workspace);
     const initial = await this.initial();
-    if (options?.stdio && !localAdvisorConnection(workspace)) initial.config = {...initial.config, protocol: 'mcp_stdio',
-      stdio_command: this.settings().get('advisorMcpStdioCommand', ''), stdio_args: this.settings().get('advisorMcpStdioArguments', []),
-      stdio_cwd: this.settings().get('advisorMcpStdioDirectory', '') || this.root()};
+    if (options?.stdio && !localAdvisorConnection(workspace)) {
+      initial.enabled = true;
+      initial.config = {...initial.config, protocol: 'mcp_stdio',
+        stdio_command: this.settings().get('advisorMcpStdioCommand', ''), stdio_args: this.settings().get('advisorMcpStdioArguments', []),
+        stdio_cwd: this.settings().get('advisorMcpStdioDirectory', '') || this.root()};
+    }
     this.assertWorkspace(workspace);
     if (generation !== this.connectionGeneration(workspace)) throw new Error('Advisor connection changed. Reopen settings to load your provider.');
     this.panelWorkspace = workspace;
