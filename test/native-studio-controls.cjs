@@ -132,7 +132,12 @@ async function controllerLaunches() {
   return Promise.all(names.map(async file=>({file,commands:(await fs.readFile(path.join(root,file),'utf8')).split(/\r?\n/).filter(line=>line.startsWith('> '))})));
 }
 
-async function nativeSuiteWorker() {
+async function nativeSuiteWorker(context) {
+  if(process.platform==='darwin'&&context.processInventory){
+    const inventory=await context.processInventory('suite-active-worker');
+    assert(inventory.direct.length<=1,'Exactly one owned suite controller may match the selected real run');
+    const row=inventory.direct[0];return row&&{pid:row.pid,parent:row.parent,executable:row.canonicalExecutable,started:row.started};
+  }
   const {execFile}=require('node:child_process'),{promisify}=require('node:util'),execute=promisify(execFile);
   const expected=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
   let rows;
@@ -141,8 +146,11 @@ async function nativeSuiteWorker() {
       `$ErrorActionPreference='Stop'; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.ParentProcessId -eq ${process.pid} -and $_.Name -like 'julia*' } | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;executable=$_.ExecutablePath;started=$_.CreationDate.ToUniversalTime().ToString('o')} }); ConvertTo-Json -InputObject $rows -Compress`],{timeout:10000});
     rows=JSON.parse(stdout);
   }else{
-    const {stdout}=await execute('ps',['-eo','pid=,ppid=,args='],{timeout:10000});
-    rows=stdout.split('\n').flatMap(line=>{const match=/^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),command:match[3]}]:[];});
+    const survey=execute('ps',['-eo','pid=,ppid=,args='],{timeout:10000}),observerPid=survey.child.pid;
+    const {stdout}=await survey;
+    rows=stdout.split('\n').flatMap(line=>{const match=/^\s*(\d+)\s+(\d+)(?:\s+(.*))?$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),command:match[3]||''}]:[];});
+    const observer=rows.find(row=>row.pid===observerPid);if(observer)assert.equal(observer.parent,process.pid);
+    rows=rows.filter(row=>row.pid!==observerPid);
   }
   assert(Array.isArray(rows),'The native process inventory returns an actual list');
   const matches=[];
@@ -158,9 +166,8 @@ async function nativeSuiteWorker() {
         if(['Z','X'].includes(fields[0]))continue;
         started=fields[19];assert(/^\d+$/.test(started),'The kernel supplies actual process start ticks');
       }else{
-        if(!/julia/i.test(row.command))continue;
         const {stdout}=await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:10000});
-        const paths=stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+        const paths=await Promise.all(stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1)).catch(()=>line.slice(1))));
         if(!paths.includes(expected))continue;
         executable=expected;started=(await execute('ps',['-p',String(row.pid),'-o','lstart='],{timeout:10000})).stdout.trim();
         assert(started&&Number.isFinite(Date.parse(started)),'macOS supplies an actual process start identity');
@@ -929,7 +936,7 @@ exports.runSelection = async context => {
     }catch(error){if(error.code==='ENOENT'||error instanceof SyntaxError)return false;throw error;}
   };
   const active=await eventually(async()=>{
-    const worker=await nativeSuiteWorker(),snapshot=await state();
+    const worker=await nativeSuiteWorker(context),snapshot=await state();
     if(worker&&Object.values(snapshot.controls).every(Boolean))return {worker,snapshot};
     if(await freshReport())return {finished:true};return false;
   },'The existing selected suite has an owned active controller and busy controls, or completes with fresh real evidence',30000);
@@ -941,7 +948,7 @@ exports.runSelection = async context => {
   view=await frame(context,'#cards');
   let activeBusyHydrationQualified=false;
   await eventually(async()=>{
-    const worker=await nativeSuiteWorker(),snapshot=await state();
+    const worker=await nativeSuiteWorker(context),snapshot=await state();
     if(worker&&active.worker){
       assert.deepEqual(worker,active.worker,'The reloaded panel keeps the same actual owned Julia controller identity');
       assert.deepEqual(snapshot,active.snapshot);activeBusyHydrationQualified=true;return true;

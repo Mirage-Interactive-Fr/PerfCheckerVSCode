@@ -3,6 +3,11 @@ const vscode = require('vscode');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const {createHash}=require('node:crypto');
+const {execFile}=require('node:child_process');
+const {promisify}=require('node:util');
+const execute=promisify(execFile);
+const processObservationSignatures=new WeakMap();
 const {chromium} = require('playwright');
 const controls = require('./native-studio-controls.cjs');
 const mcp = require('./native-mcp-controls.cjs');
@@ -179,13 +184,150 @@ async function eventually(read, description, timeout = 120000) {
   throw new Error(`${description}${last ? `: ${last.message}` : ''}`);
 }
 
+// Read only the runner-owned process tree. Arguments help diagnose phases;
+// they never establish ownership or executable identity.
+async function macProcessInventory(context,stage,port,knownIdentities=[]){
+  assert.equal(process.platform,'darwin');
+  const expectedExecutable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
+  const survey=execute('ps',['-eo','pid=,ppid=,args='],{timeout:10000,maxBuffer:4*1024*1024});
+  const observerPid=survey.child.pid,{stdout}=await survey;
+  const all=stdout.split('\n').flatMap(line=>{const match=/^\s*(\d+)\s+(\d+)(?:\s+(.*))?$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),arguments:match[3]||''}]:[];});
+  const observer=all.find(row=>row.pid===observerPid);
+  if(observer)assert.equal(observer.parent,process.pid,'Only the actual ps observer owned by this host is excluded');
+  const owned=new Set([process.pid]);
+  for(let changed=true;changed;){changed=false;for(const row of all){
+    if(row.pid===observerPid||owned.has(row.pid)||!owned.has(row.parent))continue;
+    owned.add(row.pid);changed=true;
+  }}
+  const errors=[],rows=[];
+  const relevant=all.filter(row=>row.pid!==process.pid&&(owned.has(row.pid)||knownIdentities.some(prior=>prior.pid===row.pid)));
+  await Promise.all(relevant.map(async row=>{
+    let before;
+    try{
+      const identity=async()=>{
+        const value=(await execute('ps',['-p',String(row.pid),'-o','ppid=','-o','lstart='],{timeout:3000})).stdout.trim();
+        const match=/^(\d+)\s+(.+)$/.exec(value);assert(match&&Number.isFinite(Date.parse(match[2])),'macOS supplies a real parent and lstart');
+        return {parent:Number(match[1]),started:match[2],createdAt:new Date(Date.parse(match[2])).toISOString()};
+      };
+      before=await identity();assert.equal(before.parent,row.parent);
+      const mappings=(await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:3000})).stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+      const canonicalMappings=await Promise.all(mappings.map(value=>fs.realpath(value).catch(()=>value)));
+      assert.deepEqual(await identity(),before,'The observed process retains its parent and start identity while its executable is inspected');
+      const projects=[...row.arguments.matchAll(/--project(?:=|\s+)([^\s]+)/g)].map(match=>match[1]).filter(value=>value.startsWith(process.env.PERFCHECKER_NATIVE_SESSION+path.sep));
+      rows.push({pid:row.pid,...before,canonicalExecutable:canonicalMappings.includes(expectedExecutable)?expectedExecutable:undefined,
+        executableMappings:canonicalMappings.slice(0,8),projects,argumentsCharacters:row.arguments.length});
+    }catch(error){if(before)rows.push({pid:row.pid,...before,identityOnly:true});errors.push({pid:row.pid,parent:row.parent,error:redact(error)});}
+  }));
+  let listeners=[];
+  if(port!==undefined){
+    assert(Number.isInteger(port)&&port>0&&port<65536);
+    try{const value=await execute('lsof',['-nP',`-iTCP:${port}`,'-sTCP:LISTEN','-Fpn'],{timeout:3000});
+      let pid;for(const line of value.stdout.split('\n')){
+        if(/^p\d+$/.test(line))pid=Number(line.slice(1));
+        else if(line===`n127.0.0.1:${port}`&&pid)listeners.push({pid,port,address:'127.0.0.1',state:'Listen'});
+      }
+    }catch(error){if(error.code!==1)errors.push({port,error:redact(error)});}
+  }
+  rows.sort((a,b)=>a.pid-b.pid);errors.sort((a,b)=>(a.pid||0)-(b.pid||0));
+  const inventory={stage,observedAt:new Date().toISOString(),hostPid:process.pid,expectedExecutable,observerPid,
+    observerParentVerified:!!observer,presentPids:relevant.map(row=>row.pid),rows,direct:rows.filter(row=>row.parent===process.pid&&row.canonicalExecutable===expectedExecutable),listeners,errors};
+  const signature=JSON.stringify({stage,rows,listeners,errors});
+  if(processObservationSignatures.get(context)!==signature){context.log('native-macos-owned-processes',inventory);processObservationSignatures.set(context,signature);}
+  return inventory;
+}
+
+async function observeNativeWork(context,stage){
+  const settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
+  const diagnostic={stage,observedAt:new Date().toISOString(),hostPid:process.pid,processArch:process.arch,
+    workspace:context.workspace,workspaceUri:context.vscode.Uri.file(context.workspace).toString(),trusted:context.vscode.workspace.isTrusted,visibleControls:[],
+    testItemSettings:Object.fromEntries(['testItemTags','testItemExcludeTags','testItemSamples'].map(key=>[key,settings.get(key)])),files:[],reports:[],testingRows:[],errors:[]};
+  for(const root of [...new Set([context.controller,context.target,path.resolve(context.workspace,settings.get('plutoProject','perf/pluto'))])]){
+    for(const name of ['Project.toml','Manifest.toml'])try{const file=path.join(root,name),bytes=await fs.readFile(file),stat=await fs.stat(file);
+      diagnostic.files.push({file,sha256:createHash('sha256').update(bytes).digest('hex'),modifiedAt:stat.mtime.toISOString()});
+    }catch(error){diagnostic.errors.push({file:path.join(root,name),error:String(error)});}
+  }
+  const source=path.join(context.workspace,'test','performance.jl');
+  try{diagnostic.testItemSource={file:source,sha256:createHash('sha256').update(await fs.readFile(source)).digest('hex')};}catch(error){diagnostic.errors.push({file:source,error:String(error)});}
+  try{diagnostic.testingRows=(await context.windowPage.locator('.monaco-list-row[aria-label]').evaluateAll(rows=>rows.map(row=>row.getAttribute('aria-label')))).filter(value=>/performance\.jl|Vector reduction|Passed|Failed|Errored/i.test(value)).slice(0,30);}catch(error){diagnostic.errors.push({surface:'Testing',error:String(error)});}
+  for(const frame of context.windowPage.frames())try{
+    if(!await frame.locator('#run,#app .status').first().isVisible().catch(()=>false))continue;
+    diagnostic.visibleControls.push(await frame.evaluate(()=>({
+      busy:document.getElementById('run')?.disabled,status:document.querySelector('#app .status')?.textContent?.slice(-1000),
+      progress:document.getElementById('progress')?.textContent?.slice(-1000),error:document.getElementById('designer-error')?.textContent?.slice(-2000),
+      selection:document.getElementById('count')?.textContent,controls:[...document.querySelectorAll('#run,#save,#app button')].slice(0,20).map(node=>({id:node.id,text:node.textContent?.slice(0,80),disabled:node.disabled}))
+    })));
+  }catch(error){diagnostic.errors.push({surface:'webview',error:String(error)});}
+  const plan=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json');
+  try{const bytes=await fs.readFile(plan),stat=await fs.stat(plan);diagnostic.files.push({file:plan,sha256:createHash('sha256').update(bytes).digest('hex'),modifiedAt:stat.mtime.toISOString()});}catch(error){diagnostic.errors.push({file:plan,error:String(error)});}
+  const roots=[path.join(context.workspace,'perf','results'),path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','native-testitems')];
+  for(const root of roots){
+    const names=(await fs.readdir(root,{recursive:true}).catch(()=>[])).filter(name=>/(?:result|diagnosis|list|discovery|run)\.json$/.test(name)).slice(-24);
+    for(const name of names)try{const file=path.join(root,name),bytes=await fs.readFile(file),stat=await fs.stat(file);if(bytes.length>5000000)continue;
+      const value=JSON.parse(bytes);diagnostic.reports.push({file,sha256:createHash('sha256').update(bytes).digest('hex'),modifiedAt:stat.mtime.toISOString(),schema:value.schema_version,
+        status:value.status,passed:value.passed,runId:value.run_id,runs:value.runs?.map(run=>({id:run.id,status:run.status,qualification:run.qualification})).slice(0,20),
+        records:value.records?.map(record=>({tool:record.tool,status:record.status,message:record.message})).slice(0,12)});
+    }catch(error){diagnostic.errors.push({file:path.join(root,name),error:String(error)});}
+  }
+  const logs=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'logs');diagnostic.outputTails=[];
+  const names=(await fs.readdir(logs,{recursive:true}).catch(()=>[])).filter(file=>/(?:\d+-)?PerfChecker(?: investigations| test items| Pluto)?\.log$/.test(path.basename(file)));
+  for(const name of names.slice(-4))try{const handle=await fs.open(path.join(logs,name),'r');
+    try{const stat=await handle.stat(),bytes=Buffer.alloc(Math.min(stat.size,2000));await handle.read(bytes,0,bytes.length,Math.max(0,stat.size-bytes.length));diagnostic.outputTails.push({channel:path.basename(name),tail:redact(bytes.toString('utf8'))});}finally{await handle.close();}
+  }catch(error){diagnostic.errors.push({channel:name,error:String(error)});}
+  if(process.platform==='darwin')diagnostic.processes=await macProcessInventory(context,stage);
+  context.log('native-work-phase-diagnostic',diagnostic);return diagnostic;
+}
+
+async function runSuiteCases(context,runCase,options={}){
+  const {vscode,workspace,findFrame,proof}=context,uri=vscode.Uri.file(workspace);
+  const selected=await runCase('native-suite-run-button',async()=>{context.results=await controls.runSelection(context);});
+  await runCase('native-suite-save-palette', async () => {
+          if(options.blockDependents&&!selected)throw Object.assign(new Error('Blocked by native-suite-run-button; no dependent action was executed'),{blockedBy:'native-suite-run-button'});
+          await vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace', uri);
+          const frame = await findFrame('#save');
+          await frame.locator('#save').click();
+          await eventually(() => fs.readFile(path.join(workspace, 'perf', 'perfchecker-ui.json'), 'utf8').then(JSON.parse), 'Native Save button writes the shared configuration');
+          const title = `Unsaved palette state ${Date.now()}`;
+          await frame.locator('#doc-title').fill(title);
+          await vscode.commands.executeCommand('perfchecker.saveConfiguration');
+          const saved = JSON.parse(await fs.readFile(path.join(workspace, 'perf', 'perfchecker-ui.json'), 'utf8'));
+          assert.equal(saved.documentation.blocks[0].title, title, 'Palette Save persists current unsaved editor state');
+        });
+  await runCase('native-run-selection-command',async()=>{
+          if(options.blockDependents&&!selected)throw Object.assign(new Error('Blocked by native-suite-run-button; no dependent action was executed'),{blockedBy:'native-suite-run-button'});
+          const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
+          const run=plan.runs.find(run=>run.status==='ready'&&run.backend==='benchmark');assert(run);
+          await vscode.commands.executeCommand('perfchecker.openEntrypoint',run);
+          assert.equal(vscode.window.activeTextEditor.document.uri.fsPath,vscode.Uri.file(run.entrypoint).fsPath);
+          proof('native-workload-command',{command:'perfchecker.openEntrypoint',entrypoint:run.entrypoint});
+          await vscode.commands.executeCommand('perfchecker.runNode',{runs:[run]});
+          const report=JSON.parse(await fs.readFile(path.join(context.results,'suite-result.json'),'utf8'));
+          assert.equal(report.runs.length,1);assert.equal(report.runs[0].status,'pass');
+        });
+  if(options.testItem)await runCase('native-testitem-measurement',()=>measureNativeTestItem(context,true));
+  if(options.complete){
+    await runCase('native-complete-suite-measurements',async()=>{
+            if(options.blockDependents&&!selected)throw Object.assign(new Error('Blocked by native-suite-run-button; no dependent action was executed'),{blockedBy:'native-suite-run-button'});
+            await vscode.commands.executeCommand('perfchecker.runAll');
+            const report=JSON.parse(await fs.readFile(path.join(context.results,'suite-result.json'),'utf8'));
+            const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
+            const backend=run=>plan.runs.find(item=>item.package===run.package && item.feature===run.feature && item.version===run.version)?.backend;
+            const ready=report.runs.filter(run=>run.status==='pass');
+            assert(ready.length>1);assert(report.runs.every(run=>['pass','unavailable'].includes(run.status)),'Available collectors pass correctness; only known unavailable checks may remain');
+            assert.deepEqual(new Set(report.runs.filter(run=>run.package==='Example').map(run=>run.version)),new Set(['0.5.0','0.5.3','0.5.4','0.5.5']));
+            proof('all-supported-collectors-measured',{collectors:[...new Set(ready.map(backend))],checks:ready.length,unavailable:report.runs.filter(run=>run.status==='unavailable').map(run=>({backend:backend(run),reason:run.message})),versions:['0.5.0','0.5.3','0.5.4','0.5.5']});
+          });
+  }
+}
+
 async function measureNativeTestItem(context,expectedPassed,options={}){
   const {vscode,windowPage,workspace}=context;
+  await context.observeWork?.('testitems-before-discovery');
   await controls.clickStudioAction(context,'items');
   await controls.clickStudioAction(context,'testing');
   const filename=options.file||'test/performance.jl',name=options.name||'Vector reduction';
   const row=windowPage.locator(`.monaco-list-row[aria-label*="${filename}"]`).filter({hasText:name}).first();
   await row.waitFor({state:'visible',timeout:120000});await row.hover();
+  await context.observeWork?.('testitems-real-tree-ready');
   const button=row.locator('.action-label[title="Run Test"],.action-label[aria-label="Run Test"],.action-label.codicon-testing-run-icon').first();
   const storage=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','native-testitems');
   const before=new Set(await fs.readdir(storage).catch(()=>[]));
@@ -203,6 +345,7 @@ async function measureNativeTestItem(context,expectedPassed,options={}){
     }
   },'The actual Test Explorer Run button returns fresh worker evidence',180000);
   assert.equal(measured.payload.passed,expectedPassed);assert.equal(measured.payload.runs.length,1);
+  await context.observeWork?.('testitems-current-evidence-before-teardown');
   if(options.samples!==undefined)assert.equal(measured.payload.runs[0].samples.length,options.samples);
   const retained=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'worker-evidence',process.env.PERFCHECKER_NATIVE_PHASE,
     options.retainName||(expectedPassed?'native-testitem-passed':'native-testitem-missing-target'),'result.json');
@@ -245,7 +388,7 @@ exports.run = async () => {
   assert.equal(await fs.realpath(workspace),path.join(await fs.realpath(session),'workspace'),
     'The native host must operate only on the exact workspace created by its runner');
   const checks = [], failures = [];
-  let browser, windowPage,commands=[],activeCase;
+  let browser, windowPage,commands=[],activeCase,nativeContext;
   let pendingReport=Promise.resolve();
   let configurationProperties={};
   const timing=()=>({observedAt:new Date().toISOString(),...(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT?
@@ -261,6 +404,8 @@ exports.run = async () => {
   const retainEvidence=async name=>{
     const directory=path.join(output,'worker-evidence',phase,name);
     const origins=['perf/results','perf/notebooks'].map(relative=>({root:workspace,relative,prefix:''}));
+    if(['testitems-ready','suite','diagnosis','pluto'].includes(phase))origins.push({
+      root:path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode'),relative:'native-testitems',prefix:'host-storage'});
     if(phase==='landscape'){
       const root=process.env.PERFCHECKER_NATIVE_LANDSCAPE_WORKSPACE;
       assert.equal(root,path.join(session,'landscape'),'Only the runner-owned game reports are retained');
@@ -279,17 +424,24 @@ exports.run = async () => {
     activeCase=name;await persist();
     log('native-case-start',{action:name});
     console.log(`NATIVE_CASE_START ${phase} ${name}`);
+    let observation=Promise.resolve();
+    const observe=stage=>{observation=observation.then(()=>nativeContext?.observeWork?.(stage)).catch(error=>log('native-work-observation-error',{case:name,error:redact(error)}));return observation;};
+    const observer=nativeContext?.observeWork?setInterval(()=>{void observe(`${name}-pending`);},60000):undefined;
     try {
+      await observe(`${name}-before-action`);
       if((await vscode.commands.getCommands(true)).includes('notifications.clearAll'))await vscode.commands.executeCommand('notifications.clearAll');
       await run(); proof(name, {status: 'passed'});
+      await observe(`${name}-completed-before-teardown`);
       if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(1500);
+      return true;
     }
     catch (error) {
-      failures.push({name, message: redact(error), stack: redact(error.stack)});
+      failures.push({name,status:error.blockedBy?'blocked':'failed',blockedBy:error.blockedBy,message: redact(error), stack: redact(error.stack)});
       console.error(`NATIVE_FAILURE ${name}: ${redact(error.stack || error)}`);
+      await observe(`${name}-failed-before-cleanup`);
       // Keep a short terminal witness even if GitHub cannot upload the larger
       // evidence archive. This only observes the real panel and owned log files.
-      const diagnostic={case:name,visibleDesigner:[],outputTails:[]};
+      const diagnostic={case:name,observedAt:new Date().toISOString(),visibleDesigner:[],outputTails:[]};
       try{
         for(const context of browser?.contexts()||[])for(const page of context.pages())for(const frame of page.frames()){
           if(!await frame.locator('#run').isVisible().catch(()=>false))continue;
@@ -313,8 +465,9 @@ exports.run = async () => {
       log('native-failure-diagnostic',diagnostic);
       await windowPage?.screenshot({path: path.join(output, `${phase}-${name}.png`)}).catch(() => {});
       await persist();await retainEvidence(name);
+      return false;
     }
-    finally{activeCase=undefined;await persist();}
+    finally{clearInterval(observer);await observation;activeCase=undefined;await persist();}
   };
   try {
     browser = await eventually(() => chromium.connectOverCDP('http://127.0.0.1:9222'), 'Connect to the disposable Electron host');
@@ -373,6 +526,9 @@ exports.run = async () => {
       controller: process.env.PERFCHECKER_NATIVE_CONTROLLER, target: process.env.PERFCHECKER_NATIVE_TARGET,
       results: path.join(workspace, 'perf', 'results', 'vscode'), log, proof, findFrame,
       core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION};
+    nativeContext=context;
+    if(process.platform==='darwin')context.processInventory=(stage,port,known)=>macProcessInventory(context,stage,port,known);
+    if(['testitems-ready','suite','diagnosis','pluto'].includes(phase))context.observeWork=stage=>observeNativeWork(context,stage);
     context.measureTestItem=options=>measureNativeTestItem(context,true,options);
     log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 
@@ -400,6 +556,10 @@ exports.run = async () => {
       }else if(phase==='studio-ordering')await runCase('native-plan-pagination-and-ordering',()=>controls.runOrdering(context));
       else if(phase==='workbench')await runCase('native-workbench-controls',()=>workbench.run(context));
       else if(phase==='testitems')await runCase('native-testitem-missing-target',()=>measureNativeTestItem(context,false));
+      else if(phase==='testitems-ready')await runCase('native-testitem-measurement',()=>measureNativeTestItem(context,true,{samples:settings.get('testItemSamples',1)}));
+      else if(phase==='suite')await runSuiteCases(context,runCase,{complete:true,blockDependents:true});
+      else if(phase==='diagnosis')await runCase('native-diagnosis-controls',()=>investigations.runDiagnosis(context));
+      else if(phase==='pluto')await runCase('native-pluto-controls',()=>pluto.run(context));
       else if(phase==='advisor')await runCase('native-advisor-controls',()=>advisor.run(context));
       else if(phase==='investigation-limits')await runCase('native-investigation-limits',()=>require('./native-investigation-limits.cjs').run(context));
       else if(phase==='investigation')await runCase('native-investigation-controls',()=>investigations.run(context));
@@ -545,40 +705,8 @@ exports.run = async () => {
           assert.equal(document.notebookType, 'jupyter-notebook');
           await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
         });
-        await runCase('native-suite-run-button', async () => {context.results = await controls.runSelection(context);});
-        await runCase('native-suite-save-palette', async () => {
-          await vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace', uri);
-          const frame = await findFrame('#save');
-          await frame.locator('#save').click();
-          await eventually(() => fs.readFile(path.join(workspace, 'perf', 'perfchecker-ui.json'), 'utf8').then(JSON.parse), 'Native Save button writes the shared configuration');
-          const title = `Unsaved palette state ${Date.now()}`;
-          await frame.locator('#doc-title').fill(title);
-          await vscode.commands.executeCommand('perfchecker.saveConfiguration');
-          const saved = JSON.parse(await fs.readFile(path.join(workspace, 'perf', 'perfchecker-ui.json'), 'utf8'));
-          assert.equal(saved.documentation.blocks[0].title, title, 'Palette Save persists current unsaved editor state');
-        });
-        await runCase('native-run-selection-command',async()=>{
-          const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
-          const run=plan.runs.find(run=>run.status==='ready'&&run.backend==='benchmark');assert(run);
-          await vscode.commands.executeCommand('perfchecker.openEntrypoint',run);
-          assert.equal(vscode.window.activeTextEditor.document.uri.fsPath,vscode.Uri.file(run.entrypoint).fsPath);
-          proof('native-workload-command',{command:'perfchecker.openEntrypoint',entrypoint:run.entrypoint});
-          await vscode.commands.executeCommand('perfchecker.runNode',{runs:[run]});
-          const report=JSON.parse(await fs.readFile(path.join(context.results,'suite-result.json'),'utf8'));
-          assert.equal(report.runs.length,1);assert.equal(report.runs[0].status,'pass');
-        });
-        await runCase('native-testitem-measurement',()=>measureNativeTestItem(context,true));
+        await runSuiteCases(context,runCase,{testItem:true,complete:process.env.PERFCHECKER_NATIVE_STAGE==='full'});
         if (process.env.PERFCHECKER_NATIVE_STAGE === 'full') {
-          await runCase('native-complete-suite-measurements',async()=>{
-            await vscode.commands.executeCommand('perfchecker.runAll');
-            const report=JSON.parse(await fs.readFile(path.join(context.results,'suite-result.json'),'utf8'));
-            const plan=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json'),'utf8'));
-            const backend=run=>plan.runs.find(item=>item.package===run.package && item.feature===run.feature && item.version===run.version)?.backend;
-            const ready=report.runs.filter(run=>run.status==='pass');
-            assert(ready.length>1);assert(report.runs.every(run=>['pass','unavailable'].includes(run.status)),'Available collectors pass correctness; only known unavailable checks may remain');
-            assert.deepEqual(new Set(report.runs.filter(run=>run.package==='Example').map(run=>run.version)),new Set(['0.5.0','0.5.3','0.5.4','0.5.5']));
-            proof('all-supported-collectors-measured',{collectors:[...new Set(ready.map(backend))],checks:ready.length,unavailable:report.runs.filter(run=>run.status==='unavailable').map(run=>({backend:backend(run),reason:run.message})),versions:['0.5.0','0.5.3','0.5.4','0.5.5']});
-          });
           await runCase('native-all-studio-controls', () => controls.run(context));
           await runCase('native-workbench-controls',()=>workbench.run(context));
           await runCase('native-investigation-controls', () => investigations.run(context));

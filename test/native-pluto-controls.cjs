@@ -182,16 +182,27 @@ async function windowsProcesses(context,stage){
   }
   return {...value,direct,ownedRows:value.rows.filter(row=>owned.has(row.pid))};
 }
-async function windowsSessionOwner(context,state){
+async function sessionInventory(context,stage,port,known=[]){
+  if(process.platform==='win32')return windowsProcesses(context,stage);
+  assert.equal(process.platform,'darwin');assert.equal(typeof context.processInventory,'function');
+  return context.processInventory(stage,port,known);
+}
+function identityGone(inventory,prior){
+  const observed=inventory.rows.find(row=>row.pid===prior.pid);
+  if(observed)return observed.createdAt!==prior.createdAt;
+  // Inspection errors are visible observations, never evidence of death.
+  return !inventory.errors?.some(error=>error.pid===prior.pid)&&!inventory.presentPids?.includes(prior.pid);
+}
+async function sessionOwner(context,state){
   const endpoint=new URL(state.frame.url());assert.equal(endpoint.hostname,'127.0.0.1');
   const port=Number(endpoint.port);assert(Number.isInteger(port)&&port>0&&port<65536);
-  const inventory=await windowsProcesses(context,'running-session');
+  const inventory=await sessionInventory(context,'running-session',port);
   const listeners=inventory.listeners.filter(row=>row.port===port&&row.address==='127.0.0.1'&&row.state==='Listen');
   assert.equal(listeners.length,1,'The exact live iframe port has one listening process');
   const owner=inventory.direct.find(row=>row.pid===listeners[0].pid);
   assert(owner,'The actual session listener is the selected Julia directly owned by the extension host');
   assert.doesNotThrow(()=>process.kill(owner.pid,0),'The physical session owner is alive');
-  context.log('pluto-windows-session-owner',{port,pid:owner.pid,createdAt:owner.createdAt,parent:owner.parent,
+  context.log(process.platform==='win32'?'pluto-windows-session-owner':'pluto-macos-session-owner',{port,pid:owner.pid,createdAt:owner.createdAt,parent:owner.parent,
     canonicalExecutable:owner.canonicalExecutable,exactIframeListener:true,credentialsOmitted:true});
   const owned=new Set([owner.pid]);
   for(let changed=true;changed;){changed=false;for(const row of inventory.rows)
@@ -199,8 +210,8 @@ async function windowsSessionOwner(context,state){
   return {...owner,descendants:inventory.rows.filter(row=>owned.has(row.pid))};
 }
 async function serverPids(context){
-  if(process.platform==='win32'){
-    return new Set((await windowsProcesses(context,'process-survey')).direct.map(row=>row.pid));
+  if(['win32','darwin'].includes(process.platform)){
+    return new Set((await sessionInventory(context,'process-survey')).direct.map(row=>row.pid));
   }
   const {stdout}=await execute('ps',['-eo','pid=,args=']);
   return new Set(stdout.split('\n').filter(line=>line.includes('PERFCHECKER_PLUTO_READY')&&/julia/i.test(line)).map(line=>Number(line.trim().split(/\s+/,1)[0])));
@@ -232,11 +243,11 @@ async function studioNotebookButtons(context,directory){
 async function restartFailureCleanup(context,directory){
   const file=path.join(directory,'RestartCleanup.jl');
   let state=await create(context,file,'investigation');await idle(state.frame);
-  const initialOwner=process.platform==='win32'?await windowsSessionOwner(context,state):undefined;
+  const initialOwner=['win32','darwin'].includes(process.platform)?await sessionOwner(context,state):undefined;
   await stop(context,state);
   if(initialOwner)await eventually(async()=>{
-    const actual=await windowsProcesses(context,'after-initial-stop');
-    return actual.direct.length===0&&initialOwner.descendants.every(prior=>!actual.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt));
+    const actual=await sessionInventory(context,'after-initial-stop',undefined,initialOwner.descendants);
+    return actual.direct.length===0&&initialOwner.descendants.every(prior=>identityGone(actual,prior));
   },'Initial Stop leaves no selected-Julia child or observed session descendant before the failed startup');
   const settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
   const previous=settings.get('plutoProject','perf/pluto'),before=await serverPids(context);let startingPids=[];
@@ -253,10 +264,10 @@ async function restartFailureCleanup(context,directory){
   };
   try{
     const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
-    if(process.platform==='win32'){
+    if(['win32','darwin'].includes(process.platform)){
       assert.equal(before.size,0,'The failed-startup baseline contains no direct selected-Julia child');
       const inventory=await eventually(async()=>{
-        const actual=await windowsProcesses(context,'starting-before-configuration-change');
+        const actual=await sessionInventory(context,'starting-before-configuration-change');
         return actual.direct.length?actual:false;
       },'Restart starts its real selected-Julia process');
       assert.equal(inventory.direct.length,1,'The owned Restart starts exactly one new Julia leader');
@@ -276,12 +287,12 @@ async function restartFailureCleanup(context,directory){
     }else startingPids=await eventually(async()=>{const actual=[...await serverPids(context)].filter(pid=>!before.has(pid));return actual.length?actual:false;},'Restart spawns its real owned Julia server');
     await settings.update('plutoProject','perf/changed-pluto-environment',context.vscode.ConfigurationTarget.WorkspaceFolder);
     await eventually(async()=>{
-      if(process.platform==='win32')remember(await windowsProcesses(context,'startup-configuration-change'));
+      if(['win32','darwin'].includes(process.platform))remember(await sessionInventory(context,'startup-configuration-change',undefined,[...startingIdentities.values()]));
       return /environment changed|Start the action again/.test(await (await context.findFrame('#pluto-restart')).locator('[role="status"]').innerText());
     },'Restart reports a changed environment after starting',240000);
-    if(process.platform==='win32')await eventually(async()=>{
-      const actual=await windowsProcesses(context,'failed-startup-cleanup');remember(actual);
-      return [...startingIdentities.values()].every(prior=>!actual.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt));
+    if(['win32','darwin'].includes(process.platform))await eventually(async()=>{
+      const actual=await sessionInventory(context,'failed-startup-cleanup',undefined,[...startingIdentities.values()]);remember(actual);
+      return [...startingIdentities.values()].every(prior=>identityGone(actual,prior));
     },'The failed startup leader and every observed descendant incarnation exit before harness teardown',90000);
     else await eventually(async()=>{const pids=await serverPids(context);return startingPids.every(pid=>!pids.has(pid));},'Every server from the failed Restart exits',90000);
     assert.equal(await (await context.findFrame('#pluto-restart')).locator('iframe').count(),0);
@@ -296,6 +307,7 @@ async function restartFailureCleanup(context,directory){
       let listeners;
       if(process.platform==='win32'&&port)listeners=JSON.parse((await execute('powershell.exe',['-NoProfile','-Command',
         `@(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { @{pid=$_.OwningProcess;port=$_.LocalPort} }) | ConvertTo-Json -Compress`])).stdout.trim()||'[]');
+      if(process.platform==='darwin'&&port)listeners=(await sessionInventory(context,'failure-listener',port,[...startingIdentities.values()])).listeners;
       context.log('pluto-restart-before-cleanup',{primary:String(error),priorPids:[...before],startingPids,
         currentPids:[...await serverPids(context)],status:current.status,
         listener:{port,open:port?await portOpen(port):false,owners:listeners},credentialsOmitted:true});
@@ -305,15 +317,15 @@ async function restartFailureCleanup(context,directory){
   const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
   state=await view(context);await idle(state.frame);
   assert(await portOpen(Number(new URL(state.frame.url()).port)),'A later successful Restart remains alive');
-  const finalOwner=process.platform==='win32'?await windowsSessionOwner(context,state):undefined;
+  const finalOwner=['win32','darwin'].includes(process.platform)?await sessionOwner(context,state):undefined;
   await stop(context,state,true);
   if(finalOwner)await eventually(async()=>{
-    const actual=await windowsProcesses(context,'after-final-close');
-    return finalOwner.descendants.every(prior=>!actual.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt));
+    const actual=await sessionInventory(context,'after-final-close',undefined,finalOwner.descendants);
+    return finalOwner.descendants.every(prior=>identityGone(actual,prior));
   },'Final Close stops the exact listening session owner and observed descendants before teardown');
   context.proof('pluto-failed-restart-real-worker-cleanup',{failedPids:startingPids.length,
     failedIdentities:[...startingIdentities.values()].map(row=>({pid:row.pid,createdAt:row.createdAt})),
-    nonReadyPhysicalOwnerVerified:process.platform==='win32',exactSuccessfulListenerOwnerVerified:!!finalOwner,
+    nonReadyPhysicalOwnerVerified:['win32','darwin'].includes(process.platform),exactSuccessfulListenerOwnerVerified:!!finalOwner,
     observedDescendantIdentitiesGoneBeforeHarnessCleanup:!!finalOwner,
     newSessionUnaffected:true,staleIframeAbsent:true,remoteForwardingNotEmulated:true});
 }

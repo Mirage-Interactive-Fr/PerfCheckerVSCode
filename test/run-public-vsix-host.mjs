@@ -3,7 +3,8 @@ import path from 'node:path';
 import os from 'node:os';
 import assert from 'node:assert/strict';
 import {createHash,randomUUID} from 'node:crypto';
-import {spawn} from 'node:child_process';
+import {spawn,execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
@@ -32,7 +33,7 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','workbench','advisor','investigation','investigation-limits','studio','studio-ordering','editor','testitems','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['narrative','mcp','mcp-pluto','pluto-plots','pluto','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 // The real game and SDKs are immutable fixtures, never development checkouts.
 // A trailing delimiter expands only Julia's system depots, excluding the human depot.
@@ -43,6 +44,8 @@ const runnerEnvironment=landscapeOnly?{...process.env,JULIA_DEPOT_PATH:path.join
 if(landscapeOnly)for(const key of ['DISPLAY','WAYLAND_DISPLAY','XAUTHORITY','DBUS_SESSION_BUS_ADDRESS',
   'ETENDUE_SDL3_LIBRARY','ETENDUE_SDL3_DLSS_LIBRARY','ETENDUE_JOLTC_LIBRARY'])delete runnerEnvironment[key];
 let landscapeFixture,landscapeObserver,landscapePrimaryError;
+let sessionSafeToRemove=true;
+const inspectCommand=promisify(execFile);
 const landscapeProcesses=new Map(),landscapeObserverErrors=[];
 const landscapeAbort=new AbortController();
 const abortLandscape=()=>landscapeAbort.abort(new Error('The private Landscape runner was interrupted'));
@@ -61,6 +64,110 @@ async function execute(executable, args, options = {}) {
     child.once('error', reject);
     child.once('close', code => code === 0 ? resolve(text) : reject(Object.assign(new Error(`${path.basename(executable)} exited ${code}\n${text.slice(-5000)}`), {commandOutput: text, exitCode: code})));
   });
+}
+
+// This preparation owns its compilation children independently of the import
+// timeout. No uncertain observation is accepted as proof of an empty tree.
+async function executeControllerPreflight(executable,args,receipt){
+  const windows=process.platform==='win32',expected=await fs.realpath(executable);
+  const launcher=path.join(repository,'resources','windows-owned-process.ps1');
+  const ownerExecutable=windows?path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'):expected;
+  if(windows)receipt.windowsJobOwnerSha256=createHash('sha256').update(await fs.readFile(launcher)).digest('hex');
+  const ownerArgs=windows?['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',launcher,
+    '-Executable',expected,'-WorkingDirectory',receipt.project,'-ArgumentsBase64',Buffer.from(JSON.stringify(args)).toString('base64'),'-ParentPid',String(process.pid)]:args;
+  const child=spawn(ownerExecutable,ownerArgs,{cwd:receipt.project,env:runnerEnvironment,windowsHide:true,detached:!windows,stdio:['pipe','pipe','pipe']});
+  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Date.now()+180000;
+  receipt.deadlineAt=new Date(cleanupUntil).toISOString();
+  const limit=maximum=>{const remaining=cleanupUntil-Date.now();if(remaining<=0)throw new Error('Owned preflight inspection exceeded its current preparation or cleanup deadline');return Math.min(maximum,remaining);};
+  receipt.ownership={ownerPid:child.pid,identities:[],observations:[],errors,cleanupQualified:false};
+  const exit=new Promise(resolve=>{child.once('close',(code,signal)=>resolve({code,signal}));child.once('error',error=>{spawnError=error;resolve({error:String(error)});});});
+  child.stdout.on('data',chunk=>{text+=chunk;process.stdout.write(chunk);const ready=/^CONTROLLER_PREFLIGHT_READY (\d+)\r?$/m.exec(text);if(ready)readyPid=Number(ready[1]);});
+  child.stderr.on('data',chunk=>{text+=chunk;process.stderr.write(chunk);});child.stdin.on('error',error=>errors.push({stage:'stdin',error:String(error)}));
+  const canonical=value=>windows?value.toLowerCase():value;
+  const inspect=async row=>{
+    if(windows){assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));return {...row,executable:await fs.realpath(row.executable)};}
+    if(process.platform==='linux'){
+      try{const stat=await fs.readFile(`/proc/${row.pid}/stat`,'utf8'),fields=stat.slice(stat.lastIndexOf(') ')+2).trim().split(/\s+/);if(['Z','X'].includes(fields[0]))return undefined;
+        const result={pid:row.pid,parent:Number(fields[1]),group:Number(fields[2]),started:fields[19],executable:await fs.realpath(`/proc/${row.pid}/exe`)};
+        const after=await fs.readFile(`/proc/${row.pid}/stat`,'utf8');assert.equal(after.slice(after.lastIndexOf(') ')+2).trim().split(/\s+/)[19],result.started);return result;
+      }catch(error){if(['ENOENT','ESRCH'].includes(error.code))return undefined;throw error;}
+    }
+    if(/^Z/.test(row.state))return undefined;
+    assert(Number.isFinite(Date.parse(row.started)),'macOS supplies a real process start date');
+    const after=async()=>{try{const value=(await inspectCommand('ps',['-p',String(row.pid),'-o','ppid=','-o','lstart='],{timeout:limit(3000)})).stdout.trim();return /^(\d+)\s+(.+)$/.exec(value);}catch(error){if(error.code===1&&!String(error.stdout||'').trim())return undefined;throw error;}};
+    const before=await after();if(!before)return undefined;assert.equal(Number(before[1]),row.parent);assert.equal(before[2],row.started);
+    let mappings;
+    try{mappings=(await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)})).stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
+    catch(error){if(!await after())return undefined;throw error;}
+    mappings=await Promise.all(mappings.map(file=>fs.realpath(file).catch(()=>file)));assert(mappings.length);
+    assert.deepEqual(await after(),before,'The process keeps its real parent and lstart while mapped executable paths are read');
+    return {...row,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
+  };
+  const survey=async()=>{
+    let rows;
+    if(windows){const value=await inspectCommand(ownerExecutable,['-NoProfile','-Command',"$ErrorActionPreference='Stop'; @((Get-CimInstance Win32_Process -ErrorAction Stop) | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;started=$(if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null});executable=$_.ExecutablePath} }) | ConvertTo-Json -Compress"],{timeout:limit(10000),maxBuffer:4*1024*1024});rows=JSON.parse(value.stdout);assert(Array.isArray(rows));}
+    else{const value=await inspectCommand('ps',['-eo','pid=,ppid=,pgid=,lstart=,stat='],{timeout:limit(3000),maxBuffer:4*1024*1024});rows=value.stdout.split('\n').flatMap(line=>{
+      const match=/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+(\S+)\s*$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),group:Number(match[3]),started:match[4],state:match[5]}]:[];});}
+    lastRows=rows;const inspected=new Map();
+    const read=async row=>{if(inspected.has(row.pid))return inspected.get(row.pid);try{const current=await inspect(row);inspected.set(row.pid,current);return current;}catch(error){errors.push({pid:row.pid,error:String(error)});inspected.set(row.pid,undefined);return undefined;}};
+    const original=rows.find(row=>row.pid===child.pid),owner=original&&await read(original);
+    if(owner&&!records.size){assert.equal(owner.parent,process.pid);assert.equal(canonical(owner.executable),canonical(await fs.realpath(ownerExecutable)));records.set(owner.pid,owner);}
+    const live=new Set();for(const prior of records.values()){
+      const row=rows.find(value=>value.pid===prior.pid),current=row&&await read(row);
+      if(current?.started===prior.started){
+        if(canonical(current.executable)===canonical(prior.executable))live.add(prior.pid);
+        else errors.push({stage:'owned-executable-changed',pid:prior.pid,started:prior.started,previous:prior.executable,current:current.executable});
+      }
+    }
+    const groupAnchored=!windows&&[...live].some(pid=>inspected.get(pid)?.group===child.pid);
+    for(let changed=true;changed;){changed=false;for(const row of rows){
+      if(records.has(row.pid)||!(live.has(row.parent)||groupAnchored&&row.group===child.pid))continue;
+      const current=await read(row);if(current){records.set(current.pid,current);live.add(current.pid);changed=true;}
+    }}
+    const unknown=rows.filter(row=>!windows&&row.group===child.pid&&!/^[ZX]/.test(row.state)&&!live.has(row.pid));
+    if(unknown.length)errors.push({stage:'unanchored-private-group',pids:unknown.map(row=>row.pid)});
+    receipt.ownership.identities=[...records.values()];
+    const observation={observedAt:new Date().toISOString(),alive:[...live],unknown:unknown.map(row=>row.pid)};
+    const signature=JSON.stringify({alive:observation.alive,unknown:observation.unknown});
+    if(receipt.ownership.observations.at(-1)?.signature!==signature)receipt.ownership.observations.push({...observation,signature});
+    if(readyPid&&!started){const leader=inspected.get(readyPid);assert(leader&&live.has(readyPid));assert.equal(leader.parent,windows?child.pid:process.pid);assert.equal(canonical(leader.executable),canonical(expected));started=true;child.stdin.write('OBSERVED\n');}
+    return [...live].map(pid=>records.get(pid));
+  };
+  let observation=Promise.resolve(),sampling=false;
+  const sample=()=>{if(sampling)return observation;sampling=true;observation=survey().catch(error=>errors.push({stage:'survey',error:String(error)})).finally(()=>{sampling=false;});return observation;};
+  const observer=setInterval(()=>{void sample();},windows?1000:100);
+  let deadline;const timeout=new Promise(resolve=>{deadline=setTimeout(()=>{expired=true;resolve({timeout:true});},Math.max(0,cleanupUntil-Date.now()));});
+  let outcome;
+  try{await sample();outcome=await Promise.race([exit,timeout]);}
+  finally{
+    clearTimeout(deadline);clearInterval(observer);cleanupUntil=Date.now()+20000;receipt.ownership.cleanupDeadlineAt=new Date(cleanupUntil).toISOString();
+    await observation;child.stdin.end();
+    try{
+      let remaining=await survey();receipt.ownership.aliveBeforeCleanup=remaining.map(row=>row.pid);
+      for(const [signal,milliseconds] of [['SIGTERM',5000],['SIGKILL',5000]]){
+        const until=Math.min(cleanupUntil,Date.now()+milliseconds),signalled=new Set();
+        do{
+          for(const prior of [...remaining].reverse()){
+            if(Date.now()>=until)break;
+            if(windows&&prior.pid===child.pid)continue; // The Job owner drains after its Julia leader stops.
+            let row=lastRows.find(value=>value.pid===prior.pid);
+            if(windows){const value=await inspectCommand(ownerExecutable,['-NoProfile','-Command',`$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter 'ProcessId=${prior.pid}' -ErrorAction Stop; if($p){@{pid=$p.ProcessId;parent=$p.ParentProcessId;started=$p.CreationDate.ToUniversalTime().ToString('o');executable=$p.ExecutablePath}|ConvertTo-Json -Compress}`],{timeout:limit(3000)});row=value.stdout.trim()?JSON.parse(value.stdout):undefined;}
+            const current=row&&await inspect(row);
+            if(!current||current.started!==prior.started||canonical(current.executable)!==canonical(prior.executable)||signalled.has(prior.pid))continue;
+            try{process.kill(prior.pid,signal);signalled.add(prior.pid);}catch(error){if(error.code!=='ESRCH')throw error;}
+          }
+          await new Promise(resolve=>setTimeout(resolve,100));remaining=await survey();if(!remaining.length)break;
+        }while(Date.now()<until);
+        if(!remaining.length)break;
+      }
+      receipt.ownership.survivors=remaining;
+      receipt.ownership.cleanupQualified=records.size>0&&!remaining.length&&!errors.length;
+    }catch(error){errors.push({stage:'cleanup',error:String(error)});}
+    if(!receipt.ownership.cleanupQualified){sessionSafeToRemove=false;child.unref();child.stdout.destroy();child.stderr.destroy();}
+  }
+  if(expired||spawnError||outcome?.code!==0||!started||!receipt.ownership.cleanupQualified||receipt.ownership.aliveBeforeCleanup?.length)
+    throw Object.assign(new Error(`Controller preflight failed: ${expired?'180 second timeout':spawnError||JSON.stringify(outcome)}; owned cleanup=${receipt.ownership.cleanupQualified}`),{commandOutput:text});
+  return text;
 }
 
 async function landscapeIdentity(pid){
@@ -223,10 +330,10 @@ try {
     }catch(error){if(error.commandOutput)await fs.writeFile(path.join(output,'core-external-worker.log'),error.commandOutput);await fs.writeFile(result,JSON.stringify({...record,status:'failed',error:String(error),finishedAt:new Date().toISOString()},null,2));throw error;}
   }else{
   const runtime = JSON.parse((await execute(julia, ['--startup-file=no', '-e',
-    'print("{\\\"executable\\\":", repr(joinpath(Sys.BINDIR, Base.julia_exename())), ",\\\"version\\\":", repr(string(VERSION)), "}")'])).trim());
+    "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
   julia = runtime.executable;
   const officialRuntime=JSON.parse((await execute(process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA||julia,['--startup-file=no','-e',
-    'print("{\\\"executable\\\":", repr(joinpath(Sys.BINDIR, Base.julia_exename())), ",\\\"version\\\":", repr(string(VERSION)), "}")'])).trim());
+    "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
   const expectedVersion = mode === 'public' ? '1.0.0' : JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version;
   const vscode = await downloadAndUnzipVSCode({version, cachePath: path.join(session, 'vscode')});
   const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscode, {reuseMachineInstall: true});
@@ -283,7 +390,7 @@ try {
   const cliProfile = await privateProfile(profile);
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
-    runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,
+    runner:{platform:process.platform,processArch:process.arch,runnerArch:process.env.RUNNER_ARCH||null},runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,
       actualCommit:application.commit,applicationName:application.applicationName,applicationRelativePath:path.relative(path.dirname(vscode),application.application),
       cliRelativePath:path.relative(path.dirname(vscode),cli),privateDirectoryFlags}};
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
@@ -419,8 +526,34 @@ try {
     throw new Error('The actual Core installation must match its version and registry/candidate provenance.');
   Object.assign(coreProvenance,installed);
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
+  if(stage==='targeted'||stage==='full'||stage==='focused'&&['mcp','mcp-pluto','advisor','narrative'].includes(caseGroup)){
+    const before=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
+    const receipt={status:'running',startedAt:new Date().toISOString(),project:controller,hashesBefore:before,
+      scope:'Explicit controller preparation before the native first Send; cache preparation, not a cold-start qualification'};
+    artifactRecord.controllerPreflight=receipt;await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+    try{
+      const script=`println("CONTROLLER_PREFLIGHT_READY ",getpid());flush(stdout);readline(stdin)
+using Pkg;Pkg.activate(ARGS[1]);started=time();modules=Module[]
+for name in (:PerfChecker,:HTTP)
+ println("CONTROLLER_IMPORT_BEFORE ",name," elapsed=",time()-started);flush(stdout)
+ m=Base.require(Main,name);push!(modules,m)
+ println("CONTROLLER_IMPORT_AFTER ",name," elapsed=",time()-started," version=",Base.pkgversion(m)," source=",pathof(m));flush(stdout)
+end
+core=first(modules);extension=Base.get_extension(core,:HTTPAdvisorExt);@assert extension!==nothing
+print("CONTROLLER_IMPORT_RECEIPT ");core.JSON.print(Dict("elapsedSeconds"=>time()-started,"extension"=>string(nameof(extension)),"packages"=>[Dict("name"=>string(nameof(m)),"version"=>string(Base.pkgversion(m)),"source"=>pathof(m)) for m in modules]));println();flush(stdout)`;
+      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',script,controller],receipt);
+      await fs.writeFile(path.join(output,'controller-preflight.log'),text);
+      Object.assign(receipt,JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('CONTROLLER_IMPORT_RECEIPT ')).slice('CONTROLLER_IMPORT_RECEIPT '.length)),{status:'passed'});
+    }catch(error){receipt.status='failed';receipt.error=String(error);if(error.commandOutput)await fs.writeFile(path.join(output,'controller-preflight.log'),error.commandOutput);throw error;}
+    finally{
+      receipt.finishedAt=new Date().toISOString();receipt.hashesAfter=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
+      if(Object.keys(before).some(name=>receipt.hashesAfter[name]!==before[name])){receipt.status='failed';receipt.hashMismatch=true;}
+      await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+      assert.deepEqual(receipt.hashesAfter,before,'Controller imports preserve the exact prepared Project and Manifest');
+    }
+  }
   if(!landscapeOnly){
-  if(stage==='full'||stage==='focused'&&caseGroup==='investigation')await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.add(["Aqua","SnoopCompile"]);using Aqua,SnoopCompile;println("OPTIONAL_ANALYZER_INSTALL Aqua=",Base.pkgversion(Aqua)," SnoopCompile=",Base.pkgversion(SnoopCompile))',controller]);
+  if(stage==='full'||stage==='focused'&&['investigation','diagnosis'].includes(caseGroup))await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.add(["Aqua","SnoopCompile"]);using Aqua,SnoopCompile;println("OPTIONAL_ANALYZER_INSTALL Aqua=",Base.pkgversion(Aqua)," SnoopCompile=",Base.pkgversion(SnoopCompile))',controller]);
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(["BenchmarkTools","Chairmarks","TestItems"]); Pkg.activate(ARGS[2]); Pkg.add("TestItems")', target, workspace]);
   await fs.mkdir(path.join(workspace, 'perf'), {recursive: true});
   // Fresh first-use evidence belongs to the starter; the prepared campaign uses its own reports.
@@ -449,7 +582,7 @@ perf_oracle(directory) = isdir(directory)
   await fs.mkdir(path.join(workspace,'perf','advisor'),{recursive:true});
   await fs.writeFile(path.join(workspace, 'perf', 'advisor', 'scenarios.toml'), 'schema_version = "perfchecker-scenario-catalog/1"\nroot = ".."\n[[scenarios]]\nid = "advisor_sum_squares"\nimplementation = "allocating"\nsource = "../cases.jl"\nfactory = "make_sum_case"\ncollectors = ["benchmark"]\n');
   await fs.appendFile(path.join(workspace,'perf','scenarios.toml'),'[[scenarios]]\nid = "sampled_sum_squares"\nimplementation = "sampled"\nsource = "cases.jl"\nfactory = "make_profile_case"\ncollectors = ["benchmark", "chairmark", "profile", "profile_alloc"]\n');
-  if(stage==='full'||stage==='focused'&&caseGroup==='investigation'){
+  if(stage==='full'||stage==='focused'&&['investigation','diagnosis'].includes(caseGroup)){
     const catalog=path.join(workspace,'perf','scenarios.toml');
     // Aqua needs the actual target package, rather than the perf script folder.
     // Declared source paths remain relative to the catalog's own directory.
@@ -506,15 +639,15 @@ end
   await fs.mkdir(path.join(workspace, '.vscode'),{recursive:true});
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': officialRuntime.executable, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
-  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots'].includes(caseGroup))){
-    const companion={commit:'7e9c380f0b6f08676c73658743661dcc5f826162',tree:'9bc464202aa5b60262be9483bda5968bacd2960a',version:'1.0.1'};
+  if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots','pluto'].includes(caseGroup))){
+    const companion={commit:'7fe5a07457c9f4a980b4afa64b62db7fc7847b89',tree:'9bc464202aa5b60262be9483bda5968bacd2960a',version:'1.0.1'};
     const revision=coreMode==='candidate'?companion.commit:'v1.0.1';
     const text=await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev=ARGS[7]);preserve=Pkg.PRESERVE_ALL); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid];@assert string(info.tree_hash)==ARGS[6];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[8];if ARGS[5]=="general";@assert info.is_tracking_registry;end;print("PLUTO_ENV_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerPluto,Pluto,PlutoUI)));println()`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode,coreProvenance.tree,revision,companion.tree]);
     artifactRecord.plutoEnvironment={companion:{...companion,revision},packages:JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('PLUTO_ENV_PROVENANCE ')).slice('PLUTO_ENV_PROVENANCE '.length))};
     await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
   }
   if(stage==='focused'&&caseGroup==='pluto-plots'){
-    const pins={makieCommit:'74d0deca140f34e72e2d074d185838ecc6980ecb',plutoCommit:'7e9c380f0b6f08676c73658743661dcc5f826162',makieTree:'300c1a3ee5c32a8fc7e5245d00badb3f68c235f6',plutoTree:'9bc464202aa5b60262be9483bda5968bacd2960a',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'};
+    const pins={makieCommit:'7fe5a07457c9f4a980b4afa64b62db7fc7847b89',plutoCommit:'7fe5a07457c9f4a980b4afa64b62db7fc7847b89',makieTree:'cd36865103120518bd036cb7abe366114df13aaf',plutoTree:'9bc464202aa5b60262be9483bda5968bacd2960a',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'};
     const text=await execute(julia,['--startup-file=no','-e',      'using Pkg;Pkg.activate(ARGS[1]);Pkg.add([PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerMakie",rev=ARGS[2]),PackageSpec(name="WGLMakie",version="0.13.15"),PackageSpec(name="Makie",version="0.24.15"),PackageSpec(name="Bonito",version="4.2.0")];preserve=Pkg.PRESERVE_ALL);using PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto;@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(WGLMakie)==v"0.13.15";@assert Base.pkgversion(Makie)==v"0.24.15";@assert Base.pkgversion(Bonito)==v"4.2.0";@assert Base.get_extension(PerfCheckerMakie,:WGLMakieExt)!==nothing;@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerMakie).uuid].tree_hash)==ARGS[3];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[4];@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[5];print("PLUTO_PLOT_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto)));println()',plutoProject,pins.makieCommit,pins.makieTree,pins.plutoTree,coreProvenance.tree]);
     const provenance=JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('PLUTO_PLOT_PROVENANCE ')).slice('PLUTO_PLOT_PROVENANCE '.length));
     await fs.writeFile(path.join(output,'pluto-plot-provider-provenance.json'),JSON.stringify({pins,providers:provenance,manifestSha256:createHash('sha256').update(await fs.readFile(path.join(plutoProject,'Manifest.toml'))).digest('hex'),renderer:'Disposable Electron ANGLE/SwiftShader; no physical GPU qualification'},null,2));
@@ -586,7 +719,8 @@ finally {
     if(survivors.length||landscapeObserverErrors.length)errors.push(new Error(`Session preserved because the drained observer cannot confirm an empty owned tree: ${session}; PIDs=${survivors.map(record=>record.pid).join(',')}`));
     else await fs.rm(session,{recursive:true,force:true,maxRetries:12,retryDelay:500});
     if(errors.length)throw new AggregateError(landscapePrimaryError?[landscapePrimaryError,...errors]:errors,'Native Landscape or its owned failure cleanup failed');
-  }else await fs.rm(session, {recursive: true, force: true, maxRetries: 12, retryDelay: 500});
+  }else if(sessionSafeToRemove)await fs.rm(session, {recursive: true, force: true, maxRetries: 12, retryDelay: 500});
+  else console.error(`Private session preserved: controller preflight ownership cleanup is unqualified: ${session}`);
 }
 
 function assertCI() {

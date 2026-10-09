@@ -66,8 +66,11 @@ async function reportAfter(context, before, action, timeout = 360000) {
 async function action(context, label, name) {
   const before = await directories(reportRoot(context));
   const current = await view(context);
+  await context.observeWork?.(`investigation-${name}-before-action`);
   await current.getByRole('button', {name: label, exact: true}).click();
-  return reportAfter(context, before, name);
+  const result=await reportAfter(context, before, name);
+  await context.observeWork?.(`investigation-${name}-completed-before-teardown`);
+  return result;
 }
 
 async function quickPick(context, title, choice = 0) {
@@ -241,7 +244,7 @@ async function diagnose(context) {
     }
     if (record.status === 'unavailable') assert(String(record.message || '').trim(), `${tool} unavailable status explains its prerequisite`);
     if (['latency', 'gc', 'memory'].includes(tool)) assert.equal(record.status, 'complete', `${tool} built-in worker actually executes`);
-    if (process.env.PERFCHECKER_NATIVE_PHASE === 'investigation' && ['aqua', 'snoopcompile'].includes(tool))
+    if (['investigation','diagnosis'].includes(process.env.PERFCHECKER_NATIVE_PHASE) && ['aqua', 'snoopcompile'].includes(tool))
       assert.equal(record.status, 'complete', `${tool} is explicitly installed for this positive optional-analyzer campaign`);
     if (['heap','locks'].includes(tool) && record.status === 'unavailable') assert.match(String(record.message), tool === 'heap' ? /snapshot|redact|unsupported|not supported|runtime/i : /counter|1\.11|not exposed|unsupported|runtime/i, `${tool} has a concrete runtime prerequisite`);
     context.proof(`investigation-analyzer-${tool}`, {status: record.status, correctness: record.correctness, quality: record.quality, version: record.tool_version, prerequisite: record.status === 'complete' ? undefined : record.message});
@@ -409,7 +412,7 @@ async function cancel(context) {
   context.proof('investigation-cancel-active-julia-worker', {workerStarted: true, cleanupCompleted: true, remainingConfigurationsQualified: false});
 }
 
-exports.run = async context => {
+exports.run = async (context,options={}) => {
   assert.equal(process.env.CI, 'true', 'Use disposable remote CI profiles, never the user VS Code');
   assert(path.isAbsolute(context.workspace));
   const settings = configuration(context);
@@ -422,7 +425,7 @@ exports.run = async context => {
   try {
     for (const key of keys) await settings.update(key, values[key], context.vscode.ConfigurationTarget.WorkspaceFolder);
     await clickStudioAction(context,'investigations');
-    for (const [name, callback] of [
+    const cases=[
       ['discovery-selection-proposals', () => discover(context)],
       ['adopt-real-shared-factory', () => adopt(context, 'ui_adopted', 'make_sum_case')],
       ['reject-invalid-and-duplicate-adoption', () => rejectAdoption(context)],
@@ -434,9 +437,15 @@ exports.run = async context => {
       ['bounded-investigation', () => bounded(context)],
       ['sync-tools-history', () => syncAndHistory(context)],
       ['cancel-active-scenario-worker', () => cancel(context)],
-    ]) {
+    ];
+    let blockedBy;
+    for (const [name, callback] of cases.filter(([name])=>!options.diagnosisOnly||['discovery-selection-proposals','adopt-real-shared-factory','diagnose-real-analyzers'].includes(name))) {
+      if(options.diagnosisOnly&&blockedBy){
+        failures.push(new Error(`${name}: Blocked by ${blockedBy}`));
+        context.log(`investigation-${name}-blocked`,{status:'blocked',blockedBy});continue;
+      }
       try {await callback();}
-      catch (error) {failures.push(new Error(`${name}: ${error.message}`, {cause: error})); context.log(`investigation-${name}-failed`, {message: error.message});}
+      catch (error) {failures.push(new Error(`${name}: ${error.message}`, {cause: error})); context.log(`investigation-${name}-failed`, {message: error.message});blockedBy=name;await context.observeWork?.(`investigation-${name}-failed-before-cleanup`);}
     }
   } finally {
     await context.vscode.commands.executeCommand('perfchecker.cancelInvestigation').catch(() => {});
@@ -450,3 +459,4 @@ exports.run = async context => {
   }
   if (failures.length) throw new AggregateError(failures, `${failures.length} real investigation control groups failed`);
 };
+exports.runDiagnosis=context=>exports.run(context,{diagnosisOnly:true});
