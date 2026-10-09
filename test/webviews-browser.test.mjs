@@ -82,6 +82,12 @@ test('real webviews preserve full selection, handle Git targets and render inter
       ...[20,100].map(value=>numeric(value,{measurement_definition:'julia.wall.time/chairmarks-v1'})),
       ...[20,50].map(value=>numeric(value,{metric:'other.metric'})),
       ...[20,60].map(value=>numeric(value,{unit:'s'})),
+      // Sixty qualification samples exercise mobile exploration in the real viewer;
+      // they are synthetic controls data, never a claimed Oxygen measurement.
+      ...Array.from({length:30},(_,index)=>numeric(index===29?98:10+index/10,{case_id:'mobile-baseline',comparison_key:'mobile/plain/v1'})),
+      ...Array.from({length:30},(_,index)=>numeric(index===29?81:8+index/5,{case_id:'mobile-candidate',comparison_key:'mobile/plain/v1',target_id:'1.1.0',attributes:{...base.attributes,version:'1.1.0'}})),
+      ...[0,0].map(value=>numeric(value,{case_id:'constant-zero',comparison_key:'constant-zero',metric:'julia.gc.time'})),
+      numeric(7,{case_id:'single-point',comparison_key:'single-point'}),
       ...[...Array.from({length:10000},(_,index)=>index),1e9].map(value=>numeric(value,{comparison_key:'huge-separate-series'})),
       {...base,metric:'julia.alloc.bytes',measurement_definition:'julia.alloc.bytes/profile-allocs-v1',unit:'By',value:64,attributes:{...base.attributes,source_file:'sort.jl',source_line:12,stack:['sort','allocate']}},
       {...base,metric:'julia.cpu.samples',measurement_definition:'julia.cpu.samples/profile-v1',unit:'1',value:3,attributes:{...base.attributes,stack:['sort','partition'],runtime_dispatch:[false,true]}},
@@ -98,7 +104,7 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await commands.get('perfchecker.openOutput')();
     await commands.get('perfchecker.openStudioForWorkspace')(folder.uri);
     browser=await chromium.launch({...(process.env.PERFCHECKER_BROWSER ? {executablePath:process.env.PERFCHECKER_BROWSER} : {}),headless:true,args:['--no-sandbox']});
-    const page=await browser.newPage({viewport:{width:1440,height:1100}}),errors=[];
+    const page=await browser.newPage({viewport:{width:1440,height:1100},hasTouch:true}),errors=[];
     page.on('pageerror',error=>errors.push(error.message));page.on('console',message=>{if(message.type()==='error')errors.push(message.text());});
     await page.addInitScript(()=>{
       window.messages=[];window.acquireVsCodeApi=()=>({postMessage:message=>window.messages.push(message)});
@@ -257,7 +263,7 @@ test('real webviews preserve full selection, handle Git targets and render inter
     assert.deepEqual(dragConfiguration.selection.run_ids.slice(0,3),[dragIds[1],dragIds[0],dragIds[2]],'The saved order reflects the real browser drop');
     assert.equal(dragConfiguration.selection.run_ids.length,1000);
     await page.setViewportSize({width:420,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
-    await load('perfchecker.output');assert.equal(await page.locator('.distribution .sample').count(),848);assert.equal(await page.locator('.pie-slice').count(),1);
+    await load('perfchecker.output');assert.equal(await page.locator('.distribution .sample').count(),911);assert.equal(await page.locator('.pie-slice').count(),1);
     assert.equal(await page.locator('.pie-slice').getAttribute('fill'),'#4f8cff');assert.match(await page.locator('.pie-slice').getAttribute('d'),/A82 82 0 1 1 100 182/);
     await page.locator('.pie-slice').focus();assert.match(await page.locator('#allocation-0').innerText(),/64 B · 100.00%/);
     const charts=page.locator('.normalized-plot'),firstChart=charts.nth(0),chart=charts.nth(1);
@@ -292,7 +298,7 @@ test('real webviews preserve full selection, handle Git targets and render inter
       x20:svg.querySelector('[data-value="20"]')?.getAttribute('cx'),scale:svg.parentElement.querySelector('.distribution-scale').textContent,
       sampling:svg.parentElement.querySelector('.distribution-sampling')?.textContent,
     })));
-    const baseline=distributions.find(row=>row.values.includes(11)),candidate=distributions.find(row=>row.values.length===324);
+    const baseline=distributions.find(row=>row.values.length===4&&row.values.includes(11)&&row.values.includes(20)),candidate=distributions.find(row=>row.values.length===324);
     assert(baseline&&candidate,'Every sample remains present above the former 320-point sampling threshold');
     assert.equal(baseline.x20,candidate.x20,'The same sample has the same X in compatible versions');
     for(const row of distributions.filter(row=>row!==baseline&&row!==candidate))assert.notEqual(row.x20,baseline.x20,'Different identity, collector, metric or unit retains a separate scale');
@@ -304,6 +310,59 @@ test('real webviews preserve full selection, handle Git targets and render inter
     assert.deepEqual(largeDistribution.ranks,Array.from({length:512},(_,index)=>Math.round(index*10000/511)+1));
     assert.equal(largeDistribution.values[0],0);assert.equal(largeDistribution.values.at(-1),1e9);
     assert.equal(largeDistribution.sampling,'512 of 10001 samples plotted; all samples in JSON.');
+    const mobileBase=page.locator('.distribution-view').filter({has:page.locator('svg[data-max="98"]')});
+    const mobileCandidate=page.locator('.distribution-view').filter({has:page.locator('svg[data-max="81"]')});
+    const domain=async view=>view.locator('svg').evaluate(svg=>[Number(svg.dataset.currentMin),Number(svg.dataset.currentMax)]);
+    const raw=async view=>view.evaluate(element=>({values:element.distributionValues,points:[...element.querySelectorAll('.sample')].map(point=>[point.dataset.value,point.dataset.rank]),stats:element.querySelector('.distribution-stats').textContent}));
+    const rawBefore=await raw(mobileBase),candidateBefore=await raw(mobileCandidate);
+    assert.equal(rawBefore.values.length,30);assert.equal(candidateBefore.values.length,30);
+    assert.deepEqual(await domain(mobileBase),[8,98]);assert.deepEqual(await domain(mobileCandidate),[8,98]);
+    await page.setViewportSize({width:360,height:800});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    const svgSize=await mobileBase.locator('svg').boundingBox();assert(Math.abs(svgSize.height-svgSize.width/7)<1,'SVG has proportional height rather than mobile letterboxing');
+    assert.equal(await mobileBase.locator('..').locator('.distribution-unit').evaluate(node=>getComputedStyle(node).whiteSpace),'nowrap');
+    assert.equal(await mobileBase.locator('.distribution-stats dd').evaluateAll(nodes=>nodes.every(node=>node.scrollWidth<=node.clientWidth)),true,'All five statistics remain readable at360px');
+    await mobileBase.locator('.sample[data-value="12"]').focus();
+    await mobileBase.getByRole('button',{name:'Zoom in',exact:true}).focus();await page.keyboard.press('Enter');
+    assert.deepEqual(await domain(mobileBase),[8,53],'Zoom centers on the inspected sample, clamped to the full domain');
+    assert.deepEqual(await domain(mobileCandidate),[8,53],'Compatible versions share the current range');
+    assert.equal(await mobileBase.locator('.sample[data-value="12"]').getAttribute('cx'),await mobileCandidate.locator('.sample[data-value="12"]').getAttribute('cx'));
+    assert.match(await mobileBase.locator('.distribution-visible').innerText(),/29 \/ 30 samples in view/);
+    await mobileCandidate.getByRole('button',{name:'Pan right',exact:true}).tap();
+    assert.deepEqual(await domain(mobileBase),[19.25,64.25]);assert.deepEqual(await domain(mobileCandidate),[19.25,64.25]);
+    assert.match(await mobileBase.locator('.distribution-visible').innerText(),/0 \/ 30 samples in view/);
+    assert.match(await mobileBase.locator('.plot-detail').innerText(),/^Hover, tap or focus/,'Panning clears a readout that is now outside the view');
+    await mobileBase.getByRole('button',{name:'Pan left',exact:true}).tap();
+    await mobileBase.locator('.sample[data-value="12"]').click();assert.match(await mobileBase.locator('.plot-detail').innerText(),/12 ns.*sorted sample/);
+    const tapBox=await mobileBase.locator('svg').boundingBox();
+    await mobileBase.locator('svg').tap({position:{x:tapBox.width/2,y:tapBox.height/2}});
+    assert.match(await mobileBase.locator('.plot-detail').innerText(),/sorted sample/,'A touch on the chart inspects its nearest visible point');
+    await mobileBase.getByText('Range',{exact:true}).click();
+    await mobileBase.locator('[data-distribution-bound="max"]').fill('20');await mobileBase.locator('[data-distribution-bound="max"]').press('Tab');
+    assert.deepEqual(await domain(mobileBase),[8,20]);assert.deepEqual(await domain(mobileCandidate),[8,20]);
+    await mobileBase.locator('[data-distribution-slider="min"]').focus();await page.keyboard.press('ArrowRight');
+    assert((await domain(mobileBase))[0]>8);assert.deepEqual(await domain(mobileBase),await domain(mobileCandidate));
+    await mobileCandidate.getByRole('button',{name:'Fit all samples',exact:true}).click();
+    assert.deepEqual(await domain(mobileBase),[8,98]);assert.deepEqual(await domain(mobileCandidate),[8,98]);
+    await mobileBase.locator('.sample[data-value="98"]').hover();
+    assert.match(await mobileBase.locator('.plot-detail').innerText(),/98 ns.*sorted sample/);
+    await mobileBase.getByRole('button',{name:'Zoom in',exact:true}).click();
+    assert.deepEqual(await domain(mobileBase),[53,98],'Hover anchors Zoom around the inspected outlier without removing it');
+    assert.deepEqual(await domain(mobileCandidate),[53,98]);
+    await mobileBase.getByRole('button',{name:'Pan left',exact:true}).click();
+    assert.deepEqual(await domain(mobileBase),[41.75,86.75]);
+    assert.match(await mobileBase.locator('.plot-detail').innerText(),/^Hover, tap or focus/,'Panning clears an inspected hover point outside the view');
+    await mobileBase.getByRole('button',{name:'Fit all samples',exact:true}).click();
+    assert.deepEqual(await domain(mobileBase),[8,98]);assert.deepEqual(await domain(mobileCandidate),[8,98]);
+    assert.deepEqual(await raw(mobileBase),rawBefore);assert.deepEqual(await raw(mobileCandidate),candidateBefore,'Zoom/pan/Fit never mutate samples, ranks or statistics');
+    assert.deepEqual(await page.locator('.distribution-view').filter({has:page.locator('svg[data-min="10"][data-max="20"]')}).locator('svg').evaluate(svg=>[Number(svg.dataset.currentMin),Number(svg.dataset.currentMax)]),[10,40],'An incompatible group is independent');
+    for(const value of ['0','7']){
+      const constant=page.locator('.distribution-view').filter({has:page.locator('svg[data-min="'+value+'"][data-max="'+value+'"]')});
+      assert.equal(await constant.locator('[data-distribution-action]:enabled').count(),0);
+      assert.equal(await constant.locator('[data-distribution-bound]:enabled,[data-distribution-slider]:enabled').count(),0);
+      assert.deepEqual(await domain(constant),[Number(value),Number(value)]);
+      assert.equal(await constant.locator('.sample').evaluateAll(points=>points.every(point=>point.getAttribute('cx')==='350')),true);
+    }
     const outlier=page.locator('.distribution .sample[data-value="1000000000"]');await outlier.focus();
     assert.match(await page.locator('#'+await outlier.getAttribute('data-target')).innerText(),/sorted sample 10001\/10001/);
     assert.equal(await readFile(observationFile,'utf8'),observationBytes,'Presentation preserves every original JSON sample');
