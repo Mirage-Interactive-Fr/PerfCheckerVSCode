@@ -202,7 +202,7 @@ for(const mode of ['duplicate','bad-cursor','invalid','wrong-id','interactive'])
   const pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));assert.equal(await alive(pid),false);
 },mode));
 
-for(const mode of ['eof','partial-eof'])test(`stdio ${mode}: output EOF retires a still-live server without waiting for the tool timeout`,()=>fixture(async({root,create})=>{
+for(const mode of ['eof','partial-eof'])test(`stdio ${mode}: output EOF retires a still-live server without waiting for the tool timeout`,t=>fixture(async({root,create})=>{
   const connector=await create().start(),pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));
   assert(await alive(pid));
   // Observe EOF while the real server is alive before allowing the product's
@@ -213,13 +213,23 @@ for(const mode of ['eof','partial-eof'])test(`stdio ${mode}: output EOF retires 
   connector.stop=async()=>{await readyForCleanup;await stop();};
   const evidenceDeadline=Date.now()+5000;
   const response=post(connector,'tools/call',{name:'consult',arguments:{question:'Close output',flavour:'fixture'}}).catch(error=>error);
+  const ownerState=()=>({pid:connector.child?.pid,exitCode:connector.child?.exitCode,signalCode:connector.child?.signalCode,
+    stdout:{readable:connector.child?.stdout?.readable,readableEnded:connector.child?.stdout?.readableEnded,
+      destroyed:connector.child?.stdout?.destroyed,bufferedBytes:connector.child?.stdout?.readableLength}});
+  let closed,stage='verified-stdout-close';
   try {
-    await until(()=>connector.failure,Math.max(1,evidenceDeadline-Date.now()));
-    assert.match(connector.failure.message,mode==='partial-eof'?/incomplete protocol message/:/output stream closed/);
-    const closed=await until(async()=>JSON.parse(await readFile(path.join(root,'output-closed.json'),'utf8')),Math.max(1,evidenceDeadline-Date.now()));
+    closed=await until(async()=>JSON.parse(await readFile(path.join(root,'output-closed.json'),'utf8')),Math.max(1,evidenceDeadline-Date.now()));
     assert.deepEqual(closed,{pid,stdoutClosed:true,aliveAfterClose:true,closureCheck:process.platform==='win32'?'ERROR_INVALID_HANDLE':'EBADF'});
     assert(await alive(pid),'The server remains alive after verified output closure and before owned cleanup');
+    t.diagnostic(JSON.stringify({event:'stdio-verified-output-closed-before-cleanup',mode,closed,serverAlive:true,owner:ownerState()}));
+    stage='automatic-eof-detection';
+    await until(()=>connector.failure,Math.max(1,evidenceDeadline-Date.now()));
+    assert.match(connector.failure.message,mode==='partial-eof'?/incomplete protocol message/:/output stream closed/);
     assert(connector.closing instanceof Promise,'EOF schedules automatic owned cleanup before the test releases it');
+  }catch(error){
+    const serverAlive=await alive(pid).catch(()=>'unknown');
+    t.diagnostic(JSON.stringify({event:'stdio-output-eof-failure-before-cleanup',mode,stage,closed:closed??null,serverAlive,owner:ownerState()}));
+    throw error;
   }finally{releaseCleanup();await connector.dispose();await response;}
   assert.equal(await alive(pid),false,'EOF cleans the still-live process before harness teardown');
 },mode));
