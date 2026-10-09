@@ -16,7 +16,7 @@ on:
       case_group:
         description: Native controls to exercise on a clean fixture (focused stage only)
         type: choice
-        options: [narrative, mcp, mcp-stdio, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
+        options: [general100, narrative, mcp, mcp-stdio, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
         default: narrative
       backend_julia:
         description: Core runtime for a manual qualification; automatic PR coverage remains latest
@@ -31,7 +31,7 @@ on:
       core:
         description: Registered minimum, or the explicitly pinned Core fix before registration
         type: choice
-        options: [general, candidate]
+        options: [general, candidate, general100]
         default: general
       core_commit:
         description: Immutable Core candidate commit (candidate mode only)

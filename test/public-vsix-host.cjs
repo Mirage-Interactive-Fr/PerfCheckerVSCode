@@ -614,6 +614,7 @@ exports.run = async () => {
       if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
       else if(phase==='landscape')await runCase('native-landscape-controls',()=>require('./native-landscape-controls.cjs').run(context));
       else if(phase==='studio-color')await runCase('native-colour-picker-save-reload',()=>controls.runColour(context));
+      else if(phase==='general100')await runCase('native-general100-compatibility',()=>require('./native-general100-controls.cjs').run(context));
       else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
       else if(phase==='mcp-stdio')await runCase('native-generic-mcp-stdio-controls',()=>mcp.run(context,{stdio:true,customArguments:true}));
       else if(phase==='pluto-plots')await runCase('native-pluto-rendered-plots',()=>pluto.runPlots(context));

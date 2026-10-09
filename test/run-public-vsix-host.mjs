@@ -9,6 +9,7 @@ import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
+import {nativeCoreContract} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -24,16 +25,15 @@ const coreMode=process.env.PERFCHECKER_NATIVE_CORE || 'general';
 // Candidate inputs apply only to Git candidates, never to General's tree.
 const coreCommit=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_COMMIT || ''):'';
 const coreTree=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_TREE || ''):'';
-if(!['general','candidate'].includes(coreMode))throw new Error('Choose the registered or explicitly pinned candidate Core.');
-if(coreMode==='candidate' && ![coreCommit,coreTree].every(value=>/^[a-f0-9]{40}$/.test(value)))throw new Error('Core candidate mode requires an immutable commit and expected Git tree.');
-const expectedCoreVersion=coreMode==='candidate'||mode==='candidate'?'1.0.1':'1.0.0';
-const coreProvenance={mode:coreMode,version:expectedCoreVersion,...(coreMode==='candidate'?{commit:coreCommit,tree:coreTree}:{registry:'General'})};
-const installCore=coreMode==='candidate'?'Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]))':`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))`;
+const coreProvenance=nativeCoreContract({core:coreMode,artifact:mode,stage:process.env.PERFCHECKER_NATIVE_STAGE||'smoke',
+  group:process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative',commit:process.env.PERFCHECKER_NATIVE_CORE_COMMIT||'',tree:process.env.PERFCHECKER_NATIVE_CORE_TREE||''});
+const expectedCoreVersion=coreProvenance.version;
+const installCore=coreMode==='candidate'?'Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]))':`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))${coreMode==='general100'?'; Pkg.pin(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))':''}`;
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['narrative','mcp','mcp-stdio','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['general100','narrative','mcp','mcp-stdio','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 if(stage==='focused'&&caseGroup==='pluto-start-stop'&&process.platform!=='linux')throw new Error('The first prepared Pluto start/stop observation is explicitly Linux only.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 // The real game and SDKs are immutable fixtures, never development checkouts.
@@ -648,7 +648,7 @@ try {
   if(completeCampaign)await launch('fresh');
   const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]!="landscape";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':'standard'],{timeout:landscapeOnly?900000:undefined});
   const installed=JSON.parse(installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_CORE_PROVENANCE ')).slice('QUALIFIED_CORE_PROVENANCE '.length));
-  if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode==='general'&&!installed.registered)
+  if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode!=='candidate'&&!installed.registered||coreMode==='general100'&&installed.tree!==coreProvenance.tree)
     throw new Error('The actual Core installation must match its version and registry/candidate provenance.');
   Object.assign(coreProvenance,installed);
   if(stage==='focused'&&caseGroup==='diagnosis'&&process.platform==='darwin'){
@@ -660,7 +660,7 @@ try {
     coreProvenance.diagnosticWorker={file:worker,sha256:createHash('sha256').update(await fs.readFile(worker)).digest('hex')};
   }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
-  if(stage==='targeted'||stage==='full'||stage==='focused'&&(['mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
+  if(stage==='targeted'||stage==='full'||stage==='focused'&&(['general100','mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
     const before=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
     const receipt={status:'running',startedAt:new Date().toISOString(),project:controller,hashesBefore:before,
       scope:'Explicit controller preparation before the native first Send; cache preparation, not a cold-start qualification'};

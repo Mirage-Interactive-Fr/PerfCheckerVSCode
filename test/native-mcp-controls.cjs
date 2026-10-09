@@ -538,6 +538,8 @@ async function measuredEvidence(context) {
 
 exports.run = async (context,options={}) => {
   assert.equal(process.env.CI, 'true');
+  const general100=options.general100===true;
+  if(general100){assert.equal(context.core.mode,'general100');assert.equal(context.core.version,'1.0.0');assert.equal(options.stdio,undefined);assert.equal(options.customArguments,undefined);}
   if(options.stdio){const handoff=await stdioHandoff();if(handoff)return resumeStdioReload(context,handoff);}
   const {vscode, workspace, findFrame, log, proof} = context;
   const sameNativeIdentityGone=identity=>observeNativeIdentityGone(identity,observation=>log('native-mcp-stdio-identity-observation',observation));
@@ -612,7 +614,7 @@ exports.run = async (context,options={}) => {
           assert.deepEqual(projection.evidence,attached.evidence,'The explicitly attached canonical measured IDs and content reach tools/call before the reply');
           assert([...JSON.stringify(projection.evidence)].length<=attached.evidenceBudget,'The actual request remains inside the serialized evidence budget');
           attached.inspectPayload?.(body,projection);
-          if(name!==implementationTool&&!prompt.includes('native suite evidence probe'))assert(prompt.includes('No recommendations does not mean no measurements'));
+          if(!general100&&name!==implementationTool&&!prompt.includes('native suite evidence probe'))assert(prompt.includes('No recommendations does not mean no measurements'));
         }else{
           assert.deepEqual(projection.evidence,[],'No saved measurement reaches the server without explicit Attach');
           assert(prompt.includes('No saved report was attached.'));
@@ -666,7 +668,7 @@ exports.run = async (context,options={}) => {
     advisorMcpPromptArgument:adviceArgument,advisorMcpArguments:additional,
     advisorImplementationMcpPromptArgument:implementationArgument,advisorImplementationMcpWorkspaceArgument:workspaceArgument,
     codexExecutable: path.join(workspace, 'not-installed-codex')};
-  values.scenarioSamples=100;
+  values.scenarioSamples=general100?3:100;
   const persistedSettings=[];
   if(stdio){
     const root=path.join(await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION),'persisted-stdio-a');await fs.mkdir(root);
@@ -842,7 +844,7 @@ exports.run = async (context,options={}) => {
           return !value.busy && value.messages.length === count;}, 'Actual Julia MCP worker returns the conversation');
       }catch(error){await diagnoseSend('failed-before-teardown');throw error;}
     };
-    savedEvidence=await measuredEvidence(context);
+    savedEvidence=general100?await require('./native-general100-controls.cjs').measuredEvidence(context):await measuredEvidence(context);
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#chat-root');
     if(stdio){
       await verifyPersistedStdioSettings(context,persistedSettings[0],'initial-folder-a');
@@ -888,8 +890,9 @@ exports.run = async (context,options={}) => {
     assert.deepEqual(calls[0].evidenceIds,[],'The configuration-only path remains valid without saved measurements');
     proof('native-mcp-configuration-only-conversation',{adviceTurns:1,noSavedEvidence:true,savedReportPresent:true,
       historyId:savedEvidence.id,evidenceInspectedBeforeReply:calls[0].evidenceInspectedBeforeReply,sourceUnchanged:await fs.readFile(source,'utf8')===original});
-    view=await require('./native-suite-chat-evidence.cjs').run(context,{calls:suiteCalls,receipts,providerErrors,state,
-      setAttached:value=>{attached=value;}});
+    view=general100?await require('./native-general100-controls.cjs').suiteRefusal(context,{state,calls,receipts}):
+      await require('./native-suite-chat-evidence.cjs').run(context,{calls:suiteCalls,receipts,providerErrors,state,
+        setAttached:value=>{attached=value;}});
     attached=savedEvidence;
     await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(attached.id);
     await eventually(async()=>{const value=await state();return value.evidenceId===attached.id&&value.messages.length===0;},'The real evidence selector starts a conversation with the selected measured bundle');
@@ -901,7 +904,11 @@ exports.run = async (context,options={}) => {
     assert.equal(calls[1].projectionSha256,calls[2].projectionSha256,'Follow-up sends the same bounded measured evidence');
     assert.equal(hash(await fs.readFile(attached.file)),attached.runSha256);
     assert.equal(hash(await fs.readFile(attached.adviceFile)),attached.adviceSha256);
-    proof('native-mcp-selected-measured-evidence',{nativeSelector:true,historyId:attached.id,evidenceIds:calls[1].evidenceIds,
+    if(general100)proof('native-general100-selected-recommendations',{nativeSelector:true,historyId:attached.id,core:context.core,
+      evidenceIds:calls[1].evidenceIds,legacyRecommendationProjection:attached.evidence,canonicalMeasuredRowsUnavailable:true,
+      evidenceCharacters:attached.evidenceCharacters,maxEvidenceCharacters:attached.evidenceBudget,samples:3,
+      contextualTurns:2,sourceUnchanged:true,rawMeasurementAndAdviceHashesPreserved:true,provider:providerLabel});
+    else proof('native-mcp-selected-measured-evidence',{nativeSelector:true,historyId:attached.id,evidenceIds:calls[1].evidenceIds,
       controllerProject,measurementProject,measurementEnvironments:attached.measurementEnvironments,
       runSha256:attached.runSha256,adviceSha256:attached.adviceSha256,projectionSha256:calls[1].projectionSha256,
       rawRecommendations:attached.recommendations,canonicalMeasurementSummaries:attached.rawEvidence,boundedCoreProjection:attached.evidence,
