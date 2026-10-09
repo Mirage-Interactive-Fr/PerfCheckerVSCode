@@ -105,8 +105,30 @@ async function executeControllerPreflight(executable,args,receipt){
     assert(Number.isSafeInteger(current.pid)&&current.pid>0&&Number.isSafeInteger(current.parent)&&current.parent>=0&&Number.isSafeInteger(current.group)&&current.group>=0);
     return current;
   };
+  const windowsCurrent=async pid=>{
+    const value=await inspectCommand(ownerExecutable,['-NoProfile','-Command',`$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop; if($p){@{pid=$p.ProcessId;parent=$p.ParentProcessId;started=$(if($p.CreationDate){$p.CreationDate.ToUniversalTime().ToString('o')}else{$null});executable=$p.ExecutablePath}|ConvertTo-Json -Compress}`],{timeout:limit(3000)});
+    assert(!value.stderr.trim(),'Current Windows process inspection has no stderr error');
+    if(!value.stdout.trim())return undefined;
+    const current=JSON.parse(value.stdout);assert.equal(current.pid,pid);
+    assert(typeof current.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(current.started)&&Number.isFinite(Date.parse(current.started)));
+    return current;
+  };
   const inspect=async row=>{
-    if(windows){assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));return {...row,executable:await fs.realpath(row.executable)};}
+    if(windows){
+      assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));
+      if(typeof row.executable==='string'&&row.executable)return {...row,executable:await fs.realpath(row.executable)};
+      const observation={stage:'windows-executable-unavailable',pid:row.pid,initial:row,observedAt:new Date().toISOString()};
+      (receipt.ownership.revalidations??=[]).push(observation);
+      try{
+        const current=await windowsCurrent(row.pid);observation.current=current??null;
+        if(!current){observation.resolution='proved-absent';return undefined;}
+        assert.equal(current.started,row.started,'A reused PID cannot repair an incomplete Windows identity');
+        assert.equal(current.parent,row.parent,'The same Windows process retains its observed parent');
+        assert(typeof current.executable==='string'&&current.executable,'A live Windows process requires its actual executable path');
+        const executable=await fs.realpath(current.executable);observation.resolution='same-incarnation-executable-restored';
+        return {...current,executable};
+      }catch(error){observation.resolution='inspection-failed';observation.error=String(error);throw error;}
+    }
     if(process.platform==='linux'){
       const before=await linuxCurrent(row.pid);if(!before)return undefined;
       const qualified=records.get(row.pid);
@@ -129,7 +151,9 @@ async function executeControllerPreflight(executable,args,receipt){
     try{const current=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)});assert(!current.stderr.trim(),'Mapped-executable inspection has no stderr error');mappings=current.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
     catch(error){
       if(error.code!==1||String(error.stdout||'').trim()||String(error.stderr||'').trim())throw error;
-      if(!await macCurrent(row.pid))return undefined;throw error;
+      const current=await macCurrent(row.pid);if(!current)return undefined;
+      for(const key of ['parent','group','started'])assert.equal(current[key],before[key],'An unavailable mapped executable still belongs to the same incarnation');
+      mappings=[];
     }
     const after=await macCurrent(row.pid);if(!after)return undefined;
     for(const key of ['parent','group','started'])assert.equal(after[key],before[key],'The process keeps its real identity while mapped executable paths are read');
@@ -145,9 +169,14 @@ async function executeControllerPreflight(executable,args,receipt){
         observation.rechecks.push({at:new Date().toISOString(),current:current??null});
         if(!current){observation.resolution='proved-absent-or-zombie';return undefined;}
         for(const key of ['parent','group','started'])assert.equal(current[key],before[key],'An inconclusive mapped-executable observation must retain the same incarnation');
-        const value=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(Math.max(1,until-Date.now()))});
-        assert(!value.stderr.trim(),'Mapped-executable revalidation must not hide an inspection error');
-        mappings=value.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+        try{
+          const value=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(Math.max(1,until-Date.now()))});
+          assert(!value.stderr.trim(),'Mapped-executable revalidation must not hide an inspection error');
+          mappings=value.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
+        }catch(error){
+          if(error.code!==1||String(error.stdout||'').trim()||String(error.stderr||'').trim())throw error;
+          mappings=[];observation.rechecks.at(-1).mappedExecutableUnavailable=true;
+        }
         const checked=await macCurrent(row.pid,Math.max(1,until-Date.now()));
         observation.rechecks.at(-1).after=checked??null;observation.rechecks.at(-1).mappings=mappings;
         if(!checked){observation.resolution='proved-absent-or-zombie';return undefined;}
