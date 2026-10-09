@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp, writeFile, readFile, rm, realpath} from 'node:fs/promises';
-import {spawn} from 'node:child_process';
+import {execFile, spawn} from 'node:child_process';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import Module, {createRequire} from 'node:module';
@@ -21,6 +21,61 @@ async function alive(pid) {
     catch (error) {if (error.code === 'ENOENT') return false; throw error;}
   }
   try {process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;throw error;}
+}
+async function windowsEofServer(root) {
+  // libuv deliberately does not close Windows fds 0–2. Use a real native
+  // server for output EOF, compiled only inside this disposable fixture.
+  const source=String.raw`
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Web.Script.Serialization;
+public static class NativeEofServer {
+  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int kind);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetStdHandle(int kind,IntPtr handle);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetHandleInformation(IntPtr handle,out uint flags);
+  static object Tool(string name,string[] required) {
+    var properties=new Dictionary<string,object>();
+    foreach(var field in required)properties[field]=new {type="string"};
+    return new {name,inputSchema=new {type="object",properties,required,additionalProperties=false}};
+  }
+  public static void Main(string[] args) {
+    int pid=Process.GetCurrentProcess().Id;
+    File.WriteAllText("server.pid",pid.ToString());
+    Console.Error.WriteLine("Informational native EOF server log.");
+    var json=new JavaScriptSerializer();string line;
+    while((line=Console.ReadLine())!=null) {
+      var message=json.Deserialize<Dictionary<string,object>>(line);
+      string method=(string)message["method"];object result;
+      if(method=="server/discover")result=new {resultType="complete",ttlMs=0,cacheScope="private",
+        supportedVersions=new[]{"2026-07-28"},capabilities=new {tools=new {}},
+        _meta=new Dictionary<string,object>{{"io.modelcontextprotocol/serverInfo",new {name="Native EOF fixture",version="1"}}}};
+      else if(method=="tools/list")result=new {resultType="complete",ttlMs=0,cacheScope="private",
+        tools=new[]{Tool("consult",new[]{"question","flavour"}),Tool("modify",new[]{"request","directory","style"})}};
+      else if(method=="tools/call") {
+        if(args[0]=="partial-eof")Console.Write("incomplete-json");
+        Console.Out.Flush();IntPtr output=GetStdHandle(-11);
+        Console.SetOut(TextWriter.Null);
+        if(!SetStdHandle(-11,IntPtr.Zero)||!CloseHandle(output))throw new InvalidOperationException("Native stdout close failed.");
+        uint flags;bool valid=GetHandleInformation(output,out flags);int error=Marshal.GetLastWin32Error();
+        if(valid||error!=6)throw new InvalidOperationException("Closed stdout did not report ERROR_INVALID_HANDLE.");
+        File.WriteAllText("output-closed.json",json.Serialize(new {pid,stdoutClosed=true,aliveAfterClose=true,closureCheck="ERROR_INVALID_HANDLE"}));
+        Thread.Sleep(Timeout.Infinite);return;
+      } else throw new InvalidOperationException("Unexpected native fixture method.");
+      Console.WriteLine(json.Serialize(new {jsonrpc="2.0",id=message["id"],result}));Console.Out.Flush();
+    }
+  }
+}`;
+  const executable=path.join(root,'native-eof-server.exe');
+  const powershell=path.join(process.env.SystemRoot??'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
+  const command=`$ErrorActionPreference='Stop'; Add-Type -TypeDefinition ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(source).toString('base64')}'))) -ReferencedAssemblies System.dll,System.Core.dll,System.Web.Extensions.dll -OutputAssembly '${executable.replaceAll("'","''")}' -OutputType ConsoleApplication`;
+  await new Promise((resolve,reject)=>execFile(powershell,['-NoLogo','-NoProfile','-NonInteractive','-Command',command],
+    {cwd:root,windowsHide:true,timeout:30000},error=>error?reject(error):resolve()));
+  return executable;
 }
 async function fixture(run, mode = '') {
   const root = await mkdtemp(path.join(tmpdir(), 'perfchecker-stdio-contract-'));
@@ -53,7 +108,10 @@ if(m.method==='tools/list'){
 if(m.method==='tools/call'){
  if(mode==='eof'||mode==='partial-eof'){
   if(mode==='partial-eof')fs.writeSync(1,'incomplete-json');
-  fs.closeSync(1);fs.writeFileSync('output-closed.json',JSON.stringify({pid:process.pid,stdoutClosed:true,aliveAfterClose:true}));
+  fs.closeSync(1);let closureCheck;
+  try{fs.fstatSync(1)}catch(error){if(error.code==='EBADF')closureCheck=error.code;else throw error}
+  if(!closureCheck)throw Error('Fixture stdout is still open.');
+  fs.writeFileSync('output-closed.json',JSON.stringify({pid:process.pid,stdoutClosed:true,aliveAfterClose:true,closureCheck}));
   setInterval(()=>{},1000);return}
  if(mode==='invalid'){fs.writeSync(1,'not-json\\n');return}
  if(mode==='wrong-id'){send(m.id+1,{});return}
@@ -68,9 +126,12 @@ if(m.method==='tools/call'){
 throw Error('Unsupported fixture method');});
 process.stdin.on('end',()=>{if(['ignore-eof','eof','partial-eof'].includes(mode))setInterval(()=>{},1000);else process.exit(0)});
 `);
-  const options = {command: process.execPath, args: [file, mode], cwd: root, version:'2026-07-28',timeoutMs:5000};
+  const nativeEof=process.platform==='win32'&&['eof','partial-eof'].includes(mode);
   const connectors = [];
-  try {await run({root,options,create:(overrides={})=>{const connector=new McpStdioConnector({...options,...overrides});connectors.push(connector);return connector;}});}
+  try {
+    const options = {command: nativeEof?await windowsEofServer(root):process.execPath, args: nativeEof?[mode]:[file,mode], cwd: root, version:'2026-07-28',timeoutMs:5000};
+    await run({root,options,create:(overrides={})=>{const connector=new McpStdioConnector({...options,...overrides});connectors.push(connector);return connector;}});
+  }
   finally {
     await Promise.allSettled(connectors.map(connector=>connector.dispose()));
     // Do not signal a PID merely because a fixture once reported it. Failed
@@ -156,7 +217,7 @@ for(const mode of ['eof','partial-eof'])test(`stdio ${mode}: output EOF retires 
     await until(()=>connector.failure,Math.max(1,evidenceDeadline-Date.now()));
     assert.match(connector.failure.message,mode==='partial-eof'?/incomplete protocol message/:/output stream closed/);
     const closed=await until(async()=>JSON.parse(await readFile(path.join(root,'output-closed.json'),'utf8')),Math.max(1,evidenceDeadline-Date.now()));
-    assert.deepEqual(closed,{pid,stdoutClosed:true,aliveAfterClose:true});
+    assert.deepEqual(closed,{pid,stdoutClosed:true,aliveAfterClose:true,closureCheck:process.platform==='win32'?'ERROR_INVALID_HANDLE':'EBADF'});
     assert(await alive(pid),'The server remains alive after verified output closure and before owned cleanup');
     assert(connector.closing instanceof Promise,'EOF schedules automatic owned cleanup before the test releases it');
   }finally{releaseCleanup();await connector.dispose();await response;}
