@@ -600,26 +600,39 @@ async function testFlamePresentation(context,view,graph){
   const previousViewport=await context.windowPage.evaluate(()=>({width:innerWidth,height:innerHeight}));
   const audits=[];
   const audit=async()=>{
-    const labels=await graph.locator('svg.flame').evaluate(svg=>[...svg.querySelectorAll('.flame-node text')]
-      .filter(text=>getComputedStyle(text).display!=='none').map(text=>{
+    const presentation=await graph.locator('svg.flame').evaluate(svg=>({
+      editorBackground:getComputedStyle(document.documentElement).backgroundColor,
+      cardBackground:getComputedStyle(svg.closest('.flame-card')).backgroundColor,
+      labels:[...svg.querySelectorAll('.flame-node text')].filter(text=>getComputedStyle(text).display!=='none').map(text=>{
         const rect=text.parentElement.querySelector('rect'),x=Number(rect.getAttribute('x')),width=Number(rect.getAttribute('width'));
         return {name:text.textContent,foreground:getComputedStyle(text).fill,background:getComputedStyle(rect).fill,
           filter:getComputedStyle(rect).filter,length:text.getComputedTextLength(),available:Math.min(svg.viewBox.baseVal.width,x+width)-Math.max(0,x)-8};
-      }));
+      })}));
+    const {labels,editorBackground,cardBackground}=presentation;
     assert(labels.length,'Real native profile labels remain visible');
-    const rgb=value=>{const match=/^rgba?\(([^)]+)\)$/.exec(value);assert(match,`Inspect actual computed RGB colors: ${value}`);
-      const values=match[1].split(',').map(Number);assert(values.length===3||values[3]===1,'The qualified built-in palette uses opaque frame colors');return values.slice(0,3);};
+    const rgba=value=>{const match=/^rgba?\(([^)]+)\)$/.exec(value);assert(match,`Inspect actual computed RGB colors: ${value}`);
+      const values=match[1].split(',').map(Number);if(values.length===3)values.push(1);
+      assert(values.length===4&&values.every(Number.isFinite)&&values.slice(0,3).every(channel=>channel>=0&&channel<=255)&&values[3]>=0&&values[3]<=1,
+        `Inspect finite computed RGBA channels: ${value}`);return values;};
+    // Independent source-over arithmetic, rather than the production Canvas color sampler.
+    const over=(foreground,background)=>foreground.slice(0,3).map((channel,index)=>channel*foreground[3]+background[index]*(1-foreground[3]));
+    const editor=rgba(editorBackground);assert.equal(editor[3],1,`The actual editor supplies an opaque base: ${editorBackground}`);
+    const card=over(rgba(cardBackground),editor),palettes=new Map();
     const luminance=channels=>channels.map(channel=>channel/255).map(value=>value<=.04045?value/12.92:((value+.055)/1.055)**2.4)
       .reduce((sum,value,index)=>sum+value*[.2126,.7152,.0722][index],0);
     const contrasts=labels.map(label=>{
       assert(label.length<=label.available+1e-6,`Measured label fits its visible frame: ${label.name}`);
       const brightness=label.filter==='none'?1:Number(/^brightness\(([^)]+)\)$/.exec(label.filter)?.[1]);
       assert(Number.isFinite(brightness),'The audit accounts for the actual native hover/focus brightness');
-      const background=luminance(rgb(label.background).map(value=>Math.min(255,value*brightness))),foreground=luminance(rgb(label.foreground));
+      const frame=rgba(label.background),backgroundRgb=over([...frame.slice(0,3).map(value=>Math.min(255,value*brightness)),frame[3]],card);
+      const foregroundRgb=over(rgba(label.foreground),backgroundRgb),background=luminance(backgroundRgb),foreground=luminance(foregroundRgb);
       const ratio=(Math.max(background,foreground)+.05)/(Math.min(background,foreground)+.05);
-      assert(ratio>=4.5,`Actual rendered label contrast ${ratio}: ${label.name}`);return ratio;
+      const palette={foreground:label.foreground,frame:label.background,filter:label.filter,editorBackground,cardBackground,
+        compositedForeground:foregroundRgb,compositedBackground:backgroundRgb,contrast:ratio};
+      assert(ratio>=4.5,`Actual rendered label contrast ${ratio}: ${label.name}; ${JSON.stringify(palette)}`);
+      palettes.set(JSON.stringify([label.foreground,label.background,label.filter]),palette);return ratio;
     });
-    return {visibleLabels:labels.length,minimumContrast:Math.min(...contrasts),measuredWidthsFit:true};
+    return {visibleLabels:labels.length,minimumContrast:Math.min(...contrasts),measuredWidthsFit:true,palettes:[...palettes.values()]};
   };
   try{
     for(const [uiTheme,kind,bodyClass]of [['vs',context.vscode.ColorThemeKind.Light,'vscode-light'],['vs-dark',context.vscode.ColorThemeKind.Dark,'vscode-dark']]){
