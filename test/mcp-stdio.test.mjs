@@ -202,6 +202,52 @@ for(const mode of ['duplicate','bad-cursor','invalid','wrong-id','interactive'])
   const pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));assert.equal(await alive(pid),false);
 },mode));
 
+for(const mode of ['eof','partial-eof'])test(`Windows direct native ${mode}: actual stdout EOF while the server stays alive`,{skip:process.platform!=='win32'},async t=>{
+  const root=await mkdtemp(path.join(tmpdir(),'perfchecker-direct-stdio-contract-'));
+  let child,finished,closed,ended=false,output='',protocolError,launchError,stage='launch';
+  const replies=new Map();
+  try{
+    const executable=await windowsEofServer(root);
+    child=spawn(executable,[mode],{cwd:root,windowsHide:true,stdio:['pipe','pipe','pipe']});
+    finished=new Promise(resolve=>child.once('close',resolve));
+    child.once('error',error=>{launchError=error;});
+    child.stdin.on('error',error=>{launchError=error;});
+    child.stderr.on('data',()=>{});
+    child.stdout.setEncoding('utf8');child.stdout.once('end',()=>{ended=true;});
+    child.stdout.once('error',error=>{protocolError=error;});
+    child.stdout.on('data',chunk=>{
+      output+=chunk;let newline;
+      while((newline=output.indexOf('\n'))>=0){
+        const line=output.slice(0,newline);output=output.slice(newline+1);
+        try{const reply=JSON.parse(line);replies.set(reply.id,reply);}catch(error){protocolError=error;}
+      }
+    });
+    const send=(id,method,params={})=>child.stdin.write(JSON.stringify({jsonrpc:'2.0',id,method,params})+'\n');
+    const reply=async id=>until(()=>{if(launchError)throw launchError;if(protocolError)throw protocolError;return replies.get(id);});
+    send(1,'server/discover');assert.deepEqual((await reply(1)).result.supportedVersions,['2026-07-28']);
+    send(2,'tools/list');assert.deepEqual((await reply(2)).result.tools.map(tool=>tool.name),['consult','modify']);
+    const pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));assert.equal(pid,child.pid);assert(await alive(pid));
+    const evidenceDeadline=Date.now()+5000;stage='verified-stdout-close';
+    send(3,'tools/call',{name:'consult',arguments:{question:'Close output',flavour:'fixture'}});
+    closed=await until(async()=>JSON.parse(await readFile(path.join(root,'output-closed.json'),'utf8')),Math.max(1,evidenceDeadline-Date.now()));
+    assert.deepEqual(closed,{pid,stdoutClosed:true,aliveAfterClose:true,closureCheck:'ERROR_INVALID_HANDLE'});
+    assert(await alive(pid));stage='direct-stdout-eof';
+    await until(()=>ended,Math.max(1,evidenceDeadline-Date.now()));
+    assert(Date.now()<evidenceDeadline,'Direct native stdout EOF must arrive inside the same five-second evidence deadline');
+    assert.ifError(protocolError);assert(await alive(pid),'Direct stdout EOF is observed while the native server is still alive');
+    assert.equal(child.exitCode,null);assert.equal(output,mode==='partial-eof'?'incomplete-json':'');
+    t.diagnostic(JSON.stringify({event:'direct-native-output-eof-before-cleanup',mode,closed,serverAlive:true,stdoutEnded:ended,exitCode:child.exitCode}));
+  }catch(error){
+    t.diagnostic(JSON.stringify({event:'direct-native-output-eof-failure-before-cleanup',mode,stage,closed:closed??null,
+      serverAlive:child?.pid?await alive(child.pid).catch(()=>'unknown'):false,stdoutEnded:ended,exitCode:child?.exitCode}));
+    throw error;
+  }finally{
+    if(child){child.stdin?.destroy();if(child.pid&&await alive(child.pid))child.kill('SIGKILL');await finished;
+      if(child.pid)assert.equal(await alive(child.pid),false,'Only the direct fixture child is stopped before teardown');}
+    await rm(root,{recursive:true,force:true});
+  }
+});
+
 for(const mode of ['eof','partial-eof'])test(`stdio ${mode}: output EOF retires a still-live server without waiting for the tool timeout`,t=>fixture(async({root,create})=>{
   const connector=await create().start(),pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));
   assert(await alive(pid));

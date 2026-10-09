@@ -256,7 +256,11 @@ async function resumeStdioReload(context,value){
   'Official Reload finishes owned stdio cleanup before final teardown',Math.max(1,deadline-Date.now()));
   assert.equal(Number(await fs.readFile(path.join(value.connection.root,'server.pid'),'utf8')),value.connection.identity.pid,
     'A new extension host must not automatically launch another server');
+  const selected=vscode.workspace.getWorkspaceFolder(vscode.Uri.file(value.workspace));
+  assert(selected);assert.equal(selected.uri.fsPath,value.workspace);
+  await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',vscode.Uri.file(value.workspace));
   await vscode.commands.executeCommand('perfchecker.openChat');const state=await vscode.commands.executeCommand('perfchecker.chatState');
+  assert.equal(state.workspace,selected.name,'The restarted host opens the explicitly selected owning workspace');
   assert.equal(state.connectionKind,undefined);assert.equal(state.busy,false);assert.deepEqual(state.messages,[]);
   for(const [file,digest] of Object.entries(value.files))assert.equal(hash(await fs.readFile(file)),digest,'Reload preserves source, Git index, settings, result and project/manifest bytes');
   assert.equal((await execute('git',['rev-parse','HEAD'],{cwd:workspace,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout,value.head);
@@ -265,7 +269,7 @@ async function resumeStdioReload(context,value){
   const activations=(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'mcp-stdio-activations.jsonl'),'utf8')).trim().split('\n').map(JSON.parse).filter(row=>row.invocation===value.invocation);
   assert.equal(activations.length,2);assert.deepEqual(activations.map(row=>row.pid),[value.oldHostPid,process.pid]);
   proof('native-mcp-stdio-official-editor-reload',{oldHostPid:value.oldHostPid,newHostPid:process.pid,activations,
-    oldHostAbsentBeforeTeardown:true,
+    oldHostAbsentBeforeTeardown:true,explicitWorkspaceSelectionAfterReload:true,
     server:value.connection.identity,windowsJobOwner:value.connection.windowsJobOwner,observedAbsentBeforeTeardown:true,
     sourceProjectManifestSettingsAndMeasuredResultPreserved:true,noAutomaticServerLaunch:true,sessionConnectionEmpty:true,
     newMeasurement:false,newAgent:false,priorReportSha256:value.beforeReportSha256,priorReport:'mcp-stdio-before-host-restart.json',
