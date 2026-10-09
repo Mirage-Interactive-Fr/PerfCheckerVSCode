@@ -35,21 +35,22 @@ exports.beginQualification=async context=>{
     const owned=new Set(current.filter(row=>known.has(`${row.pid}/${row.started}`)).map(row=>row.pid));
     for(const row of current.filter(row=>row.parent===process.pid&&!['Z','X'].includes(row.state)))try{
       if(await fs.realpath(`/proc/${row.pid}/exe`)===executable){owned.add(row.pid);if(row.group===row.pid)groups.add(row.group);}
-    }catch(error){const after=await identity(row.pid);if(!['ENOENT','ESRCH'].includes(error.code)||after&&!['Z','X'].includes(after.state))observedErrors.push({pid:row.pid,kind:'direct-executable-unknown',code:error.code||error.name});}
+    }catch(error){const after=await identity(row.pid);if(!['ENOENT','ESRCH'].includes(error.code)||after&&(after.started!==row.started||after.group!==row.group||!['Z','X'].includes(after.state)))observedErrors.push({pid:row.pid,kind:'direct-executable-unknown',code:error.code||error.name});}
     for(let changed=true;changed;){changed=false;for(const row of current)if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
     for(const row of current.filter(row=>groups.has(row.group)&&!owned.has(row.pid)&&!['Z','X'].includes(row.state)))observedErrors.push({pid:row.pid,kind:'unqualified-private-group-member'});
     for(const row of current.filter(row=>owned.has(row.pid)))try{
       if(['Z','X'].includes(row.state)){rows.push({...row,gone:true});continue;}
       const actual=await fs.realpath(`/proc/${row.pid}/exe`),after=await identity(row.pid);
-      if(!after||['Z','X'].includes(after.state)){rows.push({...row,gone:true});continue;}
+      if(!after){rows.push({...row,gone:true});continue;}
       assert(after.group===row.group&&after.started===row.started);
+      if(['Z','X'].includes(after.state)){rows.push({...row,gone:true});continue;}
       if(after.parent!==row.parent)context.log('native-editor-parent-transition',{stage,pid:row.pid,started:row.started,group:row.group,
         initialObservedParent:row.parent,currentParent:after.parent,stillAlive:true,observedAt:new Date().toISOString()});
       assert.equal(await fs.realpath(`/proc/${row.pid}/exe`),actual,'The executable is revalidated with the same incarnation');
       const key=`${row.pid}/${row.started}`,prior=known.get(key);assert(!prior||prior.canonicalExecutable===actual,'Executable changes stay unqualified');
       const value={...after,canonicalExecutable:actual};known.set(key,value);rows.push(value);
     }catch(error){let after;try{after=await identity(row.pid);}catch(observation){observedErrors.push({pid:row.pid,kind:'revalidation-unknown',code:observation.code||observation.name});}
-      if(['ENOENT','ESRCH'].includes(error.code)&&(!after||['Z','X'].includes(after.state))&&!observedErrors.some(x=>x.pid===row.pid)){rows.push({...row,gone:true});continue;}
+      if(['ENOENT','ESRCH'].includes(error.code)&&(!after||after.started===row.started&&after.group===row.group&&['Z','X'].includes(after.state))&&!observedErrors.some(x=>x.pid===row.pid)){rows.push({...row,gone:true});continue;}
       observedErrors.push({pid:row.pid,kind:'identity-unknown',code:error.code||error.name});}
     for(const prior of known.values())if(current.some(row=>row.pid===prior.pid&&row.started!==prior.started))observedErrors.push({pid:prior.pid,kind:'pid-reused'});
     const tcp=[];
@@ -91,7 +92,7 @@ exports.beginQualification=async context=>{
       context.log('native-editor-verified-sample-worker',{...record,ownershipObserved:true});},
     port:async port=>{assert(Number.isInteger(port)&&port>0&&port<65536);ports.add(port);const value=await sample('owned-provider-listener');
       const listener=value.tcp.filter(row=>row.localPort===port&&row.state==='0A');assert.equal(listener.length,1,'One real fixture listener exists before requests');
-      const owned=[];for(const fd of await fs.readdir(`/proc/${process.pid}/fd`))try{if(await fs.readlink(`/proc/${process.pid}/fd/${fd}`)===`socket:[${listener[0].inode}]`)owned.push(fd);}catch(error){if(error.code!=='ENOENT')throw error;}
+      const owned=[];for(const fd of await fs.readdir(`/proc/${process.pid}/fd`))try{if(await fs.readlink(`/proc/${process.pid}/fd/${fd}`)===`socket:[${listener[0].inode}]`)owned.push(fd);}catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;}
       assert(owned.length>0,'The exact listener inode belongs to this independently identified extension host');
       context.log('native-editor-owned-provider-socket',{host,hostExecutable,port,inode:listener[0].inode,ownedDescriptors:owned});},
   };

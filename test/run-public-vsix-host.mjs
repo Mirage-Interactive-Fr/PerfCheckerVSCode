@@ -108,10 +108,19 @@ async function executeControllerPreflight(executable,args,receipt){
   const inspect=async row=>{
     if(windows){assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));return {...row,executable:await fs.realpath(row.executable)};}
     if(process.platform==='linux'){
-      try{const stat=await fs.readFile(`/proc/${row.pid}/stat`,'utf8'),fields=stat.slice(stat.lastIndexOf(') ')+2).trim().split(/\s+/);if(['Z','X'].includes(fields[0]))return undefined;
-        const result={pid:row.pid,parent:Number(fields[1]),group:Number(fields[2]),started:fields[19],executable:await fs.realpath(`/proc/${row.pid}/exe`)};
-        const after=await fs.readFile(`/proc/${row.pid}/stat`,'utf8');assert.equal(after.slice(after.lastIndexOf(') ')+2).trim().split(/\s+/)[19],result.started);return result;
-      }catch(error){if(['ENOENT','ESRCH'].includes(error.code))return undefined;throw error;}
+      const before=await linuxCurrent(row.pid);if(!before)return undefined;
+      const qualified=records.get(row.pid);
+      if(qualified){assert.equal(before.started,qualified.started,'A reused observed PID never qualifies cleanup');assert.equal(before.group,qualified.group);}
+      if(['Z','X'].includes(before.state))return undefined;
+      const same=after=>{assert.equal(after.started,before.started);assert.equal(after.group,before.group);};
+      let executable;
+      try{executable=await fs.realpath(`/proc/${row.pid}/exe`);}
+      catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;const current=await linuxCurrent(row.pid);
+        if(!current)return undefined;same(current);if(['Z','X'].includes(current.state))return undefined;throw error;}
+      const after=await linuxCurrent(row.pid);if(!after)return undefined;same(after);if(['Z','X'].includes(after.state))return undefined;
+      if(after.parent!==before.parent||after.state!==before.state)(receipt.ownership.revalidations??=[]).push({stage:'mutable-process-fields',pid:row.pid,
+        started:after.started,group:after.group,beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
+      return {pid:row.pid,parent:after.parent,group:after.group,started:after.started,executable};
     }
     if(/^Z/.test(row.state))return undefined;
     assert(Number.isFinite(Date.parse(row.started)),'macOS supplies a real process start date');

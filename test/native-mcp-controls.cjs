@@ -70,22 +70,33 @@ async function neutralStdioServer(){
   });
   process.stdin.on('end',()=>{ledger({method:'stdin/eof',version});for(const controller of pending.values())controller.abort();process.exit(0);});
 }
-async function nativeIdentity(pid,expectedExecutable,observe=()=>{}){
+async function linuxNativeStat(pid){
+  let value;try{value=await fs.readFile(`/proc/${pid}/stat`,'utf8');}
+  catch(error){if(['ENOENT','ESRCH'].includes(error.code))return undefined;throw error;}
+  const end=value.lastIndexOf(')'),fields=value.slice(end+2).trim().split(/\s+/);
+  assert(end>0&&Number(value.slice(0,value.indexOf(' ')))===pid&&fields.length>19&&/^[A-Za-z]$/.test(fields[0]));
+  assert([fields[1],fields[2],fields[19]].every(field=>/^\d+$/.test(field)));
+  const current={pid,parent:Number(fields[1]),group:Number(fields[2]),start:fields[19],state:fields[0]};
+  assert(Number.isSafeInteger(current.parent)&&current.parent>=0&&Number.isSafeInteger(current.group)&&current.group>=0);return current;
+}
+async function nativeIdentity(pid,expectedExecutable,observe=()=>{},expectedIdentity){
   assert(Number.isSafeInteger(pid)&&pid>0);
   if(process.platform==='linux'){
-    let first;try{first=await fs.readFile(`/proc/${pid}/stat`,'utf8');}catch(error){if(error.code==='ENOENT')return;throw error;}
-    const fields=first.slice(first.lastIndexOf(')')+2).trim().split(/\s+/);
-    assert(fields.length>19&&/^\d+$/.test(fields[19]));
-    for(const index of [1,2])assert(/^\d+$/.test(fields[index])&&Number.isSafeInteger(Number(fields[index])));
-    if(['Z','X'].includes(fields[0]))return;
-    let executable,after;
-    try{executable=await fs.realpath(`/proc/${pid}/exe`);after=await fs.readFile(`/proc/${pid}/stat`,'utf8');}
-    catch(error){if(error.code!=='ENOENT')throw error;
-      const current=await fs.readFile(`/proc/${pid}/stat`,'utf8').catch(failure=>{if(failure.code==='ENOENT')return '';throw failure;});
-      if(!current||['Z','X'].includes(current.slice(current.lastIndexOf(')')+2).trim().split(/\s+/)[0]))return;throw error;}
-    assert.equal(after.slice(after.lastIndexOf(')')+2).trim().split(/\s+/)[19],fields[19]);
+    const before=await linuxNativeStat(pid);if(!before)return;
+    const same=after=>{assert.equal(after.start,before.start,'PID reuse during executable inspection remains a failure');assert.equal(after.group,before.group);};
+    if(expectedIdentity){assert.equal(before.start,expectedIdentity.start);assert.equal(before.group,expectedIdentity.group);}
+    if(['Z','X'].includes(before.state))return;
+    let executable;
+    try{executable=await fs.realpath(`/proc/${pid}/exe`);}
+    catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;
+      const current=await linuxNativeStat(pid);if(!current)return;same(current);
+      if(['Z','X'].includes(current.state))return;throw error;}
+    const after=await linuxNativeStat(pid);if(!after)return;same(after);
+    if(['Z','X'].includes(after.state))return;
     assert.equal(executable,expectedExecutable);
-    return {pid,parent:Number(fields[1]),group:Number(fields[2]),start:fields[19],executable};
+    if(after.parent!==before.parent||after.state!==before.state)observe({kind:'mutable-process-fields',pid,start:after.start,executable,group:after.group,
+      beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
+    return {pid,parent:after.parent,group:after.group,start:after.start,executable};
   }
   if(process.platform==='win32'){
     const text=(await execute('powershell.exe',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}' -ErrorAction Stop;if($p){@{pid=$p.ProcessId;parent=$p.ParentProcessId;start=$p.CreationDate.ToUniversalTime().ToString('o');executable=$p.ExecutablePath}|ConvertTo-Json -Compress}`],{timeout:5000})).stdout.trim();
@@ -120,7 +131,7 @@ async function nativeIdentity(pid,expectedExecutable,observe=()=>{}){
 }
 const nativeParentObservations=new WeakMap();
 async function observeNativeIdentityGone(identity,observe){
-  const current=await nativeIdentity(identity.pid,identity.executable,observe);
+  const current=await nativeIdentity(identity.pid,identity.executable,observe,identity);
   if(!current)return true;
   assert.equal(current.start,identity.start,'PID reuse is recorded as an identity mismatch, never silently accepted');
   const incarnation=({parent,...value})=>value;
@@ -145,7 +156,9 @@ async function ownedStdioJuliaProcesses(){
     rows=rows.filter(row=>row.pid!==observer);
   }
   const matches=async row=>{
-    if(process.platform==='linux'){try{return await fs.realpath(`/proc/${row.pid}/exe`)===expected;}catch(error){if(error.code==='ENOENT')return false;throw error;}}
+    if(process.platform==='linux'){try{return await fs.realpath(`/proc/${row.pid}/exe`)===expected;}catch(error){
+      if(!['ENOENT','ESRCH'].includes(error.code))throw error;const current=await linuxNativeStat(row.pid);
+      if(!current||['Z','X'].includes(current.state))return false;throw error;}}
     if(process.platform==='win32')return (await fs.realpath(row.executable)).toLowerCase()===expected.toLowerCase();
     const files=(await execute('lsof',['-nP','-a','-p',String(row.pid),'-d','txt','-F','n'],{timeout:5000})).stdout;
     return(await Promise.all(files.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1))))).includes(expected);
@@ -164,7 +177,7 @@ async function ownedLoopbackConnection(identity){
   let rows;
   if(process.platform==='linux'){
     const inodes=new Set();for(const fd of await fs.readdir(`/proc/${identity.pid}/fd`)){
-      const target=await fs.readlink(`/proc/${identity.pid}/fd/${fd}`).catch(error=>{if(error.code==='ENOENT')return '';throw error;});
+      const target=await fs.readlink(`/proc/${identity.pid}/fd/${fd}`).catch(error=>{if(['ENOENT','ESRCH'].includes(error.code))return '';throw error;});
       const match=target.match(/^socket:\[(\d+)\]$/);if(match)inodes.add(match[1]);
     }
     rows=(await fs.readFile('/proc/net/tcp','utf8')).trim().split('\n').slice(1).map(line=>line.trim().split(/\s+/))
