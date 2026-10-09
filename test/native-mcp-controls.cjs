@@ -70,7 +70,7 @@ async function neutralStdioServer(){
   });
   process.stdin.on('end',()=>{ledger({method:'stdin/eof',version});for(const controller of pending.values())controller.abort();process.exit(0);});
 }
-async function nativeIdentity(pid,expectedExecutable){
+async function nativeIdentity(pid,expectedExecutable,observe=()=>{}){
   assert(Number.isSafeInteger(pid)&&pid>0);
   if(process.platform==='linux'){
     let first;try{first=await fs.readFile(`/proc/${pid}/stat`,'utf8');}catch(error){if(error.code==='ENOENT')return;throw error;}
@@ -94,21 +94,43 @@ async function nativeIdentity(pid,expectedExecutable){
   }
   const read=async()=>{try{return(await execute('ps',['-p',String(pid),'-o','ppid=,pgid=,stat=,lstart='],{timeout:5000})).stdout.trim();}
     catch(error){if(error.code===1&&!String(error.stdout||'').trim()&&!String(error.stderr||'').trim())return '';throw error;}};
-  const before=await read();if(!before)return;
-  const match=before.match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);assert(match);if(/^[ZX]/.test(match[3]))return;
+  const parse=text=>{
+    const match=text.match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);assert(match);
+    const value={parent:Number(match[1]),group:Number(match[2]),state:match[3],start:match[4]};
+    assert(Number.isSafeInteger(value.parent)&&value.parent>=0&&Number.isSafeInteger(value.group)&&value.group>0);return value;
+  };
+  const beforeText=await read();if(!beforeText)return;
+  const before=parse(beforeText);if(/^[ZX]/.test(before.state))return;
   let mappings;
   try{mappings=(await execute('lsof',['-nP','-a','-p',String(pid),'-d','txt','-F','n'],{timeout:5000})).stdout;}
   catch(error){if(error.code!==1||String(error.stdout||'').trim()||String(error.stderr||'').trim())throw error;
-    const current=await read();if(!current||/^\d+\s+\d+\s+[ZX]/.test(current))return;throw error;}
+    const current=await read();if(!current)return;const after=parse(current);
+    assert.equal(after.start,before.start);assert.equal(after.group,before.group);
+    if(/^[ZX]/.test(after.state))return;throw error;}
   const files=await Promise.all(mappings.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1))));
-  assert(files.includes(expectedExecutable));assert.equal(await read(),before);
-  return {pid,parent:Number(match[1]),group:Number(match[2]),start:match[4],executable:expectedExecutable};
+  const afterText=await read();if(!afterText)return;
+  const after=parse(afterText);
+  assert.equal(after.start,before.start,'PID reuse during executable inspection remains a failure');
+  assert.equal(after.group,before.group,'The private process group remains anchored');
+  if(/^[ZX]/.test(after.state))return;
+  assert(files.includes(expectedExecutable));
+  if(after.parent!==before.parent||after.state!==before.state)observe({kind:'mutable-process-fields',pid,start:after.start,executable:expectedExecutable,group:after.group,
+    beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
+  return {pid,parent:after.parent,group:after.group,start:after.start,executable:expectedExecutable};
 }
-async function sameNativeIdentityGone(identity){
-  const current=await nativeIdentity(identity.pid,identity.executable);
+const nativeParentObservations=new WeakMap();
+async function observeNativeIdentityGone(identity,observe){
+  const current=await nativeIdentity(identity.pid,identity.executable,observe);
   if(!current)return true;
   assert.equal(current.start,identity.start,'PID reuse is recorded as an identity mismatch, never silently accepted');
-  assert.deepEqual(current,identity);return false;
+  const incarnation=({parent,...value})=>value;
+  assert.deepEqual(incarnation(current),incarnation(identity),'The established incarnation retains its PID, start, executable and private group');
+  if(current.parent!==identity.parent&&nativeParentObservations.get(identity)!==current.parent){
+    nativeParentObservations.set(identity,current.parent);
+    observe({kind:'parent-transition',pid:identity.pid,start:identity.start,executable:identity.executable,group:identity.group,
+      originalParent:identity.parent,currentParent:current.parent,stillAlive:true,observedAt:new Date().toISOString()});
+  }
+  return false;
 }
 async function ownedStdioJuliaProcesses(){
   const expected=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
@@ -213,6 +235,7 @@ exports.validateStdioReloadHandoff=async previous=>{
 async function resumeStdioReload(context,value){
   assert.notEqual(process.pid,value.oldHostPid);
   const {vscode,workspace,proof}=context;
+  const sameNativeIdentityGone=identity=>observeNativeIdentityGone(identity,observation=>context.log('native-mcp-stdio-identity-observation',observation));
   const deadline=Date.parse(value.reloadRequestedAt)+60000;
   assert(Date.now()<deadline,'The new extension host must resume inside the existing 60-second shutdown bound');
   await eventually(async()=>await sameNativeIdentityGone(value.connection.identity)&&
@@ -414,6 +437,7 @@ exports.run = async (context,options={}) => {
   assert.equal(process.env.CI, 'true');
   if(options.stdio){const handoff=await stdioHandoff();if(handoff)return resumeStdioReload(context,handoff);}
   const {vscode, workspace, findFrame, log, proof} = context;
+  const sameNativeIdentityGone=identity=>observeNativeIdentityGone(identity,observation=>log('native-mcp-stdio-identity-observation',observation));
   const uri = vscode.Uri.file(workspace);
   const settings = () => vscode.workspace.getConfiguration('perfchecker', uri);
   const measurementProject=await fs.realpath(path.join(workspace,'worker-environment'));
