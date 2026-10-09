@@ -974,7 +974,8 @@ class Controller {
     if (!this.resultsPanel) {
       this.resultsPanel = vscode.window.createWebviewPanel('perfchecker.output', 'PerfChecker output', vscode.ViewColumn.One,
         {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
-      this.resultsPanel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+      this.resultsPanel.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
+        dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
       const panel = this.resultsPanel, workspace = this.folder().uri.toString();
       this.resultsPanel.onDidDispose(() => { if (this.resultsPanel === panel) this.resultsPanel = undefined; });
       this.resultsPanel.webview.onDidReceiveMessage(async message => {
@@ -997,7 +998,8 @@ class Controller {
     this.designer = vscode.window.createWebviewPanel('perfchecker.designer', 'PerfChecker suite', vscode.ViewColumn.One,
       {enableScripts: true, retainContextWhenHidden: true});
     const nonce = this.nonce();
-    this.designer.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+    this.designer.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
     const logo = this.designer.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.png'));
     const script = this.designer.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'designer.js'));
     const style = this.designer.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'designer.css'));

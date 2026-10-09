@@ -136,7 +136,8 @@ export class InvestigationController implements vscode.TreeDataProvider<Node>, v
     if (this.panel) {this.panel.reveal(); this.refresh(); return;}
     this.panel = vscode.window.createWebviewPanel('perfchecker.investigation', 'PerfChecker · Investigate', vscode.ViewColumn.One,
       {enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
-    this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+    this.panel.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
     const webview = this.panel.webview;
     const script = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'investigation.js'));
     const style = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'investigation.css'));

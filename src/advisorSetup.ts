@@ -75,7 +75,8 @@ export class AdvisorSetup implements vscode.Disposable {
     const panel = this.panel, webview = panel.webview, nonce = randomUUID();
     const resource = (name: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
     const data = JSON.stringify(initial).replace(/</g, '\\u003c');
-    this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+    this.panel.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
     webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('investigation.css')}"><link rel="stylesheet" href="${resource('advisor-panel.css')}"><title>Advisor and models</title></head><body><header class="advisor-brand"><img src="${resource('perfchecker.png')}" alt="PerfChecker"><span>PerfChecker · Connections and models</span></header><main id="advisor-root"></main><script nonce="${nonce}" src="${resource('advisor-panel.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorPanel(document.getElementById('advisor-root'),m=>api.postMessage(m),${data});window.addEventListener('message',e=>panel.receive(e.data));</script></body></html>`;
     this.panel.onDidDispose(() => {this.cancel(); this.panel = undefined;});
     webview.onDidReceiveMessage(async message => {

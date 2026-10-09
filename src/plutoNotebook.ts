@@ -462,7 +462,8 @@ export class PlutoNotebooks implements vscode.Disposable {
     if (session) {session.panel.reveal(); await session.starting; return vscode.Uri.file(notebook);}
     const panel = vscode.window.createWebviewPanel('perfchecker.pluto', `Pluto · ${path.basename(notebook)}`, vscode.ViewColumn.One,
       {enableScripts:true, retainContextWhenHidden:true, localResourceRoots:[vscode.Uri.joinPath(this.context.extensionUri,'media')]});
-    panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri,'media','perfchecker.svg');
+    panel.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
     session = {folder,notebook,project,panel,disposed:false}; this.sessions.set(key,session);
     const owned = session;
     panel.onDidDispose(() => {owned.disposed = true; if (this.sessions.get(key) === owned) this.sessions.delete(key); void this.stop(owned);});

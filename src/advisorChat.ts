@@ -84,7 +84,8 @@ export class AdvisorChat implements vscode.Disposable {
       {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
     const panel = this.panel, webview = panel.webview, nonce = randomUUID();
     const resource = (name: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
-    this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+    this.panel.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
     webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('advisor-chat.css')}"><title>PerfChecker chat</title></head><body><main id="chat-root"></main><script nonce="${nonce}" src="${resource('advisor-chat.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorChat(document.getElementById('chat-root'),m=>api.postMessage(m),${JSON.stringify(String(resource('perfchecker.png')))});window.addEventListener('message',e=>panel.receive(e.data));api.postMessage({type:'chatReady'});</script></body></html>`;
     panel.onDidDispose(() => {if (this.panel===panel) {this.cancel();this.panel=undefined;}});
     webview.onDidReceiveMessage(async message => {

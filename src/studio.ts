@@ -60,7 +60,8 @@ class Studio implements vscode.Disposable {
     this.panelWorkspace = workspace;
     this.panel = vscode.window.createWebviewPanel('perfchecker.studio', `PerfChecker · ${folder.name}`, vscode.ViewColumn.One,
       {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
-    this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+    this.panel.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
     const panel = this.panel, webview = panel.webview, nonce = randomUUID();
     const resource = (name: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
     webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('studio.css')}"><title>PerfChecker Studio</title></head><body><main id="studio-root"></main><script nonce="${nonce}" src="${resource('studio.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const studio=mountPerfCheckerStudio(document.getElementById('studio-root'),m=>api.postMessage(m),${JSON.stringify(String(resource('perfchecker.png')))});window.addEventListener('message',e=>studio.receive(e.data));api.postMessage({type:'studioReady'});</script></body></html>`;

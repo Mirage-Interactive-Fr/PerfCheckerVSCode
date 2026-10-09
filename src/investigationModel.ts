@@ -132,7 +132,8 @@ export function reportSummary(report: InvestigationReport): string {
   if (report.records) return `${report.records.filter(r => r.status === 'complete').length}/${report.records.length} analyses completed`;
   if (report.recommendations) return `${report.recommendations.length} evidence-based recommendations`;
   if (report.configurations) return `${report.configurations.length} separate configurations`;
-  return `${report.runs?.length ?? 0} measurements`;
+  const count = report.runs?.length ?? 0;
+  return `${count} ${count === 1 ? 'measurement' : 'measurements'}`;
 }
 
 /** Total measured item time for VS Code's duration field, excluding process startup. */
