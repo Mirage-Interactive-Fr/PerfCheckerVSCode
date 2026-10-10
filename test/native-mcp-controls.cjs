@@ -957,10 +957,16 @@ exports.run = async (context,options={}) => {
       assert.equal(calls.length,1);assert.equal(calls[0].name,adviceTool);assert.deepEqual(calls[0].evidenceIds,[]);
       const completed=await state();assert.equal(settings().get('advisorTimeout'),90);assert.equal(completed.busy,false);
       assert.equal(completed.messages[1].role,'assistant');assert.match(completed.messages[1].content,/Consider a generator/);
-      await view.getByText(completed.messages[1].content,{exact:true}).waitFor({state:'visible',timeout:15000});
+      const completedAt=new Date().toISOString(),elapsedSeconds=(Date.parse(completedAt)-Date.parse(firstSendStartedAt))/1000;
+      log('native-mcp-documented-install-natural-outcome',{completedAt,elapsedSeconds,busy:completed.busy,
+        messages:completed.messages.length,assistantRole:completed.messages[1].role,actualProviderRequests:calls.length,configuredSeconds:90,externalSeconds:150});
+      const reply=view.locator('.transcript .message.assistant .message-text');
+      assert.equal(await reply.count(),1,'One actual assistant bubble is present in the conversation');
+      assert.equal(await reply.innerText(),completed.messages[1].content,'The visible Advice bubble contains the full actual response');
+      await reply.waitFor({state:'visible',timeout:15000});
       assert.equal(await fs.readFile(source,'utf8'),original);assert.equal(await git('rev-parse','HEAD'),head);
-      proof('native-mcp-documented-install-first-send',{installation,requestStartedAt:firstSendStartedAt,completedAt:new Date().toISOString(),
-        elapsedSeconds:(Date.now()-Date.parse(firstSendStartedAt))/1000,configuredSeconds:90,externalSeconds:150,
+      proof('native-mcp-documented-install-first-send',{installation,requestStartedAt:firstSendStartedAt,completedAt,
+        elapsedSeconds,configuredSeconds:90,externalSeconds:150,
         firstSendWithoutControllerPreflight:true,manualHttpImportBeforeSend:false,savedEvidenceRequired:false,
         actualProviderRequests:calls.length,provider:providerLabel,sourceAndHeadPreserved:true,
         scope:'Normal automatic precompilation during documented installation; not a cold-cache90s or authenticated-model claim'});

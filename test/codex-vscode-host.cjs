@@ -28,6 +28,23 @@ function loopbackServers(){
     const address=handle.address();return address&&typeof address==='object'&&address.address==='127.0.0.1';
   });
 }
+function stagedIndex(debug,bytes){
+  assert.equal(bytes.subarray(0,4).toString(),'DIRC','Retain a real Git index');
+  const version=bytes.readUInt32BE(4);assert([2,3,4].includes(version),'Require an index version supported by the native Git semantic reader');
+  const entries=[],cache=[];let position=0;
+  while(position<debug.length){
+    const end=debug.indexOf(0,position);assert(end>=0,'Every indexed path has its complete NUL terminator');
+    const header=debug.subarray(position,end),tab=header.indexOf(9);assert(tab>0);
+    const identity=header.subarray(0,tab).toString('ascii').match(/^([0-7]{6}) ([a-f0-9]{40}|[a-f0-9]{64}) ([0-3])$/);assert(identity,'Unknown stage records must fail');
+    let metadataEnd=end;for(let line=0;line<5;line++){metadataEnd=debug.indexOf(10,metadataEnd+1);assert(metadataEnd>=0,'Complete index metadata is required');}
+    const details=debug.subarray(end+1,metadataEnd+1).toString('ascii').match(/^  ctime: (\d+):(\d+)\n  mtime: (\d+):(\d+)\n  dev: (\d+)\tino: (\d+)\n  uid: (\d+)\tgid: (\d+)\n  size: (\d+)\tflags: ([a-f0-9]+)\n$/);assert(details,'Unknown index metadata must fail');
+    entries.push({mode:identity[1],oid:identity[2],stage:Number(identity[3]),pathHex:header.subarray(tab+1).toString('hex'),flags:details[10]});
+    cache.push({pathHex:entries.at(-1).pathHex,ctime:details.slice(1,3),mtime:details.slice(3,5),dev:details[5],ino:details[6],uid:details[7],gid:details[8],size:details[9]});
+    position=metadataEnd+1;
+  }
+  assert.equal(entries.length,bytes.readUInt32BE(8),'The staging proof covers every entry, without a truncated dump');
+  return {version,entries,cache,binaryMetadata:'Complete binary retained. Native Git supplies semantic entries; extensions/checksum are not independently decoded by this oracle.'};
+}
 async function processIdentity(pid){
   try{
     const stat=await fs.readFile(`/proc/${pid}/stat`,'utf8'),fields=stat.slice(stat.lastIndexOf(') ')+2).trim().split(/\s+/);
@@ -75,11 +92,12 @@ exports.run=async()=>{
   await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result));
   const configFile=path.join(root,'perf','advisor.json'),settingsFile=path.join(root,'.vscode','settings.json');
   const relative=bibliography?'src/bibtex.jl':'src/PerfCheckerNativeFixture.jl',sourceFile=path.join(root,relative);
-  const saved=await fs.readFile(configFile),savedSettings=await fs.readFile(settingsFile),source=await fs.readFile(sourceFile,'utf8'),index=await fs.readFile(path.join(root,'.git','index'));
+  const saved=await fs.readFile(configFile),savedSettings=await fs.readFile(settingsFile),source=await fs.readFile(sourceFile,'utf8');
+  let index=await fs.readFile(path.join(root,'.git','index'));
   const settings=()=>vscode.workspace.getConfiguration('perfchecker',folder.uri);
   const git=async(...args)=>(await execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout;
   const head=await git('rev-parse','HEAD'),state=()=>vscode.commands.executeCommand('perfchecker.chatState');
-  let browser,view,endpoint,server,owned,primaryError,observer,observation;
+  let browser,view,windowPage,endpoint,server,owned,primaryError,observer,observation;
   const observed=new Map(),cliObservers=new Map(),processStates=new Map();let passiveCli;
   const observe=async()=>{
     if(observation)return observation;
@@ -149,22 +167,55 @@ exports.run=async()=>{
     return true;
   },'All observed request-owned processes must stop before fixture cleanup',20000);
   const proofs=process.env.PERFCHECKER_HOST_PROOFS;
-  const capture=async(name,timeout=30000)=>{if(proofs){await fs.mkdir(proofs,{recursive:true});await view.page().screenshot({path:path.join(proofs,`${name}.png`),timeout});}};
+  const indexProof=async label=>{
+    const bytes=await fs.readFile(path.join(root,'.git','index'));
+    if(proofs){await fs.mkdir(proofs,{recursive:true});await fs.writeFile(path.join(proofs,`${label}.index`),bytes);}
+    const {stdout,stderr}=await execute('git',['ls-files','--stage','--debug','-z'],{cwd:root,encoding:'buffer',timeout:5000,maxBuffer:4_000_000,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}});
+    if(proofs)await fs.writeFile(path.join(proofs,`${label}.index-stage-debug`),stdout);
+    assert.equal(stderr.toString().trim(),'','Native Git must not warn about ignored or unsupported index metadata');
+    const parsed=stagedIndex(stdout,bytes);assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),bytes,'Read-only staging inspection never refreshes the index');
+    const proof={label,sha256:hash(bytes),...parsed};result.indexProofs??=[];result.indexProofs.push(proof);
+    return {bytes,...proof};
+  };
+  const capture=async(name,timeout=30000)=>{
+    if(!proofs)return;
+    await fs.mkdir(proofs,{recursive:true});const filename=path.join(proofs,`${name}.png`);
+    if(!bibliography){await view.page().screenshot({path:filename,timeout});return;}
+    assert(/^:\d+$/.test(process.env.DISPLAY),'Capture only the disposable driver-owned X display');
+    assert(windowPage,'Resolve the private host workbench before framebuffer capture');
+    // ImageMagick reads the actual X framebuffer, without CSS scaling or crops.
+    await execute('/usr/bin/import',['-display',process.env.DISPLAY,'-silent','-window','root',`PNG:${filename}`],{timeout,maxBuffer:1000000});
+    const bytes=await fs.readFile(filename),dimensions=png=>{
+      assert.deepEqual(png.subarray(0,8),Buffer.from([137,80,78,71,13,10,26,10]));
+      assert.equal(png.subarray(12,16).toString(),'IHDR');return {width:png.readUInt32BE(16),height:png.readUInt32BE(20)};
+    };
+    const framebuffer=dimensions(bytes),viewport=await windowPage.evaluate(()=>({width:innerWidth,height:innerHeight,
+      outerWidth,outerHeight,screenWidth:screen.width,screenHeight:screen.height,devicePixelRatio}));
+    const renderer=dimensions(await windowPage.screenshot({scale:'device',timeout}));
+    const record={file:path.basename(filename),display:process.env.DISPLAY,source:'private X11 root framebuffer; no resize, crop or image transform',
+      ...framebuffer,sha256:hash(bytes),viewport,renderer,pixelsPerCssX:framebuffer.width/viewport.width,pixelsPerCssY:framebuffer.height/viewport.height};
+    result.framebufferCaptures??=[];result.framebufferCaptures.push(record);
+    assert.deepEqual(renderer,framebuffer,'The full native renderer must fit the actual framebuffer without clipping');
+    assert(Math.abs(record.pixelsPerCssX-record.pixelsPerCssY)<=1/Math.min(viewport.width,viewport.height),
+      'The actual framebuffer and fullscreen viewport establish one unscaled pixel mapping');
+    return record;
+  };
   const captureAdvice=async turn=>{
     if(!proofs)return;
     await view.locator('.hero').scrollIntoViewIfNeeded();await capture(`advice-${turn}-context`);
     const transcript=view.locator('.transcript'),reply=view.locator('.message.assistant').last();
-    await transcript.scrollIntoViewIfNeeded();await transcript.hover();
+    await transcript.scrollIntoViewIfNeeded();await transcript.click({position:{x:2,y:2}});
+    assert(await transcript.evaluate(node=>node===document.activeElement||node.contains(document.activeElement)),
+      'A real native click focuses the scrollable conversation before keyboard/wheel navigation');
     const geometry=()=>reply.evaluate(node=>{
       const area=node.closest('.transcript'),a=area.getBoundingClientRect(),r=node.getBoundingClientRect();
       const visibleTop=Math.max(0,a.top),visibleBottom=Math.min(innerHeight,a.bottom);
       return {height:r.height,replyTop:r.top,offset:r.top-a.top,scrollTop:area.scrollTop,clientHeight:area.clientHeight,viewportHeight:innerHeight,
         visibleTop,visibleBottom,visibleHeight:visibleBottom-visibleTop,start:Math.max(0,visibleTop-r.top),end:Math.min(r.height,visibleBottom-r.top),
-        fontSize:getComputedStyle(node).fontSize,devicePixelRatio,pixelFontSize:parseFloat(getComputedStyle(node).fontSize)*devicePixelRatio};
+        fontSize:getComputedStyle(node).fontSize,devicePixelRatio};
     });
     const initial=await geometry(),record={turn,initial,parts:[],complete:false,source:'actual native transcript wheel scrolling; no CSS or message changes'};
     result.adviceCaptures??=[];result.adviceCaptures.push(record);
-    assert(initial.pixelFontSize>=22&&initial.pixelFontSize<=24,'The actual native zoom renders reply text at 22–24 screenshot pixels');
     // A long user message can leave the assistant BELOW the viewport. Scroll
     // toward its beginning in either direction, using the real wheel only.
     const delta=initial.replyTop-initial.visibleTop-2;
@@ -175,7 +226,12 @@ exports.run=async()=>{
     for(let part=1;part<=8;part++){
       const g=await geometry();assert(g.visibleHeight>0,'The actual transcript intersects the viewport');
       if(parts.length)assert(g.start<=parts.at(-1).end+2,'Consecutive native captures retain overlapping reply text');
-      await capture(part===1?`advice-${turn}`:`advice-${turn}-part-${part}`);parts.push(g);
+      const framebuffer=await capture(part===1?`advice-${turn}`:`advice-${turn}-part-${part}`);
+      assert.equal(g.devicePixelRatio,framebuffer.viewport.devicePixelRatio,'Workbench and conversation share the native zoom');
+      g.pixelFontSize=parseFloat(g.fontSize)*framebuffer.pixelsPerCssY;
+      g.framebuffer=framebuffer.file;
+      assert(g.pixelFontSize>=22&&g.pixelFontSize<=24,'The IHDR-qualified framebuffer mapping renders reply text at 22–24 native pixels');
+      parts.push(g);
       if(g.end>=g.height-2)break;
       await transcript.hover();await view.page().mouse.wheel(0,g.visibleHeight*.85);
       await eventually(async()=>(await geometry()).scrollTop>g.scrollTop,'The native transcript advances for the next readable reply section',5000);
@@ -204,7 +260,7 @@ exports.run=async()=>{
     for(const file of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(directory,'perf','episode-05a','worker',file),path.join(target,file));}};
   try{
     result.vsixSha256=hash(await fs.readFile(process.env.PERFCHECKER_HOST_ARCHIVE));
-    assert.equal(result.vsixSha256,'fac983a008dfc57b0b4a8cd422126a38432df7284d1fb7423ac260dfb62b6301');
+    assert.equal(result.vsixSha256,'c4b32567105fac62d53e7c58cf467de9359a93a81a123c4a53b32a32da7d87ca');
     const extension=vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');assert(extension,'Load the installed product');
     const installed=await fs.realpath(extension.extensionPath);
     assert(installed.startsWith(path.join(session,'extensions')+path.sep),'The product must not come from the source checkout or human extension directory');
@@ -233,7 +289,7 @@ exports.run=async()=>{
     const {chromium}=await import(process.env.PERFCHECKER_TEST_PLAYWRIGHT?pathToFileURL(process.env.PERFCHECKER_TEST_PLAYWRIGHT).href:'playwright');
     browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.PERFCHECKER_HOST_CDP_PORT}`);
     if(bibliography){
-      const windowPage=browser.contexts().flatMap(context=>context.pages()).find(page=>page.url().includes('workbench'));
+      windowPage=browser.contexts().flatMap(context=>context.pages()).find(page=>page.url().includes('workbench'));
       assert(windowPage,'Find only the private host workbench');
       const commands=await vscode.commands.getCommands(true);
       for(const command of ['workbench.action.closeAuxiliaryBar','workbench.action.closeSidebar']){
@@ -253,9 +309,12 @@ exports.run=async()=>{
         result.captureLayout.editorWidth=result.captureLayout.chat.width;
       }
       assert(result.captureLayout.editorWidth>=1000,'Capture a wide real PerfChecker editor, rather than a narrow side column');
+      result.captureLayout.framebuffer=await capture('capture-layout-preflight',5000);
     }
     observer=setInterval(()=>{void observe().catch(error=>{result.observationError=String(error);});},200);
     const measureBibliography=async label=>{
+      const beforeIndex=await indexProof(`${label}-before-measurements`);
+      assert.deepEqual(beforeIndex.bytes,index,'Measurement setup begins with the previously qualified whole index');
       const reports=path.join(root,'perf','results','investigations'),receipts=[];
       await fs.mkdir(reports,{recursive:true});
       const beforeSettings=await fs.readFile(settingsFile),beforeConfig=JSON.parse(beforeSettings);
@@ -305,6 +364,11 @@ exports.run=async()=>{
           'The intended measurement setup restores exact settings bytes and effective configuration',10000);
       }
       result.measurements??={};result.measurements[label]=receipts;
+      const afterIndex=await indexProof(`${label}-after-measurements`);
+      assert.deepEqual(afterIndex.entries,beforeIndex.entries,'Real measurements preserve every staged mode, object, stage, flag and path');
+      result.indexProofs.at(-1).statCacheChanged=JSON.stringify(afterIndex.cache)!==JSON.stringify(beforeIndex.cache);
+      result.indexProofs.at(-1).wholeBytesChanged=!afterIndex.bytes.equals(beforeIndex.bytes);
+      index=afterIndex.bytes;
       if(proofs)await fs.writeFile(path.join(proofs,`${label}-measurements.json`),JSON.stringify(receipts,null,2));
       return receipts;
     };
@@ -351,6 +415,7 @@ exports.run=async()=>{
     checks.push('two authenticated contextual advice replies through Julia MCP are visible and preserve exact source/index/HEAD/config');
     await view.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
     assert.match(await view.locator('.warning').innerText(),/Git checkpoint.*isolated copy.*diff review/);
+    const beforePrepareIndex=await indexProof('before-prepare');assert.deepEqual(beforePrepareIndex.bytes,index);
     const beforePrepare=chatOutcome(await state()),prepareStarted=Date.now();let prepareAccepted=false,lastPrepare;
     const agentBudgetMs=Number(settings().get('advisorTimeout'))*1000;
     const cleanupGraceMs=require(path.join(installed,'dist','controllerCancellation.js')).CANCELLATION_GRACE_MS;
@@ -388,6 +453,7 @@ exports.run=async()=>{
     }
     assert(proposed,'The unchanged 21 minute host budget expired before a natural Prepare outcome');
     assert.deepEqual(proposed.proposal.files,[relative]);assert.equal(proposed.proposal.applied,false);assert.match(proposed.backupRef,/^refs\/perfchecker\/checkpoints\//);await preserved();
+    assert.deepEqual((await indexProof('after-prepare')).bytes,beforePrepareIndex.bytes,'Prepare preserves the whole index byte-exact');
     // Read the installed backend's retained proposal; do not generate or apply a replacement patch.
     const {recoverActiveImplementationProposal}=require(path.join(installed,'dist','implementation.js'));
     const proposal=await recoverActiveImplementationProposal(root);assert(proposal);assert.equal(proposal.patch,proposed.proposal.patch);
@@ -413,7 +479,9 @@ exports.run=async()=>{
     await eventually(()=>vscode.window.visibleTextEditors.some(editor=>editor.document.languageId==='diff'&&editor.document.getText()===proposal.patch),'The real native diff editor displays the entire collected patch',30000);
     if(bibliography)await presentation('full-diff',()=>capture('full-diff'));
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
+    const beforeApply=await indexProof('before-apply');assert.deepEqual(beforeApply.bytes,index);
     await click('Apply reviewed changes');await eventually(async()=>!((await state()).busy)&&(await state()).proposal?.applied,'Actual Apply completes');
+    assert.deepEqual((await indexProof('after-apply')).bytes,beforeApply.bytes,'Apply preserves the whole index byte-exact before independent measurements');
     assert.notEqual(await fs.readFile(sourceFile,'utf8'),source);
     const appliedProbe=await probe(root);
     if(bibliography){
@@ -423,7 +491,9 @@ exports.run=async()=>{
       await view.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
     }else assert.equal(appliedProbe,candidateBytes);
     assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),index);assert.equal(await git('rev-parse','HEAD'),head);
+    const beforeRestore=await indexProof('before-restore');assert.deepEqual(beforeRestore.bytes,index);
     await click('Restore previous code');await eventually(async()=>!((await state()).busy)&&!(await state()).proposal?.applied,'Actual Restore completes');
+    assert.deepEqual((await indexProof('after-restore')).bytes,beforeRestore.bytes,'Restore preserves the whole index byte-exact before independent verification');
     const restoredProbe=await probe(root);
     if(bibliography){
       assert.deepEqual(restoredProbe,baselineProbe);result.fixture.restored=restoredProbe;await presentation('restored',()=>capture('restored'));
@@ -469,6 +539,7 @@ exports.run=async()=>{
       remoteInferenceCancellation:'Not established; UI accurately preserves the remote-work caveat'});
   }catch(error){
     primaryError=error;Object.assign(result,{status:'failed',error:String(error),stack:error.stack});
+    try{await indexProof('failure-before-cleanup');}catch(snapshotError){result.failureIndexError=String(snapshotError);}
     try{result.failureChat=chatOutcome(await state());}catch(snapshotError){result.failureChatError=String(snapshotError);}
     try{result.failureObservedProcesses=(await observe()).identities;}catch(snapshotError){result.failureObservationError=String(snapshotError);}
     const failedDeadline=suiteDeadline,diagnosticDeadline=Date.now()+10000;

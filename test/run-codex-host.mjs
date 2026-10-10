@@ -12,7 +12,7 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 const client=path.dirname(path.dirname(fileURLToPath(import.meta.url))),rawExecute=promisify(execFile);
 const preparationAbort=new AbortController();
 const execute=(command,args,options={})=>rawExecute(command,args,{timeout:60000,...options,signal:preparationAbort.signal});
-const vsixSha='fac983a008dfc57b0b4a8cd422126a38432df7284d1fb7423ac260dfb62b6301';
+const vsixSha='c4b32567105fac62d53e7c58cf467de9359a93a81a123c4a53b32a32da7d87ca';
 const coreTree='00c133336911b8600d63a8d6c59ce1befc5ce690';
 const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
 // This explicit real-package demo includes a cold isolated Julia environment.
@@ -24,7 +24,7 @@ for(const name of ['PERFCHECKER_TEST_CONTROLLER','PERFCHECKER_TEST_CODEX','PERFC
   if(!process.env[name]||!path.isAbsolute(process.env[name]))throw new Error(`Provide an absolute ${name} path.`);
 const archive=await fs.realpath(process.env.PERFCHECKER_TEST_VSIX);
 assert.equal(createHash('sha256').update(await fs.readFile(archive)).digest('hex'),vsixSha,'Use the approved VSIX bytes, not a development build');
-assert.equal((await fs.stat(archive)).size,1075861);
+assert.equal((await fs.stat(archive)).size,1076115);
 if(bibliography){
   assert(path.isAbsolute(bibliography),'Provide an absolute private Bibliography pilot path');
   assert.match(await fs.readFile('/proc/self/status','utf8'),/^Cpus_allowed_list:\s*16-17\s*$/m,'The real-package driver must inherit the approved two-CPU pool');
