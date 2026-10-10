@@ -16,7 +16,9 @@ const vsixSha='e68a9264c301292568edbae21b7165f893bbeec59097233676d9de3983ba21b3'
 const coreTree='00c133336911b8600d63a8d6c59ce1befc5ce690';
 const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
 const capturePreflightOnly=process.env.PERFCHECKER_TEST_CAPTURE_PREFLIGHT_ONLY==='1';
+const dialogueCancelOnly=process.env.PERFCHECKER_TEST_DIALOGUE_CANCEL_ONLY==='1';
 if(capturePreflightOnly)assert(bibliography,'The capture-only preflight uses the explicit private Bibliography fixture');
+if(dialogueCancelOnly)assert(bibliography&&!capturePreflightOnly,'Dialogue/Cancel is a distinct explicit Bibliography qualification');
 // This explicit real-package demo includes a cold isolated Julia environment.
 // Forced timeout/cancellation fixtures retain their separate 180 second budget.
 const advisorTimeout=bibliography?600:180;
@@ -112,7 +114,7 @@ const requestStop=reason=>{
   if(sdkRunning)process.emit('SIGINT');else preparationAbort.abort(reason);
 };
 const checkPreparation=()=>{preparationAbort.signal.throwIfAborted();assert(!expired,'The local runner exceeded its total deadline before launch');};
-const deadline=setTimeout(()=>requestStop(new Error('The local runner exceeded its total deadline')),(capturePreflightOnly?5:bibliography?25:18)*60*1000);
+const deadline=setTimeout(()=>requestStop(new Error('The local runner exceeded its total deadline')),(capturePreflightOnly?5:dialogueCancelOnly?14:bibliography?25:18)*60*1000);
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 try{
   if(bibliography){
@@ -157,7 +159,7 @@ try{
   checkPreparation();
   const fixture=capturePreflightOnly?{probe:{mode:'capture-only',oracleExecuted:false}}:
     await (bibliography?prepareBibliographyCodexFixture:prepareJuliaCodexFixture)(root,
-      {julia:process.env.PERFCHECKER_TEST_JULIA,project:process.env.PERFCHECKER_TEST_CONTROLLER,coreVersion:'1.0.1',coreTree,signal:preparationAbort.signal});
+      {julia:process.env.PERFCHECKER_TEST_JULIA,project:process.env.PERFCHECKER_TEST_CONTROLLER,coreVersion:'1.0.1',coreTree,signal:preparationAbort.signal,dialogueCancelOnly});
   if(affinityError)throw affinityError;checkPreparation();
   await execute('unzip',['-q',archive,'-d',path.join(session,'archive')]);
   const archiveExtension=path.join(session,'archive','extension');
@@ -208,6 +210,7 @@ try{
       ...(!capturePreflightOnly?{PERFCHECKER_HOST_BASELINE_BYTES:String(fixture.baselineBytes),PERFCHECKER_HOST_CORE:JSON.stringify(fixture.core)}:{}),
       PERFCHECKER_HOST_PRIVATE_DIRECTORIES:JSON.stringify(directories),PERFCHECKER_HOST_ADVISOR_TIMEOUT:String(advisorTimeout),
       ...(capturePreflightOnly?{PERFCHECKER_HOST_CAPTURE_PREFLIGHT_ONLY:'1'}:{}),
+      ...(dialogueCancelOnly?{PERFCHECKER_HOST_DIALOGUE_CANCEL_ONLY:'1'}:{}),
       ...(bibliography?{PERFCHECKER_HOST_BIBLIOGRAPHY:JSON.stringify(fixture.probe)}:{}),
       ...(process.env.PERFCHECKER_TEST_RESULTS?{PERFCHECKER_HOST_PROOFS:process.env.PERFCHECKER_TEST_RESULTS}:{}),
       JULIA_NUM_THREADS:bibliography?'2':'1',JULIA_NUM_PRECOMPILE_TASKS:'1',JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',OMP_NUM_THREADS:'1'}});}

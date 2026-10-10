@@ -1,7 +1,14 @@
 const {chromium}=require(process.env.PERFCHECKER_PLAYWRIGHT_MODULE || 'playwright');
 const assert=require('node:assert/strict');
 const path=require('node:path');
-const {captureConversationReply}=require('./codex-vscode-host.cjs');
+const fs=require('node:fs/promises'),os=require('node:os');
+const {captureConversationReply,requestProgressed}=require('./codex-vscode-host.cjs');
+const beforeSend={busy:false,status:'Ready',connection:'local',messages:[{role:'assistant',content:'Previous reply'}]};
+assert.equal(requestProgressed(beforeSend,{...beforeSend}),false);
+assert.equal(requestProgressed(beforeSend,{...beforeSend,busy:true}),true);
+assert.equal(requestProgressed(beforeSend,{...beforeSend,status:'Error: provider rejected'}),true);
+assert.equal(requestProgressed(beforeSend,{...beforeSend,messages:[...beforeSend.messages,{role:'assistant',content:'Fast natural reply'}]}),true);
+assert.equal(requestProgressed(beforeSend,{...beforeSend,connection:undefined}),true);
 (async()=>{
   const browser=await chromium.launch({headless:true,args:['--disable-gpu','--disable-software-rasterizer'],...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{})});
   const page=await browser.newPage({viewport:{width:1250,height:1000}}),errors=[];
@@ -93,6 +100,63 @@ const {captureConversationReply}=require('./codex-vscode-host.cjs');
     await page.evaluate(value=>panel.receive(value),state);
     const short={parts:[],wheels:[],complete:false};await captureConversationReply(view,short,capture);
     assert.equal(short.parts.length,1);assert.equal(short.wheels.length,0);assert.equal(short.complete,true);
+    // Chromium's native default zoom uses the same level 2.75 as the private
+    // VS Code host (~1.651). This required disposable browser profile changes
+    // neither the product CSS nor its messages and never uses a human profile.
+    // Chromium ChromeZoomLevelPrefs: the default partition's key is "x".
+    const zoomProfile=await fs.mkdtemp(path.join(os.tmpdir(),'perfchecker-chat-zoom-'));
+    let zoomContext;
+    try{
+      await fs.mkdir(path.join(zoomProfile,'Default'));
+      await fs.writeFile(path.join(zoomProfile,'Default','Preferences'),JSON.stringify({partition:{default_zoom_level:{x:2.75}}}));
+      zoomContext=await chromium.launchPersistentContext(zoomProfile,{headless:true,channel:'chromium',
+        viewport:{width:1250,height:1000},deviceScaleFactor:1,args:['--disable-gpu','--disable-software-rasterizer'],
+        ...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{})});
+      const zoomPage=zoomContext.pages()[0];
+      zoomPage.on('pageerror',error=>errors.push(String(error)));
+      await zoomPage.route('https://perfchecker.test/**',route=>route.fulfill({contentType:'text/html',
+        body:'<!doctype html><html lang="en"><body><main id="chat-root"></main></body></html>'}));
+      await zoomPage.goto('https://perfchecker.test/advice');
+      const nativeZoom=await zoomPage.evaluate(()=>devicePixelRatio);
+      assert(Math.abs(nativeZoom-Math.pow(1.2,2.75))<.01,'The regression actually applies Chromium native zoom, not a CSS transform');
+      await zoomPage.addStyleTag({path:path.join(__dirname,'../media/advisor-chat.css')});
+      await zoomPage.addScriptTag({path:path.join(__dirname,'../media/advisor-chat.js')});
+      await zoomPage.evaluate(()=>{globalThis.panel=mountAdvisorChat(document.getElementById('chat-root'),()=>{});});
+      const longUser=Array.from({length:220},(_,i)=>`Source context ${i+1}: preserve every recorded field and its original separator, Unicode and provenance.`).join('\n');
+      const zoomReply=Array.from({length:40},(_,i)=>`Advice ${i+1}: use the independent literal oracle before applying changes.`).join('\n');
+      await zoomPage.evaluate(value=>panel.receive(value),{...state,messages:[{role:'user',content:longUser},{role:'assistant',content:zoomReply}]});
+      const zoomRecord={parts:[],wheels:[],complete:false};
+      await captureConversationReply({locator:selector=>zoomPage.locator(selector),page:()=>zoomPage},zoomRecord,async(_part,g)=>{
+        const png=await zoomPage.screenshot();assert.equal(png.subarray(12,16).toString(),'IHDR');assert(g.end>g.start);
+      });
+      assert(zoomRecord.initial.replyTop>zoomRecord.initial.visibleBottom+5000,'The native zoom fixture includes the long source passage before the reply');
+      assert(zoomRecord.wheels.length>=2,'Observed native displacement requires convergence rather than one assumed jump');
+      assert(zoomRecord.wheels.some(action=>Math.abs(action.delta/(action.after.scrollTop-action.before.scrollTop)-nativeZoom)<.02),
+        'The real native wheel exposes the input/CSS coordinate mismatch observed in R10');
+      assert.equal(zoomRecord.complete,true);assert(zoomRecord.parts.length<=8);
+      for(let i=1;i<zoomRecord.parts.length;i++)assert(zoomRecord.parts[i].start<zoomRecord.parts[i-1].end);
+      assert.equal(await zoomPage.locator('.message.user .message-text').innerText(),longUser);
+      assert.equal(await zoomPage.locator('.message.assistant .message-text').innerText(),zoomReply);
+      // The responsive product moves scrolling to the document. Qualify that
+      // same wheel routine without adding tabindex, changing CSS or text.
+      await zoomPage.setViewportSize({width:480,height:854});
+      const portraitViewport=await zoomPage.evaluate(()=>({width:innerWidth,documentWidth:document.documentElement.scrollWidth}));
+      assert(portraitViewport.width>=200&&portraitViewport.width<=650,'The source portrait window actually reaches the responsive breakpoint');
+      assert(portraitViewport.documentWidth<=portraitViewport.width,'The real native zoom and responsive product reflow without horizontal clipping');
+      const portraitReply=Array.from({length:12},(_,i)=>`Advice ${i+1}: preserve separators, Unicode and input values.`).join('\n');
+      await zoomPage.evaluate(value=>panel.receive(value),{...state,messages:[{role:'user',content:longUser},{role:'assistant',content:portraitReply}]});
+      assert.equal(await zoomPage.locator('.transcript').evaluate(node=>getComputedStyle(node).maxHeight),'none');
+      const portraitRecord={parts:[],wheels:[],complete:false};
+      await captureConversationReply({locator:selector=>zoomPage.locator(selector),page:()=>zoomPage},portraitRecord,async(_part,g)=>{
+        assert.equal(g.scrollTarget,'document');assert(g.end>g.start);await zoomPage.screenshot();
+      });
+      assert.equal(portraitRecord.complete,true);assert(portraitRecord.parts.length>1&&portraitRecord.parts.length<=8);
+      assert(portraitRecord.wheels.every(action=>action.before.scrollTarget==='document'));
+      for(let i=1;i<portraitRecord.parts.length;i++)assert(portraitRecord.parts[i].start<portraitRecord.parts[i-1].end);
+      assert.equal(await zoomPage.locator('.message.assistant .message-text').innerText(),portraitReply);
+      assert.equal(await zoomPage.locator('.message.user .message-text').innerText(),longUser);
+      assert(await zoomPage.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+    }finally{await zoomContext?.close();await fs.rm(zoomProfile,{recursive:true,force:true});}
     await page.setViewportSize({width:390,height:844});
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
     assert.deepEqual(errors,[]); assert.equal(await page.evaluate(()=>globalThis.injected),undefined);
