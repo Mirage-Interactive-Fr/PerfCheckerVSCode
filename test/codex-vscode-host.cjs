@@ -18,13 +18,27 @@ async function captureConversationReply(view,record,capture){
   let wheelUnitsPerCssPixel=1;
   const geometry=()=>reply.evaluate(node=>{
     const area=node.closest('.transcript'),a=area.getBoundingClientRect(),r=node.getBoundingClientRect();
-    const visibleTop=Math.max(0,a.top),visibleBottom=Math.min(innerHeight,a.bottom);
-    return {height:r.height,replyTop:r.top,offset:r.top-a.top,scrollTop:area.scrollTop,clientHeight:area.clientHeight,viewportHeight:innerHeight,
+    // At the narrow product breakpoint max-height is removed. The document
+    // then scrolls naturally instead of the transcript clipping its contents.
+    const contained=area.scrollHeight>area.clientHeight+2;
+    const visibleTop=contained?Math.max(0,a.top):0,visibleBottom=contained?Math.min(innerHeight,a.bottom):innerHeight;
+    return {height:r.height,replyTop:r.top,offset:r.top-a.top,
+      scrollTop:contained?area.scrollTop:document.scrollingElement.scrollTop,scrollTarget:contained?'transcript':'document',
+      clientHeight:area.clientHeight,viewportWidth:innerWidth,viewportHeight:innerHeight,
       visibleTop,visibleBottom,visibleHeight:visibleBottom-visibleTop,start:Math.max(0,visibleTop-r.top),end:Math.min(r.height,visibleBottom-r.top),
       fontSize:getComputedStyle(node).fontSize,devicePixelRatio};
   });
   const wheel=async(delta,label,deadline=Date.now()+5000)=>{
-    await transcript.hover();const before=await geometry();
+    const before=await geometry();
+    if(before.scrollTarget==='transcript')await transcript.hover();
+    else{
+      // Hovering a very tall transcript can auto-scroll it to the wrong
+      // passage. Move the native pointer inside the actually visible frame.
+      const element=view.parentFrame?.()?await view.frameElement():undefined;
+      const box=element?await element.boundingBox():{x:0,y:0,width:before.viewportWidth,height:before.viewportHeight};
+      assert(box&&box.width>0&&box.height>0,'The native pointer targets the visible conversation frame');
+      await view.page().mouse.move(box.x+box.width/2,box.y+box.height/2);await element?.dispose();
+    }
     const action={delta,before};record.wheels.push(action);
     await view.page().mouse.wheel(0,delta);
     let lastScrollTop=before.scrollTop,stableSince=Date.now();
@@ -63,6 +77,11 @@ async function captureConversationReply(view,record,capture){
   assert(record.complete,'The complete real advice reply is visible across the retained native scroll captures');
 }
 exports.captureConversationReply=captureConversationReply;
+function requestProgressed(before,current){
+  return Boolean(current.busy)||current.status!==before.status||Boolean(current.connection)!==Boolean(before.connection)||
+    JSON.stringify(current.messages)!==JSON.stringify(before.messages);
+}
+exports.requestProgressed=requestProgressed;
 // The native Chat attaches one real timing report. This separate, explicitly
 // partial allocation context is pasted by the user gesture, not a forged bundle.
 function bibliographyAllocationProjection(runBytes,adviceBytes,sources){
@@ -182,7 +201,11 @@ exports.run=async()=>{
   const checks=[],result={runner:'codex-vscode-host.cjs',hostExecuted:true,hostPid:process.pid,status:'running',checks};
   const bibliography=process.env.PERFCHECKER_HOST_BIBLIOGRAPHY?JSON.parse(process.env.PERFCHECKER_HOST_BIBLIOGRAPHY):undefined;
   const capturePreflightOnly=process.env.PERFCHECKER_HOST_CAPTURE_PREFLIGHT_ONLY==='1';
-  suiteDeadline=Date.now()+(capturePreflightOnly?5:bibliography?21:14)*60*1000;result.maximumHostMinutes=capturePreflightOnly?5:bibliography?21:14;
+  const dialogueCancelOnly=process.env.PERFCHECKER_HOST_DIALOGUE_CANCEL_ONLY==='1';
+  assert(!dialogueCancelOnly||bibliography&&!capturePreflightOnly,'The complementary mode is explicit and separate from capture-only');
+  result.maximumHostMinutes=capturePreflightOnly?5:dialogueCancelOnly?12:bibliography?21:14;
+  suiteDeadline=Date.now()+result.maximumHostMinutes*60*1000;
+  result.maximumBridgeInvocations=dialogueCancelOnly?2:4;result.requestedInvocations=[];
   // This sentinel must be written by the actual extension host, never by the outer SDK.
   await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result));
   const configFile=path.join(root,'perf','advisor.json'),settingsFile=path.join(root,'.vscode','settings.json');
@@ -212,7 +235,7 @@ exports.run=async()=>{
   // seven setup files must remain byte-exact, rather than disappear from Git.
   const captureWorkingStateBefore=capturePreflightOnly?await captureWorkingState():undefined;
   if(capturePreflightOnly)result.captureWorkingStateBefore=captureWorkingStateBefore;
-  let browser,view,windowPage,endpoint,server,owned,primaryError,observer,observation;
+  let browser,view,windowPage,endpoint,server,owned,primaryError,observer,observation,portrait=false;
   const observed=new Map(),cliObservers=new Map(),processStates=new Map();let passiveCli;
   const observe=async()=>{
     if(observation)return observation;
@@ -271,6 +294,10 @@ exports.run=async()=>{
   },`Locate the visible installed webview ${selector}`,30000);
   const findChat=()=>findView('#chat-root');
   const click=name=>view.getByRole('button',{name,exact:true}).click();
+  const requestInvocation=kind=>{
+    assert(result.requestedInvocations.length<result.maximumBridgeInvocations,'The explicit bridge-invocation cap is never exceeded');
+    result.requestedInvocations.push({kind,requestedAt:new Date().toISOString()});
+  };
   const openConnector=async()=>{
     const summary=view.locator('summary').filter({hasText:'Optional Codex CLI connector'});
     assert.equal(await summary.count(),1);
@@ -305,7 +332,7 @@ exports.run=async()=>{
     const windows=[];
     for(const line of tree.split('\n')){
       const match=/^\s+(0x[\da-f]+).*?\s(\d+)x(\d+)[+-]\d+[+-]\d+\s+([+-]\d+)([+-]\d+)\s*$/i.exec(line);
-      if(!match||Number(match[2])<1000||Number(match[3])<500)continue;
+      if(!match||Number(match[2])<(portrait?400:1000)||Number(match[3])<500)continue;
       const {stdout:properties}=await execute('/usr/bin/xprop',['-display',process.env.DISPLAY,'-id',match[1],'WM_CLASS','_NET_WM_PID'],{timeout:5000,maxBuffer:100000});
       const pid=Number(/^_NET_WM_PID\(CARDINAL\) = (\d+)$/m.exec(properties)?.[1]);
       const item={id:match[1],pid:Number.isSafeInteger(pid)&&pid>0?pid:null,
@@ -338,8 +365,10 @@ exports.run=async()=>{
     if(!bibliography){await view.page().screenshot({path:filename,timeout});return;}
     assert(/^:\d+$/.test(process.env.DISPLAY),'Capture only the disposable driver-owned X display');
     assert(windowPage,'Resolve the private host workbench before framebuffer capture');
-    // ImageMagick reads the actual X framebuffer, without image scaling or crops.
-    await execute('/usr/bin/import',['-display',process.env.DISPLAY,'-silent','-window','root',`PNG:${filename}`],{timeout,maxBuffer:1000000});
+    const nativeWindow=await nativeCodeWindow(`before-capture:${name}`);
+    // Keep the entire verified portrait window, never a crop through text.
+    // Landscape retains the complete private root framebuffer as before.
+    await execute('/usr/bin/import',['-display',process.env.DISPLAY,'-silent','-window',portrait?nativeWindow.id:'root',`PNG:${filename}`],{timeout,maxBuffer:1000000});
     const bytes=await fs.readFile(filename),dimensions=png=>{
       assert.deepEqual(png.subarray(0,8),Buffer.from([137,80,78,71,13,10,26,10]));
       assert.equal(png.subarray(12,16).toString(),'IHDR');return {width:png.readUInt32BE(16),height:png.readUInt32BE(20)};
@@ -347,26 +376,42 @@ exports.run=async()=>{
     const framebuffer=dimensions(bytes),viewport=await windowPage.evaluate(()=>({width:innerWidth,height:innerHeight,
       outerWidth,outerHeight,screenWidth:screen.width,screenHeight:screen.height,devicePixelRatio}));
     const renderer=dimensions(await windowPage.screenshot({scale:'device',timeout}));
-    const nativeWindow=await nativeCodeWindow(`capture:${name}`);
-    const record={file:path.basename(filename),display:process.env.DISPLAY,source:'private X11 root framebuffer; no image resize, crop or transform',
+    const afterWindow=await nativeCodeWindow(`after-capture:${name}`);
+    assert.deepEqual(afterWindow.identity,nativeWindow.identity);assert.equal(afterWindow.id,nativeWindow.id);
+    for(const key of ['x','y','width','height'])assert.equal(afterWindow[key],nativeWindow[key],'Native geometry is stable during capture');
+    const record={file:path.basename(filename),display:process.env.DISPLAY,source:portrait?'complete verified private X11 window; no image resize or text crop':'private X11 root framebuffer; no image resize, crop or transform',
       ...framebuffer,sha256:hash(bytes),viewport,renderer,rendererDimensions:'informative CDP screenshot dimensions, not a physical-pixel measurement',
       nativeWindow,pixelsPerCssX:framebuffer.width/viewport.width,pixelsPerCssY:framebuffer.height/viewport.height};
     result.framebufferCaptures??=[];result.framebufferCaptures.push(record);
     assert.deepEqual({width:nativeWindow.width,height:nativeWindow.height,x:nativeWindow.x,y:nativeWindow.y},{...framebuffer,x:0,y:0},
       'The mapped private X11 Code window covers the whole framebuffer without clipping');
     assert.deepEqual({width:viewport.outerWidth,height:viewport.outerHeight},framebuffer);
-    assert.deepEqual({width:viewport.screenWidth,height:viewport.screenHeight},framebuffer);
+    if(!portrait)assert.deepEqual({width:viewport.screenWidth,height:viewport.screenHeight},framebuffer);
+    else assert(framebuffer.width<=viewport.screenWidth&&framebuffer.height<=viewport.screenHeight,'The entire portrait window fits on its private screen');
     assert(Math.abs(record.pixelsPerCssX-record.pixelsPerCssY)<=1/Math.min(viewport.width,viewport.height),
       'The actual framebuffer and fullscreen viewport establish one unscaled pixel mapping');
     return record;
   };
-  const captureAdvice=async turn=>{
+  const sizeNativeWindow=async(width,height)=>{
+    const initial=await nativeCodeWindow('before-native-sizing'),xdotool=process.env.PERFCHECKER_TEST_XDOTOOL;
+    assert(xdotool&&path.isAbsolute(xdotool),'Provide the existing native X11 window control binary');
+    await execute(xdotool,['windowmove','--sync',initial.id,'0','0'],{timeout:5000});
+    await execute(xdotool,['windowsize','--sync',initial.id,String(width),String(height)],{timeout:5000});
+    portrait=width<height;
+    await eventually(async()=>{
+      const current=await nativeCodeWindow('await-native-size');
+      assert.deepEqual(current.identity,initial.identity);assert.equal(current.id,initial.id);
+      return current.x===0&&current.y===0&&current.width===width&&current.height===height;
+    },'The verified private X11 window reaches the exact requested native bounds',5000);
+  };
+  const captureAdvice=async(turn,orientation='landscape')=>{
     if(!proofs)return;
-    await view.locator('.hero').scrollIntoViewIfNeeded();await capture(`advice-${turn}-context`);
-    const record={turn,parts:[],wheels:[],complete:false,source:'actual native transcript wheel scrolling; no CSS or message changes'};
+    const label=orientation==='portrait'?`advice-${turn}-portrait`:`advice-${turn}`;
+    await view.locator('.hero').scrollIntoViewIfNeeded();await capture(`${label}-context`);
+    const record={turn,orientation,parts:[],wheels:[],complete:false,source:'actual native wheel scrolling; no CSS or message changes'};
     result.adviceCaptures??=[];result.adviceCaptures.push(record);
     await captureConversationReply(view,record,async(part,g)=>{
-      const framebuffer=await capture(part===1?`advice-${turn}`:`advice-${turn}-part-${part}`);
+      const framebuffer=await capture(part===1?label:`${label}-part-${part}`);
       assert.equal(g.devicePixelRatio,framebuffer.viewport.devicePixelRatio,'Workbench and conversation share the native zoom');
       g.pixelFontSize=parseFloat(g.fontSize)*framebuffer.pixelsPerCssY;
       g.framebuffer=framebuffer.file;
@@ -416,11 +461,16 @@ exports.run=async()=>{
     const {probeJuliaCodexFixture,probeBibliographyCodexFixture,observeCodexEvents}=await import(pathToFileURL(path.join(__dirname,'codex-real.test.mjs')).href);
     passiveCli=observeCodexEvents;
     const probe=directory=>bibliography?probeBibliographyCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA,{prepare:true}):probeJuliaCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA);
-    const baselineProbe=capturePreflightOnly?undefined:await probe(root),baselineBytes=bibliography?baselineProbe?.allocationBytes:baselineProbe;
-    if(!capturePreflightOnly){assert.equal(baselineBytes,Number(process.env.PERFCHECKER_HOST_BASELINE_BYTES));
+    const baselineProbe=capturePreflightOnly||dialogueCancelOnly?undefined:await probe(root),baselineBytes=bibliography?baselineProbe?.allocationBytes:baselineProbe;
+    if(!capturePreflightOnly&&!dialogueCancelOnly){assert.equal(baselineBytes,Number(process.env.PERFCHECKER_HOST_BASELINE_BYTES));
       if(bibliography)assert.deepEqual(baselineProbe,bibliography);
       if(bibliography)await preserveWorker('baseline-worker',root);}
     const preflightIndex=capturePreflightOnly?await indexProof('capture-preflight-before'):undefined;
+    const dialogueIndex=dialogueCancelOnly?await indexProof('dialogue-before'):undefined;
+    if(dialogueCancelOnly){
+      assert.deepEqual(dialogueIndex.bytes,index);
+      result.fixture={kind:'bibliography-dialogue-cancel',sourceSha256:hash(source),oracleExecuted:false,measurementsExecuted:false};
+    }
     const {chromium}=await import(process.env.PERFCHECKER_TEST_PLAYWRIGHT?pathToFileURL(process.env.PERFCHECKER_TEST_PLAYWRIGHT).href:'playwright');
     browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.PERFCHECKER_HOST_CDP_PORT}`);
     if(bibliography){
@@ -436,17 +486,7 @@ exports.run=async()=>{
       await vscode.commands.executeCommand('workbench.action.toggleFullScreen');
       await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
       result.captureLayout={sideBarsClosed:true,nativeCommands:['workbench.action.closeAuxiliaryBar','workbench.action.closeSidebar','workbench.action.toggleFullScreen']};
-      const initialWindow=await nativeCodeWindow('before-native-sizing');
-      const xdotool=process.env.PERFCHECKER_TEST_XDOTOOL;assert(xdotool&&path.isAbsolute(xdotool),'Provide the existing native X11 window control binary');
-      await execute(xdotool,['windowmove','--sync',initialWindow.id,'0','0'],{timeout:5000});
-      const movedWindow=await nativeCodeWindow('after-native-move');
-      assert.deepEqual(movedWindow.identity,initialWindow.identity);assert.equal(movedWindow.id,initialWindow.id);
-      await execute(xdotool,['windowsize','--sync',movedWindow.id,'1920','1080'],{timeout:5000});
-      await eventually(async()=>{
-        const current=await nativeCodeWindow('await-native-size');
-        assert.deepEqual(current.identity,initialWindow.identity);assert.equal(current.id,initialWindow.id);
-        return current.x===0&&current.y===0&&current.width===1920&&current.height===1080;
-      },'The verified private X11 window reaches the exact framebuffer bounds',5000);
+      await sizeNativeWindow(1920,1080);
       result.captureLayout.nativeWindowActions=['windowmove 0 0','windowsize 1920 1080'];
       try{await eventually(async()=>await view.evaluate(()=>innerWidth>=1000),
         'The real native fullscreen action reaches a wide PerfChecker Chat before measurements',5000);}
@@ -457,6 +497,24 @@ exports.run=async()=>{
       }
       assert(result.captureLayout.editorWidth>=1000,'Capture a wide real PerfChecker editor, rather than a narrow side column');
       result.captureLayout.framebuffer=await capture('capture-layout-preflight',5000);
+      if(dialogueCancelOnly){
+        // Qualify the real narrow window before spending a model invocation.
+        // Native resize and the existing responsive CSS provide the reflow.
+        try{
+          await sizeNativeWindow(480,854);
+          await view.locator('#chat-question').fill('How can I review this package while preserving its exact behavior?');
+          await view.locator('#chat-question').scrollIntoViewIfNeeded();
+          const metrics=await view.locator('#chat-question').evaluate(node=>({fontSize:getComputedStyle(node).fontSize,
+            width:innerWidth,documentWidth:document.documentElement.scrollWidth,transcriptMaxHeight:getComputedStyle(document.querySelector('.transcript')).maxHeight}));
+          const framebuffer=await capture('portrait-layout-preflight',5000);
+          metrics.nativePixels=parseFloat(metrics.fontSize)*framebuffer.pixelsPerCssY;result.portraitPreflight={...metrics,framebuffer};
+          assert(metrics.width<=650&&metrics.documentWidth<=metrics.width,'The unchanged product reflows without horizontal clipping');
+          assert.equal(metrics.transcriptMaxHeight,'none','Narrow conversation uses the natural document scroll');
+          assert(metrics.nativePixels>=22&&metrics.nativePixels<=24,'Native portrait text measures 22–24 pixels from actual IHDR mapping');
+          await view.locator('#chat-question').fill('');
+          assert.equal((await state()).messages.length,0);await preserved();
+        }finally{await sizeNativeWindow(1920,1080);}
+      }
     }
     if(capturePreflightOnly){
       assert(bibliography&&proofs,'The explicit preflight preserves native framebuffer evidence');
@@ -538,10 +596,10 @@ exports.run=async()=>{
       if(proofs)await fs.writeFile(path.join(proofs,`${label}-measurements.json`),JSON.stringify(receipts,null,2));
       return receipts;
     };
-    const baselineMeasurements=bibliography?await measureBibliography('baseline'):undefined;
+    const baselineMeasurements=bibliography&&!dialogueCancelOnly?await measureBibliography('baseline'):undefined;
     let allocationContext,allocationQuestion;
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
-    if(bibliography){
+    if(bibliography&&!dialogueCancelOnly){
       const timing=baselineMeasurements.filter(item=>item.report.runs.length===2&&item.report.runs.some(run=>run.collector==='benchmark')&&item.report.runs.some(run=>run.collector==='chairmark'));
       const allocation=baselineMeasurements.filter(item=>item.report.runs.length===1&&item.report.runs[0].collector==='profile_alloc');
       assert.equal(timing.length,1);assert.equal(allocation.length,1);
@@ -566,7 +624,9 @@ exports.run=async()=>{
     assert.equal(unauthorized.status,401);await unauthorized.arrayBuffer();await preserved();
     checks.push('installed immutable candidate path/version/runtime hashes; genuine Connect control; saved disabled provider unchanged; unauthenticated HTTP refused');
 
-    const questions=bibliography?[
+    const questions=dialogueCancelOnly?[
+      `Advice only: no tools, commands, edits or implementation. Review this original name_to_string function from Bibliography and explain a bounded way to reduce repeated string construction while preserving partial names, exact separators, Unicode and non-mutation. No measurements are attached in this complementary dialogue; do not claim measured attribution or a gain. Give concrete independent checks and remaining limits in at most six short paragraphs. Original source: ${source}`
+    ]:bibliography?[
       allocationQuestion,
       `Continue the same conversation. Review a change ONLY to name_to_string in src/bibtex.jl that preserves all separators and partial Name values, Unicode, first/middle/particle/junior/last fields, and input non-mutation. The independent literal oracle is perf/episode-05a/correctness.jl; the original perf/media/export-workload.jl oracle and both episode05a catalogues must stay unchanged. On the later explicit implementation request, edit ONLY src/bibtex.jl in the supplied isolated checkout, and test that actual checkout using ${process.env.PERFCHECKER_TEST_JULIA} --startup-file=no --history-file=no --project=perf/episode-05a/worker. Its Project pins BenchmarkTools1.7.0, Chairmarks1.3.1, BibInternal792d8c709169505f998f7d70bfa092551dd4089f and BibParsercf1eb4446b986a23ed444963dcdb4c6ecc2da90f. Its ignored Manifest is intentionally absent: instantiate there with update_registry=false and allow_autoprecomp=false, assert realpath(pkgdir(Bibliography))==realpath(pwd()) and pathof points to that copy's src/Bibliography.jl, then include correctness.jl and the unchanged export oracle. Never reuse the original checkout's Manifest. Create no helper files, change no Project/oracle/catalogue, install nothing outside the private environment, run no external services or push. All descendants must retain CPU16–17, Julia2threads/GC1/precompile1/BLAS1/OMP1. Advice only for this turn; implementation follows separately.`
     ]:[
@@ -575,7 +635,8 @@ exports.run=async()=>{
     ];
     const adviceCharacters=[];
     for(const [turn,question] of questions.entries()){
-      await view.locator('#chat-question').fill(question);await click('Send question');
+      assert(Buffer.byteLength(question,'utf8')<16000,'The complete actual native question is retained without hidden truncation');
+      await view.locator('#chat-question').fill(question);requestInvocation('advice');await click('Send question');
       const reply=await eventually(async()=>{const value=await state();return !value.busy&&value.messages.length===2*(turn+1)?value:undefined;},
         `Authenticated Julia advice turn ${turn+1} completes`,(Number(settings().get('advisorTimeout'))+120)*1000);
       assert.deepEqual(reply.messages.map(message=>message.role),Array.from({length:turn+1},()=>['user','assistant']).flat());
@@ -583,21 +644,28 @@ exports.run=async()=>{
       await eventually(async()=>await view.locator('.message.assistant').count()===turn+1,'The actual reply is visible');
       assert((await view.locator('.message.assistant').last().innerText()).includes(answer));await preserved();
       if(bibliography)await presentation(`advice-${turn+1}`,()=>captureAdvice(turn+1));
+      if(dialogueCancelOnly)await presentation(`advice-${turn+1}-portrait`,async()=>{
+        try{await sizeNativeWindow(480,854);await captureAdvice(turn+1,'portrait');}
+        finally{await sizeNativeWindow(1920,1080);}
+      });
     }
     if(bibliography)result.conversation=(await state()).messages;
-    checks.push('two authenticated contextual advice replies through Julia MCP are visible and preserve exact source/index/HEAD/config');
-    await view.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
-    assert.match(await view.locator('.warning').innerText(),/Git checkpoint.*isolated copy.*diff review/);
-    const beforePrepareIndex=await indexProof('before-prepare');assert.deepEqual(beforePrepareIndex.bytes,index);
-    const beforePrepare=chatOutcome(await state()),prepareStarted=Date.now();let prepareAccepted=false,lastPrepare;
+    checks.push(`${questions.length} authenticated contextual advice replies through Julia MCP are visible and preserve exact source/index/HEAD/config`);
     const agentBudgetMs=Number(settings().get('advisorTimeout'))*1000;
     const cleanupGraceMs=require(path.join(installed,'dist','controllerCancellation.js')).CANCELLATION_GRACE_MS;
     assert.equal(agentBudgetMs,bibliography?600000:180000);assert.equal(cleanupGraceMs,60000);
     assert.equal(agentBudgetMs,Number(process.env.PERFCHECKER_HOST_ADVISOR_TIMEOUT)*1000);
-    const uiBudgetMs=agentBudgetMs+60000,setupDeadline=prepareStarted+210000;
+    const uiBudgetMs=agentBudgetMs+60000;
+    let candidateBytes,proposal;
+    if(!dialogueCancelOnly){
+    await view.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
+    assert.match(await view.locator('.warning').innerText(),/Git checkpoint.*isolated copy.*diff review/);
+    const beforePrepareIndex=await indexProof('before-prepare');assert.deepEqual(beforePrepareIndex.bytes,index);
+    const beforePrepare=chatOutcome(await state()),prepareStarted=Date.now();let prepareAccepted=false,lastPrepare;
+    const setupDeadline=prepareStarted+210000;
     result.prepare={preControllerBudgetMs:210000,agentBudgetMs,uiBudgetMs,cleanupGraceMs,transitions:[],
       timerAnchor:'First passive observation of each real PID/incarnation; conservative upper bound, not the internal spawn timestamp'};
-    await click('I reviewed the advice · Prepare implementation');
+    requestInvocation('implementation');await click('I reviewed the advice · Prepare implementation');
     let proposed;
     while(Date.now()<suiteDeadline){
       const processes=await observe(),value=await state(),outcome=chatOutcome(value),serialized=JSON.stringify(outcome),now=Date.now();
@@ -629,7 +697,7 @@ exports.run=async()=>{
     assert.deepEqual((await indexProof('after-prepare')).bytes,beforePrepareIndex.bytes,'Prepare preserves the whole index byte-exact');
     // Read the installed backend's retained proposal; do not generate or apply a replacement patch.
     const {recoverActiveImplementationProposal}=require(path.join(installed,'dist','implementation.js'));
-    const proposal=await recoverActiveImplementationProposal(root);assert(proposal);assert.equal(proposal.patch,proposed.proposal.patch);
+    proposal=await recoverActiveImplementationProposal(root);assert(proposal);assert.equal(proposal.patch,proposed.proposal.patch);
     const candidate=path.join(session,'candidate-oracle');
     if(bibliography){
       await execute('git',['clone','--quiet','--no-hardlinks',root,candidate]);
@@ -637,7 +705,7 @@ exports.run=async()=>{
       await execute('git',['checkout','--quiet','--detach','FETCH_HEAD'],{cwd:candidate});
       await execute('git',['remote','remove','origin'],{cwd:candidate});
     }else{await fs.mkdir(path.join(candidate,'src'),{recursive:true});await fs.writeFile(path.join(candidate,relative),await git('show',`${proposal.candidate}:${relative}`));}
-    const candidateProbe=await probe(candidate),candidateBytes=bibliography?candidateProbe.allocationBytes:candidateProbe;
+    const candidateProbe=await probe(candidate);candidateBytes=bibliography?candidateProbe.allocationBytes:candidateProbe;
     if(bibliography){
       for(const key of ['benchmarkTools','chairmarks','bibInternalRevision','bibParserRevision','dependencyGraphSha256','correctnessSha256','workloadSha256','projectSha256'])
         assert.equal(candidateProbe[key],baselineProbe[key],`The candidate preserves ${key}`);
@@ -674,19 +742,21 @@ exports.run=async()=>{
     }else assert.equal(restoredProbe,baselineBytes);
     await preserved();
     checks.push('real Prepare/checkpoint/diff clicks; independent Julia oracles before Apply; actual Apply/Restore preserve staging/HEAD');
+    }
 
     await view.getByRole('tab',{name:'01 · Advice',exact:true}).click();
     await openConnector();
     await view.locator('#chat-question').fill(bibliography?
       'Advice only, no tools or edits. Explain the remaining limits of this bounded bibliography name-string experiment: partial names, Unicode, separator preservation, non-mutation, sampler uncertainty, separate collectors and why one fixture does not establish universal BibTeX equivalence.':
       'Advice only, no tools or edits. Give a detailed explanation of remaining floating-point correctness and benchmark uncertainty in this Julia optimization, including NaN/Infinity, signed zero, reduction order and stable allocation measurement.');
-    const cancelStarted=Date.now();await click('Send question');
+    const beforeCancel=await state(),beforeCancelOutcome=chatOutcome(beforeCancel);
+    const cancelStarted=Date.now();requestInvocation('cancel');await click('Send question');
     result.cancelObservation={startedAt:new Date(cancelStarted).toISOString(),preControllerBudgetMs:210000,
-      agentBudgetMs,uiBudgetMs,cleanupGraceMs,transitions:[]};
+      agentBudgetMs,uiBudgetMs,cleanupGraceMs,before:beforeCancelOutcome,beforeMessageCount:beforeCancel.messages.length,transitions:[]};
     let lastCancel,cancelAccepted=false;
     while(Date.now()<suiteDeadline){
       const current=await observe(),value=await state(),outcome=chatOutcome(value),now=Date.now(),serialized=JSON.stringify(outcome);
-      cancelAccepted||=value.busy;
+      cancelAccepted||=requestProgressed(beforeCancel,value);
       if(serialized!==lastCancel){result.cancelObservation.transitions.push({elapsedMs:now-cancelStarted,...outcome});lastCancel=serialized;}
       for(const [role,pid,budget]of [['controller',current.cli,uiBudgetMs],['agent',current.agent,agentBudgetMs]]){
         const identity=current.identities.find(item=>item.pid===pid);
@@ -698,7 +768,10 @@ exports.run=async()=>{
       }
       const liveRoles=[current.cli,current.worker,current.agent];
       if(value.busy&&liveRoles.every(pid=>pid&&current.identities.some(identity=>identity.pid===pid))){owned=current;break;}
-      if(cancelAccepted)assert(value.busy,`The real request ended before a live agent could qualify Cancel: ${outcome.status}`);
+      if(cancelAccepted&&!value.busy){
+        result.cancelObservation.terminalBeforeLiveAgent={...outcome,messageCount:value.messages.length,elapsedMs:now-cancelStarted};
+        assert.fail(`The real request ended before a live agent could qualify Cancel: ${outcome.status}`);
+      }
       const controller=result.cancelObservation.controller;
       assert(controller||now<cancelStarted+210000,'The Cancel request did not reach its controller within the unchanged pre-controller budget');
       if(controller)assert(now<Date.parse(controller.deadlineAt)+cleanupGraceMs,
@@ -712,7 +785,7 @@ exports.run=async()=>{
     assert(await new Promise((resolve,reject)=>server.getConnections((error,count)=>error?reject(error):resolve(count>0))),'The Julia worker has an active real HTTP connection');
     await click('Cancel request');await idle('The actual Cancel waits for local worker cleanup');await noOwnedProcesses();
     assert.match((await state()).status,/cancelled after local worker cleanup.*remote server may still finish/i);
-    assert.equal((await state()).messages.length,4,'The interrupted third request does not manufacture a reply');
+    assert.equal((await state()).messages.length,questions.length*2,'The interrupted request does not manufacture a reply');
     assert.match(await view.locator('#chat-root').innerText(),/remote server may still finish its work/i);
     await eventually(()=>new Promise((resolve,reject)=>server.getConnections((error,count)=>error?reject(error):resolve(count===0))),'Request socket closes before teardown',10000);
     await preserved();checks.push('actual Cancel with live authenticated exec + Julia controller/worker; exact owned identities dead and HTTP socket closed before fixture cleanup; remote caveat visible');
@@ -729,9 +802,15 @@ exports.run=async()=>{
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
     assert.equal(server.listening,false);await assert.rejects(fetch(endpoint,{method:'POST',body:'{}',signal:AbortSignal.timeout(5000)}));await preserved();
     checks.push('Cancel automatically disconnects after owned cleanup; genuine Reconnect preflight (no model call) and Disconnect close the new listener and preserve saved settings');
+    if(dialogueCancelOnly){
+      const after=await indexProof('dialogue-after');assert.deepEqual(after.bytes,dialogueIndex.bytes);assert.deepEqual(after.entries,dialogueIndex.entries);
+      assert.equal(result.requestedInvocations.length,2,'Exactly one advice request and one live Cancel request were made');
+    }
     assert.equal(result.captureFailures?.length??0,0,'Every requested native presentation capture must pass before global PASS');
-    Object.assign(result,{status:'passed',adviceTurns:2,adviceCharacters,oracle:bibliography?{independentNameCases:10,Unicode:true,multiEntryExport:true,nonMutation:true,historicalOracleUnchanged:true}:{empty:0,signed:14,range1000:333833500},
-      allocationBaselineBytes:baselineBytes,allocationCandidateBytes:candidateBytes,changedFiles:proposal.files,
+    Object.assign(result,{status:'passed',mode:dialogueCancelOnly?'dialogue-cancel-only':'complete-implementation',adviceTurns:questions.length,adviceCharacters,
+      ...(dialogueCancelOnly?{notExecuted:['measurements','implementation Prepare','candidate oracle','Apply','Restore']}:
+        {oracle:bibliography?{independentNameCases:10,Unicode:true,multiEntryExport:true,nonMutation:true,historicalOracleUnchanged:true}:{empty:0,signed:14,range1000:333833500},
+          allocationBaselineBytes:baselineBytes,allocationCandidateBytes:candidateBytes,changedFiles:proposal.files}),
       ownedRequestPids:{cli:owned.cli,worker:owned.worker,codex:owned.agent},ownedDeadBeforeCleanup:true,socketClosedBeforeCleanup:true,
       remoteInferenceCancellation:'Not established; UI accurately preserves the remote-work caveat'});
     }

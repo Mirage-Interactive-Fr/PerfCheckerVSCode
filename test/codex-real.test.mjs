@@ -191,8 +191,11 @@ export async function probeBibliographyCodexFixture(directory,julia,{prepare=fal
     independentExportChecks:true,historicalOraclePassed:true};
 }
 
-export async function prepareBibliographyCodexFixture(root,{julia,project,coreTree,signal}) {
-  const probe=await probeBibliographyCodexFixture(root,julia,{prepare:true,signal});
+export async function prepareBibliographyCodexFixture(root,{julia,project,coreTree,signal,dialogueCancelOnly=false}) {
+  // The complementary UI/Cancel qualification reuses no benchmark result and
+  // performs no worker setup, measurements or implementation oracle.
+  const probe=dialogueCancelOnly?{mode:'dialogue-cancel-only',oracleExecuted:false}:
+    await probeBibliographyCodexFixture(root,julia,{prepare:true,signal});
   const fixtureGit=(...args)=>execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'},timeout:60000,signal});
   await fixtureGit('config','user.name','PerfChecker qualification');await fixtureGit('config','user.email','qualification@example.invalid');
   await fixtureGit('add','.');await fixtureGit('commit','-m','Private Bibliography MCP qualification fixture');
