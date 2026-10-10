@@ -166,8 +166,8 @@ jobs:
           }
           if(newOrigin&&(e.NATIVE_EVENT!=='workflow_dispatch'||requested))throw Error('A new candidate origin requires an explicit manual run without archive-reuse inputs');
           if(JSON.parse(fs.readFileSync('package.json')).version==='1.0.1'&&!requested&&!newOrigin){
-            // Product commit 48b382160f9cd3a5befa18c11c425b87793e9750, tree 01e71f9d1def8ebeeb76ad6d11508e126890b52f.
-            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38022749439\nREUSE_NAME=native-candidate-48b382160f9cd3a5befa18c11c425b87793e9750\nREUSE_SHA=fac983a008dfc57b0b4a8cd422126a38432df7284d1fb7423ac260dfb62b6301\n');
+            // Product commit f8637795042f17b292c548480573575920241cce, tree bfcc65e164ba1b6f34dcda27578f52c8411c7720.
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38032081418\nREUSE_NAME=native-candidate-f8637795042f17b292c548480573575920241cce\nREUSE_SHA=c4b32567105fac62d53e7c58cf467de9359a93a81a123c4a53b32a32da7d87ca\n');
             console.log('Release 1.0.1 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
           }
           NODE
