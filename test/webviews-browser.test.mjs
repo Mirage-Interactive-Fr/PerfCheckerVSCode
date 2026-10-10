@@ -7,6 +7,57 @@ import {mkdtemp,mkdir,writeFile,readFile,rm,access} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 
+test('saved diagnostic cards retain reported values and read-only boundaries at 360px', {
+  skip: !process.env.PERFCHECKER_BROWSER_TESTS,
+}, async()=>{
+  const require=createRequire(import.meta.url),{chromium}=require(process.env.PERFCHECKER_PLAYWRIGHT||'playwright');
+  const browser=await chromium.launch({headless:true,args:['--no-sandbox'],...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{})});
+  try{
+    const page=await browser.newPage({viewport:{width:360,height:640}}),errors=[];
+    page.on('pageerror',error=>errors.push(error.message));
+    await page.addInitScript(()=>{
+      window.messages=[];window.acquireVsCodeApi=()=>({getState:()=>undefined,setState(){},postMessage:message=>window.messages.push(message)});
+    });
+    await page.route('http://perfchecker.test/**',async route=>{
+      const filename=new URL(route.request().url()).pathname.slice(1);
+      if(['investigation.css','investigation.js'].includes(filename))return route.fulfill({body:await readFile(path.resolve('media',filename)),contentType:filename.endsWith('.css')?'text/css':'application/javascript'});
+      return route.fulfill({contentType:'text/html',body:`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src http://perfchecker.test; script-src 'nonce-fixture';"><link rel="stylesheet" href="/investigation.css"></head><body><div id="app"></div><script nonce="fixture" src="/investigation.js"></script></body></html>`});
+    });
+    await page.goto('http://perfchecker.test/');
+    const base={scenario:'oxygen-heap',implementation:'oxygen',status:'complete',correctness:'passed',quality:'not_checked',performance:'not_compared',summary:'',
+      findings:[{rule_id:'fixture',message:'<img src=x onerror=alert(1)>',location:{file:'/untrusted/source.jl',line:1}}],
+      artifacts:[{kind:'unsafe-source',path:'/untrusted/artifact'}],measurement_scope:'Full lifecycle including preparation, operation, verification and cleanup.',
+      limitations:['Reported values are not independently verified.'],configuration:{project:'/recorded/oxygen-1.10.2'}};
+    const latency={...base,tool:'latency',measurements:{load_seconds:7.331050373,first_case_seconds:0.822117922,warm_case_seconds:0.000143314}};
+    const memory={...base,tool:'memory',measurements:{samples:Array.from({length:5},()=>({state_before_bytes:1304,state_after_bytes:2294,state_and_result_bytes:2310}))}};
+    const importedDiagnostic={path:'/external/long-directory-name/another-very-long-directory-name/saved-diagnosis.json',sha256:'a'.repeat(64),loadedAt:'2026-10-10T00:00:00Z'};
+    const state={type:'state',report:{schema_version:'perfchecker-diagnosis/1',records:[latency,memory],cards:{ignored:'not a narrative report'}},history:[],importedDiagnostic,busy:false};
+    await page.evaluate(state=>window.dispatchEvent(new MessageEvent('message',{data:state})),state);
+    assert.match(await page.locator('.imported-diagnostic').innerText(),/not measured or independently verified/);
+    assert.match(await page.locator('.imported-diagnostic').innerText(),/does not certify their origin/);
+    assert.deepEqual(await page.locator('.diagnostic-values dd').allTextContents(),['7.331050373 s','0.822117922 s','0.000143314 s']);
+    assert.equal(await page.locator('.diagnostic-memory tbody tr').count(),5);
+    assert.deepEqual(await page.locator('.diagnostic-memory tbody tr').evaluateAll(rows=>rows.map(row=>[...row.cells].map(cell=>cell.textContent))),
+      Array.from({length:5},(_,index)=>[String(index+1),'1304','2294','2310']));
+    assert.match(await page.locator('.diagnostic-memory caption').innerText(),/not total allocations or process RSS/);
+    assert.equal(await page.getByRole('button',{name:'Advise from saved evidence',exact:true}).isDisabled(),true);
+    assert.equal(await page.getByRole('button',{name:'Explain with configured model',exact:true}).isDisabled(),true);
+    assert.equal(await page.getByRole('button',{name:'Open unsafe-source',exact:true}).count(),0);
+    assert.equal(await page.getByRole('button',{name:'/untrusted/source.jl:1',exact:true}).count(),0);
+    assert.equal(await page.locator('#app img').count(),0,'Imported strings render as text, never markup');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'Long snapshot identity and exact numeric values stay within the portrait viewport');
+    await page.getByRole('button',{name:'Open imported JSON snapshot',exact:true}).click();
+    await page.getByRole('button',{name:'Open saved diagnostic report',exact:true}).click();
+    assert.deepEqual(await page.evaluate(()=>window.messages.slice(-2)),[{type:'importedJson'},{type:'importDiagnostic'}]);
+    const unavailable={scenario:'missing-tool',implementation:'baseline',tool:'latency',status:'unavailable',message:'Analyzer unavailable; no measurements collected'};
+    await page.evaluate(state=>window.dispatchEvent(new MessageEvent('message',{data:state})),{...state,report:{schema_version:'perfchecker-diagnosis/1',records:[unavailable]},importedDiagnostic:{...importedDiagnostic,sha256:'b'.repeat(64)}});
+    assert.match(await page.locator('article.card').innerText(),/Availability: unavailable/);
+    assert.equal(await page.locator('.diagnostic-values,.diagnostic-memory').count(),0);
+    assert.equal(await page.locator('article.card').getByText('Recorded project:',{exact:true}).count(),0,'No version or project identity is inferred from the snapshot filename');
+    assert.deepEqual(errors,[]);
+  }finally{await browser.close();}
+});
+
 // Opt in with an installed Playwright and browser; the extension has no browser runtime dependency.
 test('real webviews preserve full selection, handle Git targets and render interactive plots under their CSP',{
   skip: !process.env.PERFCHECKER_BROWSER_TESTS,

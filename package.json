@@ -87,6 +87,11 @@
         "icon": "$(inspect)"
       },
       {
+        "command": "perfchecker.openDiagnosticReport",
+        "title": "PerfChecker: Open saved diagnostic report",
+        "icon": "$(file-code)"
+      },
+      {
         "command": "perfchecker.discoverScenarios",
         "title": "PerfChecker: Discover scenarios from tests",
         "icon": "$(search)"

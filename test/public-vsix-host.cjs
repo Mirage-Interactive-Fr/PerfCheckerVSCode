@@ -24,7 +24,7 @@ function commandCoverage(commands,checks){
     discoverTestItems:['testitem-current-evidence'],configureAdvisor:['advisor-native-model-management','advisor-native-provider-and-tool-discovery'],catalogTools:['native-tool-catalogue'],
     syncScenarios:['native-discovery-and-sync-after-pluto','investigation-sync-tools-history-native-exports'],
     narrateAdvice:['investigation-saved-advice-and-disabled-model','native-narrative-controlled-response','native-narrative-cancel-active-http'],investigateScenarios:['investigation-real-bounded-work'],
-    openInvestigations:['investigation-discovery-selection-source-draft','native-codelens-and-quickfix'],discoverScenarios:['investigation-discovery-selection-source-draft'],
+    openInvestigations:['investigation-discovery-selection-source-draft','native-codelens-and-quickfix'],openDiagnosticReport:['native-saved-diagnostic-import'],discoverScenarios:['investigation-discovery-selection-source-draft'],
     measureScenarios:['investigation-real-measurement'],diagnoseScenarios:['investigation-analyzer-jet','investigation-analyzer-alloccheck','native-codelens-and-quickfix'],
     adviseScenarios:['investigation-saved-advice-and-disabled-model'],compareScenarios:['investigation-real-baseline-candidate'],
     cancelInvestigation:['investigation-cancel-active-julia-worker'],prepareScenario:['investigation-discovery-selection-source-draft'],
@@ -80,6 +80,7 @@ function buttonCoverage(checks){
     'Results · filters / reports / keyboard navigation':['result-controls'],
     'Results · metric visibility / measured version range / Reset':['native-results-comparison-controls'],
     'Investigation · adoption / validation / duplicate rejection':['investigation-adoption-types-and-duplicate-rejected'],
+    'Investigation · Open saved diagnostic report / immutable JSON snapshot':['native-saved-diagnostic-import'],
     'Editor · real proposal and diagnosis CodeLens / quick fix':['native-codelens-and-quickfix'],
     'Investigation · real collectors / profile filters / raw evidence':['investigation-real-collectors-and-profile-controls'],
     'Investigation · artifact open / digest validation':['investigation-native-artifact-and-integrity'],
@@ -615,6 +616,7 @@ exports.run = async () => {
       if(phase==='narrative')await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
       else if(phase==='landscape')await runCase('native-landscape-controls',()=>require('./native-landscape-controls.cjs').run(context));
       else if(phase==='studio-color')await runCase('native-colour-picker-save-reload',()=>controls.runColour(context));
+      else if(phase==='saved-report')await runCase('native-saved-diagnostic-import',()=>require('./native-investigation-controls.cjs').runSavedImport(context));
       else if(phase==='general100')await runCase('native-general100-compatibility',()=>require('./native-general100-controls.cjs').run(context));
       else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
       else if(phase==='mcp-stdio')await runCase('native-generic-mcp-stdio-controls',()=>mcp.run(context,{stdio:true,customArguments:true}));

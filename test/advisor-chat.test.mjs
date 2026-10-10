@@ -27,3 +27,10 @@ test('chat rejects malformed roles, empty or oversized questions and unverified 
   for (const input of [{...response('x'),authority:'verified'}, {...response('x'),reference_status:'verified'}, {...response('x'),external_review:{}},response('x'.repeat(16001)), {...response('x'),schema_version:'perfchecker-narrative/2'}]) assert.throws(()=>chatReply(input));
   assert.throws(()=>chatReply({...response('x'),status:'unavailable',message:'tool missing'}),/tool missing/);
 });
+
+test('chat displays the actual global timeout and preserves the original diagnostic', () => {
+  assert.throws(()=>chatReply({...response('x'),status:'timeout',message:'isolated worker stopped'},180),
+    /Global request timed out after 180 seconds \(including worker startup\). PerfChecker did not apply changes to your project. Details: isolated worker stopped/);
+  assert.throws(()=>chatReply({...response('x'),status:'timeout',message:'isolated worker stopped'}),
+    /Global request timed out \(including worker startup\).*isolated worker stopped/);
+});

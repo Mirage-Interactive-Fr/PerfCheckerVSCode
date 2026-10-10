@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import Module, {createRequire} from 'node:module';
-import {mkdtemp, rm, writeFile} from 'node:fs/promises';
+import {mkdtemp, rm, writeFile, readFile, stat} from 'node:fs/promises';
 import {execFile, spawn} from 'node:child_process';
 import {promisify} from 'node:util';
 import http from 'node:http';
@@ -231,4 +231,124 @@ test('chat preserves the forced-stop warning after a real controller cannot unwi
     chat.dispose();if(child&&alive(child.pid))child.kill('SIGKILL');
     await rm(root,{recursive:true,force:true});
   }
+});
+
+// Real Git checkpoint/copy and a live owned child; only the Core response is
+// controlled. This proves cleanup ordering rather than a model convergence claim.
+test('failed local implementation awaits physical cleanup before removing its isolated copy', {timeout:20000},async t=>{
+  const require=createRequire(import.meta.url),connections=require('../dist/advisorConnection.js');
+  for(const mode of ['deferred','reject-then-retry'])await t.test(mode,async()=>{
+    const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-chat-copy-owner-'));
+    const folder={name:'Owned implementation copy',uri:{scheme:'file',fsPath:root,toString:()=>`file://${root}`}},key=folder.uri.toString();
+    const git=async(...args)=>(await execute('git',['-c','core.hooksPath=',...args],{cwd:root})).stdout.trim();
+    const vscode={workspace:{isTrusted:true,workspaceFolders:[folder],textDocuments:[],getConfiguration:()=>({get:(_key,fallback)=>fallback})}};
+    const source=require.resolve('../dist/advisorChat.js'),cached=require.cache[source],original=Module._load;
+    delete require.cache[source];
+    Module._load=function(name,...args){
+      if(name==='vscode')return vscode;
+      if(name==='./advisorSetup')return {readAdvisorConfiguration:async()=>connections.localAdvisorConnection(key).config};
+      return original.call(this,name,...args);
+    };
+    let AdvisorChat;
+    try{({AdvisorChat}=require('../dist/advisorChat.js'));}
+    finally{Module._load=original;if(cached)require.cache[source]=cached;else delete require.cache[source];}
+    const chat=new AdvisorChat({workspaceState:{get:()=>undefined,update:async()=>undefined}},()=>[],async()=>undefined);
+    require('../dist/workspace-root.js').selectWorkspaceFolder([folder],folder);
+    let copy,checkpoint,release,cleanupStarted,attempts=0;
+    const gate=new Promise(resolve=>{release=resolve;}),started=new Promise(resolve=>{cleanupStarted=resolve;});
+    const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+    const closed=new Promise(resolve=>child.once('close',resolve));
+    const disconnect=async()=>{
+      attempts++;cleanupStarted();
+      if(attempts===1){await gate;if(mode==='reject-then-retry')throw new Error('Controlled owner inspection failure; retry is required.');}
+      child.kill('SIGKILL');await closed;
+      assert.equal(alive(child.pid),false,'Disconnect resolves only after the actual owner is gone');
+    };
+    try{
+      await git('init');await git('config','user.name','PerfChecker test');await git('config','user.email','perfchecker@test.invalid');
+      await writeFile(path.join(root,'source.txt'),'original\n');await git('add','source.txt');await git('commit','-m','baseline');
+      const head=await git('rev-parse','HEAD'),index=await git('write-tree');
+      connections.setLocalAdvisorConnection(key,{kind:'codex',label:'Controlled real process owner',
+        config:{protocol:'mcp_http',timeout:180},implementation:{tool:'implement_perfchecker',promptArgument:'prompt',workspaceArgument:'workspace'}},disconnect);
+      chat.folder();chat.messages=[{role:'user',content:'Review allocations.'},{role:'assistant',content:'Consider a bounded implementation.'}];
+      chat.invoke=async(_folder,_config,request)=>{
+        copy=request.workspace;checkpoint=chat.backupRef;
+        return {schema_version:'perfchecker-narrative/1',status:'timeout',message:'isolated worker stopped',
+          authority:'unverified_narrative',reference_status:'unstructured_not_verified',cards:[]};
+      };
+      const outcome=chat.implement(true).then(()=>undefined,error=>error);
+      await started;
+      assert.equal(await readFile(path.join(copy,'source.txt'),'utf8'),'original\n');
+      assert(alive(child.pid));assert.equal(chat.isBusy(),true,'The failed request stays busy while owner cleanup is deferred');
+      release();const error=await outcome;
+      assert.match(error.message,/Global request timed out after 180 seconds.*isolated worker stopped/);
+      assert.equal(await git('rev-parse',checkpoint+'^{tree}'),index,'The usable checkpoint is retained');
+      if(mode==='reject-then-retry'){
+        assert.match(error.message,/cleanup is incomplete/);assert(connections.localAdvisorConnection(key));
+        assert.equal(await readFile(path.join(copy,'source.txt'),'utf8'),'original\n');
+        assert(alive(child.pid));assert(chat.retainedImplementation,'The retry handle retains the actual checkout');
+        await assert.rejects(chat.implement(true),/Retry Disconnect/);
+        await assert.rejects(chat.send('No new advice during incomplete cleanup'),/Retry Disconnect/);
+        await connections.disconnectLocalAdvisorConnection(key);
+        assert.equal(attempts,2);assert.equal(connections.localAdvisorConnection(key),undefined);
+        chat.connectionChanged(); // Same public callback invoked after the real Disconnect action.
+        const deadline=Date.now()+1000;
+        while(chat.retainedImplementation){assert(Date.now()<deadline,'Retry Disconnect releases its retained copy');await delay(10);}
+      }
+      assert.equal(alive(child.pid),false);assert.equal(chat.retainedImplementation,undefined);
+      await assert.rejects(stat(copy),{code:'ENOENT'});
+      assert.equal(chat.isBusy(),false);assert.equal(await git('rev-parse','HEAD'),head);assert.equal(await git('write-tree'),index);
+      assert.equal(await readFile(path.join(root,'source.txt'),'utf8'),'original\n');
+      t.diagnostic(JSON.stringify({mode,cleanupAttempts:attempts,copyRemovedAfterOwnerExit:true,checkpointRetained:true,sourceHeadIndexUnchanged:true}));
+    }finally{
+      release?.();if(alive(child.pid)){child.kill('SIGKILL');await closed;}
+      connections.setLocalAdvisorConnection(key);chat.dispose();
+      if(copy)await rm(path.dirname(copy),{recursive:true,force:true});await rm(root,{recursive:true,force:true});
+    }
+  });
+});
+
+test('Cancel advice keeps the local chat busy until its actual owned cleanup finishes',{timeout:10000},async t=>{
+  for(const mode of ['deferred','reject-then-retry'])await t.test(mode,async()=>{
+  const require=createRequire(import.meta.url),connections=require('../dist/advisorConnection.js');
+  const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-chat-advice-owner-'));
+  const folder={name:'Owned advice request',uri:{scheme:'file',fsPath:root,toString:()=>`file://${root}`}},key=folder.uri.toString();
+  const vscode={workspace:{isTrusted:true,workspaceFolders:[folder],textDocuments:[],getConfiguration:()=>({get:(_key,fallback)=>fallback})}};
+  const source=require.resolve('../dist/advisorChat.js'),cached=require.cache[source],original=Module._load;
+  delete require.cache[source];
+  Module._load=function(name,...args){
+    if(name==='vscode')return vscode;
+    if(name==='./advisorSetup')return {readAdvisorConfiguration:async()=>connections.localAdvisorConnection(key).config};
+    return original.call(this,name,...args);
+  };
+  let AdvisorChat;
+  try{({AdvisorChat}=require('../dist/advisorChat.js'));}
+  finally{Module._load=original;if(cached)require.cache[source]=cached;else delete require.cache[source];}
+  require('../dist/workspace-root.js').selectWorkspaceFolder([folder],folder);
+  const chat=new AdvisorChat({workspaceState:{get:()=>undefined,update:async()=>undefined}},()=>[],async()=>undefined);
+  const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}),closed=new Promise(resolve=>child.once('close',resolve));
+  let invoked,reply,cleanupStarted,release,attempts=0;
+  const started=new Promise(resolve=>{invoked=resolve;}),response=new Promise(resolve=>{reply=resolve;});
+  const cleaning=new Promise(resolve=>{cleanupStarted=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  connections.setLocalAdvisorConnection(key,{kind:'codex',label:'Controlled advice process',
+    config:{protocol:'mcp_http',mcp_response:'text',mcp_tool:'ask_perfchecker',timeout:180},
+    implementation:{tool:'implement_perfchecker',promptArgument:'prompt',workspaceArgument:'workspace'}},async()=>{
+      attempts++;cleanupStarted();if(attempts===1){await gate;if(mode==='reject-then-retry')throw new Error('Controlled advice owner cleanup failure.');}
+      child.kill('SIGKILL');await closed;assert.equal(alive(child.pid),false);
+    });
+  chat.invoke=async()=>{invoked();return response;};
+  try{
+    const pending=chat.send('Controlled advice cancellation; no model.').then(()=>undefined,error=>error);
+    await started;chat.cancel();reply({});await cleaning;
+    assert(alive(child.pid));assert.equal(chat.isBusy(),true,'HTTP completion must not publish idle before local ownership cleanup');
+    await assert.rejects(chat.send('No overlap'),/already running|cleanup is incomplete/);
+    release();const error=await pending;assert.match(error.message,/cancelled/i);
+    if(mode==='reject-then-retry'){
+      assert.match(error.message,/cleanup is incomplete/);assert(alive(child.pid));assert(connections.localAdvisorConnection(key));
+      await assert.rejects(chat.send('Refused until physical cleanup'),/Retry Disconnect/);
+      await connections.disconnectLocalAdvisorConnection(key);assert.equal(attempts,2);
+    }
+    assert.equal(chat.isBusy(),false);assert.equal(alive(child.pid),false);assert.equal(connections.localAdvisorConnection(key),undefined);
+  }finally{release?.();reply?.({});if(alive(child.pid)){child.kill('SIGKILL');await closed;}connections.setLocalAdvisorConnection(key);chat.dispose();await rm(root,{recursive:true,force:true});}
+  });
 });

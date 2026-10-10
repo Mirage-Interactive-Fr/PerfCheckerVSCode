@@ -1,12 +1,12 @@
-import {spawn, ChildProcess, execFile} from 'node:child_process';
+import {spawn, ChildProcess} from 'node:child_process';
 import {createServer, Server, IncomingMessage, ServerResponse} from 'node:http';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
-import {readFile, readdir, realpath, stat} from 'node:fs/promises';
+import {realpath, stat} from 'node:fs/promises';
 import {StringDecoder} from 'node:string_decoder';
 import {Readable} from 'node:stream';
-import {promisify} from 'node:util';
 import * as path from 'node:path';
 import {spawnWindowsOwnedProcess, WindowsOwnedChild} from './windowsOwnedProcess';
+import {PosixProcessCohort} from './posixProcessCohort';
 
 export type McpVersion = '2025-11-25' | '2026-07-28';
 export interface McpTool {name: string; description?: string; inputSchema: Record<string, unknown>}
@@ -14,8 +14,7 @@ export interface McpStdioOptions {
   command: string; args: string[]; cwd: string; version: McpVersion;
   timeoutMs?: number; onClosed?: () => void;
 }
-interface Identity {pid: number; parent: number; group: number; start: string; exe: string}
-const execute = promisify(execFile), MAX_BYTES = 1_000_000;
+const MAX_BYTES = 1_000_000;
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const object = (value: unknown): value is Record<string, any> => !!value && typeof value === 'object' && !Array.isArray(value);
 
@@ -39,9 +38,10 @@ export class McpStdioConnector {
   private failure?: Error;
   private closed = false;
   private childClosed = false;
-  private known = new Map<number, Identity>();
-  private groups = new Set<number>();
-  private groupGone = false;
+  private cohort?: PosixProcessCohort;
+  private get known() {return this.cohort!.known;}
+  private get groups() {return this.cohort!.groups;}
+  private set groups(value: Set<number>) {this.cohort!.groups = value;}
   private observer?: ReturnType<typeof setInterval>;
   private observation: Promise<void> = Promise.resolve();
   constructor(private options: McpStdioOptions) {}
@@ -63,6 +63,7 @@ export class McpStdioConnector {
     for (const name of Object.keys(env)) if (/^PERFCHECKER_(MCP|CODEX)_TOKEN_/.test(name)) delete env[name];
     this.child = process.platform === 'win32' ? spawnWindowsOwnedProcess(command, this.options.args, {cwd, env, privateStdout: true}) :
       spawn(command, this.options.args, {cwd, env, detached: true, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
+    if (process.platform !== 'win32') this.cohort = new PosixProcessCohort(this.child);
     const child = this.child, decoder = new StringDecoder('utf8');
     const output = this.output = (child as WindowsOwnedChild).protocolOutput ?? child.stdout ?? undefined;
     let buffer = '', bufferedBytes = 0;
@@ -261,101 +262,8 @@ export class McpStdioConnector {
     this.pending.clear();
     if (!this.closed) void this.dispose().catch(() => {}); // An explicit retry retains ownership after cleanup errors.
   }
-  private knownReparent(row: Omit<Identity, 'exe'>, exe: string, parent: string, initial: boolean) {
-    const known = initial ? undefined : this.known.get(row.pid);
-    return /^\d+$/.test(parent) && Number.isSafeInteger(Number(parent)) &&
-      known?.start === row.start && known.exe === exe && known.group === row.group && this.groups.has(row.group);
-  }
-  private async group(initial = false): Promise<Identity[]> {
-    const group = this.child?.pid;
-    if (!group || this.groupGone) return [];
-    const metadata: Array<Omit<Identity, 'exe'>> = [];
-    if (process.platform === 'linux') {
-      for (const name of await readdir('/proc')) {
-        if (!/^\d+$/.test(name)) continue;
-        try {
-          const raw = await readFile(`/proc/${name}/stat`, 'utf8'), fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/);
-          if (![fields[1], fields[2], fields[19]].every(value => /^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value)))) throw new Error('Invalid process identity.');
-          if (['Z', 'X'].includes(fields[0])) continue;
-          metadata.push({pid: Number(name), parent: Number(fields[1]), group: Number(fields[2]), start: fields[19]});
-        } catch (error) {if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;}
-      }
-    } else {
-      const result = await execute('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,stat=,lstart='], {timeout: 2000, maxBuffer: 2_000_000});
-      for (const line of result.stdout.split('\n')) {
-        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
-        if (!match || /^[ZX]/.test(match[4])) continue;
-        metadata.push({pid: Number(match[1]), parent: Number(match[2]), group: Number(match[3]), start: match[5]});
-      }
-    }
-    const selected = new Map<number, Omit<Identity, 'exe'>>();
-    for (const row of metadata) if ((initial && row.pid === group) || this.known.get(row.pid)?.start === row.start) selected.set(row.pid, row);
-    // Ascendance is inspected while parents still exist. Previously observed
-    // incarnations remain owned after reparenting; unseen daemonization is not
-    // claimed. Private groups require an observed owned group leader.
-    for (let changed = true; changed;) {
-      changed = false;
-      for (const row of metadata) if (!selected.has(row.pid) && selected.has(row.parent)) {selected.set(row.pid, row); changed = true;}
-    }
-    for (const privateGroup of this.groups) {
-      const members = metadata.filter(row => row.group === privateGroup);
-      if (members.length && !members.some(row => selected.has(row.pid))) throw new Error('A private MCP group has no qualified live incarnation.');
-      for (const row of members) selected.set(row.pid, row);
-    }
-    const rows: Identity[] = [];
-    for (const row of selected.values()) {
-      const {pid} = row;
-      if (process.platform === 'linux') {
-        try {
-          let exe: string;
-          try {exe = await realpath(`/proc/${pid}/exe`);}
-          catch (error) {
-            const current = await readFile(`/proc/${pid}/stat`, 'utf8').catch(error => {
-              if (['ENOENT', 'ESRCH'].includes(error.code)) return ''; throw error;
-            });
-            if (!current || ['Z', 'X'].includes(current.slice(current.lastIndexOf(')') + 2).trim().split(/\s+/)[0])) continue;
-            throw new Error('A live private MCP process has no observable executable.');
-          }
-          const after = await readFile(`/proc/${pid}/stat`, 'utf8'), fields = after.slice(after.lastIndexOf(')') + 2).trim().split(/\s+/);
-          if (fields[19] !== row.start || Number(fields[2]) !== row.group ||
-            (Number(fields[1]) !== row.parent && !this.knownReparent(row, exe, fields[1], initial))) throw new Error('Process identity changed while inspecting.');
-          if (!['Z','X'].includes(fields[0])) rows.push({...row, parent: Number(fields[1]), exe});
-        } catch (error) {if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;}
-        continue;
-      }
-      try {
-        const txt = await execute('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'txt', '-Fn'], {timeout: 2000, maxBuffer: 1_000_000});
-        const filename = txt.stdout.split('\n').find(line => line.startsWith('n/'))?.slice(1);
-        if (!filename) throw new Error('The MCP executable mapping is unavailable.');
-        const exe = await realpath(filename);
-        const after = await execute('/bin/ps', ['-p', String(pid), '-o', 'pid=,ppid=,pgid=,stat=,lstart='], {timeout: 2000});
-        const again = after.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
-        if (!again || Number(again[1]) !== row.pid || Number(again[3]) !== row.group || again[5] !== row.start ||
-          (Number(again[2]) !== row.parent && !this.knownReparent(row, exe, again[2], initial))) throw new Error('MCP process identity changed while inspecting its executable.');
-        if (!/^[ZX]/.test(again[4])) rows.push({...row, parent: Number(again[2]), exe});
-      } catch (error) {
-        const current = await execute('/bin/ps', ['-p', String(pid), '-o', 'pid=,stat=,lstart='], {timeout: 2000}).catch(error => {
-          if (error.code === 1 && !String(error.stdout ?? '').trim() && !String(error.stderr ?? '').trim()) return {stdout: ''}; throw error;
-        });
-        if (current.stdout.trim() && !/^\s*\d+\s+[ZX]/.test(current.stdout)) throw error;
-      }
-    }
-    return rows;
-  }
-  private async observe(initial = false, command?: string) {
-    const rows = await this.group(initial);
-    if (initial && rows.length && !rows.some(row => row.pid === this.child?.pid && row.parent === process.pid && row.group === row.pid && row.exe === command))
-      throw new Error('The MCP process group is not anchored to the launched executable.');
-    if (!initial && rows.length && !rows.some(row => this.known.get(row.pid)?.start === row.start)) throw new Error('The MCP process group lost its owned identity.');
-    for (const row of rows) {
-      const known = this.known.get(row.pid);
-      if (known && (known.start !== row.start || known.exe !== row.exe)) throw new Error('An MCP process identity or executable changed.');
-      this.known.set(row.pid, row);
-      if (row.group === row.pid && (initial || rows.some(parent => parent.pid === row.parent) || this.groups.has(row.group))) this.groups.add(row.group);
-    }
-    if (!rows.length && this.known.size) this.groupGone = true;
-    return rows;
-  }
+  private group(initial = false) {return this.cohort!.group(initial);}
+  private observe(initial = false, command?: string) {return this.cohort!.observe(initial, command);}
   private async stop() {
     const until = Date.now() + 10000;
     this.closed = true;

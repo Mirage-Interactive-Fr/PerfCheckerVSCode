@@ -16,7 +16,7 @@ on:
       case_group:
         description: Native controls to exercise on a clean fixture (focused stage only)
         type: choice
-        options: [bootstrap, general100, narrative, mcp, mcp-stdio, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
+        options: [bootstrap, general100, narrative, mcp, mcp-stdio, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, saved-report, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
         default: narrative
       backend_julia:
         description: Core runtime for a manual qualification; automatic PR coverage remains latest
@@ -29,7 +29,7 @@ on:
         options: [all, linux, linux-stable, windows, windows-stable, macos-stable]
         default: all
       core:
-        description: Registered minimum, or the explicitly pinned Core fix before registration
+        description: Published General minimum, explicit legacy compatibility, or a pinned candidate
         type: choice
         options: [general, candidate, general100]
         default: general
@@ -193,9 +193,9 @@ jobs:
       PERFCHECKER_NATIVE_CANDIDATE_SHA: ${{ needs.package.outputs.sha }}
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
-      PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || 'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642') || '' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || '00c133336911b8600d63a8d6c59ce1befc5ce690') || '' }}
+      PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'general' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name == 'workflow_dispatch' && inputs.core == 'candidate') && (inputs.core_commit || 'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642') || '' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name == 'workflow_dispatch' && inputs.core == 'candidate') && (inputs.core_tree || '00c133336911b8600d63a8d6c59ce1befc5ce690') || '' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'

@@ -228,8 +228,13 @@ async function studioNotebookButtons(context,directory){
     await clickStudioAction(context,'notebook');
     let picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
     let input=picker.locator('input[type="text"]');await input.fill(file);await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter');
-    await picker.locator('.monaco-list-row').filter({hasText:'Investigation'}).first().waitFor();
-    await picker.locator('.monaco-list-row').filter({hasText:'Investigation'}).first().click();
+    // Filter the real QuickPick, then accept its active option with the native keyboard.
+    // A pointer target may disappear while the file dialog transitions on macOS.
+    picker=context.windowPage.locator('.quick-input-widget').filter({has:context.windowPage.locator('.quick-input-title').filter({hasText:/^PerfChecker · Pluto dashboard$/})});
+    await picker.waitFor({state:'visible'});
+    const kindInput=picker.locator('input[type="text"]');await kindInput.fill('Investigation');
+    await picker.locator('.monaco-list-row').filter({hasText:'Investigation'}).first().waitFor({state:'visible'});
+    await kindInput.press('Enter');
     const state=await view(context);await idle(state.frame);
     assert((await fs.readFile(file,'utf8')).startsWith('### A Pluto.jl notebook ###'));
     await stop(context,state,true);

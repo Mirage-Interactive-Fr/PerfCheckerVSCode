@@ -7,7 +7,7 @@ import {StringDecoder} from 'node:string_decoder';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {readAdvisorConfiguration} from './advisorSetup';
-import {localAdvisorConnection, implementationMcpArguments} from './advisorConnection';
+import {localAdvisorConnection, implementationMcpArguments, disconnectLocalAdvisorConnection} from './advisorConnection';
 import {ChatMessage, prepareChatMessages, completeChatMessages, chatReply} from './advisorChatModel';
 import {InvestigationReport} from './investigationModel';
 import {createImplementationCheckout, applyImplementation, recoverImplementationProposal, recoverActiveImplementationProposal, saveActiveImplementationProposal, ImplementationProposal} from './implementation';
@@ -32,6 +32,9 @@ export class AdvisorChat implements vscode.Disposable {
   private implementationSummary = '';
   private backupRef = '';
   private recoveredWorkspace?: string;
+  private retainedRelease?: Promise<void>;
+  private incompleteLocalCleanup = new Set<string>();
+  private retainedImplementation?: {key: string; checkout: Awaited<ReturnType<typeof createImplementationCheckout>>};
   constructor(private context: vscode.ExtensionContext,
     private evidenceOptions: () => ChatEvidence[],
     private readEvidence: (id: string) => Promise<InvestigationReport | SuiteChatSource>,
@@ -81,6 +84,13 @@ export class AdvisorChat implements vscode.Disposable {
     const workspace = this.panel ? this.workspace : this.folder().uri.toString();
     const local = workspace ? localAdvisorConnection(workspace) : undefined;
     this.status = local ? `${local.label} connected for this editor session. Advice is requested explicitly; implementation requires review. Tool permissions are managed by the server.` : 'Local connector disconnected. Saved provider configuration is active again. Reconnect after an editor restart.';
+    const retained = this.retainedImplementation;
+    if (retained && !localAdvisorConnection(retained.key)) {
+      void this.releaseRetainedImplementation().then(() => this.publish(), error => {
+        this.status = 'Local agent stopped, but isolated copy cleanup failed; checkpoint retained. ' + String(error);
+        this.publish();
+      });
+    }
     this.publish();
   }
   private publish() {
@@ -134,8 +144,14 @@ export class AdvisorChat implements vscode.Disposable {
     this.status = 'New conversation. Only the selected saved evidence and your messages will be sent.';
     this.publish();
   }
+  private assertLocalCleanup(workspace: string) {
+    if (!this.incompleteLocalCleanup.has(workspace)) return;
+    if (localAdvisorConnection(workspace)) throw new Error('Local agent cleanup is incomplete. Retry Disconnect before making another request.');
+    this.incompleteLocalCleanup.delete(workspace);
+  }
   async send(question: unknown, evidenceId: unknown = this.evidenceId) {
-    const folder = this.folder();
+    const folder = this.folder(), key = folder.uri.toString(), local = localAdvisorConnection(key);
+    this.assertLocalCleanup(key);
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before connecting an advisor.');
     if (this.busy) throw new Error('An advisor request is already running.');
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri);
@@ -146,6 +162,7 @@ export class AdvisorChat implements vscode.Disposable {
     this.busy = true; this.cancelled = false;
     this.pending = prepared.messages.at(-1)!.content;
     this.status = 'Connecting to the configured MCP advice tool…'; this.publish();
+    let invoked = false;
     try {
       await this.recoverProposal();
       const config = await readAdvisorConfiguration(folder);
@@ -154,9 +171,10 @@ export class AdvisorChat implements vscode.Disposable {
       }
       const advice = evidenceId ? await this.selectedEvidence(folder, evidenceId) : undefined;
       if (this.cancelled) throw new Error('Request cancelled.');
+      invoked = true;
       const result = await this.invoke(folder, config, {messages: prepared.messages, ...(advice ? {advice} : {})});
       if (this.cancelled) throw new Error('Request cancelled. The remote server may still finish its work.');
-      const reply = chatReply(result);
+      const reply = chatReply(result, Number(config.timeout ?? 90));
       const completed = completeChatMessages(prepared.messages, reply);
       this.messages = completed.messages;
       this.evidenceId = evidenceId;
@@ -164,8 +182,15 @@ export class AdvisorChat implements vscode.Disposable {
       const omitted = prepared.omitted + completed.omitted;
       this.status = `Reply received · advice is unverified.${omitted ? ` ${omitted / 2} older exchanges were omitted to fit the context limit.` : ''}`;
       return result;
-    } catch (error) {this.status = String(error); throw error;}
-    finally {this.busy = false; this.child = undefined; this.publish();}
+    } catch (error) {
+      let failure = error;
+      if (invoked && local) {
+        this.incompleteLocalCleanup.add(key);
+        try {await disconnectLocalAdvisorConnection(key); this.incompleteLocalCleanup.delete(key);}
+        catch (cleanupError) {failure = new AggregateError([error, cleanupError], String(error) + ' Local agent cleanup is incomplete. Retry Disconnect before making another request.');}
+      }
+      this.status = String(failure); throw failure;
+    } finally {this.busy = false; this.child = undefined; this.publish();}
   }
   private async selectedEvidence(folder: vscode.WorkspaceFolder, id: string): Promise<InvestigationReport> {
     const evidence = await this.readEvidence(id);
@@ -204,8 +229,22 @@ export class AdvisorChat implements vscode.Disposable {
     await settings.update('advisorImplementationMcpArguments', argumentsValue, vscode.ConfigurationTarget.WorkspaceFolder);
     this.status = 'Implementation tool saved. Review advice before preparing changes.'; this.publish();
   }
+  private async releaseRetainedImplementation() {
+    if (this.retainedRelease) return this.retainedRelease;
+    const retained = this.retainedImplementation;
+    if (!retained) return;
+    if (localAdvisorConnection(retained.key)) throw new Error('Local agent cleanup is incomplete. Retry Disconnect before preparing another implementation. The isolated copy and checkpoint are retained.');
+    const release = retained.checkout.dispose().then(() => {
+      if (this.retainedImplementation === retained) this.retainedImplementation = undefined;
+    });
+    this.retainedRelease = release;
+    try {await release;} finally {if (this.retainedRelease === release) this.retainedRelease = undefined;}
+  }
   async implement(warningShown = false) {
+    if (this.busy) throw new Error('An advisor request is already running.');
+    await this.releaseRetainedImplementation();
     const folder = this.folder();
+    this.assertLocalCleanup(folder.uri.toString());
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before requesting implementation.');
     if (this.busy) throw new Error('An advisor request is already running.');
     if (!this.messages.length) throw new Error('Get and review advice before requesting implementation.');
@@ -224,6 +263,7 @@ export class AdvisorChat implements vscode.Disposable {
     this.busy = true; this.cancelled = false;
     this.status = 'Creating Git checkpoint and isolated checkout…'; this.publish();
     let checkout: Awaited<ReturnType<typeof createImplementationCheckout>> | undefined;
+    let primaryFailure: unknown;
     try {
       await this.recoverProposal();
       const config = await readAdvisorConfiguration(folder);
@@ -246,14 +286,35 @@ export class AdvisorChat implements vscode.Disposable {
         workspace: checkout.workspace, workspace_argument: workspaceArgument}, 'implement');
       if (this.cancelled) throw new Error('Implementation cancelled; checkpoint retained. The remote agent may still be running.');
       this.folder();
-      const summary = chatReply(result);
+      const summary = chatReply(result, Number(config.timeout ?? 90));
       this.proposal = await checkout.collect();
       this.implementationSummary = summary;
       await this.persistProposal();
       this.status = this.proposal.files.length ? 'Review the proposed diff, then apply it. Rerun correctness and performance checks after applying.' : 'The agent returned no code changes. Its summary is unverified.';
       return this.proposal;
-    } catch (error) {this.status = String(error); throw error;}
-    finally {try {await checkout?.dispose();} finally {this.busy = false; this.child = undefined; this.publish();}}
+    } catch (error) {
+      primaryFailure = error;
+      if (checkout && local) {
+        this.retainedImplementation = {key: folder.uri.toString(), checkout};
+        this.incompleteLocalCleanup.add(folder.uri.toString());
+        try {await disconnectLocalAdvisorConnection(folder.uri.toString()); this.incompleteLocalCleanup.delete(folder.uri.toString());}
+        catch (cleanupError) {
+          primaryFailure = new AggregateError([error, cleanupError],
+            String(error) + ' Local agent cleanup is incomplete. Retry Disconnect; isolated copy retained at ' + checkout.workspace + '. Git checkpoint retained: ' + checkout.backupRef);
+        }
+      }
+      this.status = String(primaryFailure); throw primaryFailure;
+    } finally {
+      try {
+        if (checkout && this.retainedImplementation?.checkout === checkout) {
+          if (!localAdvisorConnection(this.retainedImplementation.key)) await this.releaseRetainedImplementation();
+        } else await checkout?.dispose();
+      } catch (cleanupError) {
+        const failure = new AggregateError(primaryFailure ? [primaryFailure, cleanupError] : [cleanupError],
+          String(primaryFailure ?? 'Implementation completed.') + ' Isolated copy cleanup failed; checkpoint retained.');
+        this.status = String(failure); throw failure;
+      } finally {this.busy = false; this.child = undefined; this.publish();}
+    }
   }
   async apply(restore = false) {
     this.folder();

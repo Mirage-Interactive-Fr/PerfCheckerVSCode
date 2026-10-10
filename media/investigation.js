@@ -66,6 +66,7 @@
     app.replaceChildren();
     const toolbar = node('div', undefined, 'toolbar');
     toolbar.append(button('Discover tests', () => execute('discover'), state.busy),
+      button('Open saved diagnostic report', () => send('importDiagnostic'), state.busy),
       button('Measure selected', () => execute('run'), state.busy || !selected.size),
       button('Diagnose selected', () => execute('diagnose'), state.busy || !selected.size || !selectedTools.size),
       button('Investigate selected', () => execute('investigate'), state.busy || !selected.size || !selectedTools.size),
@@ -149,9 +150,18 @@
   }
 
   function evidence(body) {
-    body.append(node('h2', 'Evidence and next experiments'), button('Advise from saved evidence', () => execute('advise'), state.busy),
-      button('Explain with configured model', () => execute('narrate'), state.busy), button('Model settings', () => send('advisorSettings')));
-    if (state.report?.cards) {
+    body.append(node('h2', 'Evidence and next experiments'), button('Advise from saved evidence', () => execute('advise'), state.busy || Boolean(state.importedDiagnostic)),
+      button('Explain with configured model', () => execute('narrate'), state.busy || Boolean(state.importedDiagnostic)), button('Model settings', () => send('advisorSettings')));
+    if (state.importedDiagnostic) {
+      const imported = node('aside', undefined, 'status imported-diagnostic');
+      imported.append(node('strong', 'Imported saved report — not measured or independently verified in this editor session.'),
+        paragraph('Source:', state.importedDiagnostic.path), paragraph('Read at:', state.importedDiagnostic.loadedAt),
+        paragraph('Snapshot SHA-256:', state.importedDiagnostic.sha256),
+        node('p', 'The hash identifies the loaded bytes; it does not certify their origin or the reported results. Maximum file size: 32 MiB.'),
+        button('Open imported JSON snapshot', () => send('importedJson')));
+      body.append(imported);
+    }
+    if (!state.importedDiagnostic && state.report?.cards) {
       body.append(node('h2', 'Optional model explanation'), node('p', `${state.report.status} · Generated prose needs review. The deterministic evidence below remains authoritative.`));
       if (state.report.external_review) {
         const review = node('article', undefined, 'card');
@@ -166,13 +176,13 @@
       }
       body.append(details('Model usage and availability', {status: state.report.status, model: state.report.model, usage: state.report.usage, elapsed_seconds: state.report.elapsed_seconds, message: state.report.message}));
     }
-    if (state.report?.experiments) {
+    if (!state.importedDiagnostic && state.report?.experiments) {
       body.append(node('h2', 'Bounded investigation'), paragraph('Outcome:', state.report.status), details('Limits', state.report.limits));
       for (const experiment of state.report.experiments) body.append(paragraph(`${experiment.status} · ${experiment.elapsed_seconds.toFixed(2)} s`, experiment.purpose));
       body.append(details('Experiments not executed', state.report.unexecuted), details('Optional model decisions', state.report.decisions));
     }
-    if (state.report?.coverage) body.append(node('h2', 'Shared catalogue and CI'), node('p', 'These combinations are proposals. They do not certify CI coverage or adopt budgets.'), details('Configurations to qualify', state.report.coverage), details('Changed inputs', state.report.changes), details('Unresolved CI constructs', state.report.warnings));
-    if (state.report?.tools) {
+    if (!state.importedDiagnostic && state.report?.coverage) body.append(node('h2', 'Shared catalogue and CI'), node('p', 'These combinations are proposals. They do not certify CI coverage or adopt budgets.'), details('Configurations to qualify', state.report.coverage), details('Changed inputs', state.report.changes), details('Unresolved CI constructs', state.report.warnings));
+    if (!state.importedDiagnostic && state.report?.tools) {
       body.append(node('h2', 'Tool catalogue'), node('p', 'Integration status describes availability of an adapter, never successful qualification on your machine.'));
       const filter = node('input'); filter.type = 'search'; filter.placeholder = 'Search category, tool or integration status'; filter.setAttribute('aria-label', 'Search tool catalogue');
       const list = node('div');
@@ -187,15 +197,46 @@
       for (const [label, value] of [['Availability', record.status], ['Correctness', record.correctness || 'not_checked'], ['Quality', record.quality || 'not_checked'], ['Performance', record.performance || 'not_compared']]) badges.append(node('span', `${label}: ${value}`, 'badge'));
       card.append(badges); if (record.message) card.append(node('pre', record.message));
       if (record.summary) card.append(node('p', record.summary));
+      if (record.configuration?.project) card.append(paragraph('Recorded project:', record.configuration.project));
+      if (record.status === 'complete' && record.tool === 'latency') {
+        const phases = node('dl', undefined, 'diagnostic-values');
+        for (const [name, key] of [['Source loading', 'load_seconds'], ['First lifecycle', 'first_case_seconds'], ['Warm lifecycle', 'warm_case_seconds']]) {
+          const value = record.measurements?.[key];
+          phases.append(node('dt', name), node('dd', Number.isFinite(value) && value >= 0 ? `${value} s` : 'Unavailable'));
+        }
+        card.append(phases);
+      }
+      if (record.status === 'complete' && record.tool === 'memory' && Array.isArray(record.measurements?.samples)) {
+        const table = node('table', undefined, 'diagnostic-memory');
+        table.append(node('caption', 'Recorded reachable Julia objects — bytes, not total allocations or process RSS'));
+        const head = node('thead'), labels = node('tr');
+        for (const title of ['Sample', 'State before', 'State after', 'State + result']) {const cell = node('th', title); cell.scope = 'col'; labels.append(cell);}
+        head.append(labels); const rows = node('tbody');
+        record.measurements.samples.forEach((sample, index) => {
+          const row = node('tr'); row.append(node('th', index + 1)); row.firstChild.scope = 'row';
+          for (const key of ['state_before_bytes', 'state_after_bytes', 'state_and_result_bytes']) {
+            const value = sample?.[key]; row.append(node('td', Number.isFinite(value) && value >= 0 ? String(value) : 'Unavailable'));
+          }
+          rows.append(row);
+        });
+        table.append(head, rows); card.append(table);
+      }
+      if (record.measurement_scope) card.append(paragraph('Measurement scope:', record.measurement_scope));
+      if (record.limitations?.length) {
+        const limits = node('ul', undefined, 'diagnostic-limits');
+        for (const limit of record.limitations) limits.append(node('li', limit));
+        card.append(limits);
+      }
       for (const finding of record.findings || []) {
         const findingCard = node('div', undefined, 'finding'); findingCard.append(node('strong', finding.rule_id), node('pre', finding.message));
-        if (finding.location?.file) findingCard.append(source(finding.location.file, finding.location.line)); card.append(findingCard);
+        if (finding.location?.file && !state.importedDiagnostic) findingCard.append(source(finding.location.file, finding.location.line)); card.append(findingCard);
       }
-      for (const artifact of record.artifacts || []) card.append(button(`Open ${artifact.kind}`, () => send('artifact', {file: artifact.path})));
+      if (!state.importedDiagnostic) for (const artifact of record.artifacts || []) card.append(button(`Open ${artifact.kind}`, () => send('artifact', {file: artifact.path})));
+      if (state.importedDiagnostic && record.environment_provenance) card.append(details('Recorded environment provenance (reported, not independently verified)', record.environment_provenance));
       card.append(details('Configuration, measurements and limits', {configuration: record.configuration, measurements: record.measurements, scope: record.analysis_scope || record.measurement_scope, version: record.tool_version, limits: record.limitations})); body.append(card);
     }
-    if (state.report?.runs) for (const run of state.report.runs) body.append(measurement(run));
-    const advice = state.advice || (state.report?.recommendations ? state.report : undefined);
+    if (!state.importedDiagnostic && state.report?.runs) for (const run of state.report.runs) body.append(measurement(run));
+    const advice = !state.importedDiagnostic && (state.advice || (state.report?.recommendations ? state.report : undefined));
     if (advice) {
       body.append(node('h2', 'Recommendations'));
       for (const recommendation of advice.recommendations) {
@@ -211,7 +252,7 @@
 
   function comparisons(body) {
     body.append(node('h2', 'Compare the same scenarios'), node('p', 'Choose explicit before and after measurements. Implementations and collectors remain separate; absent or incompatible configurations remain visible.'), button('Choose baseline and candidate', () => execute('compare'), state.busy));
-    for (const configuration of state.report?.configurations || []) {
+    for (const configuration of (!state.importedDiagnostic && state.report?.configurations) || []) {
       const card = node('article', undefined, 'card'); card.append(node('h3', `${configuration.scenario} · ${configuration.implementation} · ${configuration.collector}`),
         node('p', configuration.status, 'badge'), details('Changes, regressions and compatibility', configuration.comparison || {status: 'not_tested'})); body.append(card);
     }
@@ -230,7 +271,9 @@
   window.addEventListener('message', event => {
     if (event.data.type !== 'state') return;
     const previousAttempt = state.history?.[0]?.id;
+    const previousImport = state.importedDiagnostic?.sha256;
     state = event.data;
+    if (state.importedDiagnostic && state.importedDiagnostic.sha256 !== previousImport) tab = 'evidence';
     if (state.history?.[0]?.id && state.history[0].id !== previousAttempt) tab = state.history[0].action === 'discover' ? 'scenarios' : state.history[0].action === 'compare' ? 'comparisons' : 'evidence';
     if (!toolsInitialized) {selectedTools = new Set(state.tools || []); toolsInitialized = true;}
     if (state.discovery) {
@@ -239,7 +282,7 @@
       selected = new Set([...selected].filter(item => available.has(item)));
     }
     if (state.report?.records || state.report?.recommendations || state.report?.runs) {if (state.busy) tab = 'evidence';}
-    if (state.report?.configurations) tab = 'comparisons';
+    if (!state.importedDiagnostic && state.report?.configurations) tab = 'comparisons';
     persist(); render();
   });
   send('ready');

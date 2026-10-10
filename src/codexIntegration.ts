@@ -1,11 +1,16 @@
 import * as vscode from 'vscode';
-import {CodexConnector, inspectCodex} from './codexConnector';
+import {CodexConnector, inspectCodex, shutdownCodexPreflights} from './codexConnector';
 import {localAdvisorConnection, setLocalAdvisorConnection, disconnectLocalAdvisorConnection, beginLocalAdvisorConnectionOperation} from './advisorConnection';
 import {currentWorkspaceFolder} from './workspace-root';
 
 const shutdowns = new Set<() => Promise<void>>();
 const closing = new Set<Promise<void>>();
-export async function shutdownCodexConnections() {await Promise.allSettled([...shutdowns].map(stop => stop())); await Promise.allSettled([...closing]);}
+export async function shutdownCodexConnections() {
+  const results = [...await Promise.allSettled([...shutdowns].map(stop => stop())), ...await Promise.allSettled([...closing]),
+    ...await Promise.allSettled([shutdownCodexPreflights()])];
+  const failed = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failed.length) throw new AggregateError(failed.map(result => result.reason), 'Codex cleanup is incomplete. Owned handles are retained for retry.');
+}
 
 export function registerCodexConnections(context: vscode.ExtensionContext, busy: () => boolean, changed: () => void) {
   const connectors = new Map<string, CodexConnector>();

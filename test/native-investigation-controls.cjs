@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const {clickStudioAction}=require('./native-studio-controls.cjs');
 const {createHash} = require('node:crypto');
+const {tmpdir} = require('node:os');
 
 const reportNames = {discover: 'discovery', run: 'run', diagnose: 'diagnosis',
   advise: 'advice', compare: 'comparison', tools: 'tools', sync: 'sync', investigate: 'investigation'};
@@ -420,6 +421,63 @@ async function cancel(context) {
   context.proof('investigation-cancel-active-julia-worker', {workerStarted: true, cleanupCompleted: true, remainingConfigurationsQualified: false});
 }
 
+async function savedImport(context) {
+  const temporary=await fs.mkdtemp(path.join(tmpdir(),'perfchecker-native-diagnostic-import-'));
+  const filename=path.join(temporary,'saved-diagnosis.json'),invalid=path.join(temporary,'invalid.json');
+  const base={scenario:'saved-diagnostic-control',implementation:'fixture',status:'complete',correctness:'passed',summary:'',findings:[],
+    configuration:{project:'Recorded control fixture; no workload was executed'},measurement_scope:'Synthetic data qualifies the saved-report viewer only'};
+  const report={schema_version:'perfchecker-diagnosis/1',records:[
+    {...base,tool:'latency',measurements:{load_seconds:1.25,first_case_seconds:2.5,warm_case_seconds:0.125}},
+    {...base,tool:'memory',measurements:{samples:Array.from({length:5},()=>({state_before_bytes:10,state_after_bytes:20,state_and_result_bytes:30}))}},
+    {scenario:'missing-control',implementation:'fixture',tool:'latency',status:'unavailable',message:'Not measured in this fixture'},
+  ]};
+  const text=JSON.stringify(report,null,2)+'\n',sha256=createHash('sha256').update(text).digest('hex');
+  await fs.writeFile(filename,text);await fs.writeFile(invalid,'{"schema_version":"perfchecker-diagnosis/1","records":[{"tool":"latency"}]}');
+  const files=context.vscode.workspace.getConfiguration('files',context.vscode.Uri.file(context.workspace));
+  const previous=files.inspect('simpleDialog.enable')?.globalValue;
+  const beforeDirectories=await directories(reportRoot(context));
+  const beforeHistory=await (await tab(context,'Saved evidence')).locator('article.card').allTextContents();
+  const choose=async file=>{
+    const picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:30000});
+    const input=picker.locator('input[type="text"]');await input.fill(file);await input.press('Enter');
+    await picker.waitFor({state:'hidden',timeout:30000});
+  };
+  try{
+    await files.update('simpleDialog.enable',true,context.vscode.ConfigurationTarget.Global);
+    const pending=context.vscode.commands.executeCommand('perfchecker.openDiagnosticReport');await choose(filename);await pending;
+    let current=await view(context);
+    const banner=current.locator('.imported-diagnostic');await banner.waitFor({state:'visible'});
+    assert.match(await banner.innerText(),/not measured or independently verified in this editor session/);
+    assert((await banner.innerText()).includes(sha256));assert((await banner.innerText()).includes(filename));
+    assert.deepEqual(await current.locator('.diagnostic-values dd').allTextContents(),['1.25 s','2.5 s','0.125 s']);
+    assert.equal(await current.locator('.diagnostic-memory tbody tr').count(),5);
+    assert.match(await current.locator('article.card').last().innerText(),/Availability: unavailable/);
+    for(const name of ['Advise from saved evidence','Explain with configured model'])assert.equal(await current.getByRole('button',{name,exact:true}).isDisabled(),true);
+    await current.getByRole('button',{name:'Open imported JSON snapshot',exact:true}).click();
+    await eventually(()=>context.vscode.window.activeTextEditor?.document.isUntitled,'Imported JSON opens an unsaved snapshot');
+    assert.equal(context.vscode.window.activeTextEditor.document.getText(),text);
+    await context.vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+    current=await view(context);
+    await current.getByRole('button',{name:'Open saved diagnostic report',exact:true}).click();
+    const picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});await picker.locator('input[type="text"]').press('Escape');
+    await picker.waitFor({state:'hidden'});assert((await current.locator('.imported-diagnostic').innerText()).includes(sha256));
+    await current.getByRole('button',{name:'Open saved diagnostic report',exact:true}).click();await choose(invalid);
+    await eventually(async()=>/Invalid diagnostic record/.test(await current.locator('#app > .status').innerText()),'Invalid saved JSON is refused without replacing the snapshot');
+    assert((await current.locator('.imported-diagnostic').innerText()).includes(sha256));
+    assert.deepEqual(await current.locator('.diagnostic-values dd').allTextContents(),['1.25 s','2.5 s','0.125 s']);
+    assert.equal(await fs.readFile(filename,'utf8'),text);
+    assert.deepEqual(await directories(reportRoot(context)),beforeDirectories);
+    assert.deepEqual(await (await tab(context,'Saved evidence')).locator('article.card').allTextContents(),beforeHistory);
+    context.proof('native-saved-diagnostic-import',{fixture:'synthetic viewer control, not measured evidence',sourceSha256:sha256,sourceBytesUnchanged:true,
+      commandDialog:true,buttonDialog:true,cancelPreservesSnapshot:true,invalidPreservesSnapshot:true,unsavedOriginalJson:true,
+      displayedLatencySeconds:[1.25,2.5,0.125],displayedMemorySamples:5,unavailablePreserved:true,historyViewUnchanged:true,reportDirectoriesUnchanged:true});
+  }finally{
+    await files.update('simpleDialog.enable',previous,context.vscode.ConfigurationTarget.Global);
+    await fs.rm(temporary,{recursive:true,force:true});
+  }
+}
+exports.runSavedImport=savedImport;
+
 exports.run = async (context,options={}) => {
   assert.equal(process.env.CI, 'true', 'Use disposable remote CI profiles, never the user VS Code');
   assert(path.isAbsolute(context.workspace));
@@ -434,6 +492,7 @@ exports.run = async (context,options={}) => {
     for (const key of keys) await settings.update(key, values[key], context.vscode.ConfigurationTarget.WorkspaceFolder);
     await clickStudioAction(context,'investigations');
     const cases=[
+      ['read-only-saved-diagnostic-import', () => savedImport(context)],
       ['discovery-selection-proposals', () => discover(context)],
       ['adopt-real-shared-factory', () => adopt(context, 'ui_adopted', 'make_sum_case')],
       ['reject-invalid-and-duplicate-adoption', () => rejectAdoption(context)],

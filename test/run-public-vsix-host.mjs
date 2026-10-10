@@ -9,7 +9,7 @@ import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
-import {nativeCoreContract} from './native-core-contract.mjs';
+import {nativeCoreContract,GENERAL101_TREE} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure} from './native-controller-preflight.mjs';
 
@@ -34,11 +34,12 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['bootstrap','general100','narrative','mcp','mcp-stdio','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['bootstrap','general100','narrative','mcp','mcp-stdio','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','saved-report','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 const bootstrapOnly=stage==='focused'&&caseGroup==='bootstrap';
 if(bootstrapOnly&&(mode!=='candidate'||coreMode!=='general'))throw new Error('Fresh production bootstrap requires the candidate VSIX and published General Core, without Git source overrides.');
 if(stage==='focused'&&caseGroup==='pluto-start-stop'&&process.platform!=='linux')throw new Error('The first prepared Pluto start/stop observation is explicitly Linux only.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
+const savedReportOnly=stage==='focused'&&caseGroup==='saved-report';
 // The real game and SDKs are immutable fixtures, never development checkouts.
 // A trailing delimiter expands only Julia's system depots, excluding the human depot.
 const candidateGitConfig=process.platform==='win32'&&coreMode==='candidate'?path.join(session,'git-config','.gitconfig'):undefined;
@@ -523,6 +524,7 @@ try {
   const versionsText=await minimumResponse.text(),minimumSection=versionsText.split(/^\["1\.0\.1"\]\s*$/m)[1]?.split(/^\[/m)[0];
   const minimumTree=/^git-tree-sha1\s*=\s*"([a-f0-9]{40})"/m.exec(minimumSection||'')?.[1];
   const minimumAvailable=Boolean(minimumTree);
+  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,GENERAL101_TREE,'The published General 1.0.1 tree is the immutable release contract');
   const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml');
   if(!plutoTagResponse.ok&&plutoTagResponse.status!==404)throw new Error(`Cannot verify published Pluto companion tag: ${plutoTagResponse.status}`);
   const plutoTagAvailable=plutoTagResponse.ok&&/^version\s*=\s*"1\.0\.1"\s*$/m.test(await plutoTagResponse.text());
@@ -665,9 +667,9 @@ try {
   // The first real launch has no PerfChecker settings, Julia or Jupyter extension.
   if(completeCampaign||bootstrapOnly)await launch('fresh');
   if(!bootstrapOnly){
-  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]!="landscape";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':'standard'],{timeout:landscapeOnly?900000:undefined});
+  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]=="standard";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':savedReportOnly?'saved-report':'standard'],{timeout:landscapeOnly?900000:undefined});
   const installed=JSON.parse(installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_CORE_PROVENANCE ')).slice('QUALIFIED_CORE_PROVENANCE '.length));
-  if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode!=='candidate'&&!installed.registered||coreMode==='general100'&&installed.tree!==coreProvenance.tree)
+  if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode!=='candidate'&&!installed.registered||coreProvenance.tree&&installed.tree!==coreProvenance.tree)
     throw new Error('The actual Core installation must match its version and registry/candidate provenance.');
   Object.assign(coreProvenance,installed);
   if(stage==='focused'&&caseGroup==='diagnosis'&&process.platform==='darwin'){
@@ -696,7 +698,7 @@ try {
       assert.deepEqual(receipt.hashesAfter,before,'Controller imports preserve the exact prepared Project and Manifest');
     }
   }
-  if(!landscapeOnly){
+  if(!landscapeOnly&&!savedReportOnly){
   if(stage==='full'||stage==='focused'&&['investigation','diagnosis'].includes(caseGroup))await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.add(["Aqua","SnoopCompile"]);using Aqua,SnoopCompile;println("OPTIONAL_ANALYZER_INSTALL Aqua=",Base.pkgversion(Aqua)," SnoopCompile=",Base.pkgversion(SnoopCompile))',controller]);
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(["BenchmarkTools","Chairmarks","TestItems"]); Pkg.activate(ARGS[2]); Pkg.add("TestItems")', target, workspace]);
   await fs.mkdir(path.join(workspace, 'perf'), {recursive: true});
@@ -792,9 +794,10 @@ end
   }
   if(stage==='focused'&&caseGroup==='pluto-plots'){
     const pins={makieCommit:'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642',plutoCommit:'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642',makieTree:'18b54d832a73df6ffa72d1c7f07ddb5cb9eb1e3a',plutoTree:'7ad6a3a84b8284fec905753e02a2877d3762ba9e',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'};
-    const text=await execute(julia,['--startup-file=no','-e',      'using Pkg;Pkg.activate(ARGS[1]);Pkg.add([PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerMakie",rev=ARGS[2]),PackageSpec(name="WGLMakie",version="0.13.15"),PackageSpec(name="Makie",version="0.24.15"),PackageSpec(name="Bonito",version="4.2.0")];preserve=Pkg.PRESERVE_ALL);using PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto;@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(WGLMakie)==v"0.13.15";@assert Base.pkgversion(Makie)==v"0.24.15";@assert Base.pkgversion(Bonito)==v"4.2.0";@assert Base.get_extension(PerfCheckerMakie,:WGLMakieExt)!==nothing;@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerMakie).uuid].tree_hash)==ARGS[3];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[4];@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[5];print("PLUTO_PLOT_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto)));println()',plutoProject,pins.makieCommit,pins.makieTree,pins.plutoTree,coreProvenance.tree]);
+    const makieRevision=coreMode==='candidate'?pins.makieCommit:'v1.0.1';
+    const text=await execute(julia,['--startup-file=no','-e',      'using Pkg;Pkg.activate(ARGS[1]);Pkg.add([PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerMakie",rev=ARGS[2]),PackageSpec(name="WGLMakie",version="0.13.15"),PackageSpec(name="Makie",version="0.24.15"),PackageSpec(name="Bonito",version="4.2.0")];preserve=Pkg.PRESERVE_ALL);using PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto;@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(WGLMakie)==v"0.13.15";@assert Base.pkgversion(Makie)==v"0.24.15";@assert Base.pkgversion(Bonito)==v"4.2.0";@assert Base.get_extension(PerfCheckerMakie,:WGLMakieExt)!==nothing;@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerMakie).uuid].tree_hash)==ARGS[3];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[4];@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[5];print("PLUTO_PLOT_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto)));println()',plutoProject,makieRevision,pins.makieTree,pins.plutoTree,coreProvenance.tree]);
     const provenance=JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('PLUTO_PLOT_PROVENANCE ')).slice('PLUTO_PLOT_PROVENANCE '.length));
-    await fs.writeFile(path.join(output,'pluto-plot-provider-provenance.json'),JSON.stringify({pins,providers:provenance,manifestSha256:createHash('sha256').update(await fs.readFile(path.join(plutoProject,'Manifest.toml'))).digest('hex'),renderer:'Disposable Electron ANGLE/SwiftShader; no physical GPU qualification'},null,2));
+    await fs.writeFile(path.join(output,'pluto-plot-provider-provenance.json'),JSON.stringify({pins,makieRevision,providers:provenance,manifestSha256:createHash('sha256').update(await fs.readFile(path.join(plutoProject,'Manifest.toml'))).digest('hex'),renderer:'Disposable Electron ANGLE/SwiftShader; no physical GPU qualification'},null,2));
   }
   if(completeCampaign)await launch('configured');
   // TestItemRunner's default imports use the chosen controller. This explicit fixture
@@ -805,7 +808,7 @@ end
   for (const extension of completeCampaign||stage==='focused'&&caseGroup==='workbench'?(mode==='public'?['julialang.language-julia','ms-toolsai.jupyter']:['julialang.language-julia']):[]) {
     await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', extension], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   }
-  }else{
+  }else if(landscapeOnly){
     landscapeFixture=await prepareLandscapeFixture(runtime);
     artifactRecord.landscapeFixture=landscapeFixture.provenance;
     await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));

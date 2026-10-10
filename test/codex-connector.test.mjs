@@ -29,19 +29,26 @@ Module._load = function(name, ...args) {
     cli === 'sacrificial-codex' ? nativeSpawn(process.execPath, [fixture, ...argv], options) : nativeSpawn(cli, argv, options)};
   return original.call(this, name, ...args);
 };
-let CodexConnector, inspectCodex;
-try {({CodexConnector, inspectCodex} = require('../dist/codexConnector.js'));} finally {Module._load = original;}
+let CodexConnector, inspectCodex, shutdownCodexPreflights;
+try {({CodexConnector, inspectCodex, shutdownCodexPreflights} = require('../dist/codexConnector.js'));} finally {Module._load = original;}
 
 async function environment(run) {
   const root = await mkdtemp(path.join(tmpdir(), 'perfchecker-codex-contract-'));
   fixture = path.join(root, 'cli.cjs');
   await writeFile(fixture, `const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
-const args=process.argv.slice(2);if(args[0]==='--version'){console.log('codex-cli 0.159.2');process.exit(0)}
+const args=process.argv.slice(2);
+function execImage(){const child=cp.spawn('/bin/sh',['-c','while [ ! -e "$1" ]; do sleep 0.02; done; exec /bin/sleep 1000','--',path.join(process.cwd(),'release-exec')],{stdio:'ignore'});fs.writeFileSync('exec-image.json',JSON.stringify({leader:process.pid,child:child.pid}));setInterval(()=>{if(fs.existsSync('release-parent'))process.exit(0)},10)}
+if(args[0]==='--exec-owner'){execImage();return}
+if(args[0]==='--cohort-detached'){const leaf=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('cohort.json',JSON.stringify({middle:process.ppid,detached:process.pid,leaf:leaf.pid}));setInterval(()=>{},1000);return}
+if(args[0]==='--cohort-middle'){cp.spawn(process.execPath,[__filename,'--cohort-detached'],{detached:true,stdio:'ignore'});setInterval(()=>{if(fs.existsSync('release-middle'))process.exit(0)},10);return}
+if(args[0]==='--version'){console.log('codex-cli 0.159.2');process.exit(0)}
 if(args[0]==='--help'){console.log('--no-daemon');process.exit(0)}
 if(args[1]==='--help'){console.log('--ephemeral --sandbox --output-last-message --json --skip-git-repo-check --ignore-user-config --ignore-rules');process.exit(0)}
 if(args[0]==='login'){process.exit(process.env.PERFCHECKER_FAKE_AUTH==='no'?1:0)}
 let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',s=>prompt+=s);process.stdin.on('end',()=>{
 fs.writeFileSync(path.join(process.cwd(),'captured.json'),JSON.stringify({args,prompt,leaked:Object.keys(process.env).some(k=>k.startsWith('PERFCHECKER_CODEX_TOKEN_'))}));
+if(prompt.includes('EXEC_IMAGE')){execImage();return}
+if(prompt.includes('REPARENT_COHORT')){const middle=cp.spawn(process.execPath,[__filename,'--cohort-middle'],{stdio:'ignore'});fs.writeFileSync('cohort-leader.json',JSON.stringify({leader:process.pid,middle:middle.pid}));setInterval(()=>{if(fs.existsSync('release-leader'))process.exit(0)},10);return}
 if(prompt.includes('EXIT_WITH_CHILD')||prompt.includes('OWNED_ACTIVE_CHILD')){const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:['ignore','inherit','inherit']});fs.writeFileSync(path.join(process.cwd(),'exited-cli.json'),JSON.stringify({leader:process.pid,descendant:child.pid}));if(prompt.includes('EXIT_WITH_CHILD'))process.exit(0);setInterval(()=>{},1000);return}
 if(prompt.includes('SLOW')){const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)']);fs.writeFileSync(path.join(process.cwd(),'descendant.pid'),String(child.pid));setInterval(()=>{},1000);return}
 if(args[args.indexOf('--sandbox')+1]==='workspace-write')fs.writeFileSync(path.join(process.cwd(),'source.txt'),'optimized\\n');
@@ -189,67 +196,166 @@ test('timeout, HTTP cancellation and disposal stop the actual CLI process tree a
   }
 }));
 
-test('timeout, HTTP cancellation and disposal reclaim the owned CLI descendants before teardown', async t => environment(async root => {
-  const failures=[], processObservations=[];
-  const alive=async pid=>{
-    try{process.kill(pid,0);}catch(error){
-      if(error.code!=='ESRCH')throw error;
-      processObservations.push({pid,state:'absent',code:error.code});return false;
-    }
-    if(process.platform==='linux'){
-      try{
-        const stat=await readFile(`/proc/${pid}/stat`,'utf8'), fields=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\s+/);
-        processObservations.push({pid,state:fields[0],startTicks:fields[19],statBytes:stat.length});
-        return fields[0]!=='Z';
-      }catch(error){
-        if(error.code!=='ENOENT'&&error.code!=='ESRCH')throw error;
-        processObservations.push({pid,state:'absent',code:error.code});return false;
-      }
-    }
-    return true;
-  };
-  for(const mode of ['timeout','cancel','dispose']){
-    processObservations.length=0;
-    await rm(path.join(root,'exited-cli.json'),{force:true});
-    const windows=process.platform==='win32';
-    const connector=await new CodexConnector({cli:'sacrificial-codex',root,timeoutMs:mode==='timeout'?(windows?10000:350):30000}).start();
-    const controller=new AbortController();
-    const request=tool(connector,'ask_perfchecker',{prompt:windows?'OWNED_ACTIVE_CHILD':'EXIT_WITH_CHILD'},controller.signal).catch(error=>error);
-    let owned;
+// No model/authentication: exercise the installed product bridge against a real
+// disposable process cohort. Its ancestry is observed before either fork parent
+// exits; the detached child and its child survive that reparenting naturally.
+test('Codex owns an observed detached/reparented cohort through timeout, HTTP abort, disposal and natural exit',
+  {skip:process.platform==='win32'},async t=>environment(async root=>{
+  const identity=async pid=>{
     try{
-      owned=JSON.parse(await until(()=>readFile(path.join(root,'exited-cli.json'),'utf8')));
-      if(!windows)await until(async()=>{if(await alive(owned.leader))throw new Error('The CLI leader has not exited yet');return true;});
-      assert(await alive(owned.descendant),'The inherited-stream descendant is actually alive before the owned stop');
-      const leaderAliveBeforeStop=await alive(owned.leader);
-      assert.equal(leaderAliveBeforeStop,windows,'POSIX reproduces an exited leader; Windows owns and stops the Job immediately on natural leader exit (tested separately)');
-      if(mode==='cancel')controller.abort();
+      if(process.platform==='linux'){
+        const raw=await readFile('/proc/'+pid+'/stat','utf8'),f=raw.slice(raw.lastIndexOf(')')+2).trim().split(/\s+/);
+        if(['Z','X'].includes(f[0]))return undefined;
+        return{pid,parent:Number(f[1]),group:Number(f[2]),session:Number(f[3]),start:f[19],exe:await realpath('/proc/'+pid+'/exe')};
+      }
+      const exec=(file,args)=>new Promise((resolve,reject)=>nativeChildProcess.execFile(file,args,{timeout:2000},(error,stdout)=>error?reject(error):resolve(stdout)));
+      const raw=await exec('/bin/ps',['-p',String(pid),'-o','pid=,ppid=,pgid=,sess=,stat=,lstart=']);
+      const m=raw.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.+)$/);
+      if(!m||/^[ZX]/.test(m[5]))return undefined;
+      const mapped=await exec('/usr/sbin/lsof',['-a','-p',String(pid),'-d','txt','-Fn']);
+      const filename=mapped.split('\n').find(x=>x.startsWith('n/'))?.slice(1);assert(filename);
+      return{pid,parent:Number(m[2]),group:Number(m[3]),session:m[4],start:m[6],exe:await realpath(filename)};
+    }catch(error){if(['ENOENT','ESRCH'].includes(error.code)||error.code===1)return undefined;throw error;}
+  };
+  for(const mode of ['timeout','cancel','dispose','natural-exit'])await t.test(mode,async()=>{
+    for(const file of ['cohort.json','cohort-leader.json','release-middle','release-leader'])await rm(path.join(root,file),{force:true});
+    const foreign=nativeSpawn(process.execPath,['-e','setInterval(()=>{},1000)'],{cwd:root,detached:true,stdio:'ignore'});
+    const connector=await new CodexConnector({cli:'sacrificial-codex',root,timeoutMs:mode==='timeout'?5000:30000}).start();
+    const abort=new AbortController(),pending=tool(connector,'ask_perfchecker',{prompt:'REPARENT_COHORT'},abort.signal).catch(error=>error);
+    const qualified=[];
+    try{
+      const leader=JSON.parse(await until(()=>readFile(path.join(root,'cohort-leader.json'),'utf8')));
+      const cohort=JSON.parse(await until(()=>readFile(path.join(root,'cohort.json'),'utf8')));
+      for(const pid of [leader.leader,cohort.middle,cohort.detached,cohort.leaf]){
+        const current=await identity(pid);assert(current,'Every ancestor is alive before reparenting');qualified.push(current);
+      }
+      assert.equal(qualified[1].parent,leader.leader);assert.equal(qualified[2].parent,cohort.middle);assert.equal(qualified[3].parent,cohort.detached);
+      assert.notEqual(qualified[2].group,qualified[0].group);assert.notEqual(qualified[2].session,qualified[0].session);
+      const owner=connector.owners?.values().next().value;
+      if(owner?.cohort)await until(()=>{assert(qualified.every(row=>owner.cohort.known.get(row.pid)?.start===row.start));return true;});
+      await writeFile(path.join(root,'release-middle'),'release');
+      const reparented=await until(async()=>{assert.equal(await identity(cohort.middle),undefined);const row=await identity(cohort.detached);assert(row);assert.notEqual(row.parent,cohort.middle);return row;});
+      assert.equal(reparented.start,qualified[2].start);assert.equal(reparented.exe,qualified[2].exe);
+      assert(await identity(cohort.leaf));assert(await identity(foreign.pid));
+      if(mode==='cancel')abort.abort();
       const disposal=mode==='dispose'?connector.dispose():undefined;
-      const deadline=Date.now()+(windows?15000:2500);
-      let survivingBeforeHarnessCleanup=await alive(owned.descendant);
-      while(survivingBeforeHarnessCleanup&&Date.now()<deadline){
-        await new Promise(resolve=>setTimeout(resolve,20));
-        survivingBeforeHarnessCleanup=await alive(owned.descendant);
+      if(mode==='natural-exit')await writeFile(path.join(root,'release-leader'),'release');
+      const outcome=await pending;await disposal;
+      // Fetch aborts before the server finishes ownership cleanup. Await its
+      // actual retained request, without calling dispose as a cleanup oracle.
+      await until(async()=>{assert.equal(connector.owners.size,0);assert.equal(connector.children.size,0);return true;});
+      for(const row of qualified)assert.equal(await identity(row.pid),undefined,mode+': owned incarnation absent before harness teardown');
+      assert(await identity(foreign.pid),'An unrelated process with the same executable/cwd survives');
+      if(mode==='timeout'){assert.equal(outcome.isError,true);assert.match(outcome.content[0].text,/timed out/);}
+      if(owner)assert.equal(connector.owners.size,0,'Only proven cleanup retires ownership');
+      t.diagnostic(JSON.stringify({mode,qualified,reparented,ownedAbsentBeforeTeardown:true,foreignAlive:true}));
+    }finally{
+      abort.abort();
+      // On a regression, reclaim only an exact incarnation recorded alive while
+      // its full parent chain was still attached to this fixture's leader.
+      for(const row of qualified.reverse()){
+        const current=await identity(row.pid);
+        if(current?.start===row.start&&current.exe===row.exe)try{process.kill(row.pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}
       }
-      t.diagnostic(JSON.stringify({mode,...owned,leaderAliveBeforeStop,survivingBeforeHarnessCleanup,processObservations}));
-      assert.equal(survivingBeforeHarnessCleanup,false,`${mode}: the owned descendant must stop before fixture teardown`);
-      await disposal;
-      const result=await request;
-      if(mode==='timeout'){assert.equal(result.isError,true);assert.match(result.content[0].text,/timed out/);}
-      if(mode!=='dispose'){
-        await until(async()=>{
-          const retry=await tool(connector,'ask_perfchecker',{prompt:'Retry'});
-          assert.equal(retry.isError,undefined,'Cleanup returns the connector to idle');return retry;
-        });
-      }
-    }catch(error){t.diagnostic(JSON.stringify({mode,error:String(error),stack:error.stack,processObservations}));failures.push(error);}
-    finally{
-      // Only the PID reported by this disposable fixture is eligible for teardown.
-      if(owned&&await alive(owned.descendant)){
-        try{process.kill(owned.descendant,'SIGKILL');}
-        catch(error){if(error.code!=='ESRCH')throw error;}
-      }
-      await connector.dispose();await request;
+      await connector.dispose();await pending;
+      foreign.kill('SIGKILL');await new Promise(resolve=>foreign.once('close',resolve));
     }
-  }
-  if(failures.length)throw new AggregateError(failures,'Exited CLI descendants survived before harness cleanup');
+  });
 }));
+
+
+test('Codex preflight handles ENOENT and rapid normal exit without retaining an owner',async()=>environment(async root=>{
+  await assert.rejects(inspectCodex(path.join(root,'missing-native-cli'),root),/ENOENT/);
+  await shutdownCodexPreflights();
+  for(let iteration=0;iteration<3;iteration++)assert.equal(await inspectCodex('sacrificial-codex',root),'codex-cli 0.159.2');
+  await shutdownCodexPreflights();
+}));
+
+test('Codex recovers cleanup after a rejected initial identity inspection without losing its owner',
+  {skip:process.platform==='win32',timeout:10000},async()=>environment(async root=>{
+  const {PosixProcessCohort}=require('../dist/posixProcessCohort.js'),observe=PosixProcessCohort.prototype.observe;
+  let failed=false,pid;
+  PosixProcessCohort.prototype.observe=async function(initial,...args){
+    if(initial&&!failed){failed=true;pid=this.child.pid;throw new Error('Controlled initial process inspection failure.');}
+    return observe.call(this,initial,...args);
+  };
+  try{await assert.rejects(inspectCodex('sacrificial-codex',root),/Controlled initial/);}
+  finally{PosixProcessCohort.prototype.observe=observe;}
+  assert(failed&&pid);await shutdownCodexPreflights();
+  const rows=await new PosixProcessCohort({pid},true).group(true);
+  assert.equal(rows.length,0,'The rejected preflight process is physically absent before retry');
+  assert.equal(await inspectCodex('sacrificial-codex',root),'codex-cli 0.159.2');
+}));
+
+
+test('a live unobservable Codex owner is retained, blocks new calls, and can be disconnected after observation recovers',
+  {skip:process.platform==='win32',timeout:10000},async()=>environment(async root=>{
+  const {PosixProcessCohort}=require('../dist/posixProcessCohort.js'),observe=PosixProcessCohort.prototype.observe;
+  const connector=await new CodexConnector({cli:'sacrificial-codex',root}).start();
+  let pid;
+  PosixProcessCohort.prototype.observe=async function(initial,...args){
+    pid??=this.child.pid;throw new Error('Controlled unavailable process inspection.');
+  };
+  try{
+    const result=await tool(connector,'ask_perfchecker',{prompt:'Must never be sent without qualified ownership.'});
+    assert.equal(result.isError,true);assert.match(result.content[0].text,/Controlled unavailable/);
+    assert.equal(connector.owners.size,1);assert.equal(connector.children.size,1);
+    assert(pid);process.kill(pid,0);
+    const blocked=await tool(connector,'ask_perfchecker',{prompt:'No second invocation.'});
+    assert.equal(blocked.isError,true);assert.match(blocked.content[0].text,/cleanup is incomplete/);
+  }finally{PosixProcessCohort.prototype.observe=observe;await connector.dispose();}
+  assert.equal(connector.owners.size,0);assert.equal(connector.children.size,0);
+  const rows=await new PosixProcessCohort({pid},true).group(true);assert.equal(rows.length,0);
+}));
+
+
+test('Codex observes a real shell exec while its parent is owned; an exec after reparenting is refused explicitly',
+  {skip:process.platform==='win32',timeout:15000},async t=>{
+  const {PosixProcessCohort}=require('../dist/posixProcessCohort.js');
+  const identity=async pid=>(await new PosixProcessCohort({pid},true).group(true)).find(row=>row.pid===pid);
+  const image=await realpath('/bin/sleep');
+  for(const mode of ['attached','reparented'])await t.test(mode,()=>environment(async root=>{
+    const foreign=nativeSpawn('/bin/sleep',['1000'],{stdio:'ignore'}),foreignClosed=new Promise(resolve=>foreign.once('close',resolve));
+    const abort=new AbortController();let connector,leader,closed,pending,cohort,owned,initial;
+    try{
+      if(mode==='attached'){
+        connector=await new CodexConnector({cli:'sacrificial-codex',root,timeoutMs:10000}).start();
+        pending=tool(connector,'ask_perfchecker',{prompt:'EXEC_IMAGE'},abort.signal).catch(error=>error);
+      }else{
+        leader=nativeSpawn(process.execPath,[fixture,'--exec-owner'],{cwd:root,detached:true,stdio:'ignore'});
+        closed=new Promise(resolve=>leader.once('close',resolve));cohort=new PosixProcessCohort(leader,true);await cohort.observe(true);
+      }
+      owned=JSON.parse(await until(()=>readFile(path.join(root,'exec-image.json'),'utf8')));
+      if(connector)cohort=connector.owners.values().next().value.cohort;
+      await until(async()=>{await cohort.observe();assert(cohort.known.has(owned.child));return true;});
+      initial=cohort.known.get(owned.child);assert.notEqual(initial.exe,image);assert.equal(initial.parent,owned.leader);
+      if(mode==='reparented'){
+        await writeFile(path.join(root,'release-parent'),'release');await closed;
+        await until(async()=>{await cohort.observe();assert.notEqual(cohort.known.get(owned.child).parent,owned.leader);return true;});
+      }
+      await writeFile(path.join(root,'release-exec'),'release');
+      const current=await until(async()=>{const row=await identity(owned.child);assert(row);assert.equal(row.exe,image);return row;});
+      assert.equal(current.start,initial.start,'exec keeps the exact observed kernel birth');
+      if(mode==='attached'){
+        await until(()=>{assert.equal(cohort.known.get(owned.child).exe,image);return true;});
+        abort.abort();await pending;await until(()=>{assert.equal(connector.owners.size,0);return true;});
+        assert.equal(await identity(owned.child),undefined,'The new executable is stopped before harness cleanup');
+      }else{
+        await assert.rejects(cohort.observe(),/executable changed without a currently qualified live parent/);
+        await assert.rejects(cohort.signal('SIGKILL'),/executable changed without a currently qualified live parent/);
+        assert(await identity(owned.child),'The unresolved image is not signalled on incomplete ownership proof');
+      }
+      assert(await identity(foreign.pid),'The unrelated same-executable process survives');
+      t.diagnostic(JSON.stringify({mode,pid:owned.child,start:initial.start,fromExecutable:initial.exe,toExecutable:current.exe,
+        executableTransitionQualified:mode==='attached',cleanupRefusedExplicitly:mode==='reparented',foreignAlive:true}));
+    }finally{
+      abort.abort();
+      // External fixture teardown has its own creation/birth proof, distinct
+      // from the product's deliberately refused detached-image cleanup.
+      if(owned&&initial){const current=await identity(owned.child);if(current?.start===initial.start)process.kill(owned.child,'SIGKILL');}
+      if(leader&&await identity(leader.pid))leader.kill('SIGKILL');
+      if(closed)await closed;if(connector)await connector.dispose();if(pending)await pending;
+      foreign.kill('SIGKILL');await foreignClosed;
+    }
+  }));
+});
