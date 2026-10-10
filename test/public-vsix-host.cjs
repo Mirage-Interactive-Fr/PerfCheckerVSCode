@@ -707,6 +707,10 @@ exports.run = async () => {
         assert(!await fs.stat(path.join(workspace,'perf','controller','Project.toml')).then(()=>true).catch(()=>false));
         await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',uri);
         const studio=await findFrame('#setup-workspace');
+        const suitePlanFile=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json');
+        await assert.rejects(fs.access(suitePlanFile),{code:'ENOENT'},'Fresh setup must not reuse a stale plan from any workspace');
+        const initializationStartedAt=Date.now(),initializationDeadline=initializationStartedAt+600000;
+        const initializationRemaining=()=>{assert(Date.now()<initializationDeadline,'First-use setup must finish inside its original 600-second budget');return initializationDeadline-Date.now();};
         await studio.locator('#setup-workspace').click();
         await picker.waitFor({state:'visible',timeout:60000});
         await picker.locator('.monaco-list-row').filter({hasText:'Create controller environment'}).click();
@@ -721,9 +725,17 @@ exports.run = async () => {
           proof('bootstrap-awaiting-registration',{status:'prerequisite',minimum:'1.0.1',registry:'General',positiveBootstrapQualified:false,explicitConfirmation:true,nativeStudioClick:true});
           return;
         }
-        await eventually(()=>fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false),'Explicit first-use setup creates a real suite',600000);
-        await eventually(()=>vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject')===path.join('perf','controller'),'Controller setting is saved only after successful setup');
+        await eventually(()=>fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false),'Explicit first-use setup creates a real suite',initializationRemaining());
+        await eventually(()=>vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject')===path.join('perf','controller'),'Controller setting is saved only after successful setup',initializationRemaining());
         assert.equal(await fs.realpath(path.resolve(workspace,vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject'))),await fs.realpath(path.join(workspace,'perf','controller')));
+        let bootstrapPlan;
+        await eventually(async()=>{
+          try{const bytes=await fs.readFile(suitePlanFile);
+            const plan=JSON.parse(bytes);if(plan.schema_version!=='perfchecker-suite-plan/1'||!Array.isArray(plan.runs)||!plan.runs.length)return false;
+            bootstrapPlan={sha256:createHash('sha256').update(bytes).digest('hex'),runs:plan.runs.length};return true;
+          }catch(error){if(error.code==='ENOENT'||error instanceof SyntaxError)return false;throw error;}
+        },'The real initialization plan finishes before opening Feature suite',initializationRemaining());
+        log('native-bootstrap-plan-ready',{...bootstrapPlan,elapsedMs:Date.now()-initializationStartedAt,maximumMs:600000,noAdditionalPlanRequested:true});
         await controls.runSelection(context);
         proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:'General 1.0.1',nativeStudioClick:true});
       });
