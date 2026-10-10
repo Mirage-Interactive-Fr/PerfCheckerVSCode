@@ -159,10 +159,12 @@ exports.run=async()=>{
       const area=node.closest('.transcript'),a=area.getBoundingClientRect(),r=node.getBoundingClientRect();
       const visibleTop=Math.max(0,a.top),visibleBottom=Math.min(innerHeight,a.bottom);
       return {height:r.height,replyTop:r.top,offset:r.top-a.top,scrollTop:area.scrollTop,clientHeight:area.clientHeight,viewportHeight:innerHeight,
-        visibleTop,visibleBottom,visibleHeight:visibleBottom-visibleTop,start:Math.max(0,visibleTop-r.top),end:Math.min(r.height,visibleBottom-r.top),fontSize:getComputedStyle(node).fontSize};
+        visibleTop,visibleBottom,visibleHeight:visibleBottom-visibleTop,start:Math.max(0,visibleTop-r.top),end:Math.min(r.height,visibleBottom-r.top),
+        fontSize:getComputedStyle(node).fontSize,devicePixelRatio,pixelFontSize:parseFloat(getComputedStyle(node).fontSize)*devicePixelRatio};
     });
     const initial=await geometry(),record={turn,initial,parts:[],complete:false,source:'actual native transcript wheel scrolling; no CSS or message changes'};
     result.adviceCaptures??=[];result.adviceCaptures.push(record);
+    assert(initial.pixelFontSize>=22&&initial.pixelFontSize<=24,'The actual native zoom renders reply text at 22–24 screenshot pixels');
     // A long user message can leave the assistant BELOW the viewport. Scroll
     // toward its beginning in either direction, using the real wheel only.
     const delta=initial.replyTop-initial.visibleTop-2;
@@ -202,7 +204,7 @@ exports.run=async()=>{
     for(const file of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(directory,'perf','episode-05a','worker',file),path.join(target,file));}};
   try{
     result.vsixSha256=hash(await fs.readFile(process.env.PERFCHECKER_HOST_ARCHIVE));
-    assert.equal(result.vsixSha256,'2607dc00a03ff343a953879af68d04f23f43bed8179360e223e76f93c36f2959');
+    assert.equal(result.vsixSha256,'fac983a008dfc57b0b4a8cd422126a38432df7284d1fb7423ac260dfb62b6301');
     const extension=vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');assert(extension,'Load the installed product');
     const installed=await fs.realpath(extension.extensionPath);
     assert(installed.startsWith(path.join(session,'extensions')+path.sep),'The product must not come from the source checkout or human extension directory');
@@ -214,6 +216,12 @@ exports.run=async()=>{
     assert.equal(settings().get('runnerProject'),process.env.PERFCHECKER_TEST_CONTROLLER);
     assert.equal(settings().get('juliaExecutable'),process.env.PERFCHECKER_TEST_JULIA);
     result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'00c133336911b8600d63a8d6c59ce1befc5ce690');assert.equal(result.core.version,'1.0.1');
+    if(bibliography)assert.equal(result.core.registered,true);
+    const directories=JSON.parse(process.env.PERFCHECKER_HOST_PRIVATE_DIRECTORIES);
+    assert.deepEqual(directories.map(([flag])=>flag),['user-data-dir','extensions-dir','shared-data-dir','agent-plugins-dir','agents-user-data-dir','agents-extensions-dir']);
+    for(const [,directory]of directories){assert.equal(await fs.realpath(directory),directory);assert(directory.startsWith(session+path.sep));}
+    assert.equal(new Set(directories.map(([,directory])=>directory)).size,6);result.privateCodeDirectories=directories;
+    assert.equal(settings().get('advisorTimeout'),bibliography?600:180);result.configuredAdvisorTimeoutSeconds=settings().get('advisorTimeout');
     process.env.PERFCHECKER_CODEX_HOST_ONLY='1';
     const {probeJuliaCodexFixture,probeBibliographyCodexFixture,observeCodexEvents}=await import(pathToFileURL(path.join(__dirname,'codex-real.test.mjs')).href);
     passiveCli=observeCodexEvents;
@@ -322,7 +330,8 @@ exports.run=async()=>{
     const adviceCharacters=[];
     for(const [turn,question] of questions.entries()){
       await view.locator('#chat-question').fill(question);await click('Send question');
-      const reply=await eventually(async()=>{const value=await state();return !value.busy&&value.messages.length===2*(turn+1)?value:undefined;},`Authenticated Julia advice turn ${turn+1} completes`);
+      const reply=await eventually(async()=>{const value=await state();return !value.busy&&value.messages.length===2*(turn+1)?value:undefined;},
+        `Authenticated Julia advice turn ${turn+1} completes`,(Number(settings().get('advisorTimeout'))+120)*1000);
       assert.deepEqual(reply.messages.map(message=>message.role),Array.from({length:turn+1},()=>['user','assistant']).flat());
       const answer=reply.messages.at(-1).content;assert(answer.length>10);adviceCharacters.push(answer.length);
       await eventually(async()=>await view.locator('.message.assistant').count()===turn+1,'The actual reply is visible');
@@ -336,7 +345,8 @@ exports.run=async()=>{
     const beforePrepare=chatOutcome(await state()),prepareStarted=Date.now();let prepareAccepted=false,lastPrepare;
     const agentBudgetMs=Number(settings().get('advisorTimeout'))*1000;
     const cleanupGraceMs=require(path.join(installed,'dist','controllerCancellation.js')).CANCELLATION_GRACE_MS;
-    assert.equal(agentBudgetMs,180000);assert.equal(cleanupGraceMs,60000);
+    assert.equal(agentBudgetMs,bibliography?600000:180000);assert.equal(cleanupGraceMs,60000);
+    assert.equal(agentBudgetMs,Number(process.env.PERFCHECKER_HOST_ADVISOR_TIMEOUT)*1000);
     const uiBudgetMs=agentBudgetMs+60000,setupDeadline=prepareStarted+210000;
     result.prepare={preControllerBudgetMs:210000,agentBudgetMs,uiBudgetMs,cleanupGraceMs,transitions:[],
       timerAnchor:'First passive observation of each real PID/incarnation; conservative upper bound, not the internal spawn timestamp'};
@@ -363,7 +373,7 @@ exports.run=async()=>{
       if(controller){
         const deadline=Date.parse(controller.deadlineAt);
         if(now>=deadline)result.prepare.uiDeadlineObserved=true;
-        if(now>=deadline+cleanupGraceMs)throw new Error('Actual Prepare remained busy beyond its real 240 second UI budget and existing 60 second product cleanup grace');
+        if(now>=deadline+cleanupGraceMs)throw new Error(`Actual Prepare remained busy beyond its real ${uiBudgetMs/1000} second UI budget and existing 60 second product cleanup grace`);
       }
       await delay(100);
     }
@@ -430,11 +440,19 @@ exports.run=async()=>{
     assert.match(await view.locator('#chat-root').innerText(),/remote server may still finish its work/i);
     await eventually(()=>new Promise((resolve,reject)=>server.getConnections((error,count)=>error?reject(error):resolve(count===0))),'Request socket closes before teardown',10000);
     await preserved();checks.push('actual Cancel with live authenticated exec + Julia controller/worker; exact owned identities dead and HTTP socket closed before fixture cleanup; remote caveat visible');
-    await click('Disconnect Codex');await eventually(async()=>!((await state()).connection),'Actual Disconnect clears the session');
+    assert.equal((await state()).connection,undefined,'Cancel returns idle only after the local connection is actually disconnected');
     assert.equal((await state()).implementation.tool,'previous_agent');
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
     assert.equal(server.listening,false);await assert.rejects(fetch(endpoint,{method:'POST',body:'{}',signal:AbortSignal.timeout(5000)}));await preserved();
-    checks.push('actual Disconnect closes the listener and preserves original disabled configuration/file/tool');
+    result.cancelledConnectionAutomaticallyDisconnected=true;
+    const beforeReconnectServers=new Set(loopbackServers());await openConnector();await click('Connect Codex CLI');
+    await eventually(async()=>Boolean((await state()).connection),'The real reconnect button runs preflight without another model request',60000);
+    server=await eventually(()=>{const added=loopbackServers().filter(handle=>!beforeReconnectServers.has(handle));assert(added.length<=1);return added[0];},'Observe only the newly reconnected listener',10000);
+    endpoint=`http://127.0.0.1:${server.address().port}/mcp`;
+    await click('Disconnect Codex');await eventually(async()=>!((await state()).connection),'Actual Disconnect clears the reconnected session');
+    assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
+    assert.equal(server.listening,false);await assert.rejects(fetch(endpoint,{method:'POST',body:'{}',signal:AbortSignal.timeout(5000)}));await preserved();
+    checks.push('Cancel automatically disconnects after owned cleanup; genuine Reconnect preflight (no model call) and Disconnect close the new listener and preserve saved settings');
     assert.equal(result.captureFailures?.length??0,0,'Every requested native presentation capture must pass before global PASS');
     Object.assign(result,{status:'passed',adviceTurns:2,adviceCharacters,oracle:bibliography?{independentNameCases:10,Unicode:true,multiEntryExport:true,nonMutation:true,historicalOracleUnchanged:true}:{empty:0,signed:14,range1000:333833500},
       allocationBaselineBytes:baselineBytes,allocationCandidateBytes:candidateBytes,changedFiles:proposal.files,
