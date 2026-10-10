@@ -127,7 +127,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p native-qualification-results
-          node --test --test-concurrency=1 test/windows-owned-process.test.mjs test/codex-connector.test.mjs test/mcp-stdio.test.mjs > native-qualification-results/connector-workers.tap 2>&1
+          node --test --test-concurrency=1 test/windows-owned-process.test.mjs test/codex-connector.test.mjs test/mcp-stdio.test.mjs test/posix-process-cohort.test.mjs > native-qualification-results/connector-workers.tap 2>&1
       - name: Verify complete Windows checkpoint paths on the immutable product
         if: runner.os == 'Windows'
         shell: bash
