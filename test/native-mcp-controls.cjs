@@ -135,7 +135,12 @@ async function nativeIdentity(pid,expectedExecutable,observe=()=>{},expectedIden
     const current=await read();if(!current)return;const after=parse(current);
     assert.equal(after.start,before.start);assert.equal(after.group,before.group);
     if(/^[ZX]/.test(after.state))return;throw error;}
-  const files=await Promise.all(mappings.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1))));
+  const files=await Promise.all(mappings.split('\n').filter(line=>line.startsWith('n')).map(async line=>{
+    try{return await fs.realpath(line.slice(1));}
+    catch(error){if(error.code!=='ENOENT')throw error;
+      const observation={kind:'absent-lsof-mapping',pid,path:line.slice(1),code:error.code,observedAt:new Date().toISOString()};
+      observe(observation);console.log('NATIVE_IDENTITY_MAPPING_OBSERVATION',JSON.stringify(observation));return undefined;}
+  }));
   const afterText=await read();if(!afterText)return;
   const after=parse(afterText);
   assert.equal(after.start,before.start,'PID reuse during executable inspection remains a failure');
@@ -178,7 +183,12 @@ async function ownedStdioJuliaProcesses(){
       if(!current||['Z','X'].includes(current.state))return false;throw error;}}
     if(process.platform==='win32')return (await fs.realpath(row.executable)).toLowerCase()===expected.toLowerCase();
     const files=(await execute('lsof',['-nP','-a','-p',String(row.pid),'-d','txt','-F','n'],{timeout:5000})).stdout;
-    return(await Promise.all(files.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1))))).includes(expected);
+    return(await Promise.all(files.split('\n').filter(line=>line.startsWith('n')).map(async line=>{
+      try{return await fs.realpath(line.slice(1));}
+      catch(error){if(error.code!=='ENOENT')throw error;
+        console.log('NATIVE_IDENTITY_MAPPING_OBSERVATION',JSON.stringify({kind:'absent-lsof-mapping',pid:row.pid,path:line.slice(1),code:error.code,observedAt:new Date().toISOString()}));
+        return undefined;}
+    }))).includes(expected);
   };
   const direct=[];for(const row of rows.filter(row=>row.parent===process.pid))if(await matches(row))direct.push(row);
   assert.equal(direct.length,1,'One active canonical Julia controller is a direct extension-host child');
