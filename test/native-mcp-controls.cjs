@@ -322,9 +322,10 @@ async function stdioHandoff(){
       'B uses a distinct real native executable path with the same controlled Node bytes');
     assert.deepEqual(fixture.values,persistedStdioValues(command,endpoint,fixture.root,label));
   }
+  const projectDirectories=await Promise.all([process.env.PERFCHECKER_NATIVE_CONTROLLER,path.join(value.workspace,'worker-environment')].map(directory=>fs.realpath(directory)));
   const expectedFiles=[path.join(value.workspace,'src','PerfCheckerNativeFixture.jl'),path.join(value.workspace,'.git','index'),path.join(value.workspace,'.vscode','settings.json'),
     path.join(value.persistedSettings[1].workspace,'.vscode','settings.json'),
-    ...[process.env.PERFCHECKER_NATIVE_CONTROLLER,path.join(value.workspace,'worker-environment')].flatMap(directory=>['Project.toml','Manifest.toml'].map(name=>path.join(directory,name))),
+    ...projectDirectories.flatMap(directory=>['Project.toml','Manifest.toml'].map(name=>path.join(directory,name))),
     value.savedMeasurement.file,value.savedMeasurement.adviceFile];
   assert.deepEqual(Object.keys(value.files).sort(),expectedFiles.sort());
   for(const file of [value.savedMeasurement.file,value.savedMeasurement.adviceFile]){
