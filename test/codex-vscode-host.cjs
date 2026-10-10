@@ -135,6 +135,14 @@ exports.run=async()=>{
   },`Locate the visible installed webview ${selector}`,30000);
   const findChat=()=>findView('#chat-root');
   const click=name=>view.getByRole('button',{name,exact:true}).click();
+  const openConnector=async()=>{
+    const summary=view.locator('summary').filter({hasText:'Optional Codex CLI connector'});
+    assert.equal(await summary.count(),1);
+    const before=await summary.evaluate(node=>node.closest('details').open);
+    if(!before)await summary.click();
+    assert(await summary.evaluate(node=>node.closest('details').open),'The real connector details are open');
+    return {before,after:true};
+  };
   const idle=label=>eventually(async()=>!((await state()).busy),label);
   const noOwnedProcesses=()=>eventually(async()=>{
     for(const item of owned.identities)if(await processIdentity(item.pid)===item.start)return false;
@@ -149,21 +157,40 @@ exports.run=async()=>{
     await transcript.scrollIntoViewIfNeeded();await transcript.hover();
     const geometry=()=>reply.evaluate(node=>{
       const area=node.closest('.transcript'),a=area.getBoundingClientRect(),r=node.getBoundingClientRect();
-      return {height:r.height,offset:r.top-a.top,scrollTop:area.scrollTop,clientHeight:area.clientHeight,
-        start:Math.max(0,a.top-r.top),end:Math.min(r.height,a.bottom-r.top),fontSize:getComputedStyle(node).fontSize};
+      const visibleTop=Math.max(0,a.top),visibleBottom=Math.min(innerHeight,a.bottom);
+      return {height:r.height,replyTop:r.top,offset:r.top-a.top,scrollTop:area.scrollTop,clientHeight:area.clientHeight,viewportHeight:innerHeight,
+        visibleTop,visibleBottom,visibleHeight:visibleBottom-visibleTop,start:Math.max(0,visibleTop-r.top),end:Math.min(r.height,visibleBottom-r.top),fontSize:getComputedStyle(node).fontSize};
     });
-    const initial=await geometry();if(initial.start>2)await view.page().mouse.wheel(0,initial.offset-2);
-    await eventually(async()=>{const g=await geometry();return g.start<5&&g.end>0;},'The real transcript scroll exposes the beginning of the reply',5000);
-    const parts=[];
+    const initial=await geometry(),record={turn,initial,parts:[],complete:false,source:'actual native transcript wheel scrolling; no CSS or message changes'};
+    result.adviceCaptures??=[];result.adviceCaptures.push(record);
+    // A long user message can leave the assistant BELOW the viewport. Scroll
+    // toward its beginning in either direction, using the real wheel only.
+    const delta=initial.replyTop-initial.visibleTop-2;
+    if(Math.abs(delta)>2)await view.page().mouse.wheel(0,delta);
+    await eventually(async()=>{const g=await geometry();return g.start<5&&g.end>0&&(g.replyTop<=g.visibleTop+5||g.end>=g.height-2);},
+      'The real transcript scroll exposes the reply beginning at the visible top, or the entire short reply',5000);
+    const parts=record.parts;
     for(let part=1;part<=8;part++){
-      const g=await geometry();await capture(part===1?`advice-${turn}`:`advice-${turn}-part-${part}`);parts.push(g);
+      const g=await geometry();assert(g.visibleHeight>0,'The actual transcript intersects the viewport');
+      if(parts.length)assert(g.start<=parts.at(-1).end+2,'Consecutive native captures retain overlapping reply text');
+      await capture(part===1?`advice-${turn}`:`advice-${turn}-part-${part}`);parts.push(g);
       if(g.end>=g.height-2)break;
-      await transcript.hover();await view.page().mouse.wheel(0,g.clientHeight*.85);
+      await transcript.hover();await view.page().mouse.wheel(0,g.visibleHeight*.85);
       await eventually(async()=>(await geometry()).scrollTop>g.scrollTop,'The native transcript advances for the next readable reply section',5000);
     }
     const complete=parts[0].start<5&&parts.at(-1).end>=parts.at(-1).height-2;
-    result.adviceCaptures??=[];result.adviceCaptures.push({turn,parts,complete,source:'actual native transcript wheel scrolling; no CSS or message changes'});
+    record.complete=complete;
     assert(complete,'The complete real advice reply is visible across the retained native scroll captures');
+  };
+  const presentation=async(stage,read)=>{
+    try{await read();}catch(error){
+      // A failed presentation capture remains a global FAIL, but cannot
+      // prevent independent implementation/correctness/Apply/Restore checks.
+      result.captureFailures??=[];const failure={stage,name:error.name,message:String(error.message).slice(0,4000)};
+      result.captureFailures.push(failure);
+      try{await capture(`${stage}-capture-failed`,5000);}catch(snapshotError){failure.captureError=String(snapshotError.message).slice(0,1000);}
+      await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result,null,2));
+    }
   };
   // Retain the actual user-visible outcome before teardown, without provider
   // configuration, tool arguments, token-bearing environment or full source.
@@ -300,7 +327,7 @@ exports.run=async()=>{
       const answer=reply.messages.at(-1).content;assert(answer.length>10);adviceCharacters.push(answer.length);
       await eventually(async()=>await view.locator('.message.assistant').count()===turn+1,'The actual reply is visible');
       assert((await view.locator('.message.assistant').last().innerText()).includes(answer));await preserved();
-      if(bibliography)await captureAdvice(turn+1);
+      if(bibliography)await presentation(`advice-${turn+1}`,()=>captureAdvice(turn+1));
     }
     if(bibliography)result.conversation=(await state()).messages;
     checks.push('two authenticated contextual advice replies through Julia MCP are visible and preserve exact source/index/HEAD/config');
@@ -365,14 +392,14 @@ exports.run=async()=>{
     }else assert(candidateBytes<baselineBytes,'The real Julia candidate reduces measured allocations');
     await click('Open full diff');
     await eventually(()=>vscode.window.visibleTextEditors.some(editor=>editor.document.languageId==='diff'&&editor.document.getText()===proposal.patch),'The real native diff editor displays the entire collected patch',30000);
-    if(bibliography)await capture('full-diff');
+    if(bibliography)await presentation('full-diff',()=>capture('full-diff'));
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
     await click('Apply reviewed changes');await eventually(async()=>!((await state()).busy)&&(await state()).proposal?.applied,'Actual Apply completes');
     assert.notEqual(await fs.readFile(sourceFile,'utf8'),source);
     const appliedProbe=await probe(root);
     if(bibliography){
       assert.equal(appliedProbe.sourceSha256,candidateProbe.sourceSha256);assert.equal(appliedProbe.dependencyGraphSha256,baselineProbe.dependencyGraphSha256);
-      result.fixture.applied=appliedProbe;await capture('applied');await measureBibliography('applied');
+      result.fixture.applied=appliedProbe;await presentation('applied',()=>capture('applied'));await measureBibliography('applied');
       await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
       await view.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
     }else assert.equal(appliedProbe,candidateBytes);
@@ -380,13 +407,14 @@ exports.run=async()=>{
     await click('Restore previous code');await eventually(async()=>!((await state()).busy)&&!(await state()).proposal?.applied,'Actual Restore completes');
     const restoredProbe=await probe(root);
     if(bibliography){
-      assert.deepEqual(restoredProbe,baselineProbe);result.fixture.restored=restoredProbe;await capture('restored');
+      assert.deepEqual(restoredProbe,baselineProbe);result.fixture.restored=restoredProbe;await presentation('restored',()=>capture('restored'));
       checks.push('Bibliography: exact source/entrypoint in baseline/candidate/Apply/Restore; independent 10 literal name cases and Unicode/multi-entry/nonmutation export oracles; identical full dependency graph; actual benchmark100/chairmark100/profile_alloc3 measurements before and after Apply; no improvement assumed');
     }else assert.equal(restoredProbe,baselineBytes);
     await preserved();
     checks.push('real Prepare/checkpoint/diff clicks; independent Julia oracles before Apply; actual Apply/Restore preserve staging/HEAD');
 
     await view.getByRole('tab',{name:'01 · Advice',exact:true}).click();
+    await openConnector();
     await view.locator('#chat-question').fill(bibliography?
       'Advice only, no tools or edits. Explain the remaining limits of this bounded bibliography name-string experiment: partial names, Unicode, separator preservation, non-mutation, sampler uncertainty, separate collectors and why one fixture does not establish universal BibTeX equivalence.':
       'Advice only, no tools or edits. Give a detailed explanation of remaining floating-point correctness and benchmark uncertainty in this Julia optimization, including NaN/Infinity, signed zero, reduction order and stable allocation measurement.');
@@ -407,6 +435,7 @@ exports.run=async()=>{
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
     assert.equal(server.listening,false);await assert.rejects(fetch(endpoint,{method:'POST',body:'{}',signal:AbortSignal.timeout(5000)}));await preserved();
     checks.push('actual Disconnect closes the listener and preserves original disabled configuration/file/tool');
+    assert.equal(result.captureFailures?.length??0,0,'Every requested native presentation capture must pass before global PASS');
     Object.assign(result,{status:'passed',adviceTurns:2,adviceCharacters,oracle:bibliography?{independentNameCases:10,Unicode:true,multiEntryExport:true,nonMutation:true,historicalOracleUnchanged:true}:{empty:0,signed:14,range1000:333833500},
       allocationBaselineBytes:baselineBytes,allocationCandidateBytes:candidateBytes,changedFiles:proposal.files,
       ownedRequestPids:{cli:owned.cli,worker:owned.worker,codex:owned.agent},ownedDeadBeforeCleanup:true,socketClosedBeforeCleanup:true,
@@ -436,7 +465,11 @@ exports.run=async()=>{
           await click('Cancel request');await idle('Failure cleanup finishes the owned request');
           result.failureCancellation.after=chatOutcome(await state());
         }
-        if((await state()).connection){await click('Disconnect Codex');await eventually(async()=>!((await state()).connection),'Failure cleanup disconnects the local connector');}
+        if((await state()).connection){
+          result.failureDisconnect={before:chatOutcome(await state()),details:await openConnector()};
+          await click('Disconnect Codex');await eventually(async()=>!((await state()).connection),'Failure cleanup disconnects the local connector');
+          result.failureDisconnect.after=chatOutcome(await state());
+        }
         if(primaryError)result.failureAfterCleanup=chatOutcome(await state());
       }
     }catch(error){result.cleanupError=String(error);primaryError??=error;result.status='failed';}
