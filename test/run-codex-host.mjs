@@ -10,7 +10,7 @@ import os from 'node:os';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 const client=path.dirname(path.dirname(fileURLToPath(import.meta.url))),execute=promisify(execFile);
 const vsixSha='2607dc00a03ff343a953879af68d04f23f43bed8179360e223e76f93c36f2959';
-const coreTree='d3c96c70fa621ad7580e0c1c9b5010ecab9a79ea';
+const coreTree='00c133336911b8600d63a8d6c59ce1befc5ce690';
 const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
 if(process.env.CI)throw new Error('Authenticated Codex qualification is local-only. Never transfer authentication to CI.');
 if(process.platform!=='linux')throw new Error('This isolated display qualification currently requires Linux and a private Xvfb.');

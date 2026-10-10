@@ -8,6 +8,7 @@ import {mkdtemp,writeFile,readFile,rm,mkdir,realpath as fsRealpath} from 'node:f
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {PassThrough} from 'node:stream';
 const require=createRequire(import.meta.url),execute=promisify(execFile);
 const client=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const product=()=>({
@@ -16,6 +17,63 @@ const product=()=>({
 });
 // Read-only status observations must not refresh Git's index stat cache after restore.
 const git=async(root,...args)=>(await execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout;
+
+// Passive test-only observation of the real connector's JSONL. No command,
+// assistant text, error body, token, environment or tool argument is retained.
+export function observeCodexEvents(stream,identity,record){
+  const began=Date.now(),types=new Set(['thread.started','turn.started','turn.completed','turn.failed','item.started','item.updated','item.completed','error']);
+  const itemTypes=new Set(['agent_message','reasoning','command_execution','file_change','mcp_tool_call','web_search','todo_list']);
+  const statuses=new Set(['in_progress','completed','failed','pending']);
+  let pending='',bytes=0,count=0,unknown=false;
+  const emit=value=>{if(count<2000){count++;record({...identity,elapsedMs:Date.now()-began,...value});}};
+  const uncertain=reason=>{if(!unknown){unknown=true;emit({observation:'unknown',reason});}};
+  const consume=line=>{
+    if(!line.trim())return;
+    let value;try{value=JSON.parse(line);}catch{uncertain('invalid-jsonl');return;}
+    if(!value||!types.has(value.type)){uncertain('unrecognized-event-type');return;}
+    const item=value.item;
+    emit({event:value.type,...(item&&typeof item==='object'?{
+      itemType:itemTypes.has(item.type)?item.type:'unknown',
+      ...(typeof item.id==='string'&&/^item_\d{1,12}$/.test(item.id)?{itemId:item.id}:{}),
+      ...(statuses.has(item.status)?{status:item.status}:{}),
+      ...(Number.isSafeInteger(item.exit_code)?{exitCode:item.exit_code}:{})}:{}),
+      ...(Number.isSafeInteger(value.error?.code)?{errorCode:value.error.code}:{})});
+  };
+  const data=chunk=>{
+    if(unknown&&bytes>2_000_000)return;
+    bytes+=Buffer.byteLength(chunk);
+    if(bytes>2_000_000||count>=1999){uncertain('observation-budget');pending='';return;}
+    pending+=String(chunk);let newline;
+    while((newline=pending.indexOf('\n'))>=0){const line=pending.slice(0,newline);pending=pending.slice(newline+1);consume(line);}
+    if(pending.length>65536){uncertain('unterminated-event-budget');pending='';}
+  };
+  const end=()=>{if(pending.trim())consume(pending);pending='';};
+  stream.on('data',data);stream.once('end',end);
+  return ()=>{stream.off('data',data);stream.off('end',end);if(pending.trim())uncertain('detached-mid-event');pending='';};
+}
+
+if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('passive CLI observation retains only whitelisted state and preserves the original stream',async()=>{
+  const stream=new PassThrough(),events=[],original=[];
+  const primary=value=>original.push(value.toString());stream.on('data',primary);
+  const stop=observeCodexEvents(stream,{pid:123,start:'456',parent:1},value=>events.push(value));
+  const raw=JSON.stringify({type:'item.completed',item:{type:'command_execution',id:'item_7',status:'completed',exit_code:3,
+    command:'DO NOT RETAIN secret command',aggregated_output:'DO NOT RETAIN secret output'},token:'DO NOT RETAIN token'})+'\n';
+  stream.write(raw.slice(0,10));stream.write(raw.slice(10));
+  stream.write(JSON.stringify({type:'item.updated',item:{type:'agent_message',text:'DO NOT RETAIN secret assistant'}})+'\n');
+  stream.write('{invalid DO NOT RETAIN secret}\n');
+  stop();assert(stream.listeners('data').includes(primary));stream.end('after-detach');
+  await new Promise(resolve=>stream.once('end',resolve));
+  assert.equal(original[0]+original[1],raw);assert.equal(original.at(-1),'after-detach');
+  assert.equal(events[0].exitCode,3);assert.equal(events[0].itemId,'item_7');assert.equal(events[0].pid,123);
+  assert.equal(events[1].itemType,'agent_message');assert.equal(events[2].observation,'unknown');
+  assert(!JSON.stringify(events).includes('DO NOT RETAIN'));assert(!JSON.stringify(events).includes('secret'));
+});
+
+if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('passive CLI diagnostic overflows are explicit and bounded',()=>{
+  const stream=new PassThrough(),events=[],stop=observeCodexEvents(stream,{pid:1,start:'2'},value=>events.push(value));
+  stream.write('x'.repeat(65537));stream.write('x'.repeat(2_000_001));stop();stream.destroy();
+  assert.equal(events.length,1);assert.equal(events[0].observation,'unknown');assert.equal(events[0].reason,'unterminated-event-budget');
+});
 
 export async function ownedProcessState(pid) {
   try{

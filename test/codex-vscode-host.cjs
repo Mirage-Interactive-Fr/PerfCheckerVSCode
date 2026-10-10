@@ -52,7 +52,15 @@ async function requestProcesses(root){
   const ids=new Set([cli?.pid,worker?.pid,agent?.pid].filter(Boolean));let previous;
   do{previous=ids.size;for(const row of rows)if(ids.has(row.parent))ids.add(row.pid);}while(previous!==ids.size);
   const identities=(await Promise.all([...ids].map(async pid=>({pid,parent:rows.find(row=>row.pid===pid).parent,start:await processIdentity(pid)})))).filter(item=>item.start);
-  return {cli:cli?.pid,worker:worker?.pid,agent:agent?.pid,identities};
+  const states=await Promise.all(identities.map(async identity=>{
+    try{
+      const raw=await fs.readFile(`/proc/${identity.pid}/stat`,'utf8'),fields=raw.slice(raw.lastIndexOf(') ')+2).trim().split(/\s+/);
+      if(fields[19]!==identity.start)return {...identity,observation:'incarnation-changed'};
+      const executable=path.basename(await fs.readlink(`/proc/${identity.pid}/exe`));
+      return {...identity,currentParent:Number(fields[1]),state:fields[0],executable:executable.slice(0,100)};
+    }catch(error){return {...identity,observation:['ENOENT','ESRCH'].includes(error.code)?'exited-during-observation':'unknown',errorCode:error.code??error.name};}
+  }));
+  return {cli:cli?.pid,worker:worker?.pid,agent:agent?.pid,identities,states};
 }
 
 exports.run=async()=>{
@@ -72,12 +80,38 @@ exports.run=async()=>{
   const git=async(...args)=>(await execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout;
   const head=await git('rev-parse','HEAD'),state=()=>vscode.commands.executeCommand('perfchecker.chatState');
   let browser,view,endpoint,server,owned,primaryError,observer,observation;
-  const observed=new Map();
+  const observed=new Map(),cliObservers=new Map(),processStates=new Map();let passiveCli;
   const observe=async()=>{
     if(observation)return observation;
     observation=(async()=>{
       let changed=false;const current=await requestProcesses(root);
       for(const item of current.identities)if(!observed.has(`${item.pid}:${item.start}`)){observed.set(`${item.pid}:${item.start}`,item);changed=true;}
+      if(passiveCli&&current.agent){
+        const identity=current.identities.find(item=>item.pid===current.agent),key=identity&&`${identity.pid}:${identity.start}`;
+        if(identity&&!cliObservers.has(key)){
+          const child=process._getActiveHandles().find(value=>value instanceof require('node:child_process').ChildProcess&&value.pid===identity.pid);
+          if(child?.stdout&&await processIdentity(identity.pid)===identity.start){
+            result.cliEvents??=[];
+            cliObservers.set(key,passiveCli(child.stdout,identity,value=>{
+              if(result.cliEvents.length<2000)result.cliEvents.push(value);else result.cliEventsUnknown='observation-budget';
+            }));
+          }
+        }
+      }
+      result.processTimeline??=[];
+      for(const row of current.states){const key=`${row.pid}:${row.start}`,signature=JSON.stringify(row),prior=processStates.get(key),now=Date.now();
+        if(prior?.signature!==signature){processStates.set(key,{signature,firstSeen:prior?.firstSeen??now,identity:row,live:true});changed=true;
+          if(result.processTimeline.length<2000)result.processTimeline.push({observedAt:new Date(now).toISOString(),observedDurationMs:now-(prior?.firstSeen??now),...row});
+          else result.processTimelineUnknown='observation-budget';
+        }
+      }
+      const currentKeys=new Set(current.identities.map(row=>`${row.pid}:${row.start}`));
+      for(const [key,prior]of processStates)if(prior.live&&!currentKeys.has(key)&&await processIdentity(prior.identity.pid)!==prior.identity.start){
+        prior.live=false;changed=true;const now=Date.now();
+        if(result.processTimeline.length<2000)result.processTimeline.push({pid:prior.identity.pid,start:prior.identity.start,
+          observation:'proved-gone',observedAt:new Date(now).toISOString(),observedDurationMs:now-prior.firstSeen});
+        else result.processTimelineUnknown='observation-budget';
+      }
       if(changed){result.observedProcesses=[...observed.values()];await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result));}
       return current;
     })();
@@ -129,9 +163,10 @@ exports.run=async()=>{
     await extension.activate();assert(extension.isActive);
     assert.equal(settings().get('runnerProject'),process.env.PERFCHECKER_TEST_CONTROLLER);
     assert.equal(settings().get('juliaExecutable'),process.env.PERFCHECKER_TEST_JULIA);
-    result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'d3c96c70fa621ad7580e0c1c9b5010ecab9a79ea');assert.equal(result.core.version,'1.0.1');
+    result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'00c133336911b8600d63a8d6c59ce1befc5ce690');assert.equal(result.core.version,'1.0.1');
     process.env.PERFCHECKER_CODEX_HOST_ONLY='1';
-    const {probeJuliaCodexFixture,probeBibliographyCodexFixture}=await import(pathToFileURL(path.join(__dirname,'codex-real.test.mjs')).href);
+    const {probeJuliaCodexFixture,probeBibliographyCodexFixture,observeCodexEvents}=await import(pathToFileURL(path.join(__dirname,'codex-real.test.mjs')).href);
+    passiveCli=observeCodexEvents;
     const probe=directory=>bibliography?probeBibliographyCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA,{prepare:true}):probeJuliaCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA);
     const baselineProbe=await probe(root),baselineBytes=bibliography?baselineProbe.allocationBytes:baselineProbe;
     assert.equal(baselineBytes,Number(process.env.PERFCHECKER_HOST_BASELINE_BYTES));
@@ -211,7 +246,7 @@ exports.run=async()=>{
     endpoint=`http://127.0.0.1:${server.address().port}/mcp`;
     const unauthorized=await fetch(endpoint,{method:'POST',headers:{Connection:'close'},body:'{}',signal:AbortSignal.timeout(5000)});
     assert.equal(unauthorized.status,401);await unauthorized.arrayBuffer();await preserved();
-    checks.push('installed 1af product path/version/runtime hashes; genuine Connect control; saved disabled provider unchanged; unauthenticated HTTP refused');
+    checks.push('installed immutable candidate path/version/runtime hashes; genuine Connect control; saved disabled provider unchanged; unauthenticated HTTP refused');
 
     const questions=bibliography?[
       `Advice only: no tools, commands or edits. The attached real measurements concern one Bibliography export. The source below is src/bibtex.jl. Explain whether name_to_string is a plausible bounded allocation experiment; distinguish measured attribution from hypotheses and do not claim any gain. Source: ${source}`,
@@ -324,6 +359,9 @@ exports.run=async()=>{
     try{if(browser){view=await findChat();await capture('failure-before-cleanup',Math.max(1,diagnosticDeadline-Date.now()));}}
     catch(snapshotError){result.failureCaptureError=String(snapshotError);}
     finally{suiteDeadline=failedDeadline;}
+    // Persist the actual terminal failure and passive chronology before Cancel
+    // can trigger cleanup or any subsequent diagnostic can fail.
+    await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result,null,2));
   }
   finally{
     suiteDeadline=Date.now()+30000;
@@ -344,6 +382,7 @@ exports.run=async()=>{
     clearInterval(observer);
     try{await observation;await observe();}
     catch(error){result.observationError=String(error);primaryError??=error;result.status='failed';}
+    for(const stop of cliObservers.values())stop();
     try{
       const remaining=[];for(const record of observed.values())if(await processIdentity(record.pid)===record.start)remaining.push(record);
       if(remaining.length){

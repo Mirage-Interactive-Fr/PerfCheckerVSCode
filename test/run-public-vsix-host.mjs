@@ -11,6 +11,7 @@ import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 import {nativeCoreContract} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
+import {controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -198,7 +199,7 @@ async function executeControllerPreflight(executable,args,receipt){
     else{const value=await inspectCommand('ps',['-eo','pid=,ppid=,pgid=,lstart=,stat='],{timeout:limit(3000),maxBuffer:4*1024*1024});rows=value.stdout.split('\n').flatMap(line=>{
       const match=/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+(\S+)\s*$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),group:Number(match[3]),started:match[4],state:match[5]}]:[];});}
     lastRows=rows;const inspected=new Map();
-    const read=async row=>{if(inspected.has(row.pid))return inspected.get(row.pid);try{const current=await inspect(row);inspected.set(row.pid,current);return current;}catch(error){errors.push({pid:row.pid,error:String(error)});inspected.set(row.pid,undefined);return undefined;}};
+    const read=async row=>{if(inspected.has(row.pid))return inspected.get(row.pid);try{const current=await inspect(row);inspected.set(row.pid,current);return current;}catch(error){errors.push(controllerInspectionFailure(error,{stage:'inspect',pid:row.pid,ownerPid:child.pid}));inspected.set(row.pid,undefined);return undefined;}};
     const original=rows.find(row=>row.pid===child.pid),owner=original&&await read(original);
     if(owner&&!records.size){assert.equal(owner.parent,process.pid);assert.equal(canonical(owner.executable),canonical(await fs.realpath(ownerExecutable)));records.set(owner.pid,owner);}
     const live=new Set();for(const prior of records.values()){
@@ -242,7 +243,7 @@ async function executeControllerPreflight(executable,args,receipt){
     return [...live].map(pid=>records.get(pid));
   };
   let observation=Promise.resolve(),sampling=false;
-  const sample=()=>{if(sampling)return observation;sampling=true;observation=survey().catch(error=>errors.push({stage:'survey',error:String(error)})).finally(()=>{sampling=false;});return observation;};
+  const sample=()=>{if(sampling)return observation;sampling=true;observation=survey().catch(error=>errors.push(controllerInspectionFailure(error,{stage:'survey',pid:readyPid??child.pid,ownerPid:child.pid}))).finally(()=>{sampling=false;});return observation;};
   const observer=setInterval(()=>{void sample();},windows?1000:100);
   let deadline;const timeout=new Promise(resolve=>{deadline=setTimeout(()=>{expired=true;resolve({timeout:true});},Math.max(0,cleanupUntil-Date.now()));});
   let outcome;
@@ -270,7 +271,7 @@ async function executeControllerPreflight(executable,args,receipt){
       }
       receipt.ownership.survivors=remaining;
       receipt.ownership.cleanupQualified=records.size>0&&!remaining.length&&!errors.length;
-    }catch(error){errors.push({stage:'cleanup',error:String(error)});}
+    }catch(error){errors.push(controllerInspectionFailure(error,{stage:'cleanup',pid:readyPid??child.pid,ownerPid:child.pid}));}
     if(!receipt.ownership.cleanupQualified){sessionSafeToRemove=false;child.unref();child.stdout.destroy();child.stderr.destroy();}
   }
   if(expired||spawnError||outcome?.code!==0||!started||!receipt.ownership.cleanupQualified||receipt.ownership.aliveBeforeCleanup?.length)
@@ -677,18 +678,9 @@ try {
       scope:'Explicit controller preparation before the native first Send; cache preparation, not a cold-start qualification'};
     artifactRecord.controllerPreflight=receipt;await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
     try{
-      const script=`println("CONTROLLER_PREFLIGHT_READY ",getpid());flush(stdout);readline(stdin)
-using Pkg;Pkg.activate(ARGS[1]);started=time();modules=Module[]
-for name in (:PerfChecker,:HTTP)
- println("CONTROLLER_IMPORT_BEFORE ",name," elapsed=",time()-started);flush(stdout)
- m=Base.require(Main,name);push!(modules,m)
- println("CONTROLLER_IMPORT_AFTER ",name," elapsed=",time()-started," version=",Base.pkgversion(m)," source=",pathof(m));flush(stdout)
-end
-core=first(modules);extension=Base.get_extension(core,:HTTPAdvisorExt);@assert extension!==nothing
-print("CONTROLLER_IMPORT_RECEIPT ");core.JSON.print(Dict("elapsedSeconds"=>time()-started,"extension"=>string(nameof(extension)),"packages"=>[Dict("name"=>string(nameof(m)),"version"=>string(Base.pkgversion(m)),"source"=>pathof(m)) for m in modules]));println();flush(stdout)`;
-      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',script,controller],receipt);
+      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',controllerPreflightScript,controller],receipt);
       await fs.writeFile(path.join(output,'controller-preflight.log'),text);
-      Object.assign(receipt,JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('CONTROLLER_IMPORT_RECEIPT ')).slice('CONTROLLER_IMPORT_RECEIPT '.length)),{status:'passed'});
+      Object.assign(receipt,parseControllerImportReceipt(text,{project:await fs.realpath(path.join(controller,'Project.toml')),version:expectedCoreVersion,tree:coreProvenance.tree}),{status:'passed'});
     }catch(error){receipt.status='failed';receipt.error=String(error);if(error.commandOutput)await fs.writeFile(path.join(output,'controller-preflight.log'),error.commandOutput);throw error;}
     finally{
       receipt.finishedAt=new Date().toISOString();receipt.hashesAfter=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
@@ -785,14 +777,14 @@ end
   await fs.writeFile(path.join(workspace, '.vscode', 'settings.json'), JSON.stringify({'julia.executablePath': officialRuntime.executable, 'julia.enableTelemetry': false, 'julia.symbolCacheDownload': false, 'git.enabled': false, 'telemetry.telemetryLevel': 'off', 'workbench.startupEditor': 'none'}));
   const plutoProject=path.join(workspace,'perf','pluto');
   if(mode==='candidate'&&(completeCampaign||stage==='focused'&&['mcp-pluto','pluto-plots','pluto','pluto-start-stop'].includes(caseGroup))){
-    const companion={commit:'2ea69694e4b8a4e2d9fe097c665108887342dca1',tree:'7ad6a3a84b8284fec905753e02a2877d3762ba9e',version:'1.0.1'};
+    const companion={commit:'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642',tree:'7ad6a3a84b8284fec905753e02a2877d3762ba9e',version:'1.0.1'};
     const revision=coreMode==='candidate'?companion.commit:'v1.0.1';
     const text=await execute(julia,['--startup-file=no','-e',`using Pkg; Pkg.activate(ARGS[1]); ${installCore}; Pkg.add([PackageSpec(name="Pluto",version="1.0.4"),PackageSpec(name="PlutoUI"),PackageSpec(name="BenchmarkTools"),PackageSpec(name="Chairmarks")]); Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerPluto",rev=ARGS[7]);preserve=Pkg.PRESERVE_ALL); using PerfChecker,PerfCheckerPluto,Pluto,PlutoUI; @assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]);info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid];@assert string(info.tree_hash)==ARGS[6];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[8];if ARGS[5]=="general";@assert info.is_tracking_registry;end;print("PLUTO_ENV_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerPluto,Pluto,PlutoUI)));println()`,plutoProject,coreCommit,coreTree,expectedCoreVersion,coreMode,coreProvenance.tree,revision,companion.tree]);
     artifactRecord.plutoEnvironment={companion:{...companion,revision},packages:JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('PLUTO_ENV_PROVENANCE ')).slice('PLUTO_ENV_PROVENANCE '.length))};
     await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
   }
   if(stage==='focused'&&caseGroup==='pluto-plots'){
-    const pins={makieCommit:'2ea69694e4b8a4e2d9fe097c665108887342dca1',plutoCommit:'2ea69694e4b8a4e2d9fe097c665108887342dca1',makieTree:'18b54d832a73df6ffa72d1c7f07ddb5cb9eb1e3a',plutoTree:'7ad6a3a84b8284fec905753e02a2877d3762ba9e',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'};
+    const pins={makieCommit:'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642',plutoCommit:'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642',makieTree:'18b54d832a73df6ffa72d1c7f07ddb5cb9eb1e3a',plutoTree:'7ad6a3a84b8284fec905753e02a2877d3762ba9e',WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'};
     const text=await execute(julia,['--startup-file=no','-e',      'using Pkg;Pkg.activate(ARGS[1]);Pkg.add([PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",subdir="packages/PerfCheckerMakie",rev=ARGS[2]),PackageSpec(name="WGLMakie",version="0.13.15"),PackageSpec(name="Makie",version="0.24.15"),PackageSpec(name="Bonito",version="4.2.0")];preserve=Pkg.PRESERVE_ALL);using PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto;@assert Base.pkgversion(PerfCheckerPluto)==v"1.0.1";@assert Base.pkgversion(Pluto)==v"1.0.4";@assert Base.pkgversion(WGLMakie)==v"0.13.15";@assert Base.pkgversion(Makie)==v"0.24.15";@assert Base.pkgversion(Bonito)==v"4.2.0";@assert Base.get_extension(PerfCheckerMakie,:WGLMakieExt)!==nothing;@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerMakie).uuid].tree_hash)==ARGS[3];@assert string(Pkg.dependencies()[Base.PkgId(PerfCheckerPluto).uuid].tree_hash)==ARGS[4];@assert string(Pkg.dependencies()[Base.PkgId(PerfChecker).uuid].tree_hash)==ARGS[5];print("PLUTO_PLOT_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(Pkg.dependencies()[Base.PkgId(m).uuid].tree_hash)) for m in (PerfChecker,PerfCheckerMakie,PerfCheckerPluto,WGLMakie,Makie,Bonito,Pluto)));println()',plutoProject,pins.makieCommit,pins.makieTree,pins.plutoTree,coreProvenance.tree]);
     const provenance=JSON.parse(text.split(/\r?\n/).find(line=>line.startsWith('PLUTO_PLOT_PROVENANCE ')).slice('PLUTO_PLOT_PROVENANCE '.length));
     await fs.writeFile(path.join(output,'pluto-plot-provider-provenance.json'),JSON.stringify({pins,providers:provenance,manifestSha256:createHash('sha256').update(await fs.readFile(path.join(plutoProject,'Manifest.toml'))).digest('hex'),renderer:'Disposable Electron ANGLE/SwiftShader; no physical GPU qualification'},null,2));

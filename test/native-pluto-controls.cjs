@@ -760,7 +760,7 @@ end`;
   const data=await evidence();assert.equal(data.kind,'distribution');assert(data.selected.startsWith('distribution-'));assert.equal(data.selectedLabel,distribution.label);assert(data.values.length>=2);
   const providerProvenance=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'pluto-plot-provider-provenance.json'),'utf8'));
   assert.equal(providerProvenance.pins.makieCommit,context.core.commit);
-  assert.equal(providerProvenance.providers.PerfCheckerMakie.tree,'cd36865103120518bd036cb7abe366114df13aaf');
+  assert.equal(providerProvenance.providers.PerfCheckerMakie.tree,'18b54d832a73df6ffa72d1c7f07ddb5cb9eb1e3a');
   assert.equal(providerProvenance.pins.makieTree,providerProvenance.providers.PerfCheckerMakie.tree);
   assert.equal(providerProvenance.providers.PerfCheckerMakie.version,'1.0.1');
   for(const [name,version] of Object.entries({PerfCheckerMakie:providerProvenance.providers.PerfCheckerMakie.version,WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'}))assert.equal(data.providers[name].version,version);
@@ -1178,9 +1178,29 @@ exports.runPlots = async context => {
     beforeClose:()=>collectBefore('plots-before-native-close'),
     afterClose:deadline=>inspectAfter('plots-after-native-close-before-teardown',deadline)
   }:undefined);}
-  catch(error){failures.push(error);await capture(context,'pluto-rendered-plots-failed').catch(diagnostic=>context.log('pluto-plot-capture-error',{message:String(diagnostic)}));}
+  catch(error){failures.push(error);
+    context.log('pluto-plot-rendering-failure',{name:error.name,message:String(error.message).slice(0,4000),stack:String(error.stack??'').slice(0,8000)});
+    await capture(context,'pluto-rendered-plots-failed').catch(diagnostic=>context.log('pluto-plot-capture-error',{message:String(diagnostic)}));}
   finally{
     const stopDeadline=Date.now()+45000;
+    let diagnosticTimer;
+    try{
+      const notebooks=await Promise.race([
+        Promise.all(context.windowPage.frames().map(frame=>frame.evaluate(()=>{
+          if(!document.querySelector('pluto-notebook'))return null;
+          const cells=[...document.querySelectorAll('pluto-cell')];
+          return {loading:!!document.querySelector('pluto-editor.loading'),disconnected:!!document.querySelector('pluto-editor.disconnected'),
+            cellCount:cells.length,running:cells.filter(node=>node.classList.contains('running')).length,
+            queued:cells.filter(node=>node.classList.contains('queued')).length,
+            states:[...document.querySelectorAll('[data-suite-state]')].map(node=>node.getAttribute('data-suite-state')),
+            activeCells:cells.filter(node=>node.matches('.running,.queued,.errored')).slice(0,100).map(node=>({id:node.id,
+              running:node.classList.contains('running'),queued:node.classList.contains('queued'),errored:node.classList.contains('errored')}))};
+        }))),
+        new Promise((_,reject)=>{diagnosticTimer=setTimeout(()=>reject(new Error('Read-only pre-Stop DOM observation exceeded 2.5 seconds')),2500);})
+      ]);
+      context.log('pluto-plot-before-stop-dom',{notebooks:notebooks.filter(Boolean),deadlineAt:new Date(stopDeadline).toISOString()});
+    }catch(error){context.log('pluto-plot-before-stop-dom-unknown',{errorClass:error.name});}
+    finally{clearTimeout(diagnosticTimer);}
     if(owner)try{
       await collectBefore('plots-before-stop');
     }catch(error){failures.push(error);context.log('pluto-plot-ownership-error',{stage:'before-stop',message:String(error)});}
