@@ -120,38 +120,63 @@ async function nativeIdentity(pid,expectedExecutable,observe=()=>{},expectedIden
     if(!text)return;const row=JSON.parse(text);assert.equal(row.pid,pid);assert(Number.isSafeInteger(row.parent)&&row.parent>0);assert(Number.isFinite(Date.parse(row.start)));
     row.executable=await fs.realpath(row.executable);assert.equal(row.executable.toLowerCase(),expectedExecutable.toLowerCase());return row;
   }
-  const read=async()=>{try{return(await execute('ps',['-p',String(pid),'-o','ppid=,pgid=,stat=,lstart='],{timeout:5000})).stdout.trim();}
+  const read=async(timeout=5000)=>{try{return(await execute('ps',['-p',String(pid),'-o','ppid=,pgid=,stat=,lstart='],{timeout})).stdout.trim();}
     catch(error){if(error.code===1&&!String(error.stdout||'').trim()&&!String(error.stderr||'').trim())return '';throw error;}};
   const parse=text=>{
     const match=text.match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);assert(match);
     const value={parent:Number(match[1]),group:Number(match[2]),state:match[3],start:match[4]};
-    assert(Number.isSafeInteger(value.parent)&&value.parent>=0&&Number.isSafeInteger(value.group)&&value.group>0);return value;
+    assert(Number.isSafeInteger(value.parent)&&value.parent>=0&&Number.isSafeInteger(value.group)&&value.group>0);
+    if(expectedIdentity){assert.equal(value.start,expectedIdentity.start,'A reused PID is never an extinction receipt');
+      assert.equal(value.group,expectedIdentity.group,'The established private group remains anchored');}
+    return value;
   };
   const beforeText=await read();if(!beforeText)return;
   const before=parse(beforeText);if(/^[ZX]/.test(before.state))return;
-  let mappings;
-  try{mappings=(await execute('lsof',['-nP','-a','-p',String(pid),'-d','txt','-F','n'],{timeout:5000})).stdout;}
-  catch(error){if(error.code!==1||String(error.stdout||'').trim()||String(error.stderr||'').trim())throw error;
-    const current=await read();if(!current)return;const after=parse(current);
-    assert.equal(after.start,before.start);assert.equal(after.group,before.group);
-    if(/^[ZX]/.test(after.state))return;throw error;}
-  // lsof txt includes unrelated data mappings. Inspect the expected executable,
-  // not every mapped file, while still requiring its exact canonical path.
-  const files=await Promise.all(mappings.split('\n').filter(line=>line.startsWith('n')&&path.basename(line.slice(1))===path.basename(expectedExecutable)).map(async line=>{
-    try{return await fs.realpath(line.slice(1));}
-    catch(error){if(error.code!=='ENOENT')throw error;
-      const observation={kind:'absent-lsof-mapping',pid,path:line.slice(1),code:error.code,observedAt:new Date().toISOString()};
-      observe(observation);console.log('NATIVE_IDENTITY_MAPPING_OBSERVATION',JSON.stringify(observation));return undefined;}
-  }));
-  const afterText=await read();if(!afterText)return;
-  const after=parse(afterText);
-  assert.equal(after.start,before.start,'PID reuse during executable inspection remains a failure');
-  assert.equal(after.group,before.group,'The private process group remains anchored');
-  if(/^[ZX]/.test(after.state))return;
-  assert(files.includes(expectedExecutable));
-  if(after.parent!==before.parent||after.state!==before.state)observe({kind:'mutable-process-fields',pid,start:after.start,executable:expectedExecutable,group:after.group,
-    beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
-  return {pid,parent:after.parent,group:after.group,start:after.start,executable:expectedExecutable};
+  let unavailableUntil,unavailableError;
+  const remaining=()=>{if(unavailableUntil===undefined)return 5000;
+    const value=unavailableUntil-Date.now();if(value<=0)throw unavailableError;return value;};
+  const resolution=(value,outcome)=>{
+    if(unavailableUntil!==undefined)observe({kind:'darwin-executable-revalidation',pid,expectedExecutable,
+      expectedIdentity,deadlineAt:new Date(unavailableUntil).toISOString(),resolution:outcome,current:value??null,observedAt:new Date().toISOString()});
+    return value;
+  };
+  for(;;){
+    let mappings,mappingError;
+    try{mappings=(await execute('lsof',['-nP','-a','-p',String(pid),'-d','txt','-F','n'],{timeout:remaining()})).stdout;}
+    catch(error){if(error.code!==1||String(error.stdout||'').trim()||String(error.stderr||'').trim())throw error;
+      mappingError=error;mappings='';}
+    // lsof txt includes unrelated data mappings. Inspect the expected executable,
+    // not every mapped file, while still requiring its exact canonical path.
+    const files=await Promise.all(mappings.split('\n').filter(line=>line.startsWith('n')&&path.basename(line.slice(1))===path.basename(expectedExecutable)).map(async line=>{
+      try{return await fs.realpath(line.slice(1));}
+      catch(error){if(error.code!=='ENOENT')throw error;
+        const observation={kind:'absent-lsof-mapping',pid,path:line.slice(1),code:error.code,observedAt:new Date().toISOString()};
+        observe(observation);console.log('NATIVE_IDENTITY_MAPPING_OBSERVATION',JSON.stringify(observation));return undefined;}
+    }));
+    const afterText=await read(remaining());if(!afterText)return resolution(undefined,'proved-absent');
+    const after=parse(afterText);
+    assert.equal(after.start,before.start,'PID reuse during executable inspection remains a failure');
+    assert.equal(after.group,before.group,'The private process group remains anchored');
+    if(/^[ZX]/.test(after.state))return resolution(undefined,'same-incarnation-dead');
+    if(files.includes(expectedExecutable)){
+      if(after.parent!==before.parent||after.state!==before.state)observe({kind:'mutable-process-fields',pid,start:after.start,executable:expectedExecutable,group:after.group,
+        beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
+      return resolution({pid,parent:after.parent,group:after.group,start:after.start,executable:expectedExecutable},'same-incarnation-canonical-image');
+    }
+    assert(!files.some(Boolean),'A different canonical executable remains an identity failure');
+    if(!expectedIdentity){if(mappingError)throw mappingError;assert(files.includes(expectedExecutable));}
+    // Only an established incarnation gets this bounded observation. Missing
+    // mappings grant no signal authority and persistent uncertainty still fails.
+    if(unavailableUntil===undefined){unavailableUntil=Date.now()+200;
+      unavailableError=mappingError??new Error('The established Darwin executable remained unavailable during bounded revalidation');}
+    observe({kind:'darwin-unavailable-executable',pid,expectedExecutable,expectedIdentity,before,current:after,
+      mappedExecutables:files.map(value=>value??null),deadlineAt:new Date(unavailableUntil).toISOString(),observedAt:new Date().toISOString()});
+    await delay(Math.min(10,remaining()));
+    const currentText=await read(remaining());if(!currentText)return resolution(undefined,'proved-absent');
+    const current=parse(currentText);
+    assert.equal(current.start,before.start);assert.equal(current.group,before.group);
+    if(/^[ZX]/.test(current.state))return resolution(undefined,'same-incarnation-dead');
+  }
 }
 const nativeParentObservations=new WeakMap();
 async function observeNativeIdentityGone(identity,observe,extinctions){
