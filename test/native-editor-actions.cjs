@@ -27,6 +27,24 @@ exports.beginQualification=async context=>{
     }catch(error){if(['ENOENT','ESRCH'].includes(error.code))return undefined;throw error;}
   };
   const host=await identity(process.pid);assert(host);const hostExecutable=await fs.realpath(`/proc/${process.pid}/exe`);
+  const exitedAfterExecutableError=async(row,error,stage)=>{
+    if(!['ENOENT','ESRCH'].includes(error.code))return false;
+    const until=Math.min(deadline,Date.now()+1000),observations=[];
+    while(true){
+      const after=await identity(row.pid);observations.push(after?{started:after.started,group:after.group,state:after.state}:{absent:true});
+      if(!after||after.started===row.started&&after.group===row.group&&['Z','X'].includes(after.state)){
+        context.log('native-editor-executable-exit-race',{stage,pid:row.pid,started:row.started,group:row.group,
+          executableError:error.code,observations,qualifiedGone:true});return true;
+      }
+      // A live reused PID, changed group, or undecidable disappearance is never
+      // adopted as our old worker and never converts an inspection failure to PASS.
+      if(after.started!==row.started||after.group!==row.group||Date.now()>=until){
+        context.log('native-editor-executable-exit-race',{stage,pid:row.pid,started:row.started,group:row.group,
+          executableError:error.code,observations,qualifiedGone:false});return false;
+      }
+      await delay(Math.min(25,until-Date.now()));
+    }
+  };
   let inventorySignature;
   const inspect=async stage=>{
     assert(Date.now()<deadline);const rows=[],current=[],observedErrors=[];
@@ -35,7 +53,7 @@ exports.beginQualification=async context=>{
     const owned=new Set(current.filter(row=>known.has(`${row.pid}/${row.started}`)).map(row=>row.pid));
     for(const row of current.filter(row=>row.parent===process.pid&&!['Z','X'].includes(row.state)))try{
       if(await fs.realpath(`/proc/${row.pid}/exe`)===executable){owned.add(row.pid);if(row.group===row.pid)groups.add(row.group);}
-    }catch(error){const after=await identity(row.pid);if(!['ENOENT','ESRCH'].includes(error.code)||after&&(after.started!==row.started||after.group!==row.group||!['Z','X'].includes(after.state)))observedErrors.push({pid:row.pid,kind:'direct-executable-unknown',code:error.code||error.name});}
+    }catch(error){if(!await exitedAfterExecutableError(row,error,stage))observedErrors.push({pid:row.pid,kind:'direct-executable-unknown',code:error.code||error.name});}
     for(let changed=true;changed;){changed=false;for(const row of current)if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
     for(const row of current.filter(row=>groups.has(row.group)&&!owned.has(row.pid)&&!['Z','X'].includes(row.state)))observedErrors.push({pid:row.pid,kind:'unqualified-private-group-member'});
     for(const row of current.filter(row=>owned.has(row.pid)))try{
@@ -50,7 +68,7 @@ exports.beginQualification=async context=>{
       const key=`${row.pid}/${row.started}`,prior=known.get(key);assert(!prior||prior.canonicalExecutable===actual,'Executable changes stay unqualified');
       const value={...after,canonicalExecutable:actual};known.set(key,value);rows.push(value);
     }catch(error){let after;try{after=await identity(row.pid);}catch(observation){observedErrors.push({pid:row.pid,kind:'revalidation-unknown',code:observation.code||observation.name});}
-      if(['ENOENT','ESRCH'].includes(error.code)&&(!after||after.started===row.started&&after.group===row.group&&['Z','X'].includes(after.state))&&!observedErrors.some(x=>x.pid===row.pid)){rows.push({...row,gone:true});continue;}
+      if(!observedErrors.some(x=>x.pid===row.pid)&&await exitedAfterExecutableError(row,error,stage)){rows.push({...row,gone:true});continue;}
       observedErrors.push({pid:row.pid,kind:'identity-unknown',code:error.code||error.name});}
     for(const prior of known.values())if(current.some(row=>row.pid===prior.pid&&row.started!==prior.started))observedErrors.push({pid:prior.pid,kind:'pid-reused'});
     const tcp=[];
