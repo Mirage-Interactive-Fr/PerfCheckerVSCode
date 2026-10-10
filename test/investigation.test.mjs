@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import Module, {createRequire} from 'node:module';
-import {mkdtemp, mkdir, writeFile, readFile, open, rm} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, open, realpath, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {promises as hostFs} from 'node:fs';
@@ -70,7 +70,7 @@ test('public diagnostic import reads original external bytes without histories, 
   try{
     await controller.openDiagnosticReport();
     const imported=controller.importedDiagnostic,report=controller.report;
-    assert.equal(imported.path,filename);assert.equal(imported.sha256,createHash('sha256').update(text).digest('hex'));
+    assert.equal(imported.path,await realpath(filename));assert.equal(imported.sha256,createHash('sha256').update(text).digest('hex'));
     assert.equal(imported.text,text);assert.deepEqual(controller.history,history);assert.equal(workerCalls,0);
     assert.match(messages.at(-1).message,/not measured or independently verified/);
     assert.equal(messages.at(-1).importedDiagnostic.text,undefined,'Original bytes stay in the host, not every webview state message');
@@ -87,10 +87,11 @@ test('public diagnostic import reads original external bytes without histories, 
     try{await file.truncate(32*1024*1024+1);}finally{await file.close();}
     selected=[uri(oversized)];await assert.rejects(controller.openDiagnosticReport(),/32 MiB/);assert.equal(controller.importedDiagnostic,imported);
     const growing=path.join(temporary,'growing.json');await writeFile(growing,text);
+    const canonicalGrowing=await realpath(growing);
     const originalOpen=hostFs.open;
     hostFs.open=async function(name,...args){
       const handle=await originalOpen.call(this,name,...args);
-      if(name===growing){const originalStat=handle.stat.bind(handle);handle.stat=async()=>{
+      if(name===canonicalGrowing){const originalStat=handle.stat.bind(handle);handle.stat=async()=>{
         const prior=await originalStat(),writer=await originalOpen.call(hostFs,growing,'r+');
         try{await writer.truncate(32*1024*1024+1);}finally{await writer.close();}
         return prior;
@@ -108,7 +109,7 @@ test('public diagnostic import reads original external bytes without histories, 
     assert.equal(controller.importedDiagnostic,undefined);assert.equal(workerCalls,0);
     vscode.workspace.workspaceFolders=[{name:'SSH workspace',uri:uri(root,'vscode-remote','ssh-remote+fixture')}];
     selected=[uri(filename,'vscode-remote','ssh-remote+fixture')];await controller.openDiagnosticReport();
-    assert.equal(controller.importedDiagnostic.path,filename,'A Remote SSH file is read on its matching extension host');
+    assert.equal(controller.importedDiagnostic.path,await realpath(filename),'A Remote SSH file is read on its matching extension host');
     selected=[uri(filename,'vscode-remote','ssh-remote+different-host')];await assert.rejects(controller.openDiagnosticReport(),/extension host/);
     assert.equal(workerCalls,0);
   }finally{

@@ -448,7 +448,7 @@ async function savedImport(context) {
     let current=await view(context);
     const banner=current.locator('.imported-diagnostic');await banner.waitFor({state:'visible'});
     assert.match(await banner.innerText(),/not measured or independently verified in this editor session/);
-    assert((await banner.innerText()).includes(sha256));assert((await banner.innerText()).includes(filename));
+    assert((await banner.innerText()).includes(sha256));assert((await banner.innerText()).includes(await fs.realpath(filename)));
     assert.deepEqual(await current.locator('.diagnostic-values dd').allTextContents(),['1.25 s','2.5 s','0.125 s']);
     assert.equal(await current.locator('.diagnostic-memory tbody tr').count(),5);
     assert.match(await current.locator('article.card').last().innerText(),/Availability: unavailable/);

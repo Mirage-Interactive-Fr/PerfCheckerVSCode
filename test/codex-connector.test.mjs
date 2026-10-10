@@ -264,8 +264,11 @@ test('Codex owns an observed detached/reparented cohort through timeout, HTTP ab
 }));
 
 
-test('Codex preflight handles ENOENT and rapid normal exit without retaining an owner',async()=>environment(async root=>{
-  await assert.rejects(inspectCodex(path.join(root,'missing-native-cli'),root),/ENOENT/);
+test('Codex preflight handles a missing executable and rapid normal exit without retaining an owner',async()=>environment(async root=>{
+  // POSIX spawn raises ENOENT; the Windows private launcher reports failure
+  // through its exit code, which inspectCodex translates into the public refusal.
+  await assert.rejects(inspectCodex(path.join(root,'missing-native-cli'),root),
+    process.platform==='win32'?/^Error: Choose a Codex CLI executable, then reconnect\.$/:/ENOENT/);
   await shutdownCodexPreflights();
   for(let iteration=0;iteration<3;iteration++)assert.equal(await inspectCodex('sacrificial-codex',root),'codex-cli 0.159.2');
   await shutdownCodexPreflights();
