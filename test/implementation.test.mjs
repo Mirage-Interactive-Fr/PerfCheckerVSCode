@@ -6,6 +6,8 @@ import os from 'node:os';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {createHash} from 'node:crypto';
+import {createRequire} from 'node:module';
+import {unlinkSync} from 'node:fs';
 import {createImplementationCheckout, applyImplementation, recoverImplementationProposal, saveActiveImplementationProposal, recoverActiveImplementationProposal} from '../dist/implementation.js';
 const execute=promisify(execFile);
 const git=async(root,...args)=>(await execute('git',args,{cwd:root,maxBuffer:32_000_000})).stdout;
@@ -62,11 +64,15 @@ test('generated report checkpoint retains the complete tree before a single sour
     ].map(name=>prefix+name);
     assert.equal(paths.length,26);
     for(const file of paths){await fs.mkdir(path.dirname(path.join(root,file)),{recursive:true});await fs.writeFile(path.join(root,file),`fixture ${file}\n`);}
-    receipt.original=await fs.realpath(root);receipt.gitVersion=(await command(root,'--version')).trim();receipt.configuration={};
-    for(const key of ['core.longpaths','core.fscache','core.autocrlf','core.filemode','core.ignorecase']){
-      try{receipt.configuration[key]=(await command(root,'config','--show-origin','--get',key)).trim();}
-      catch(error){if(error.code!==1)throw error;receipt.configuration[key]=null;}
-    }
+    receipt.original=await fs.realpath(root);receipt.gitVersion=(await command(root,'--version')).trim();
+    const configuration=async()=>{const values={};
+      for(const key of ['core.longpaths','core.fscache','core.autocrlf','core.filemode','core.ignorecase']){
+        try{values[key]=(await command(root,'config','--show-origin','--get',key)).trim();}
+        catch(error){if(error.code!==1)throw error;values[key]=null;}
+      }return values;
+    };
+    receipt.configuration=await configuration();
+    const originalConfig=await fs.readFile(path.join(root,'.git','config'));receipt.originalConfigSha256=hash(originalConfig);
     receipt.head=(await command(root,'rev-parse','HEAD')).trim();await snapshot('originalBefore',root);
     checkout=await createImplementationCheckout(root);receipt.suppliedCheckout=checkout.workspace;
     receipt.canonicalCheckout=await fs.realpath(checkout.workspace);receipt.backupRef=checkout.backupRef;
@@ -92,6 +98,22 @@ test('generated report checkpoint retains the complete tree before a single sour
     assert.equal((await command(root,'rev-parse','HEAD')).trim(),receipt.head);
     assert.deepEqual(indexes.originalAfter,indexes.originalBefore,'The original complete index is byte-exact');
     for(const file of paths)assert.equal(await fs.readFile(path.join(root,file),'utf8'),`fixture ${file}\n`);
+    await applyImplementation(proposal);assert.equal(proposal.applied,true);await snapshot('originalApplied',root);
+    assert.equal(await fs.readFile(path.join(root,source),'utf8'),'changed\n');
+    assert.deepEqual(indexes.originalApplied,indexes.originalBefore,'Apply preserves the complete original index');
+    for(const file of paths)assert.equal(await fs.readFile(path.join(root,file),'utf8'),`fixture ${file}\n`);
+    await applyImplementation(proposal,true);assert.equal(proposal.applied,false);await snapshot('originalRestored',root);
+    assert.equal(await fs.readFile(path.join(root,source),'utf8'),'original\n');
+    assert.equal((await command(root,'rev-parse','HEAD')).trim(),receipt.head);
+    assert.equal((await command(root,'rev-parse',checkout.backupRef)).trim(),receipt.checkpoint,'The recovery checkpoint is retained');
+    assert.deepEqual(indexes.originalRestored,indexes.originalBefore,'Restore preserves the complete original index');
+    assert.equal(receipt.originalRestoredStatus,receipt.originalBeforeStatus);
+    assert.equal(receipt.originalRestoredStage,receipt.originalBeforeStage);
+    for(const file of paths)assert.equal(await fs.readFile(path.join(root,file),'utf8'),`fixture ${file}\n`);
+    assert.deepEqual(await fs.readFile(path.join(root,'.git','config')),originalConfig,'Git configuration is never rewritten');
+    receipt.configurationAfter=await configuration();assert.deepEqual(receipt.configurationAfter,receipt.configuration,
+      'The effective user/repository Git configuration remains unchanged');
+    receipt.reviewedApplyAndRestore=true;receipt.originalConfigUnchanged=true;
     receipt.status='passed';
   }catch(error){
     receipt.status='failed';receipt.error={name:error.name,message:error.message,code:error.code};
@@ -110,6 +132,35 @@ test('generated report checkpoint retains the complete tree before a single sour
     }finally{await checkout?.dispose();await fs.rm(session,{recursive:true,force:true});}
   }
 });
+test('an exit-zero checkout with a missing tracked file is refused before any agent request',async t=>fixture(async root=>{
+  const report='saved report.txt',contents='saved report bytes\r\n';await fs.writeFile(path.join(root,report),contents);
+  const head=await git(root,'rev-parse','HEAD'),index=await fs.readFile(path.join(root,'.git','index'));
+  const config=await fs.readFile(path.join(root,'.git','config'));
+  const status=await git(root,'--no-optional-locks','status','--porcelain=v1','-z','--untracked-files=all');
+  const childProcesses=createRequire(import.meta.url)('node:child_process'),spawn=childProcesses.spawn;
+  let isolated,accepted,successfulExitObserved=false;
+  t.mock.method(childProcesses,'spawn',(command,args,options)=>{
+    const child=spawn(command,args,options);
+    if(command==='git'&&args.includes('checkout')&&args.includes('--detach')&&path.basename(options.cwd)==='checkout'){
+      isolated=options.cwd;
+      // The actual Git command runs normally. Fault injection removes one real
+      // private file after its successful exit and before the product checks it.
+      child.prependOnceListener('close',code=>{successfulExitObserved=code===0;if(code===0)unlinkSync(path.join(isolated,report));});
+    }
+    return child;
+  });
+  try{
+    await assert.rejects(async()=>{accepted=await createImplementationCheckout(root);},/isolated checkout does not match.*Recovery checkpoint:/);
+    assert.equal(successfulExitObserved,true);assert(isolated);await assert.rejects(fs.access(isolated),{code:'ENOENT'});
+    const refs=(await git(root,'for-each-ref','--format=%(refname)','refs/perfchecker/checkpoints/')).trim().split('\n');
+    assert.equal(refs.length,1);assert.equal(await git(root,'show',`${refs[0]}:${report}`),contents);
+    assert.equal(await fs.readFile(path.join(root,'source.jl'),'utf8'),'original\n');
+    assert.equal(await fs.readFile(path.join(root,report),'utf8'),contents);
+    assert.equal(await git(root,'rev-parse','HEAD'),head);assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),index);
+    assert.deepEqual(await fs.readFile(path.join(root,'.git','config')),config);
+    assert.equal(await git(root,'--no-optional-locks','status','--porcelain=v1','-z','--untracked-files=all'),status);
+  }finally{t.mock.restoreAll();await accepted?.dispose();}
+}));
 test('checkpoint, reviewed apply, reload recovery and restore preserve HEAD and byte-identical staging',()=>fixture(async root=>{
   await fs.writeFile(path.join(root,'source.jl'),'staged\n'); await git(root,'add','source.jl');
   await fs.writeFile(path.join(root,'source.jl'),'dirty beyond staged\n');

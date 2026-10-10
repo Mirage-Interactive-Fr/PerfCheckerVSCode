@@ -11,7 +11,10 @@ async function gitBytes(root: string, args: string[], input?: string | Buffer, e
   return await new Promise((resolve, reject) => {
     const inherited = {...process.env};
     for (const key of Object.keys(inherited)) if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG_COUNT|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)$/.test(key)) delete inherited[key];
-    const child = spawn('git', ['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=', ...args],
+    // The private checkpoint prefix can push otherwise valid workspace paths
+    // beyond MAX_PATH. This override applies only to our Git processes.
+    const child = spawn('git', ['--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=',
+      ...(process.platform === 'win32' ? ['-c', 'core.longpaths=true'] : []), ...args],
       {cwd: root, windowsHide: true, detached: process.platform !== 'win32',
         env: {...inherited, ...environment, GIT_TERMINAL_PROMPT: '0'}});
     const chunks: Buffer[] = []; let size = 0, error = '', exceeded = false;
@@ -184,7 +187,13 @@ export async function createImplementationCheckout(workspace: string) {
     // The original checkpoint still retains its full parent/history.
     await git(checkout, ['fetch', '--quiet', '--no-tags', '--depth=1', repository, backupRef]);
     const attributes = await rawCheckoutAttributes(checkout);
-    try {await git(checkout, ['checkout', '--quiet', '--detach', base]);}
+    try {
+      await git(checkout, ['checkout', '--quiet', '--detach', base]);
+      // Check the private working tree while raw attributes still disable text
+      // conversions. An exit-zero checkout must not become a deletion proposal.
+      try {await git(checkout, ['diff', '--quiet', '--no-ext-diff', '--no-textconv', base, '--']);}
+      catch (error) {throw new Error(`The isolated checkout does not match its saved Git checkpoint. No agent request was started. Recovery checkpoint: ${backupRef}.`, {cause: error});}
+    }
     finally {await fs.rm(attributes, {force: true});}
     const relative = path.relative(repository, workspace);
     const isolatedWorkspace = path.join(checkout, relative);
