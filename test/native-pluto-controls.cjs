@@ -599,14 +599,16 @@ function renderedPng(png){
   }
   const raw=inflateSync(Buffer.concat(chunks)),stride=width*channels;
   assert.equal(raw.length,(stride+1)*height);
-  let previous=Buffer.alloc(stride),colored=0,orange=0,orangeX=0,orangeY=0;const colors=new Map();
+  let previous=Buffer.alloc(stride),colored=0,highlight=0,highlightX=0,highlightY=0;const colors=new Map();
+  // The public v1.0.1 WGL inspector uses _PLOT_PALETTE[2], #c2410c.
+  const highlightRgb=[0xc2,0x41,0x0c];
   const paeth=(a,b,c)=>{const p=a+b-c,da=Math.abs(p-a),db=Math.abs(p-b),dc=Math.abs(p-c);return da<=db&&da<=dc?a:db<=dc?b:c;};
   for(let y=0;y<height;y++){
     const mode=raw[y*(stride+1)],row=Buffer.from(raw.subarray(y*(stride+1)+1,(y+1)*(stride+1)));assert(mode<=4);
     for(let x=0;x<stride;x++){const a=x>=channels?row[x-channels]:0,b=previous[x],c=x>=channels?previous[x-channels]:0;row[x]=(row[x]+[0,a,b,Math.floor((a+b)/2),paeth(a,b,c)][mode])&255;}
     for(let x=0;x<stride;x+=channels){const alpha=channels===4?row[x+3]:255;if(alpha===0)continue;const [r,g,b]=row.subarray(x,x+3),key=(r>>4)*256+(g>>4)*16+(b>>4);colors.set(key,(colors.get(key)||0)+1);if(Math.max(r,g,b)-Math.min(r,g,b)>25)colored++;
-      // The canonical point inspector draws its highlight in Makie's :orange.
-      if(r>=200&&g>=70&&g<=210&&b<=80&&r>g+25){orange++;orangeX+=x/channels;orangeY+=y;}}
+      // Allow edge antialiasing around that specific canonical colour.
+      if(Math.max(...[r,g,b].map((value,index)=>Math.abs(value-highlightRgb[index])))<=20){highlight++;highlightX+=x/channels;highlightY+=y;}}
     previous=row;
   }
   const channelsOf=key=>[key>>8,(key>>4)&15,key&15];
@@ -614,7 +616,7 @@ function renderedPng(png){
   const highContrastPixels=[...colors.entries()].reduce((count,[key,pixels])=>count+
     (Math.max(...channelsOf(key).map((value,index)=>Math.abs(value-background[index])))>=4?pixels:0),0);
   return {width,height,quantizedColors:colors.size,coloredPixels:colored,highContrastPixels,dominantColorBin:dominant,
-    highlight:orange>=10?{pixels:orange,x:orangeX/orange,y:orangeY/orange}:null,sha256:createHash('sha256').update(png).digest('hex')};
+    highlight:highlight>=10?{pixels:highlight,x:highlightX/highlight,y:highlightY/highlight}:null,sha256:createHash('sha256').update(png).digest('hex')};
 }
 
 function assertDrawnFigure(pixels){
@@ -625,10 +627,10 @@ function assertDrawnFigure(pixels){
 
 function assertMovedHighlight(before,after){
   assert.equal(after.width,before.width);assert.equal(after.height,before.height);
-  assert(before.highlight&&after.highlight,'Both actual screenshots contain the canonical orange point highlight');
+  assert(before.highlight&&after.highlight,'Both actual screenshots contain the canonical #c2410c point highlight');
   assert.notEqual(after.sha256,before.sha256,'A distinct measured point changes the actual canvas');
   assert(Math.hypot(after.highlight.x-before.highlight.x,after.highlight.y-before.highlight.y)>1,
-    'The orange point changes position, rather than merely changing a readout or drawing a spinner');
+    'The canonical point changes position, rather than merely changing a readout or drawing a spinner');
 }
 
 function distinctMeasuredPoint(data){

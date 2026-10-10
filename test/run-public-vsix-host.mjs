@@ -621,10 +621,12 @@ try {
         PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE:String(plutoTagAvailable),
         PERFCHECKER_NATIVE_VIDEO_STARTED_AT:videoStartedAt||'',
         UV_THREADPOOL_SIZE: '4'};
+      const launchWorkspace=phase!=='fresh'&&(phase==='prepared'||stage==='focused')?workspaceFile:workspace;
+      await fs.access(launchWorkspace);
       await new Promise((resolve,reject)=>{
         // Actual interactive host: no --extensionTestsPath or smoke driver, and
         // no intercepted APIs. All dialogs are clicked through the real UI.
-        const child=spawn(vscode,[phase==='prepared'||stage==='focused'?workspaceFile:workspace,...phaseCliProfile,'--new-window','--skip-welcome','--skip-release-notes',
+        const child=spawn(vscode,[launchWorkspace,...phaseCliProfile,'--new-window','--skip-welcome','--skip-release-notes',
           ...(phase==='restricted'?[]:['--disable-workspace-trust']),...(phase==='pluto-plots'?['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']:['--disable-gpu']),'--remote-debugging-port=9222',
           ...(process.platform==='linux'?['--no-sandbox']:[]),
           `--extensionDevelopmentPath=${path.join(repository,'test','qualification-host')}`],
