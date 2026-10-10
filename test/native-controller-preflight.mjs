@@ -16,7 +16,7 @@ function diagnose_controller_tree(m,root,source,tree,pinned)
  println(join(["CONTROLLER_TREE_CHECK_V1",string(nameof(m)),string(Base.pkgversion(m)),bytes2hex(codeunits(root)),bytes2hex(codeunits(source)),tree,pinned],'\t'));flush(stdout)
  tree==pinned&&return
  println("CONTROLLER_TREE_MISMATCH_V1 ",nameof(m));flush(stdout)
- config=Cmd(["git","-C",root,"config","--show-origin","--get-regexp","^core\\.(autocrlf|eol|filemode)$"])
+ config=Cmd(["git","-C",root,"config","--show-origin","--get-regexp","^core\\.(autocrlf|eol|filemode)\$"])
  try
   process=open(pipeline(ignorestatus(config),stderr=devnull));value=""
   try;value=read(process,String);wait(process)
