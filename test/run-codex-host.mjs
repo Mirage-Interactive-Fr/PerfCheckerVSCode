@@ -12,7 +12,7 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 const client=path.dirname(path.dirname(fileURLToPath(import.meta.url))),rawExecute=promisify(execFile);
 const preparationAbort=new AbortController();
 const execute=(command,args,options={})=>rawExecute(command,args,{timeout:60000,...options,signal:preparationAbort.signal});
-const vsixSha='a7494937bd14f94b9bc403320ff5d02b09dde76ec6c8b3284f9ce80b63739b7d';
+const vsixSha='771ff166e24e96ac1c7121bce8181cb4456089ea83b0356fc6d86593440dfa88';
 const coreTree='9abef061386c97c97bf136b9e4747673fe690b01';
 const coreCommit='9942c4e1fb9dc02a66a03f629b40efdf9c6bdc33';
 const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
@@ -31,7 +31,7 @@ for(const name of ['PERFCHECKER_TEST_CONTROLLER','PERFCHECKER_TEST_CODEX','PERFC
   if(!process.env[name]||!path.isAbsolute(process.env[name]))throw new Error(`Provide an absolute ${name} path.`);
 const archive=await fs.realpath(process.env.PERFCHECKER_TEST_VSIX);
 assert.equal(createHash('sha256').update(await fs.readFile(archive)).digest('hex'),vsixSha,'Use the approved VSIX bytes, not a development build');
-assert.equal((await fs.stat(archive)).size,1077372);
+assert.equal((await fs.stat(archive)).size,1077954);
 if(bibliography){
   assert(path.isAbsolute(bibliography),'Provide an absolute private Bibliography pilot path');
   assert(!process.env.WAYLAND_DISPLAY,'Remove WAYLAND_DISPLAY before launching this private X11 test');

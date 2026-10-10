@@ -468,7 +468,7 @@ exports.run=async()=>{
     for(const file of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(directory,'perf','episode-05a','worker',file),path.join(target,file));}};
   try{
     result.vsixSha256=hash(await fs.readFile(process.env.PERFCHECKER_HOST_ARCHIVE));
-    assert.equal(result.vsixSha256,'a7494937bd14f94b9bc403320ff5d02b09dde76ec6c8b3284f9ce80b63739b7d');
+    assert.equal(result.vsixSha256,'771ff166e24e96ac1c7121bce8181cb4456089ea83b0356fc6d86593440dfa88');
     const extension=vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');assert(extension,'Load the installed product');
     const installed=await fs.realpath(extension.extensionPath);
     assert(installed.startsWith(path.join(session,'extensions')+path.sep),'The product must not come from the source checkout or human extension directory');
