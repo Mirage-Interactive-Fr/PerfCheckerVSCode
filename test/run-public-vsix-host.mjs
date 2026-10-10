@@ -11,7 +11,7 @@ import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 import {nativeCoreContract,CORE110_CANDIDATE} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -104,7 +104,8 @@ async function execute(executable, args, options = {}) {
 
 // This preparation owns its compilation children independently of the import
 // timeout. No uncertain observation is accepted as proof of an empty tree.
-async function executeControllerPreflight(executable,args,receipt){
+async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180000}={}){
+  assert(Number.isSafeInteger(timeoutMs)&&timeoutMs>0);
   const windows=process.platform==='win32',expected=await fs.realpath(executable);
   const launcher=path.join(repository,'resources','windows-owned-process.ps1');
   const ownerExecutable=windows?path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'):expected;
@@ -112,7 +113,7 @@ async function executeControllerPreflight(executable,args,receipt){
   const ownerArgs=windows?['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',launcher,
     '-Executable',expected,'-WorkingDirectory',receipt.project,'-ArgumentsBase64',Buffer.from(JSON.stringify(args)).toString('base64'),'-ParentPid',String(process.pid)]:args;
   const child=spawn(ownerExecutable,ownerArgs,{cwd:receipt.project,env:runnerEnvironment,windowsHide:true,detached:!windows,stdio:['pipe','pipe','pipe']});
-  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Date.now()+180000;
+  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Date.now()+timeoutMs;
   receipt.deadlineAt=new Date(cleanupUntil).toISOString();
   const limit=maximum=>{const remaining=cleanupUntil-Date.now();if(remaining<=0)throw new Error('Owned preflight inspection exceeded its current preparation or cleanup deadline');return Math.min(maximum,remaining);};
   receipt.ownership={ownerPid:child.pid,identities:[],observations:[],errors,cleanupQualified:false};
@@ -310,7 +311,7 @@ async function executeControllerPreflight(executable,args,receipt){
     if(!receipt.ownership.cleanupQualified){sessionSafeToRemove=false;child.unref();child.stdout.destroy();child.stderr.destroy();}
   }
   if(expired||spawnError||outcome?.code!==0||!started||!receipt.ownership.cleanupQualified||receipt.ownership.aliveBeforeCleanup?.length)
-    throw Object.assign(new Error(`Controller preflight failed: ${expired?'180 second timeout':spawnError||JSON.stringify(outcome)}; owned cleanup=${receipt.ownership.cleanupQualified}`),{commandOutput:text});
+    throw Object.assign(new Error(`Controller ${receipt.phase??'preflight'} failed: ${expired?`${timeoutMs/1000} second timeout`:spawnError||JSON.stringify(outcome)}; owned cleanup=${receipt.ownership.cleanupQualified}`),{commandOutput:text});
   return text;
 }
 
@@ -732,6 +733,31 @@ try {
   }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   if(stage==='targeted'||stage==='full'||stage==='focused'&&(['general100','mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
+    // This is installation/cache preparation, not first-Send or a cold-start
+    // measurement. Keep its explicit compilation cost and physical ownership
+    // separate from the unchanged 180-second prepared-import qualification.
+    const preparationBefore=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
+    const preparation={status:'running',phase:'cache preparation',startedAt:new Date().toISOString(),project:controller,
+      packages:['PerfChecker','HTTP'],strict:true,timeoutMilliseconds:900000,hashesBefore:preparationBefore,
+      automaticPrecompile:runnerEnvironment.JULIA_PKG_PRECOMPILE_AUTO,
+      scope:'Explicit selected-package cache preparation with owned compilation children; no cold-start or native first-Send claim'};
+    artifactRecord.controllerCachePreparation=preparation;await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+    try{
+      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',controllerCachePreparationScript,controller],preparation,{timeoutMs:preparation.timeoutMilliseconds});
+      await fs.writeFile(path.join(output,'controller-cache-preparation.log'),text);
+      const complete=text.split(/\r?\n/).filter(line=>line.startsWith('CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 '));
+      assert.equal(complete.length,1,'Exactly one completed explicit cache-preparation receipt is required');
+      preparation.precompileSeconds=Number(complete[0].slice('CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 '.length));
+      assert(Number.isFinite(preparation.precompileSeconds)&&preparation.precompileSeconds>=0);
+      preparation.status='passed';
+    }catch(error){preparation.status='failed';preparation.error=String(error);if(error.commandOutput)await fs.writeFile(path.join(output,'controller-cache-preparation.log'),error.commandOutput);throw error;}
+    finally{
+      preparation.finishedAt=new Date().toISOString();preparation.elapsedSeconds=(Date.now()-Date.parse(preparation.startedAt))/1000;
+      preparation.hashesAfter=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
+      if(Object.keys(preparationBefore).some(name=>preparation.hashesAfter[name]!==preparationBefore[name])){preparation.status='failed';preparation.hashMismatch=true;}
+      await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+      assert.deepEqual(preparation.hashesAfter,preparationBefore,'Explicit cache preparation preserves the exact installed Project and Manifest');
+    }
     const before=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
     const receipt={status:'running',startedAt:new Date().toISOString(),project:controller,hashesBefore:before,
       scope:'Explicit controller preparation before the native first Send; cache preparation, not a cold-start qualification'};

@@ -53,8 +53,17 @@ export const candidateCheckoutPermissionsScript=String.raw`if Sys.iswindows()
  println("CANDIDATE_CHECKOUT_V1 tree=",actual," files=",count[]," bytes=",bytecount[]," aclChanged=",changed[]," beforeModes=",join([k*":"*string(v) for (k,v) in sort!(collect(before_modes))],",")," contentRewritten=false complete=true");flush(stdout)
 end`;
 
+// Package installation disables automatic precompilation in this disposable
+// campaign. Finish the selected provider caches explicitly before observing a
+// prepared import; the owner/descendant observer also covers this process.
+export const controllerCachePreparationScript=String.raw`println("CONTROLLER_PREFLIGHT_READY ",getpid());flush(stdout);readline(stdin)
+using Pkg;Pkg.activate(ARGS[1]);started=time()
+println("CONTROLLER_CACHE_PREPARATION_BEGIN PerfChecker HTTP strict=true");flush(stdout)
+Pkg.precompile(["PerfChecker","HTTP"];strict=true)
+println("CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 ",time()-started);flush(stdout)`;
+
 // Emit primitive fields rather than compiling a generic JSON writer after the
-// cold HTTP import. All loading, identity checks and the 180 s budget remain real.
+// prepared HTTP import. All loading, identity checks and the 180 s budget remain real.
 export const controllerPreflightScript=String.raw`println("CONTROLLER_PREFLIGHT_READY ",getpid());flush(stdout);readline(stdin)
 using Pkg;Pkg.activate(ARGS[1]);started=time();modules=Module[]
 for name in (:PerfChecker,:HTTP)
