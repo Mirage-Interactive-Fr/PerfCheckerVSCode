@@ -1035,7 +1035,7 @@ exports.runFreshInstall = async context => {
         {cwd:workspace,env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)},timeout:180000,maxBuffer:1000000});
       const line=result.stdout.split(/\r?\n/).find(value=>value.startsWith('PUBLISHED_BOOTSTRAP_PROVENANCE '));assert(line,'The actual installed modules report their source provenance');
       environments[name]=JSON.parse(line.slice('PUBLISHED_BOOTSTRAP_PROVENANCE '.length));
-      assert.equal(environments[name].PerfChecker.version,'1.0.1');assert.equal(environments[name].PerfChecker.registered,true);
+      assert.equal(environments[name].PerfChecker.version,process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION);assert.equal(environments[name].PerfChecker.registered,true);
       assert.equal(environments[name].PerfChecker.tree,process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_TREE);
       await fs.mkdir(path.join(retained,name),{recursive:true});
       for(const leaf of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(directory,leaf),path.join(retained,name,leaf));
@@ -1046,7 +1046,7 @@ exports.runFreshInstall = async context => {
     assert.equal(environments.pluto.Pluto.version,'1.0.4');assert.equal(environments.pluto.Pluto.registered,true);
     await fs.copyFile(file,path.join(retained,path.basename(file)));
     context.proof('bootstrap-pluto-published-install',{nativeStudioClick:true,nativeInstallConfirmation:true,noPreparedEnvironment:true,
-      sourceOverride:false,core:'General 1.0.1',companion:'PerfCheckerPluto subdir at v1.0.1',environments,
+      sourceOverride:false,core:`General ${process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION}`,companion:'PerfCheckerPluto subdir at v1.0.1',environments,
       separateControllerPreserved:true,notebookGenerated:true,interactiveNotebookOpened:true,nativeStopClick:true,listenerClosed:true});
   }finally{
     await vscode.commands.executeCommand('perfchecker.stopNotebookSession',uri);

@@ -40,10 +40,10 @@ test('the production Pluto check accepts current metadata and rejects the old co
     }
   };
   const old=await check(process.env.PERFCHECKER_PLUTO_OLD_COMPANION_PROJECT);
-  assert.match(old.stdout,/Detected PerfChecker 1\.0\.1; PerfCheckerPluto 1\.0\.0; Pluto 1\.0\.4/);
+  assert.match(old.stdout,/Detected PerfChecker 1\.1\.0; PerfCheckerPluto 1\.0\.0; Pluto 1\.0\.4/);
   assert.notEqual(old.exit,0);assert.match(old.stderr,/requires PerfCheckerPluto 1\.0\.1.*Explicitly upgrade the separate Pluto environment/);
   const current=await check(process.env.PERFCHECKER_PLUTO_CURRENT_COMPANION_PROJECT);
-  assert.match(current.stdout,/Detected PerfChecker 1\.0\.1; PerfCheckerPluto 1\.0\.1; Pluto 1\.0\.4/);
+  assert.match(current.stdout,/Detected PerfChecker 1\.1\.0; PerfCheckerPluto 1\.0\.1; Pluto 1\.0\.4/);
   assert.equal(current.exit,0,current.stderr);
 });
 
@@ -377,6 +377,7 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
     assert.equal(await pluto.create(notebook,{kind:'suite'}),undefined);
     assert.equal(messages.length,1,'No package manager runs before the installation choice');
     assert.match(messages[0],/own Julia environment.*perf.*pluto/);
+    assert.match(messages[0],/Install registered PerfChecker 1\.1\.0, PerfCheckerPluto 1\.0\.1, Pluto 1\.0\.4/);
     assert.deepEqual(choices[0],['Install Pluto environment','Open setup guide']);
     assert.deepEqual(await readdir(root),[],'Declining setup creates neither an environment nor a notebook');
     vscode.workspace.isTrusted=false;
@@ -402,6 +403,7 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
     try{
       assert.equal(await pluto.ensureEnvironment(folder),undefined);
       assert.equal(checks.length,1);assert.equal(checks[0][3],'PerfChecker · Check Pluto environment');
+      assert.match(checks[0][2],/v"1\.1\.0" <= Base\.pkgversion\(PerfChecker\)/);
       assert.match(messages.at(-1),/existing separate Pluto environment needs an explicit upgrade/);
       assert.match(messages.at(-1),/PerfCheckerPluto 1\.0\.1/);
       assert.deepEqual(choices.at(-1),['Upgrade Pluto environment','Open setup guide']);

@@ -9,7 +9,7 @@ import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
-import {nativeCoreContract,GENERAL101_TREE} from './native-core-contract.mjs';
+import {nativeCoreContract,CORE110_CANDIDATE} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure} from './native-controller-preflight.mjs';
 
@@ -29,6 +29,7 @@ const coreTree=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_TREE 
 const coreProvenance=nativeCoreContract({core:coreMode,artifact:mode,stage:process.env.PERFCHECKER_NATIVE_STAGE||'smoke',
   group:process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative',commit:process.env.PERFCHECKER_NATIVE_CORE_COMMIT||'',tree:process.env.PERFCHECKER_NATIVE_CORE_TREE||''});
 const expectedCoreVersion=coreProvenance.version;
+const minimumVersion=mode==='public'?'1.0.0':'1.1.0';
 const installCore=coreMode==='candidate'?`${candidateGitSetupScript};Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]));${candidateCheckoutPermissionsScript}`:`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))${coreMode==='general100'?'; Pkg.pin(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))':''}`;
 // Read the actual dependency and Manifest route, not the declared fixture pin.
 const companionProvenance=String.raw`function native_provider_provenance(m)
@@ -544,14 +545,14 @@ try {
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
-  const versionsText=await minimumResponse.text(),minimumSection=versionsText.split(/^\["1\.0\.1"\]\s*$/m)[1]?.split(/^\[/m)[0];
+  const versionsText=await minimumResponse.text(),minimumSection=versionsText.split('["'+minimumVersion+'"]')[1]?.split(/^\[/m)[0];
   const minimumTree=/^git-tree-sha1\s*=\s*"([a-f0-9]{40})"/m.exec(minimumSection||'')?.[1];
   const minimumAvailable=Boolean(minimumTree);
-  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,GENERAL101_TREE,'The published General 1.0.1 tree is the immutable release contract');
+  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,CORE110_CANDIDATE.tree,'Published General 1.1.0 must match the independently pinned Core source tree');
   const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml');
   if(!plutoTagResponse.ok&&plutoTagResponse.status!==404)throw new Error(`Cannot verify published Pluto companion tag: ${plutoTagResponse.status}`);
   const plutoTagAvailable=plutoTagResponse.ok&&/^version\s*=\s*"1\.0\.1"\s*$/m.test(await plutoTagResponse.text());
-  await fs.writeFile(path.join(output,'production-bootstrap-gate.json'),JSON.stringify({minimum:'1.0.1',registry:'General',available:minimumAvailable,
+  await fs.writeFile(path.join(output,'production-bootstrap-gate.json'),JSON.stringify({minimum:minimumVersion,registry:'General',available:minimumAvailable,
     tree:minimumTree,plutoTag:'v1.0.1',plutoTagAvailable,
     status:minimumAvailable&&plutoTagAvailable?'native-positive-test-required':'awaiting-registration-or-tag',candidateFunctions:coreProvenance},null,2));
 
@@ -616,6 +617,7 @@ try {
         PERFCHECKER_NATIVE_STAGE: process.env.PERFCHECKER_NATIVE_STAGE || 'smoke',
         PERFCHECKER_NATIVE_EXPECTED_VERSION: expectedVersion, PERFCHECKER_NATIVE_JULIA_VERSION: runtime.version,
         PERFCHECKER_NATIVE_CORE_VERSION: expectedCoreVersion, PERFCHECKER_NATIVE_CORE_PROVENANCE:JSON.stringify(coreProvenance),
+        PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION:minimumVersion,
         PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE:String(minimumAvailable),
         PERFCHECKER_NATIVE_GENERAL_MINIMUM_TREE:minimumTree||'',
         PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE:String(plutoTagAvailable),
@@ -712,7 +714,7 @@ try {
     artifactRecord.documentedMcpInstallation={status:'passed',startedAt:installationStartedAt,finishedAt:new Date().toISOString(),
       elapsedSeconds:(Date.now()-Date.parse(installationStartedAt))/1000,autoPrecompile:runnerEnvironment.JULIA_PKG_PRECOMPILE_AUTO,
       privateDepot:runnerEnvironment.JULIA_DEPOT_PATH,project:controller,core:{...coreProvenance},http,
-      packagesAdded:['PerfChecker@1.0.1','HTTP'],manualHttpImport:false,controllerPreflight:false,
+      packagesAdded:[`PerfChecker@${expectedCoreVersion}`,'HTTP'],manualHttpImport:false,controllerPreflight:false,
       scope:'Documented package installation with normal automatic precompilation, not a cold-cache advice qualification'};
     assert.equal(artifactRecord.documentedMcpInstallation.autoPrecompile,'1');
     await fs.writeFile(path.join(output,'documented-mcp-installation.log'),installation);

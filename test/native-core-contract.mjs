@@ -1,5 +1,7 @@
-// Qualification contracts are explicit: the legacy run never lowers the normal minimum.
-export const GENERAL101_TREE='00c133336911b8600d63a8d6c59ce1befc5ce690';
+// Qualification contracts are explicit: legacy compatibility never lowers the
+// guided-setup version exercised by the current candidate campaign.
+// Expected source identity; this constant does not assert General registration.
+export const CORE110_CANDIDATE={version:'1.1.0',commit:'9942c4e1fb9dc02a66a03f629b40efdf9c6bdc33',tree:'9abef061386c97c97bf136b9e4747673fe690b01'};
 export const GENERAL100_TREE='7af0cc74194b953c5e998efd7523f0c5f455e395';
 export function nativeCoreContract({core='general',artifact='public',stage='smoke',group='narrative',commit='',tree=''}) {
   if(!['general','candidate','general100'].includes(core))throw new Error('Choose a registered minimum, pinned candidate, or explicit General 1.0.0 compatibility campaign.');
@@ -12,6 +14,6 @@ export function nativeCoreContract({core='general',artifact='public',stage='smok
   if(group==='general100')throw new Error('The General 1.0.0 group requires its explicit registry contract.');
   if(core==='candidate'&&![commit,tree].every(value=>/^[a-f0-9]{40}$/.test(value)))
     throw new Error('Core candidate mode requires an immutable commit and expected Git tree.');
-  return {mode:core,version:core==='candidate'||artifact==='candidate'?'1.0.1':'1.0.0',
-    ...(core==='candidate'?{commit,tree}:{registry:'General',...(artifact==='candidate'?{tree:GENERAL101_TREE}:{})})};
+  return {mode:core,version:core==='candidate'||artifact==='candidate'?'1.1.0':'1.0.0',
+    ...(core==='candidate'?{commit,tree}:{registry:'General',...(artifact==='candidate'?{tree:CORE110_CANDIDATE.tree}:{})})};
 }

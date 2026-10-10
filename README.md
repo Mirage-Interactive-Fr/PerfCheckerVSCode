@@ -1,8 +1,12 @@
 # PerfChecker for VS Code
 
-PerfChecker 1.0.1 brings a full Studio, interactive plots, Julia tools, MCP
-conversation, and reviewed agent implementation with Git recovery into VS Code.
-Use a controller environment containing PerfChecker.jl 1.0.1 or later.
+PerfChecker for VS Code 1.0.2 provides Studio, interactive plots, Julia tools, MCP
+conversation, and reviewed agent implementation with Git recovery. Chat adapts to
+narrow VS Code webviews, and explicit controller setup installs PerfChecker.jl
+1.1.0. Guided setup and Pluto notebooks require Core 1.1.0; existing CLI
+controllers with Core 1.0.1 remain compatible. Core 1.1.0 is recommended for its
+read-only worker-environment fixes. Opening a workspace never installs or
+upgrades Julia packages.
 
 The user guides are maintained with PerfChecker.jl on its existing documentation host:
 
@@ -20,7 +24,9 @@ modify and asks before downloading packages. An existing package `Project.toml`
 alone does not make a measurement controller ready.
 
 Use **Create controller environment**, **Use an existing controller**, or **Read the setup guide**
-as appropriate. A controller needs registered PerfChecker.jl 1.0.1 or later.
+as appropriate. Guided setup requires registered PerfChecker.jl 1.1.0 or later.
+It asks before upgrading an existing controller; other CLI actions remain
+compatible with a controller containing PerfChecker.jl 1.0.1.
 The starter installs measurement dependencies; add your package and its test
 dependencies explicitly to the selected controller before measuring test items.
 Add `HTTP` there for an MCP HTTP provider, a local MCP stdio server or the optional Codex connector. Optional
@@ -36,7 +42,8 @@ REPL/debugger while using a newer Julia for PerfChecker if needed.
 For notebooks, select **New Pluto notebook** and choose **Feature suite** or
 **Investigation**. The extension uses real reactive Pluto `.jl` notebooks in an
 editor tab. Stable Pluto 1.0.4 and PerfCheckerPluto 1.0.1 use a separate `perf/pluto`
-Julia environment. Installing or upgrading it requires an explicit choice and
+Julia environment. The companion stays on its independent public `v1.0.1` tag;
+the Core requirement is 1.1.0. Installing or upgrading it requires an explicit choice and
 does not modify the MCP controller.
 Opening the notebook or changing selectors does not launch measurements.
 Use its Launch/Cancel/Refresh controls, and **Save completed reports** in a suite
@@ -144,6 +151,8 @@ Sorting breaks equivalent numeric ties by target label, with a release before
   `perfchecker.juliaExecutable`.
 - A controller environment in the opened package workspace, normally `perf`,
   containing PerfChecker.jl 1.0.1 or later and a `suite.jl` with `build_suite()`.
+  Guided setup and Pluto notebooks require 1.1.0; use that version for the
+  read-only worker-environment fixes.
 
 The extension invokes the public PerfChecker CLI and reads only versioned JSON,
 JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundary.
@@ -154,8 +163,8 @@ JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundar
 Set-Location C:\path\to\PerfCheckerVSCode
 npm ci
 npm test
-npm run package -- --out perfchecker-vscode-1.0.1.vsix
-code --install-extension .\perfchecker-vscode-1.0.1.vsix --force
+npm run package -- --out perfchecker-vscode-1.0.2.vsix
+code --install-extension .\perfchecker-vscode-1.0.2.vsix --force
 ```
 
 Reload VS Code, open a Julia package workspace, then select the PerfChecker icon
@@ -209,7 +218,8 @@ the quality contract and `perf/live_provider.jl` before launch. The provider mus
 write `perfchecker-provider-result/1` JSON to `PERFCHECKER_OUTPUT`, using the
 explicit `--quality=<slug>` argument. It runs in the game project; PerfChecker runs
 in the folder's configured controller project. The controller must already contain
-PerfChecker.jl 1.0.1 or later. No package installation or suite factory runs automatically.
+PerfChecker.jl 1.0.1 or later. Core 1.1.0 is recommended for its read-only
+worker-environment fixes. No package installation or suite factory runs automatically.
 
 The provider's `suite` is `etendu-beautiful-landscape-live`. Its `environment`
 contains `quality_profile`, effective `width` and `height`, `resolution_source`,
@@ -270,7 +280,7 @@ separate extension development profile before choosing a deployment.
 
 ### Extension host integration test (opt-in)
 
-Prepare a controller containing PerfChecker.jl 1.0.1 or later, SharedScenarioDemo,
+Prepare a controller containing PerfChecker.jl 1.1.0 or later, SharedScenarioDemo,
 BenchmarkTools, Chairmarks and JET. Then create a **new** scratch workspace:
 
 ```text
@@ -306,7 +316,7 @@ workspace named `/tmp/perfchecker-chat-host-*`, with an initial HEAD,
 `PRIVATE_NOT_ATTACHED` and stage a version of `source.jl` before changing its
 on-disk content. In `.vscode/settings.json`, set absolute `juliaExecutable`,
 `runnerProject` and `scenarioProject` paths. The prepared controller must contain
-PerfChecker.jl 1.0.1 or later and HTTP; no package installation occurs in
+PerfChecker.jl 1.1.0 or later and HTTP; no package installation occurs in
 these tests. Use new profile/extensions directories and keep their paths for the
 second process. Workspace-trust disabling below belongs only to these fixtures.
 
@@ -353,7 +363,7 @@ against an existing project or your normal editor profile.
 ```powershell
 npm ci
 npm test
-npm run package -- --out perfchecker-vscode-1.0.1.vsix
+npm run package -- --out perfchecker-vscode-1.0.2.vsix
 ```
 
 `npm test` compiles TypeScript and runs the model/contract tests. The generated
@@ -361,7 +371,7 @@ npm run package -- --out perfchecker-vscode-1.0.1.vsix
 
 ## Marketplace publication
 
-Publish the stable extension only after PerfChecker.jl 1.0.1 is available in
+Publish the stable extension only after PerfChecker.jl 1.1.0 is available in
 Julia's General registry. Build and test the exact VSIX before publishing it.
 
 The immutable Marketplace identity is
@@ -372,7 +382,7 @@ For a manual stable release:
 
 ```powershell
 npx vsce login mirage-interactive-fr
-npx vsce publish --packagePath .\perfchecker-vscode-1.0.1.vsix
+npx vsce publish --packagePath .\perfchecker-vscode-1.0.2.vsix
 ```
 
 Publishing requires a free Microsoft identity and Marketplace publisher, not a
@@ -397,9 +407,9 @@ Implementation requires a separate explicit tool configuration in the chat's
 **Implementation** tab. The supplied checkout is not an operating-system sandbox:
 use a trusted agent that respects the path and can access the local filesystem.
 Preparation creates a checkpoint; application requires a separate reviewed action.
-The extension uses the controller's public `chat` and `implement` commands, which
-are supplied by PerfChecker.jl 1.0.1 or later; an older controller fails
-visibly instead of providing an implementation fallback. The extension does not
+The controller's public `chat` and `implement` commands remain compatible with
+PerfChecker.jl 1.0.1 or later. Core 1.1.0 is recommended for its read-only
+worker-environment fixes; upgrading requires an explicit choice. The extension does not
 install an agent backend. An MCP server may supply ordinary tools without an LLM
 or an implementation tool. Choose tools whose documented inputs and capabilities
 match the requested operation. Codex CLI is an optional connector, not a prerequisite

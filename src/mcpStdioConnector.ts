@@ -123,7 +123,7 @@ export class McpStdioConnector {
       }
       if (this.options.version === '2025-11-25') {
         const result = await this.rpc('initialize', {protocolVersion: this.options.version, capabilities: {},
-          clientInfo: {name: 'PerfChecker', version: '1.0.1'}});
+          clientInfo: {name: 'PerfChecker', version: '1.0.2'}});
         if (result.protocolVersion !== this.options.version || !object(result.capabilities?.tools))
           throw new Error('The selected MCP revision or tools capability is unavailable.');
         this.serverName = this.name(result.serverInfo);
@@ -175,7 +175,7 @@ export class McpStdioConnector {
     const id = ++this.sequence;
     if (this.options.version === '2026-07-28') params = {...params, _meta: {
       'io.modelcontextprotocol/protocolVersion': this.options.version,
-      'io.modelcontextprotocol/clientInfo': {name: 'PerfChecker', version: '1.0.1'},
+      'io.modelcontextprotocol/clientInfo': {name: 'PerfChecker', version: '1.0.2'},
       'io.modelcontextprotocol/clientCapabilities': {}}};
     let timer: ReturnType<typeof setTimeout>;
     const stop = () => {
@@ -241,9 +241,9 @@ export class McpStdioConnector {
       if (body.method === 'notifications/initialized') {response.writeHead(202); response.end(); return;}
       if (body.method === 'initialize') {
         if (this.options.version !== '2025-11-25' || body.params?.protocolVersion !== this.options.version) throw new Error('MCP revision mismatch.');
-        send({protocolVersion: this.options.version, capabilities: {tools: {}}, serverInfo: {name: this.serverName, version: '1.0.1'}});
+        send({protocolVersion: this.options.version, capabilities: {tools: {}}, serverInfo: {name: this.serverName, version: '1.0.2'}});
       } else if (body.method === 'server/discover' && this.options.version === '2026-07-28') send({resultType: 'complete', ttlMs: 0, cacheScope: 'private', supportedVersions: [this.options.version], capabilities: {tools: {}},
-        _meta: {'io.modelcontextprotocol/serverInfo': {name: this.serverName, version: '1.0.1'}}});
+        _meta: {'io.modelcontextprotocol/serverInfo': {name: this.serverName, version: '1.0.2'}}});
       else if (body.method === 'tools/list') {this.tools = await this.discover(abort.signal); send({tools: this.tools,
         ...(this.options.version === '2026-07-28' ? {resultType: 'complete', ttlMs: 0, cacheScope: 'private'} : {})});}
       else if (body.method === 'tools/call') {

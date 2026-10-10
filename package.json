@@ -2,7 +2,7 @@
   "name": "perfchecker-vscode",
   "displayName": "PerfChecker",
   "description": "Measure Julia performance, explore interactive results and improve code with a connected agent.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "publisher": "mirage-interactive-fr",
   "author": "Mirage Interactive",
   "repository": {
