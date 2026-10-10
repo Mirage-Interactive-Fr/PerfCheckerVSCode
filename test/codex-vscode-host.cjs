@@ -142,6 +142,29 @@ exports.run=async()=>{
   },'All observed request-owned processes must stop before fixture cleanup',20000);
   const proofs=process.env.PERFCHECKER_HOST_PROOFS;
   const capture=async(name,timeout=30000)=>{if(proofs){await fs.mkdir(proofs,{recursive:true});await view.page().screenshot({path:path.join(proofs,`${name}.png`),timeout});}};
+  const captureAdvice=async turn=>{
+    if(!proofs)return;
+    await view.locator('.hero').scrollIntoViewIfNeeded();await capture(`advice-${turn}-context`);
+    const transcript=view.locator('.transcript'),reply=view.locator('.message.assistant').last();
+    await transcript.scrollIntoViewIfNeeded();await transcript.hover();
+    const geometry=()=>reply.evaluate(node=>{
+      const area=node.closest('.transcript'),a=area.getBoundingClientRect(),r=node.getBoundingClientRect();
+      return {height:r.height,offset:r.top-a.top,scrollTop:area.scrollTop,clientHeight:area.clientHeight,
+        start:Math.max(0,a.top-r.top),end:Math.min(r.height,a.bottom-r.top),fontSize:getComputedStyle(node).fontSize};
+    });
+    const initial=await geometry();if(initial.start>2)await view.page().mouse.wheel(0,initial.offset-2);
+    await eventually(async()=>{const g=await geometry();return g.start<5&&g.end>0;},'The real transcript scroll exposes the beginning of the reply',5000);
+    const parts=[];
+    for(let part=1;part<=8;part++){
+      const g=await geometry();await capture(part===1?`advice-${turn}`:`advice-${turn}-part-${part}`);parts.push(g);
+      if(g.end>=g.height-2)break;
+      await transcript.hover();await view.page().mouse.wheel(0,g.clientHeight*.85);
+      await eventually(async()=>(await geometry()).scrollTop>g.scrollTop,'The native transcript advances for the next readable reply section',5000);
+    }
+    const complete=parts[0].start<5&&parts.at(-1).end>=parts.at(-1).height-2;
+    result.adviceCaptures??=[];result.adviceCaptures.push({turn,parts,complete,source:'actual native transcript wheel scrolling; no CSS or message changes'});
+    assert(complete,'The complete real advice reply is visible across the retained native scroll captures');
+  };
   // Retain the actual user-visible outcome before teardown, without provider
   // configuration, tool arguments, token-bearing environment or full source.
   const chatOutcome=value=>({busy:Boolean(value.busy),status:String(value.status??'').slice(0,4000),
@@ -174,6 +197,17 @@ exports.run=async()=>{
     if(bibliography)await preserveWorker('baseline-worker',root);
     const {chromium}=await import(process.env.PERFCHECKER_TEST_PLAYWRIGHT?pathToFileURL(process.env.PERFCHECKER_TEST_PLAYWRIGHT).href:'playwright');
     browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.PERFCHECKER_HOST_CDP_PORT}`);
+    if(bibliography){
+      const windowPage=browser.contexts().flatMap(context=>context.pages()).find(page=>page.url().includes('workbench'));
+      assert(windowPage,'Find only the private host workbench');
+      const commands=await vscode.commands.getCommands(true);
+      for(const command of ['workbench.action.closeAuxiliaryBar','workbench.action.closeSidebar']){
+        assert(commands.includes(command));await vscode.commands.executeCommand(command);
+      }
+      await eventually(async()=>!await windowPage.locator('[id="workbench.parts.auxiliarybar"]').isVisible()&&
+        !await windowPage.locator('[id="workbench.parts.sidebar"]').isVisible(),'Native close actions hide the private side bars',5000);
+      result.captureLayout={sideBarsClosed:true,nativeCommands:['workbench.action.closeAuxiliaryBar','workbench.action.closeSidebar']};
+    }
     observer=setInterval(()=>{void observe().catch(error=>{result.observationError=String(error);});},200);
     const measureBibliography=async label=>{
       const reports=path.join(root,'perf','results','investigations'),receipts=[];
@@ -231,6 +265,8 @@ exports.run=async()=>{
     const baselineMeasurements=bibliography?await measureBibliography('baseline'):undefined;
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
     if(bibliography){
+      result.captureLayout.editorWidth=await view.evaluate(()=>innerWidth);
+      assert(result.captureLayout.editorWidth>=1000,'Capture a wide real PerfChecker editor, rather than a narrow side column');
       const evidenceId=baselineMeasurements.at(-1).id;
       await eventually(async()=>(await state()).evidence.some(item=>item.id===evidenceId),'Actual saved Bibliography allocation evidence appears in Chat');
       await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(evidenceId);
@@ -242,6 +278,7 @@ exports.run=async()=>{
     await eventually(async()=>Boolean((await state()).connection),'The actual Connect button authenticates the existing CLI',60000);
     const connected=await state();assert.match(connected.connection,/^codex-cli\s+\S+/);assert.equal(connected.implementation.tool,'implement_perfchecker');
     result.agent=connected.connection;
+    if(bibliography)await view.locator('summary').filter({hasText:'Optional Codex CLI connector'}).click();
     server=await eventually(()=>{const added=loopbackServers().filter(handle=>!beforeServers.has(handle));assert(added.length<=1);return added[0];},'Observe the newly owned loopback listener',10000);
     endpoint=`http://127.0.0.1:${server.address().port}/mcp`;
     const unauthorized=await fetch(endpoint,{method:'POST',headers:{Connection:'close'},body:'{}',signal:AbortSignal.timeout(5000)});
@@ -263,23 +300,47 @@ exports.run=async()=>{
       const answer=reply.messages.at(-1).content;assert(answer.length>10);adviceCharacters.push(answer.length);
       await eventually(async()=>await view.locator('.message.assistant').count()===turn+1,'The actual reply is visible');
       assert((await view.locator('.message.assistant').last().innerText()).includes(answer));await preserved();
-      if(bibliography){await view.locator('.message.assistant').last().scrollIntoViewIfNeeded();await capture(`advice-${turn+1}`);}
+      if(bibliography)await captureAdvice(turn+1);
     }
     if(bibliography)result.conversation=(await state()).messages;
     checks.push('two authenticated contextual advice replies through Julia MCP are visible and preserve exact source/index/HEAD/config');
     await view.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
     assert.match(await view.locator('.warning').innerText(),/Git checkpoint.*isolated copy.*diff review/);
     const beforePrepare=chatOutcome(await state()),prepareStarted=Date.now();let prepareAccepted=false,lastPrepare;
-    result.prepare={deadlineMs:210000,transitions:[]};
+    const agentBudgetMs=Number(settings().get('advisorTimeout'))*1000;
+    const cleanupGraceMs=require(path.join(installed,'dist','controllerCancellation.js')).CANCELLATION_GRACE_MS;
+    assert.equal(agentBudgetMs,180000);assert.equal(cleanupGraceMs,60000);
+    const uiBudgetMs=agentBudgetMs+60000,setupDeadline=prepareStarted+210000;
+    result.prepare={preControllerBudgetMs:210000,agentBudgetMs,uiBudgetMs,cleanupGraceMs,transitions:[],
+      timerAnchor:'First passive observation of each real PID/incarnation; conservative upper bound, not the internal spawn timestamp'};
     await click('I reviewed the advice · Prepare implementation');
-    const proposed=await eventually(async()=>{
-      const value=await state(),outcome=chatOutcome(value),serialized=JSON.stringify(outcome);
-      if(serialized!==lastPrepare){result.prepare.transitions.push({elapsedMs:Date.now()-prepareStarted,...outcome});lastPrepare=serialized;}
+    let proposed;
+    while(Date.now()<suiteDeadline){
+      const processes=await observe(),value=await state(),outcome=chatOutcome(value),serialized=JSON.stringify(outcome),now=Date.now();
+      for(const [role,pid,budgetMs]of [['controller',processes.cli,uiBudgetMs],['agent',processes.agent,agentBudgetMs]]){
+        const identity=processes.identities.find(item=>item.pid===pid);
+        if(identity&&!result.prepare[role]){
+          const firstObserved=processStates.get(`${identity.pid}:${identity.start}`)?.firstSeen??now;
+          result.prepare[role]={...identity,firstObservedAt:new Date(firstObserved).toISOString(),
+            observedAfterPrepareMs:firstObserved-prepareStarted,deadlineAt:new Date(firstObserved+budgetMs).toISOString()};
+        }
+      }
+      if(serialized!==lastPrepare){result.prepare.transitions.push({elapsedMs:now-prepareStarted,...outcome});lastPrepare=serialized;}
       prepareAccepted||=outcome.busy||outcome.backupRef!==beforePrepare.backupRef||outcome.status!==beforePrepare.status;
-      if(!prepareAccepted||value.busy)return;
-      assert(value.proposal?.patch,`Actual Prepare completed without a reviewed patch: ${outcome.status}; ${outcome.implementationSummary}`);
-      return value;
-    },'Actual Prepare has not completed with a reviewed proposal within 210 seconds');
+      if(prepareAccepted&&!value.busy){
+        assert(value.proposal?.patch,`Actual Prepare completed without a reviewed patch: ${outcome.status}; ${outcome.implementationSummary}`);
+        result.prepare.naturalCompletionMs=now-prepareStarted;proposed=value;break;
+      }
+      const controller=result.prepare.controller;
+      if(!controller&&now>=setupDeadline)throw new Error('Actual Prepare did not reach its Julia controller within the unchanged 210 second pre-controller budget');
+      if(controller){
+        const deadline=Date.parse(controller.deadlineAt);
+        if(now>=deadline)result.prepare.uiDeadlineObserved=true;
+        if(now>=deadline+cleanupGraceMs)throw new Error('Actual Prepare remained busy beyond its real 240 second UI budget and existing 60 second product cleanup grace');
+      }
+      await delay(100);
+    }
+    assert(proposed,'The unchanged 21 minute host budget expired before a natural Prepare outcome');
     assert.deepEqual(proposed.proposal.files,[relative]);assert.equal(proposed.proposal.applied,false);assert.match(proposed.backupRef,/^refs\/perfchecker\/checkpoints\//);await preserved();
     // Read the installed backend's retained proposal; do not generate or apply a replacement patch.
     const {recoverActiveImplementationProposal}=require(path.join(installed,'dist','implementation.js'));

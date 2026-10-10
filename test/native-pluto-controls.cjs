@@ -754,8 +754,20 @@ async function renderedPlots(context,state,selector,completedRoot){
     info = Dict("selected"=>selected_plot,"selectedLabel"=>entry["title"] * " · " * entry["label"],"kind"=>string(p.kind),"values"=>[row["value"] for row in p.data],"versions"=>[row["version"] for row in p.data],"unit"=>p.options["unit"],"figure"=>string(typeof(f)),"extension"=>true,"providers"=>Dict(n=>Dict("version"=>string(Base.pkgversion(modules[n])),"source"=>pathof(modules[n])) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito")))
     HTML("<pre id=\\"native-plot-evidence\\" hidden>" * replace(sprint(PerfChecker.JSON.print,info),"&"=>"&amp;","<"=>"&lt;",">"=>"&gt;") * "</pre>")
 end`;
-  await editor.click();await editor.press('ControlOrMeta+A');await editor.pressSequentially(diagnostic);await editor.press('ControlOrMeta+Enter');
+  // Use the real private runner clipboard and native CodeMirror paste. Typing
+  // character by character can time out or leave an autocomplete menu open.
+  assert.equal(process.env.CI,'true');
+  const clipboard=await context.vscode.env.clipboard.readText();
+  try{
+    await context.vscode.env.clipboard.writeText(diagnostic);
+    await editor.click();await editor.press('ControlOrMeta+A');await editor.press('ControlOrMeta+V');
+    await eventually(async()=>await editor.evaluate(node=>[...node.querySelectorAll('.cm-line')].map(line=>line.textContent).join('\n'))===diagnostic,
+      'Native clipboard paste inserts the complete diagnostic into the real editor',30000);
+  }finally{await context.vscode.env.clipboard.writeText(clipboard);}
+  await editor.press('ControlOrMeta+Enter');
   await ready(state.frame,'Launch selected checks');
+  await eventually(async()=>(await fs.readFile(path.join(context.workspace,'perf','notebooks','NativeSuite.jl'),'utf8')).includes(diagnostic),
+    'The submitted diagnostic is present in the actual Pluto-saved notebook',30000);
   const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent();return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',360000);
   const data=await evidence();assert.equal(data.kind,'distribution');assert(data.selected.startsWith('distribution-'));assert.equal(data.selectedLabel,distribution.label);assert(data.values.length>=2);
   const providerProvenance=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'pluto-plot-provider-provenance.json'),'utf8'));
@@ -1183,7 +1195,18 @@ exports.runPlots = async context => {
     await capture(context,'pluto-rendered-plots-failed').catch(diagnostic=>context.log('pluto-plot-capture-error',{message:String(diagnostic)}));}
   finally{
     const stopDeadline=Date.now()+45000;
-    let diagnosticTimer;
+    let diagnosticTimer,savedNotebook;
+    try{
+      // Preserve the actual Pluto-saved file before Stop, including the real
+      // cell UUIDs, so a running cell is never guessed from a generated template.
+      const bytes=await fs.readFile(path.join(directory,'NativeSuite.jl'));
+      const artifact='pluto-plots-notebook-before-stop.jl';
+      await fs.writeFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,artifact),bytes);
+      savedNotebook={artifact,sha256:createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length,
+        cells:[...bytes.toString('utf8').matchAll(/^# ╔═╡ ([a-f0-9-]{36})\r?\n([\s\S]*?)(?=^# ╔═╡ |$(?![\s\S]))/gm)].map(cell=>({id:cell[1],
+          sha256:createHash('sha256').update(cell[2]).digest('hex')}))};
+      context.log('pluto-plot-notebook-before-stop',savedNotebook);
+    }catch(error){context.log('pluto-plot-notebook-before-stop-unknown',{errorClass:error.name});failures.push(error);}
     try{
       const notebooks=await Promise.race([
         Promise.all(context.windowPage.frames().map(frame=>frame.evaluate(()=>{
@@ -1198,7 +1221,11 @@ exports.runPlots = async context => {
         }))),
         new Promise((_,reject)=>{diagnosticTimer=setTimeout(()=>reject(new Error('Read-only pre-Stop DOM observation exceeded 2.5 seconds')),2500);})
       ]);
-      context.log('pluto-plot-before-stop-dom',{notebooks:notebooks.filter(Boolean),deadlineAt:new Date(stopDeadline).toISOString()});
+      const observed=notebooks.filter(Boolean);
+      context.log('pluto-plot-before-stop-dom',{notebooks:observed,deadlineAt:new Date(stopDeadline).toISOString(),
+        activeCellSources:observed.flatMap(notebook=>notebook.activeCells.map(cell=>({id:cell.id,
+          artifact:savedNotebook?.artifact,sha256:savedNotebook?.cells.find(saved=>saved.id===cell.id)?.sha256,
+          matchedSavedCell:Boolean(savedNotebook?.cells.some(saved=>saved.id===cell.id))})))});
     }catch(error){context.log('pluto-plot-before-stop-dom-unknown',{errorClass:error.name});}
     finally{clearTimeout(diagnosticTimer);}
     if(owner)try{
