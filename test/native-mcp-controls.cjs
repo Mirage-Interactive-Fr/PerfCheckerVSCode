@@ -225,8 +225,18 @@ async function ownedLoopbackConnection(identity){
         assert.equal(local[0],'0100007F');assert.equal(remote[0],'0100007F');
         return{localAddress:'127.0.0.1',localPort:parseInt(local[1],16),remoteAddress:'127.0.0.1',remotePort:parseInt(remote[1],16),inode:fields[9]};
       });
-  }else if(process.platform==='win32')rows=JSON.parse((await execute('powershell.exe',['-NoProfile','-Command',
-    `$ErrorActionPreference='Stop';ConvertTo-Json -InputObject @(Get-NetTCPConnection -State Established -OwningProcess ${identity.pid} -ErrorAction Stop | ForEach-Object {@{localAddress=$_.LocalAddress;localPort=$_.LocalPort;remoteAddress=$_.RemoteAddress;remotePort=$_.RemotePort}}) -Compress`],{timeout:5000})).stdout);
+  }else if(process.platform==='win32'){
+    const started=Date.now();
+    try{rows=JSON.parse((await execute('powershell.exe',['-NoProfile','-Command',
+      `$ErrorActionPreference='Stop';ConvertTo-Json -InputObject @(Get-NetTCPConnection -State Established -OwningProcess ${identity.pid} -ErrorAction Stop | ForEach-Object {@{localAddress=$_.LocalAddress;localPort=$_.LocalPort;remoteAddress=$_.RemoteAddress;remotePort=$_.RemotePort}}) -Compress`],{timeout:5000})).stdout);}
+    catch(error){
+      error.nativeQuery={phase:'owned-stdio-worker-loopback',identity,timeoutMilliseconds:5000,
+        elapsedMilliseconds:Date.now()-started,code:error.code??null,signal:error.signal??null,killed:error.killed??null,
+        stdout:String(error.stdout||'').slice(0,4096),stderr:String(error.stderr||'').slice(0,4096),
+        observedAt:new Date().toISOString()};
+      throw error;
+    }
+  }
   else rows=(await execute('lsof',['-nP','-a','-p',String(identity.pid),'-iTCP','-sTCP:ESTABLISHED','-F','n'],{timeout:5000})).stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>{
     const match=line.match(/^n127\.0\.0\.1:(\d+)->127\.0\.0\.1:(\d+)$/);assert(match);return{localAddress:'127.0.0.1',localPort:Number(match[1]),remoteAddress:'127.0.0.1',remotePort:Number(match[2])};
   });
@@ -721,7 +731,7 @@ exports.run = async (context,options={}) => {
         result = {content: [{type: 'text', text: answer}]};
       }
       res.end(JSON.stringify({jsonrpc: '2.0', id: body.id, result}));
-    } catch (error) {providerErrors.push(String(error));log('native-controlled-provider-error',{error:String(error)});res.writeHead(500); res.end(JSON.stringify({error: String(error)}));}
+    } catch (error) {providerErrors.push(String(error));log('native-controlled-provider-error',{error:String(error),...(error.nativeQuery?{queryFailure:error.nativeQuery}:{})});res.writeHead(500); res.end(JSON.stringify({error: String(error)}));}
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const values = {advisorEnabled: true, advisorProtocol: 'mcp_http',
