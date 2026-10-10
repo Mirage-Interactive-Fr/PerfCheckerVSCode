@@ -1,5 +1,5 @@
 // Local authenticated replay through the installed VSIX and real Chat controls.
-const vscode=require('vscode'),assert=require('node:assert/strict'),fs=require('node:fs/promises');
+const assert=require('node:assert/strict'),fs=require('node:fs/promises');
 const path=require('node:path'),{execFile}=require('node:child_process'),{promisify}=require('node:util');
 const {createHash}=require('node:crypto'),{pathToFileURL}=require('node:url');
 const execute=promisify(execFile),delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -10,6 +10,50 @@ async function eventually(read,label,timeout=210000){
   while(Date.now()<until){const value=await read();if(value)return value;await delay(100);}
   throw new Error(label);
 }
+// Shared with the real advisor-chat browser regression. Wheel events do not
+// require keyboard focus; qualify their actual target and complete coverage.
+async function captureConversationReply(view,record,capture){
+  const transcript=view.locator('.transcript'),reply=view.locator('.message.assistant').last();
+  await transcript.scrollIntoViewIfNeeded();
+  const geometry=()=>reply.evaluate(node=>{
+    const area=node.closest('.transcript'),a=area.getBoundingClientRect(),r=node.getBoundingClientRect();
+    const visibleTop=Math.max(0,a.top),visibleBottom=Math.min(innerHeight,a.bottom);
+    return {height:r.height,replyTop:r.top,offset:r.top-a.top,scrollTop:area.scrollTop,clientHeight:area.clientHeight,viewportHeight:innerHeight,
+      visibleTop,visibleBottom,visibleHeight:visibleBottom-visibleTop,start:Math.max(0,visibleTop-r.top),end:Math.min(r.height,visibleBottom-r.top),
+      fontSize:getComputedStyle(node).fontSize,devicePixelRatio};
+  });
+  const wheel=async(delta,label)=>{
+    await transcript.hover();const before=await geometry();
+    const action={delta,before};record.wheels.push(action);
+    await view.page().mouse.wheel(0,delta);
+    await eventually(async()=>{
+      action.after=await geometry();
+      return Math.sign(delta)*(action.after.scrollTop-before.scrollTop)>0;
+    },label,5000);
+  };
+  const beginning=g=>g.start<5&&g.end>0&&(g.replyTop<=g.visibleTop+5||g.end>=g.height-2);
+  record.initial=await geometry();
+  // A long user message can leave the reply below the viewport; a prior
+  // capture can leave its beginning above it. Use the native wheel both ways.
+  if(!beginning(record.initial)){
+    const delta=record.initial.replyTop-record.initial.visibleTop-2;
+    assert(Math.abs(delta)>2,'An obscured reply needs a nonzero native scroll');
+    await wheel(delta,'The native wheel moves the actual conversation toward the reply beginning');
+  }
+  await eventually(async()=>beginning(await geometry()),
+    'The real transcript scroll exposes the reply beginning, or the entire short reply',5000);
+  const parts=record.parts;
+  for(let part=1;part<=8;part++){
+    const g=await geometry();assert(g.visibleHeight>0,'The actual transcript intersects the viewport');
+    if(parts.length)assert(g.start<parts.at(-1).end,'Consecutive native captures retain strictly overlapping reply text');
+    await capture(part,g);parts.push(g);
+    if(g.end>=g.height-2)break;
+    await wheel(g.visibleHeight*.85,'The native transcript advances for the next readable reply section');
+  }
+  record.complete=parts[0].start<5&&parts.at(-1).end>=parts.at(-1).height-2;
+  assert(record.complete,'The complete real advice reply is visible across the retained native scroll captures');
+}
+exports.captureConversationReply=captureConversationReply;
 async function packagedFiles(root){
   const files={};
   const visit=async relative=>{
@@ -81,6 +125,7 @@ async function requestProcesses(root){
 }
 
 exports.run=async()=>{
+  const vscode=require('vscode');
   assert(!process.env.CI,'Never run authenticated model tests in CI');assert.equal(process.platform,'linux');
   const session=await fs.realpath(process.env.PERFCHECKER_HOST_SESSION),folder=vscode.workspace.workspaceFolders[0],root=await fs.realpath(folder.uri.fsPath);
   assert(path.basename(session).startsWith('perfchecker-codex-host-'));assert.equal(path.dirname(root),session);
@@ -269,42 +314,15 @@ exports.run=async()=>{
   const captureAdvice=async turn=>{
     if(!proofs)return;
     await view.locator('.hero').scrollIntoViewIfNeeded();await capture(`advice-${turn}-context`);
-    const transcript=view.locator('.transcript'),reply=view.locator('.message.assistant').last();
-    await transcript.scrollIntoViewIfNeeded();await transcript.click({position:{x:2,y:2}});
-    assert(await transcript.evaluate(node=>node===document.activeElement||node.contains(document.activeElement)),
-      'A real native click focuses the scrollable conversation before keyboard/wheel navigation');
-    const geometry=()=>reply.evaluate(node=>{
-      const area=node.closest('.transcript'),a=area.getBoundingClientRect(),r=node.getBoundingClientRect();
-      const visibleTop=Math.max(0,a.top),visibleBottom=Math.min(innerHeight,a.bottom);
-      return {height:r.height,replyTop:r.top,offset:r.top-a.top,scrollTop:area.scrollTop,clientHeight:area.clientHeight,viewportHeight:innerHeight,
-        visibleTop,visibleBottom,visibleHeight:visibleBottom-visibleTop,start:Math.max(0,visibleTop-r.top),end:Math.min(r.height,visibleBottom-r.top),
-        fontSize:getComputedStyle(node).fontSize,devicePixelRatio};
-    });
-    const initial=await geometry(),record={turn,initial,parts:[],complete:false,source:'actual native transcript wheel scrolling; no CSS or message changes'};
+    const record={turn,parts:[],wheels:[],complete:false,source:'actual native transcript wheel scrolling; no CSS or message changes'};
     result.adviceCaptures??=[];result.adviceCaptures.push(record);
-    // A long user message can leave the assistant BELOW the viewport. Scroll
-    // toward its beginning in either direction, using the real wheel only.
-    const delta=initial.replyTop-initial.visibleTop-2;
-    if(Math.abs(delta)>2)await view.page().mouse.wheel(0,delta);
-    await eventually(async()=>{const g=await geometry();return g.start<5&&g.end>0&&(g.replyTop<=g.visibleTop+5||g.end>=g.height-2);},
-      'The real transcript scroll exposes the reply beginning at the visible top, or the entire short reply',5000);
-    const parts=record.parts;
-    for(let part=1;part<=8;part++){
-      const g=await geometry();assert(g.visibleHeight>0,'The actual transcript intersects the viewport');
-      if(parts.length)assert(g.start<=parts.at(-1).end+2,'Consecutive native captures retain overlapping reply text');
+    await captureConversationReply(view,record,async(part,g)=>{
       const framebuffer=await capture(part===1?`advice-${turn}`:`advice-${turn}-part-${part}`);
       assert.equal(g.devicePixelRatio,framebuffer.viewport.devicePixelRatio,'Workbench and conversation share the native zoom');
       g.pixelFontSize=parseFloat(g.fontSize)*framebuffer.pixelsPerCssY;
       g.framebuffer=framebuffer.file;
       assert(g.pixelFontSize>=22&&g.pixelFontSize<=24,'The IHDR-qualified framebuffer mapping renders reply text at 22–24 native pixels');
-      parts.push(g);
-      if(g.end>=g.height-2)break;
-      await transcript.hover();await view.page().mouse.wheel(0,g.visibleHeight*.85);
-      await eventually(async()=>(await geometry()).scrollTop>g.scrollTop,'The native transcript advances for the next readable reply section',5000);
-    }
-    const complete=parts[0].start<5&&parts.at(-1).end>=parts.at(-1).height-2;
-    record.complete=complete;
-    assert(complete,'The complete real advice reply is visible across the retained native scroll captures');
+    });
   };
   const presentation=async(stage,read)=>{
     try{await read();}catch(error){
