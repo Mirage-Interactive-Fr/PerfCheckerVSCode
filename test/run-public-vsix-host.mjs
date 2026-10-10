@@ -11,7 +11,7 @@ import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 import {nativeCoreContract,CORE110_CANDIDATE} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -172,7 +172,10 @@ async function executeControllerPreflight(executable,args,receipt){
       const same=after=>{assert.equal(after.started,before.started);assert.equal(after.group,before.group);};
       let executable;
       try{executable=await fs.realpath(`/proc/${row.pid}/exe`);}
-      catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;const current=await linuxCurrent(row.pid);
+      catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;
+        if(qualified)return revalidateQualifiedLinuxExecutable({identity:qualified,error,deadlineAt:cleanupUntil,readCurrent:linuxCurrent,
+          readExecutable:pid=>fs.realpath(`/proc/${pid}/exe`),record:observation=>(receipt.ownership.revalidations??=[]).push(observation)});
+        const current=await linuxCurrent(row.pid);
         if(!current)return undefined;same(current);if(['Z','X'].includes(current.state))return undefined;throw error;}
       const after=await linuxCurrent(row.pid);if(!after)return undefined;same(after);if(['Z','X'].includes(after.state))return undefined;
       if(after.parent!==before.parent||after.state!==before.state)(receipt.ownership.revalidations??=[]).push({stage:'mutable-process-fields',pid:row.pid,

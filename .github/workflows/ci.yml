@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: Mirage-Interactive-Fr/PerfChecker.jl
-          ref: 9942c4e1fb9dc02a66a03f629b40efdf9c6bdc33
+          ref: 00e94c62a2080dba02782e451422ed98ea0b358a
           path: validation-core
           persist-credentials: false
       - uses: actions/setup-node@v7
@@ -53,7 +53,7 @@ jobs:
       - run: npm run compile
       - name: Verify the pinned Core candidate tree
         shell: bash
-        run: test "$(git -C validation-core rev-parse HEAD^{tree})" = "9abef061386c97c97bf136b9e4747673fe690b01"
+        run: test "$(git -C validation-core rev-parse HEAD^{tree})" = "2563a09e7904f19592e8f658289566e76bf93c6c"
       - name: Prepare exact Core candidate controller source
         shell: bash
         run: julia --startup-file=no -e 'using Pkg; Pkg.activate(ENV["PERFCHECKER_TEST_CONTROLLER"]); Pkg.develop(path=ENV["PERFCHECKER_TEST_CORE"]); Pkg.instantiate()'

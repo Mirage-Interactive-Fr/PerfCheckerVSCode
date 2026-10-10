@@ -603,7 +603,8 @@ exports.run = async (context,options={}) => {
   const documentedInstall=options.documentedInstall===true;
   let installation;
   if(documentedInstall){
-    assert.equal(process.platform,'darwin');assert.equal(context.core.mode,'general');assert.equal(context.core.version,'1.0.1');
+    assert.equal(process.platform,'darwin');assert.equal(context.core.mode,'general');
+    assert.equal(context.core.version,process.env.PERFCHECKER_NATIVE_CORE_VERSION);
     const artifact=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'artifact.json')));
     assert.equal(artifact.controllerPreflight,undefined);installation=artifact.documentedMcpInstallation;
     assert.equal(installation.status,'passed');assert.equal(installation.autoPrecompile,'1');

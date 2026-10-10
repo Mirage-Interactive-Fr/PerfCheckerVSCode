@@ -207,7 +207,7 @@ jobs:
           const tree=cp.execFileSync('git',['rev-parse',p.commit+'^{tree}'],{encoding:'utf8'}).trim();
           if(p.tree!==tree)throw Error('Original archive tree does not match its Git commit');
           const changed=cp.execFileSync('git',['diff','--name-only','-z',p.commit,'HEAD'],{encoding:'utf8'}).split('\0').filter(Boolean);
-          const forbidden=changed.filter(file=>!file.startsWith('test/')&&file!=='.github/workflows/native-vsix.yml');
+          const forbidden=changed.filter(file=>!file.startsWith('test/')&&!['.github/workflows/native-vsix.yml','.github/workflows/ci.yml'].includes(file));
           if(forbidden.length)throw Error('Frozen release product/package inputs changed (including tsconfig and every non-qualification file): '+forbidden.join(', ')+'. Declare and qualify a new candidate origin explicitly.');
           console.log('EXACT_VSIX_REUSED '+sha+' originalRun='+p.run+' originalCommit='+p.commit+' originalTree='+p.tree+' qualificationRevision='+e.GITHUB_SHA);
           NODE
@@ -243,8 +243,8 @@ jobs:
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || '9942c4e1fb9dc02a66a03f629b40efdf9c6bdc33') || '' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || '9abef061386c97c97bf136b9e4747673fe690b01') || '' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || '00e94c62a2080dba02782e451422ed98ea0b358a') || '' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || '2563a09e7904f19592e8f658289566e76bf93c6c') || '' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'

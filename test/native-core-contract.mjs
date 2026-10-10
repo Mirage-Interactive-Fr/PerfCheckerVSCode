@@ -1,7 +1,7 @@
 // Qualification contracts are explicit: legacy compatibility never lowers the
 // guided-setup version exercised by the current candidate campaign.
 // Expected source identity; this constant does not assert General registration.
-export const CORE110_CANDIDATE={version:'1.1.0',commit:'9942c4e1fb9dc02a66a03f629b40efdf9c6bdc33',tree:'9abef061386c97c97bf136b9e4747673fe690b01'};
+export const CORE110_CANDIDATE={version:'1.1.0',commit:'00e94c62a2080dba02782e451422ed98ea0b358a',tree:'2563a09e7904f19592e8f658289566e76bf93c6c'};
 export const GENERAL100_TREE='7af0cc74194b953c5e998efd7523f0c5f455e395';
 export function nativeCoreContract({core='general',artifact='public',stage='smoke',group='narrative',commit='',tree=''}) {
   if(!['general','candidate','general100'].includes(core))throw new Error('Choose a registered minimum, pinned candidate, or explicit General 1.0.0 compatibility campaign.');

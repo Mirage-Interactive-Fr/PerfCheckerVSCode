@@ -482,10 +482,10 @@ exports.run=async()=>{
     assert.equal(settings().get('runnerProject'),process.env.PERFCHECKER_TEST_CONTROLLER);
     assert.equal(settings().get('juliaExecutable'),process.env.PERFCHECKER_TEST_JULIA);
     if(capturePreflightOnly)result.core={loaded:false,probed:false,configuredProject:settings().get('runnerProject')};
-    else{result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'9abef061386c97c97bf136b9e4747673fe690b01');assert.equal(result.core.version,'1.1.0');
+    else{result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'2563a09e7904f19592e8f658289566e76bf93c6c');assert.equal(result.core.version,'1.1.0');
       if(bibliography){assert.equal(result.core.registered,false);assert.equal(result.core.trackingRepo,true);
         assert.equal(result.core.gitSource,'https://github.com/Mirage-Interactive-Fr/PerfChecker.jl');
-        assert.equal(result.core.gitRevision,'9942c4e1fb9dc02a66a03f629b40efdf9c6bdc33');assert.equal(result.core.qualificationSource,'pinned-candidate');}}
+        assert.equal(result.core.gitRevision,'00e94c62a2080dba02782e451422ed98ea0b358a');assert.equal(result.core.qualificationSource,'pinned-candidate');}}
     const directories=JSON.parse(process.env.PERFCHECKER_HOST_PRIVATE_DIRECTORIES);
     assert.deepEqual(directories.map(([flag])=>flag),['user-data-dir','extensions-dir','shared-data-dir','agent-plugins-dir','agents-user-data-dir','agents-extensions-dir']);
     for(const [,directory]of directories){assert.equal(await fs.realpath(directory),directory);assert(directory.startsWith(session+path.sep));}

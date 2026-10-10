@@ -143,3 +143,49 @@ export function controllerInspectionFailure(error,{stage,pid,ownerPid}){
     killed:typeof error.killed==='boolean'?error.killed:null,
     stderr:String(error.stderr??'').slice(-4000)};
 }
+
+// Only an already qualified incarnation may resolve a transient /proc/exe
+// disappearance. These reads grant no signal authority while its image is unknown.
+export async function revalidateQualifiedLinuxExecutable({identity,error,deadlineAt,readCurrent,readExecutable,record,
+  now=Date.now,wait=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds))}){
+  assert(identity&&Number.isSafeInteger(identity.pid)&&identity.pid>0&&/^\d+$/.test(identity.started)&&
+    Number.isSafeInteger(identity.group)&&identity.group>0&&path.isAbsolute(identity.executable));
+  if(!['ENOENT','ESRCH'].includes(error.code))throw error;
+  const until=Math.min(deadlineAt,now()+1000);
+  const observation={stage:'qualified-executable-revalidation',pid:identity.pid,started:identity.started,group:identity.group,
+    expectedExecutable:identity.executable,errorCode:error.code,observedAt:new Date(now()).toISOString(),rechecks:[],resolution:'pending'};
+  record(observation);
+  const bounded=async callback=>{
+    const remaining=until-now();if(remaining<=0)throw error;let timer;
+    try{return await Promise.race([Promise.resolve().then(callback),new Promise((resolve,reject)=>{timer=setTimeout(()=>reject(error),remaining);})]);}
+    finally{clearTimeout(timer);}
+  };
+  const current=async(attempt,step)=>{
+    const value=await bounded(()=>readCurrent(identity.pid));attempt[step]=value??null;
+    if(value){assert.equal(value.pid,identity.pid);assert.equal(value.started,identity.started,'Reused PID cannot resolve an executable inspection failure');
+      assert.equal(value.group,identity.group,'A changed process group cannot resolve an executable inspection failure');}
+    return value;
+  };
+  const gone=value=>!value||['Z','X'].includes(value.state);
+  const resolvedGone=value=>{observation.resolution=value?'same-incarnation-dead':'proved-absent';return undefined;};
+  try{
+    while(true){
+      const attempt={observedAt:new Date(now()).toISOString()};observation.rechecks.push(attempt);
+      let value=await current(attempt,'before');if(gone(value))return resolvedGone(value);
+      try{
+        for(const step of ['first','second']){
+          const executable=await bounded(()=>readExecutable(identity.pid));attempt[step+'Executable']=executable;
+          assert.equal(executable,identity.executable,'A different executable cannot resolve an owned image inspection failure');
+          value=await current(attempt,step+'After');if(gone(value))return resolvedGone(value);
+        }
+        observation.resolution='same-incarnation-stable-image';return {...value,executable:identity.executable};
+      }catch(recheckError){
+        if(!['ENOENT','ESRCH'].includes(recheckError.code))throw recheckError;
+        attempt.executableError=recheckError.code;value=await current(attempt,'afterError');if(gone(value))return resolvedGone(value);
+      }
+      if(now()>=until)throw error;
+      await wait(Math.min(25,until-now()));
+    }
+  }catch(refusal){observation.resolution='refused';observation.refusal=String(refusal.message??refusal).slice(0,1000);throw refusal;}
+  finally{observation.finishedAt=new Date(now()).toISOString();}
+}

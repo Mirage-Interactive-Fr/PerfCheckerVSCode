@@ -13,8 +13,8 @@ const client=path.dirname(path.dirname(fileURLToPath(import.meta.url))),rawExecu
 const preparationAbort=new AbortController();
 const execute=(command,args,options={})=>rawExecute(command,args,{timeout:60000,...options,signal:preparationAbort.signal});
 const vsixSha='771ff166e24e96ac1c7121bce8181cb4456089ea83b0356fc6d86593440dfa88';
-const coreTree='9abef061386c97c97bf136b9e4747673fe690b01';
-const coreCommit='9942c4e1fb9dc02a66a03f629b40efdf9c6bdc33';
+const coreTree='2563a09e7904f19592e8f658289566e76bf93c6c';
+const coreCommit='00e94c62a2080dba02782e451422ed98ea0b358a';
 const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
 const capturePreflightOnly=process.env.PERFCHECKER_TEST_CAPTURE_PREFLIGHT_ONLY==='1';
 const dialogueCancelOnly=process.env.PERFCHECKER_TEST_DIALOGUE_CANCEL_ONLY==='1';
