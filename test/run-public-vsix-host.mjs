@@ -52,12 +52,15 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['bootstrap','general100','narrative','mcp','mcp-stdio','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','saved-report','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['bootstrap','general100','narrative','mcp','mcp-stdio','mcp-documented-install','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','saved-report','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 const bootstrapOnly=stage==='focused'&&caseGroup==='bootstrap';
 if(bootstrapOnly&&(mode!=='candidate'||coreMode!=='general'))throw new Error('Fresh production bootstrap requires the candidate VSIX and published General Core, without Git source overrides.');
 if(stage==='focused'&&caseGroup==='pluto-start-stop'&&process.platform!=='linux')throw new Error('The first prepared Pluto start/stop observation is explicitly Linux only.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 const savedReportOnly=stage==='focused'&&caseGroup==='saved-report';
+const documentedMcpInstall=stage==='focused'&&caseGroup==='mcp-documented-install';
+if(documentedMcpInstall)assert(process.platform==='darwin'&&mode==='candidate'&&coreMode==='general',
+  'Documented first MCP installation is a separate macOS/public-General candidate qualification.');
 // The real game and SDKs are immutable fixtures, never development checkouts.
 // A trailing delimiter expands only Julia's system depots, excluding the human depot.
 const candidateGitConfig=process.platform==='win32'&&coreMode==='candidate'?path.join(session,'git-config','.gitconfig'):undefined;
@@ -70,6 +73,8 @@ const runnerEnvironment=landscapeOnly?{...process.env,JULIA_DEPOT_PATH:path.join
   JULIA_LOAD_PATH:'@:@stdlib',JULIA_PKG_PRECOMPILE_AUTO:'0',JULIA_NUM_THREADS:'1',JULIA_NUM_PRECOMPILE_TASKS:'1',
   JULIA_PKG_SERVER:'https://pkg.julialang.org',JULIA_PKG_OFFLINE:'false',XDG_RUNTIME_DIR:path.join(session,'runtime'),
   JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',GIT_TERMINAL_PROMPT:'0',GIT_OPTIONAL_LOCKS:'0',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_SYSTEM:'/dev/null'}:
+  documentedMcpInstall?{...process.env,JULIA_PKG_PRECOMPILE_AUTO:'1',JULIA_LOAD_PATH:'@:@stdlib',
+    JULIA_DEPOT_PATH:path.join(session,'documented-mcp-depot')+path.delimiter}:
   candidateGitConfig?{...process.env,GIT_CONFIG_GLOBAL:candidateGitConfig,PERFCHECKER_NATIVE_GIT_CONFIG:candidateGitConfig}:process.env;
 if(landscapeOnly)for(const key of ['DISPLAY','WAYLAND_DISPLAY','XAUTHORITY','DBUS_SESSION_BUS_ADDRESS',
   'ETENDUE_SDL3_LIBRARY','ETENDUE_SDL3_DLSS_LIBRARY','ETENDUE_JOLTC_LIBRARY'])delete runnerEnvironment[key];
@@ -685,11 +690,31 @@ try {
   // The first real launch has no PerfChecker settings, Julia or Jupyter extension.
   if(completeCampaign||bootstrapOnly)await launch('fresh');
   if(!bootstrapOnly){
-  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]=="standard";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':savedReportOnly?'saved-report':'standard'],{timeout:landscapeOnly?900000:undefined});
+  const installationStartedAt=new Date().toISOString();
+  if(documentedMcpInstall){artifactRecord.documentedMcpInstallation={status:'running',startedAt:installationStartedAt};
+    await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));}
+  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]=="documented-mcp";Pkg.add("HTTP");elseif ARGS[6]=="standard";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();if ARGS[6]=="documented-mcp";httpinfo=only(p for p in values(Pkg.dependencies()) if p.name=="HTTP");@assert httpinfo.is_tracking_registry;print("QUALIFIED_DOCUMENTED_HTTP ");PerfChecker.JSON.print(Dict("version"=>string(httpinfo.version),"tree"=>string(httpinfo.tree_hash),"registered"=>httpinfo.is_tracking_registry,"source"=>realpath(httpinfo.source),"autoPrecompile"=>ENV["JULIA_PKG_PRECOMPILE_AUTO"]));println();end;println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':savedReportOnly?'saved-report':documentedMcpInstall?'documented-mcp':'standard'],{timeout:landscapeOnly?900000:undefined}).catch(async error=>{
+    if(documentedMcpInstall){Object.assign(artifactRecord.documentedMcpInstallation,{status:'failed',finishedAt:new Date().toISOString(),
+      elapsedSeconds:(Date.now()-Date.parse(installationStartedAt))/1000,error:String(error).slice(0,5000)});
+      await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+      if(error.commandOutput)await fs.writeFile(path.join(output,'documented-mcp-installation.log'),error.commandOutput);}
+    throw error;
+  });
   const installed=JSON.parse(installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_CORE_PROVENANCE ')).slice('QUALIFIED_CORE_PROVENANCE '.length));
   if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode!=='candidate'&&!installed.registered||coreProvenance.tree&&installed.tree!==coreProvenance.tree)
     throw new Error('The actual Core installation must match its version and registry/candidate provenance.');
   Object.assign(coreProvenance,installed);
+  if(documentedMcpInstall){
+    const http=JSON.parse(installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_DOCUMENTED_HTTP ')).slice('QUALIFIED_DOCUMENTED_HTTP '.length));
+    assert.equal(http.registered,true);assert.equal(http.autoPrecompile,'1');assert(/^[a-f0-9]{40}$/.test(http.tree));
+    artifactRecord.documentedMcpInstallation={status:'passed',startedAt:installationStartedAt,finishedAt:new Date().toISOString(),
+      elapsedSeconds:(Date.now()-Date.parse(installationStartedAt))/1000,autoPrecompile:runnerEnvironment.JULIA_PKG_PRECOMPILE_AUTO,
+      privateDepot:runnerEnvironment.JULIA_DEPOT_PATH,project:controller,core:{...coreProvenance},http,
+      packagesAdded:['PerfChecker@1.0.1','HTTP'],manualHttpImport:false,controllerPreflight:false,
+      scope:'Documented package installation with normal automatic precompilation, not a cold-cache advice qualification'};
+    assert.equal(artifactRecord.documentedMcpInstallation.autoPrecompile,'1');
+    await fs.writeFile(path.join(output,'documented-mcp-installation.log'),installation);
+  }
   if(stage==='focused'&&caseGroup==='diagnosis'&&process.platform==='darwin'){
     const sourceLine=installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_CORE_MODE=')&&line.includes(' SOURCE='));
     assert(sourceLine,'The actual qualified Core installation records pathof(PerfChecker)');

@@ -619,6 +619,7 @@ exports.run = async () => {
       else if(phase==='saved-report')await runCase('native-saved-diagnostic-import',()=>require('./native-investigation-controls.cjs').runSavedImport(context));
       else if(phase==='general100')await runCase('native-general100-compatibility',()=>require('./native-general100-controls.cjs').run(context));
       else if(phase==='mcp')await runCase('native-mcp-controls',()=>mcp.run(context));
+      else if(phase==='mcp-documented-install')await runCase('native-mcp-documented-install-first-send',()=>mcp.run(context,{documentedInstall:true}));
       else if(phase==='mcp-stdio')await runCase('native-generic-mcp-stdio-controls',()=>mcp.run(context,{stdio:true,customArguments:true}));
       else if(phase==='pluto-plots')await runCase('native-pluto-rendered-plots',()=>pluto.runPlots(context));
       else if(phase==='pluto-start-stop')await runCase('native-pluto-first-prepared-start-stop',()=>pluto.runStartStop(context));

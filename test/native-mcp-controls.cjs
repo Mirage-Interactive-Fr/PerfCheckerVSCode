@@ -589,6 +589,16 @@ async function measuredEvidence(context) {
 exports.run = async (context,options={}) => {
   assert.equal(process.env.CI, 'true');
   const general100=options.general100===true;
+  const documentedInstall=options.documentedInstall===true;
+  let installation;
+  if(documentedInstall){
+    assert.equal(process.platform,'darwin');assert.equal(context.core.mode,'general');assert.equal(context.core.version,'1.0.1');
+    const artifact=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'artifact.json')));
+    assert.equal(artifact.controllerPreflight,undefined);installation=artifact.documentedMcpInstallation;
+    assert.equal(installation.status,'passed');assert.equal(installation.autoPrecompile,'1');
+    assert.equal(installation.manualHttpImport,false);assert.equal(installation.controllerPreflight,false);
+    assert.equal(await fs.realpath(installation.project),await fs.realpath(context.controller));
+  }
   if(general100){assert.equal(context.core.mode,'general100');assert.equal(context.core.version,'1.0.0');assert.equal(options.stdio,undefined);assert.equal(options.customArguments,undefined);}
   if(options.stdio){const handoff=await stdioHandoff();if(handoff)return resumeStdioReload(context,handoff);}
   const {vscode, workspace, findFrame, log, proof} = context;
@@ -616,7 +626,7 @@ exports.run = async (context,options={}) => {
       ['--startup-file=no', '-e', code], {cwd: root, windowsHide: true,
         env: {...process.env, UV_THREADPOOL_SIZE: '1'}})).stdout.trim());
   };
-  const baselineBytes = await probe(workspace);
+  const baselineBytes = documentedInstall?undefined:await probe(workspace);
   const calls = [], suiteCalls=[], pending = new Set(), pendingSockets=new Map(), providerErrors=[],receipts=[];
   let alternateFolder;
   const stdio=options.stdio===true;
@@ -671,7 +681,7 @@ exports.run = async (context,options={}) => {
           assert(prompt.includes(general100
             ? 'If evidence is empty, explain that no saved measurements were attached.'
             : 'No saved report was attached.'));
-          assert(savedEvidence,'A real saved report already exists before testing the absence of implicit attachment');
+          if(!documentedInstall)assert(savedEvidence,'A real saved report already exists before testing the absence of implicit attachment');
         }
         // Keep the additional Suite request recorded separately, preserving all
         // original Investigation turn/count oracles without deleting a receipt.
@@ -717,7 +727,7 @@ exports.run = async (context,options={}) => {
     scenarioProject:measurementProject,scenarioCatalog:'perf/advisor/scenarios.toml',
     advisorEndpoint: `http://127.0.0.1:${server.address().port}/mcp`, advisorModel: 'native-fixture',
     advisorMcpTool: adviceTool, advisorMcpResponse: 'text', advisorMcpVersion: '2026-07-28',
-    advisorImplementationMcpTool: implementationTool, advisorTimeout: 180,
+    advisorImplementationMcpTool: implementationTool, advisorTimeout: documentedInstall?90:180,
     advisorMcpPromptArgument:adviceArgument,advisorMcpArguments:additional,
     advisorImplementationMcpPromptArgument:implementationArgument,advisorImplementationMcpWorkspaceArgument:workspaceArgument,
     advisorImplementationMcpArguments:implementationAdditional,
@@ -821,10 +831,11 @@ exports.run = async (context,options={}) => {
     const configuredFile=typeof configuredPath==='string'&&configuredPath.trim()?path.resolve(workspace,configuredPath):undefined;
     const readSavedConfiguration=()=>configuredFile?fs.readFile(configuredFile).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;}):Promise.resolve(undefined);
     const savedConfig=await readSavedConfiguration();
-    await clickStudioAction(context,'chat');
+    if(documentedInstall)await vscode.commands.executeCommand('perfchecker.openChat');
+    else await clickStudioAction(context,'chat');
     let view = await findFrame('#chat-root');
     await context.editorQualification?.surface('custom-mcp-before-connect',view);
-    if(!stdio){
+    if(!stdio&&!documentedInstall){
     await view.locator('summary').filter({hasText: 'Optional Codex CLI connector'}).click();
     await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click();
     await eventually(async () => /ENOENT|executable|could not|launch/i.test(await view.locator('[role="status"]').innerText()), 'Missing Codex explains its executable prerequisite');
@@ -898,7 +909,7 @@ exports.run = async (context,options={}) => {
           return !value.busy && value.messages.length === count;}, 'Actual Julia MCP worker returns the conversation');
       }catch(error){await diagnoseSend('failed-before-teardown');throw error;}
     };
-    savedEvidence=general100?await require('./native-general100-controls.cjs').measuredEvidence(context):await measuredEvidence(context);
+    if(!documentedInstall)savedEvidence=general100?await require('./native-general100-controls.cjs').measuredEvidence(context):await measuredEvidence(context);
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#chat-root');
     if(stdio){
       await verifyPersistedStdioSettings(context,persistedSettings[0],'initial-folder-a');
@@ -940,7 +951,21 @@ exports.run = async (context,options={}) => {
       view=await connectStdio('2026-07-28');
     }
     assert.equal((await state()).evidenceId,'','Saving a real report does not attach it to the conversation');
+    const firstSendStartedAt=new Date().toISOString();
     await send('Inspect the intermediate allocation in sum_squares without editing. What should I verify?', 2);
+    if(documentedInstall){
+      assert.equal(calls.length,1);assert.equal(calls[0].name,adviceTool);assert.deepEqual(calls[0].evidenceIds,[]);
+      const completed=await state();assert.equal(settings().get('advisorTimeout'),90);assert.equal(completed.busy,false);
+      assert.equal(completed.messages[1].role,'assistant');assert.match(completed.messages[1].content,/Consider a generator/);
+      await view.getByText(completed.messages[1].content,{exact:true}).waitFor({state:'visible',timeout:15000});
+      assert.equal(await fs.readFile(source,'utf8'),original);assert.equal(await git('rev-parse','HEAD'),head);
+      proof('native-mcp-documented-install-first-send',{installation,requestStartedAt:firstSendStartedAt,completedAt:new Date().toISOString(),
+        elapsedSeconds:(Date.now()-Date.parse(firstSendStartedAt))/1000,configuredSeconds:90,externalSeconds:150,
+        firstSendWithoutControllerPreflight:true,manualHttpImportBeforeSend:false,savedEvidenceRequired:false,
+        actualProviderRequests:calls.length,provider:providerLabel,sourceAndHeadPreserved:true,
+        scope:'Normal automatic precompilation during documented installation; not a cold-cache90s or authenticated-model claim'});
+      return;
+    }
     assert.deepEqual(calls[0].evidenceIds,[],'The configuration-only path remains valid without saved measurements');
     proof('native-mcp-configuration-only-conversation',{adviceTurns:1,noSavedEvidence:true,savedReportPresent:true,
       historyId:savedEvidence.id,evidenceInspectedBeforeReply:calls[0].evidenceInspectedBeforeReply,sourceUnchanged:await fs.readFile(source,'utf8')===original});
@@ -1220,7 +1245,26 @@ exports.run = async (context,options={}) => {
       errorClass:error.name,code:error.code,message:String(error),stack:error.stack});
     throw error;}
   finally {
-    if(stdio&&!reloading){
+    if(documentedInstall){
+      const errors=[],observations=[];
+      const cleanup=async(stage,action)=>{try{await action();observations.push({stage,status:'passed'});}catch(error){errors.push(error);observations.push({stage,status:'failed',errorClass:error.name,message:String(error)});}};
+      await cleanup('product-idle-or-explicit-failure-recovery',async()=>{
+        const active=(await state()).busy;
+        if(active){assert(primaryError,'Recovery cancellation is allowed only after the first Send failed');
+          log('native-mcp-documented-install-recovery',{afterFailure:true,originalFailure:String(primaryError),nativeOutcomeBeforeCancel:await state()});
+          await vscode.commands.executeCommand('perfchecker.chatCancel');
+          await eventually(async()=>!(await state()).busy,'Documented-install failure recovery awaits product cleanup',60000);
+        }
+        assert.equal((await state()).busy,false);
+      });
+      await cleanup('close-controlled-provider',async()=>{for(const response of pending)response.destroy();server.closeAllConnections();if(server.listening)await new Promise(resolve=>server.close(resolve));});
+      await cleanup('restore-resource-settings',async()=>{for(const [key,value]of Object.entries(previous))await settings().update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);});
+      await cleanup('end-owned-foreign-fixture',async()=>{if(foreign.exitCode===null&&foreign.signalCode===null)foreign.kill();await foreignFinished;});
+      await fs.writeFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'documented-mcp-cleanup.json'),JSON.stringify({
+        qualified:errors.length===0,recoveryAfterFailure:!!primaryError,observations,
+        scope:'Product idle and controlled fixture closure; no claim of exhaustive physical external-server descendants'},null,2));
+      if(errors.length)throw new AggregateError(primaryError?[primaryError,...errors]:errors,'Documented MCP installation assertion or cleanup failed');
+    }else if(stdio&&!reloading){
       const errors=[],observations=[];
       const cleanup=async(stage,action)=>{try{await action();}catch(error){errors.push(error);observations.push({stage,errorClass:error.name,code:error.code});}};
       // Attempt every owned cleanup even when an earlier one fails; retain the

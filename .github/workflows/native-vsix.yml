@@ -16,7 +16,7 @@ on:
       case_group:
         description: Native controls to exercise on a clean fixture (focused stage only)
         type: choice
-        options: [bootstrap, general100, narrative, mcp, mcp-stdio, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, saved-report, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
+        options: [bootstrap, general100, narrative, mcp, mcp-stdio, mcp-documented-install, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, saved-report, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
         default: narrative
       backend_julia:
         description: Core runtime for a manual qualification; automatic PR coverage remains latest
