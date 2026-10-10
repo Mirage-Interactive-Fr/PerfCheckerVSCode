@@ -185,23 +185,22 @@ async function ownedStdioJuliaProcesses(){
     rows=JSON.parse((await execute('powershell.exe',['-NoProfile','-Command',
       "$ErrorActionPreference='Stop';ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {$_.Name -like 'julia*'} | ForEach-Object {@{pid=$_.ProcessId;parent=$_.ParentProcessId;executable=$_.ExecutablePath}}) -Compress"],{timeout:5000})).stdout);
   }else{
-    const query=execute('ps',['-eo','pid=,ppid='],{timeout:5000}),observer=query.child.pid;
-    rows=(await query).stdout.trim().split('\n').map(line=>{const [pid,parent]=line.trim().split(/\s+/).map(Number);return{pid,parent};});
+    const query=execute('ps',['-eo',process.platform==='darwin'?'pid=,ppid=,comm=':'pid=,ppid='],{timeout:5000}),observer=query.child.pid;
+    rows=(await query).stdout.trim().split('\n').map(line=>{
+      const match=line.trim().match(/^(\d+)\s+(\d+)(?:\s+(.*))?$/);assert(match);
+      return{pid:Number(match[1]),parent:Number(match[2]),executableName:match[3]};
+    });
     const observed=rows.find(row=>row.pid===observer);if(observed)assert.equal(observed.parent,process.pid);
     rows=rows.filter(row=>row.pid!==observer);
+    // comm only restricts candidates; it never proves their executable identity.
+    if(process.platform==='darwin')rows=rows.filter(row=>path.basename(row.executableName||'')===path.basename(expected));
   }
   const matches=async row=>{
     if(process.platform==='linux'){try{return await fs.realpath(`/proc/${row.pid}/exe`)===expected;}catch(error){
       if(!['ENOENT','ESRCH'].includes(error.code))throw error;const current=await linuxNativeStat(row.pid);
       if(!current||['Z','X'].includes(current.state))return false;throw error;}}
     if(process.platform==='win32')return (await fs.realpath(row.executable)).toLowerCase()===expected.toLowerCase();
-    const files=(await execute('lsof',['-nP','-a','-p',String(row.pid),'-d','txt','-F','n'],{timeout:5000})).stdout;
-    return(await Promise.all(files.split('\n').filter(line=>line.startsWith('n')&&path.basename(line.slice(1))===path.basename(expected)).map(async line=>{
-      try{return await fs.realpath(line.slice(1));}
-      catch(error){if(error.code!=='ENOENT')throw error;
-        console.log('NATIVE_IDENTITY_MAPPING_OBSERVATION',JSON.stringify({kind:'absent-lsof-mapping',pid:row.pid,path:line.slice(1),code:error.code,observedAt:new Date().toISOString()}));
-        return undefined;}
-    }))).includes(expected);
+    return Boolean(await nativeIdentity(row.pid,expected));
   };
   const direct=[];for(const row of rows.filter(row=>row.parent===process.pid))if(await matches(row))direct.push(row);
   assert.equal(direct.length,1,'One active canonical Julia controller is a direct extension-host child');
