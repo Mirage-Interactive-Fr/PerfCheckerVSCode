@@ -179,7 +179,10 @@ export async function createImplementationCheckout(workspace: string) {
     await git(checkout, ['init', '--quiet']);
     await git(checkout, ['config', 'core.hooksPath', path.join(directory, 'disabled-hooks')]);
     await git(checkout, ['config', 'core.autocrlf', 'false']);
-    await git(checkout, ['fetch', '--quiet', '--no-tags', repository, backupRef]);
+    // tree() materializes every checkpoint blob. Its private copy needs this
+    // commit, not historical promised blobs from a partial-clone ancestor.
+    // The original checkpoint still retains its full parent/history.
+    await git(checkout, ['fetch', '--quiet', '--no-tags', '--depth=1', repository, backupRef]);
     const attributes = await rawCheckoutAttributes(checkout);
     try {await git(checkout, ['checkout', '--quiet', '--detach', base]);}
     finally {await fs.rm(attributes, {force: true});}

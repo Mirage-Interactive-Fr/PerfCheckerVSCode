@@ -43,7 +43,12 @@ async function requestProcesses(root){
   }).filter(Boolean);
   const cli=rows.find(row=>row.parent===process.pid&&/perfchecker-chat-/.test(row.command)&&/--source=/.test(row.command));
   const worker=cli&&rows.find(row=>row.parent===cli.pid&&/advisor_worker\.jl/.test(row.command));
-  const agent=rows.find(row=>row.parent===process.pid&&row.command.includes(root)&&/--no-daemon\s+exec/.test(row.command));
+  const agent=rows.find(row=>{
+    if(row.parent!==process.pid||!/--no-daemon\s+exec/.test(row.command))return false;
+    const cwd=row.command.match(/(?:^|\s)-C\s+(\S+)/)?.[1];
+    return cwd===root||(cwd&&path.basename(cwd)==='checkout'&&
+      path.dirname(path.dirname(cwd))===require('node:os').tmpdir()&&path.basename(path.dirname(cwd)).startsWith('perfchecker-implementation-'));
+  });
   const ids=new Set([cli?.pid,worker?.pid,agent?.pid].filter(Boolean));let previous;
   do{previous=ids.size;for(const row of rows)if(ids.has(row.parent))ids.add(row.pid);}while(previous!==ids.size);
   const identities=(await Promise.all([...ids].map(async pid=>({pid,parent:rows.find(row=>row.pid===pid).parent,start:await processIdentity(pid)})))).filter(item=>item.start);
@@ -56,11 +61,12 @@ exports.run=async()=>{
   assert(path.basename(session).startsWith('perfchecker-codex-host-'));assert.equal(path.dirname(root),session);
   assert.equal(await fs.readFile(path.join(root,'.perfchecker-test-fixture'),'utf8'),'sacrificial\n');
   const checks=[],result={runner:'codex-vscode-host.cjs',hostExecuted:true,hostPid:process.pid,status:'running',checks};
-  suiteDeadline=Date.now()+14*60*1000;result.maximumHostMinutes=14;
+  const bibliography=process.env.PERFCHECKER_HOST_BIBLIOGRAPHY?JSON.parse(process.env.PERFCHECKER_HOST_BIBLIOGRAPHY):undefined;
+  suiteDeadline=Date.now()+(bibliography?21:14)*60*1000;result.maximumHostMinutes=bibliography?21:14;
   // This sentinel must be written by the actual extension host, never by the outer SDK.
   await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result));
   const configFile=path.join(root,'perf','advisor.json'),settingsFile=path.join(root,'.vscode','settings.json');
-  const relative='src/PerfCheckerNativeFixture.jl',sourceFile=path.join(root,relative);
+  const relative=bibliography?'src/bibtex.jl':'src/PerfCheckerNativeFixture.jl',sourceFile=path.join(root,relative);
   const saved=await fs.readFile(configFile),savedSettings=await fs.readFile(settingsFile),source=await fs.readFile(sourceFile,'utf8'),index=await fs.readFile(path.join(root,'.git','index'));
   const settings=()=>vscode.workspace.getConfiguration('perfchecker',folder.uri);
   const git=async(...args)=>(await execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout;
@@ -83,25 +89,36 @@ exports.run=async()=>{
     assert.equal(await git('rev-parse','HEAD'),head);assert.equal(await git('status','--porcelain'),'');
     assert.equal(settings().get('advisorEnabled'),false);assert.equal(settings().get('advisorImplementationMcpTool'),'previous_agent');
   };
-  const findChat=()=>eventually(async()=>{
+  const findView=selector=>eventually(async()=>{
     for(const context of browser.contexts())for(const page of context.pages())for(const frame of page.frames()){
-      if(!await frame.locator('#chat-root').isVisible().catch(()=>false))continue;
+      if(!await frame.locator(selector).isVisible().catch(()=>false))continue;
       let visible=true;
       for(let current=frame;current.parentFrame();current=current.parentFrame()){
         const owner=await current.frameElement();visible&&=await owner.isVisible();await owner.dispose();
       }
       if(visible)return frame;
     }
-  },'Locate the visible installed Chat webview',30000);
+  },`Locate the visible installed webview ${selector}`,30000);
+  const findChat=()=>findView('#chat-root');
   const click=name=>view.getByRole('button',{name,exact:true}).click();
   const idle=label=>eventually(async()=>!((await state()).busy),label);
   const noOwnedProcesses=()=>eventually(async()=>{
     for(const item of owned.identities)if(await processIdentity(item.pid)===item.start)return false;
     return true;
   },'All observed request-owned processes must stop before fixture cleanup',20000);
+  const proofs=process.env.PERFCHECKER_HOST_PROOFS;
+  const capture=async(name,timeout=30000)=>{if(proofs){await fs.mkdir(proofs,{recursive:true});await view.page().screenshot({path:path.join(proofs,`${name}.png`),timeout});}};
+  // Retain the actual user-visible outcome before teardown, without provider
+  // configuration, tool arguments, token-bearing environment or full source.
+  const chatOutcome=value=>({busy:Boolean(value.busy),status:String(value.status??'').slice(0,4000),
+    backupRef:value.backupRef,connected:Boolean(value.connection),
+    proposal:value.proposal?{files:value.proposal.files,patchBytes:Buffer.byteLength(value.proposal.patch??''),applied:value.proposal.applied}:undefined,
+    implementationSummary:String(value.implementationSummary??'').slice(0,16000)});
+  const preserveWorker=async(name,directory)=>{if(proofs){const target=path.join(proofs,name);await fs.mkdir(target,{recursive:true});
+    for(const file of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(directory,'perf','episode-05a','worker',file),path.join(target,file));}};
   try{
     result.vsixSha256=hash(await fs.readFile(process.env.PERFCHECKER_HOST_ARCHIVE));
-    assert.equal(result.vsixSha256,'b899ea751d7baf1d99c150271721f935aa4591f6292dbf41f224b5bd2016664c');
+    assert.equal(result.vsixSha256,'1af8108bfe2c491684da2435e4b9bc5430b33e8f8a6d8f02699790074d249de4');
     const extension=vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');assert(extension,'Load the installed product');
     const installed=await fs.realpath(extension.extensionPath);
     assert(installed.startsWith(path.join(session,'extensions')+path.sep),'The product must not come from the source checkout or human extension directory');
@@ -112,15 +129,79 @@ exports.run=async()=>{
     await extension.activate();assert(extension.isActive);
     assert.equal(settings().get('runnerProject'),process.env.PERFCHECKER_TEST_CONTROLLER);
     assert.equal(settings().get('juliaExecutable'),process.env.PERFCHECKER_TEST_JULIA);
-    result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'309e12d55896cbe5b9aed2b07e39421793c7248f');assert.equal(result.core.version,'1.0.1');
+    result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'920bd59cee056970d2c2ab03ef0d9103e071c536');assert.equal(result.core.version,'1.0.1');
     process.env.PERFCHECKER_CODEX_HOST_ONLY='1';
-    const {probeJuliaCodexFixture}=await import(pathToFileURL(path.join(__dirname,'codex-real.test.mjs')).href);
-    const probe=directory=>probeJuliaCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA);
-    const baselineBytes=await probe(root);assert.equal(baselineBytes,Number(process.env.PERFCHECKER_HOST_BASELINE_BYTES));
+    const {probeJuliaCodexFixture,probeBibliographyCodexFixture}=await import(pathToFileURL(path.join(__dirname,'codex-real.test.mjs')).href);
+    const probe=directory=>bibliography?probeBibliographyCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA,{prepare:true}):probeJuliaCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA);
+    const baselineProbe=await probe(root),baselineBytes=bibliography?baselineProbe.allocationBytes:baselineProbe;
+    assert.equal(baselineBytes,Number(process.env.PERFCHECKER_HOST_BASELINE_BYTES));
+    if(bibliography)assert.deepEqual(baselineProbe,bibliography);
+    if(bibliography)await preserveWorker('baseline-worker',root);
     const {chromium}=await import(process.env.PERFCHECKER_TEST_PLAYWRIGHT?pathToFileURL(process.env.PERFCHECKER_TEST_PLAYWRIGHT).href:'playwright');
     browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.PERFCHECKER_HOST_CDP_PORT}`);
     observer=setInterval(()=>{void observe().catch(error=>{result.observationError=String(error);});},200);
+    const measureBibliography=async label=>{
+      const reports=path.join(root,'perf','results','investigations'),receipts=[];
+      await fs.mkdir(reports,{recursive:true});
+      const beforeSettings=await fs.readFile(settingsFile),beforeConfig=JSON.parse(beforeSettings);
+      const priorSamples=settings().get('scenarioSamples'),priorCatalog=settings().get('scenarioCatalog');
+      try{
+        for(const [id,samples,collectors,catalog]of [['episode05-export-bibtex-timing',100,['benchmark','chairmark'],'timing'],['episode05-export-bibtex-allocation',3,['profile_alloc'],'allocation']]){
+          await settings().update('scenarioSamples',samples,vscode.ConfigurationTarget.WorkspaceFolder);
+          await settings().update('scenarioCatalog',`perf/episode-05a/${catalog}/scenarios.toml`,vscode.ConfigurationTarget.WorkspaceFolder);
+          await vscode.commands.executeCommand('perfchecker.discoverScenarios');
+          const investigation=await findView('nav[aria-label="Investigation views"]');
+          await investigation.getByRole('button',{name:'Scenarios',exact:true}).click();
+          await investigation.getByRole('button',{name:'Clear selection',exact:true}).click();
+          await eventually(async()=>await investigation.locator('.scenario-title input:checked').count()===0,
+            'The actual Clear selection control removes every previous scenario selection',10000);
+          await investigation.locator('.scenario-title').filter({hasText:id}).getByRole('checkbox').check();
+          const before=new Set(await fs.readdir(reports));
+          await investigation.getByRole('button',{name:'Measure selected',exact:true}).click();
+          const receipt=await eventually(async()=>{
+            for(const name of await fs.readdir(reports))if(!before.has(name)){
+              const file=path.join(reports,name,'run.json'),advice=path.join(reports,name,'advice','advice.json');
+              try{const report=JSON.parse(await fs.readFile(file,'utf8'));await fs.access(advice);
+                if(!await investigation.locator('.status.busy').count())return {id:name,directory:path.dirname(file),report};
+              }catch(error){if(error.code!=='ENOENT'&&!(error instanceof SyntaxError))throw error;}
+            }
+          },`The actual ${label} ${id} measurements and advice finish`,300000);
+          assert.deepEqual(receipt.report.runs.map(run=>run.collector).sort(),[...collectors].sort());
+          for(const run of receipt.report.runs){assert.equal(run.scenario.id,id);assert.equal(run.scenario.implementation,'local-checkout');
+            assert.equal(run.qualification.correctness,'passed');assert.equal(run.qualification.availability,'complete');
+            if(run.collector!=='profile_alloc')assert.equal(run.summaries.find(summary=>summary.metric==='julia.wall.time').samples,100);
+            else assert.equal(run.profile.allocation_profile.profile_evaluations,3);
+          }
+          if(proofs){const retained=path.join(proofs,`${label}-measurements`,receipt.id);await fs.cp(receipt.directory,retained,{recursive:true});receipt.retainedDirectory=retained;}
+          receipts.push(receipt);
+        }
+      }finally{
+        // Only these two setup keys are intentional. Reject any other write
+        // before restoring formatting, so restoration cannot hide agent edits.
+        const currentConfig=JSON.parse(await fs.readFile(settingsFile,'utf8'));
+        for(const object of [beforeConfig,currentConfig])for(const key of ['perfchecker.scenarioSamples','perfchecker.scenarioCatalog'])delete object[key];
+        assert.deepEqual(currentConfig,beforeConfig,'Measurements change only the explicitly controlled setup keys');
+        await settings().update('scenarioSamples',priorSamples,vscode.ConfigurationTarget.WorkspaceFolder);
+        await settings().update('scenarioCatalog',priorCatalog,vscode.ConfigurationTarget.WorkspaceFolder);
+        const document=await vscode.workspace.openTextDocument(vscode.Uri.file(settingsFile)),edit=new vscode.WorkspaceEdit();
+        edit.replace(document.uri,new vscode.Range(document.positionAt(0),document.positionAt(document.getText().length)),beforeSettings.toString('utf8'));
+        assert(await vscode.workspace.applyEdit(edit));assert(await document.save());
+        await eventually(async()=>Buffer.compare(await fs.readFile(settingsFile),beforeSettings)===0&&settings().get('scenarioSamples')===priorSamples&&settings().get('scenarioCatalog')===priorCatalog,
+          'The intended measurement setup restores exact settings bytes and effective configuration',10000);
+      }
+      result.measurements??={};result.measurements[label]=receipts;
+      if(proofs)await fs.writeFile(path.join(proofs,`${label}-measurements.json`),JSON.stringify(receipts,null,2));
+      return receipts;
+    };
+    const baselineMeasurements=bibliography?await measureBibliography('baseline'):undefined;
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
+    if(bibliography){
+      const evidenceId=baselineMeasurements.at(-1).id;
+      await eventually(async()=>(await state()).evidence.some(item=>item.id===evidenceId),'Actual saved Bibliography allocation evidence appears in Chat');
+      await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(evidenceId);
+      await eventually(async()=>(await state()).evidenceId===evidenceId,'Native evidence selection reaches the product');
+      result.fixture={kind:'bibliography',baseline:baselineProbe,selectedEvidenceId:evidenceId};
+    }
     await view.locator('summary').filter({hasText:'Optional Codex CLI connector'}).click();
     const beforeServers=new Set(loopbackServers());await click('Connect Codex CLI');
     await eventually(async()=>Boolean((await state()).connection),'The actual Connect button authenticates the existing CLI',60000);
@@ -130,9 +211,12 @@ exports.run=async()=>{
     endpoint=`http://127.0.0.1:${server.address().port}/mcp`;
     const unauthorized=await fetch(endpoint,{method:'POST',headers:{Connection:'close'},body:'{}',signal:AbortSignal.timeout(5000)});
     assert.equal(unauthorized.status,401);await unauthorized.arrayBuffer();await preserved();
-    checks.push('installed b899 product path/version/runtime hashes; genuine Connect control; saved disabled provider unchanged; unauthenticated HTTP refused');
+    checks.push('installed 1af product path/version/runtime hashes; genuine Connect control; saved disabled provider unchanged; unauthenticated HTTP refused');
 
-    const questions=[
+    const questions=bibliography?[
+      `Advice only: no tools, commands or edits. The attached real measurements concern one Bibliography export. The source below is src/bibtex.jl. Explain whether name_to_string is a plausible bounded allocation experiment; distinguish measured attribution from hypotheses and do not claim any gain. Source: ${source}`,
+      `Continue the same conversation. Review a change ONLY to name_to_string in src/bibtex.jl that preserves all separators and partial Name values, Unicode, first/middle/particle/junior/last fields, and input non-mutation. The independent literal oracle is perf/episode-05a/correctness.jl; the original perf/media/export-workload.jl oracle and both episode05a catalogues must stay unchanged. On the later explicit implementation request, edit ONLY src/bibtex.jl in the supplied isolated checkout, and test that actual checkout using ${process.env.PERFCHECKER_TEST_JULIA} --startup-file=no --history-file=no --project=perf/episode-05a/worker. Its Project pins BenchmarkTools1.7.0, Chairmarks1.3.1, BibInternal792d8c709169505f998f7d70bfa092551dd4089f and BibParsercf1eb4446b986a23ed444963dcdb4c6ecc2da90f. Its ignored Manifest is intentionally absent: instantiate there with update_registry=false and allow_autoprecomp=false, assert realpath(pkgdir(Bibliography))==realpath(pwd()) and pathof points to that copy's src/Bibliography.jl, then include correctness.jl and the unchanged export oracle. Never reuse the original checkout's Manifest. Create no helper files, change no Project/oracle/catalogue, install nothing outside the private environment, run no external services or push. All descendants must retain CPU16–17, Julia2threads/GC1/precompile1/BLAS1/OMP1. Advice only for this turn; implementation follows separately.`
+    ]:[
       `Advice only, no tools, commands or file changes. This real Julia function allocated ${baselineBytes} bytes after warming on1000 Float64 inputs: ${source}. Explain removing its intermediate squared array and what remains unmeasured. When I later explicitly request implementation, modify ONLY ${relative}, preserve the module and @noinline API, create no other files, and use ONLY the existing Julia executable ${process.env.PERFCHECKER_TEST_JULIA} with --startup-file=no --history-file=no -e for checks. Never install packages or call external services.`,
       `Continue the same conversation: specify actual Julia checks for Float64[]==0.0, [1.0,-2.0,3.0]==14.0 and collect(1.0:1000.0)==333833500.0. The implementation should preserve those results and reduce warmed @allocated, without claiming speed improved. Advice only now: no tools, commands or edits. On the later explicit implementation request, change ONLY ${relative}, preserve module/@noinline, test those three cases with ${process.env.PERFCHECKER_TEST_JULIA} --startup-file=no --history-file=no -e, warm then measure1000 inputs. Create no files except that source edit.`
     ];
@@ -144,31 +228,72 @@ exports.run=async()=>{
       const answer=reply.messages.at(-1).content;assert(answer.length>10);adviceCharacters.push(answer.length);
       await eventually(async()=>await view.locator('.message.assistant').count()===turn+1,'The actual reply is visible');
       assert((await view.locator('.message.assistant').last().innerText()).includes(answer));await preserved();
+      if(bibliography){await view.locator('.message.assistant').last().scrollIntoViewIfNeeded();await capture(`advice-${turn+1}`);}
     }
+    if(bibliography)result.conversation=(await state()).messages;
     checks.push('two authenticated contextual advice replies through Julia MCP are visible and preserve exact source/index/HEAD/config');
     await view.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
     assert.match(await view.locator('.warning').innerText(),/Git checkpoint.*isolated copy.*diff review/);
+    const beforePrepare=chatOutcome(await state()),prepareStarted=Date.now();let prepareAccepted=false,lastPrepare;
+    result.prepare={deadlineMs:210000,transitions:[]};
     await click('I reviewed the advice · Prepare implementation');
-    const proposed=await eventually(async()=>{const value=await state();return !value.busy&&value.proposal?.patch?value:undefined;},'Actual Prepare returns an isolated reviewed proposal');
+    const proposed=await eventually(async()=>{
+      const value=await state(),outcome=chatOutcome(value),serialized=JSON.stringify(outcome);
+      if(serialized!==lastPrepare){result.prepare.transitions.push({elapsedMs:Date.now()-prepareStarted,...outcome});lastPrepare=serialized;}
+      prepareAccepted||=outcome.busy||outcome.backupRef!==beforePrepare.backupRef||outcome.status!==beforePrepare.status;
+      if(!prepareAccepted||value.busy)return;
+      assert(value.proposal?.patch,`Actual Prepare completed without a reviewed patch: ${outcome.status}; ${outcome.implementationSummary}`);
+      return value;
+    },'Actual Prepare has not completed with a reviewed proposal within 210 seconds');
     assert.deepEqual(proposed.proposal.files,[relative]);assert.equal(proposed.proposal.applied,false);assert.match(proposed.backupRef,/^refs\/perfchecker\/checkpoints\//);await preserved();
     // Read the installed backend's retained proposal; do not generate or apply a replacement patch.
     const {recoverActiveImplementationProposal}=require(path.join(installed,'dist','implementation.js'));
     const proposal=await recoverActiveImplementationProposal(root);assert(proposal);assert.equal(proposal.patch,proposed.proposal.patch);
-    const candidate=path.join(session,'candidate-oracle');await fs.mkdir(path.join(candidate,'src'),{recursive:true});
-    await fs.writeFile(path.join(candidate,relative),await git('show',`${proposal.candidate}:${relative}`));
-    const candidateBytes=await probe(candidate);assert(candidateBytes<baselineBytes,'The real Julia candidate reduces measured allocations');
+    const candidate=path.join(session,'candidate-oracle');
+    if(bibliography){
+      await execute('git',['clone','--quiet','--no-hardlinks',root,candidate]);
+      await execute('git',['fetch','--quiet','origin',proposal.candidateRef],{cwd:candidate});
+      await execute('git',['checkout','--quiet','--detach','FETCH_HEAD'],{cwd:candidate});
+      await execute('git',['remote','remove','origin'],{cwd:candidate});
+    }else{await fs.mkdir(path.join(candidate,'src'),{recursive:true});await fs.writeFile(path.join(candidate,relative),await git('show',`${proposal.candidate}:${relative}`));}
+    const candidateProbe=await probe(candidate),candidateBytes=bibliography?candidateProbe.allocationBytes:candidateProbe;
+    if(bibliography){
+      for(const key of ['benchmarkTools','chairmarks','bibInternalRevision','bibParserRevision','dependencyGraphSha256','correctnessSha256','workloadSha256','projectSha256'])
+        assert.equal(candidateProbe[key],baselineProbe[key],`The candidate preserves ${key}`);
+      assert.notEqual(candidateProbe.sourceSha256,baselineProbe.sourceSha256);await preserveWorker('candidate-worker',candidate);
+      result.fixture.candidate=candidateProbe;result.fixture.proposedSource=await fs.readFile(path.join(candidate,relative),'utf8');
+      const functionStart=source.indexOf('function name_to_string(name)'),nextDoc=source.indexOf('\n"""\n    names_to_strings',functionStart);
+      assert(functionStart>=0&&nextDoc>functionStart,'The reviewed fixture has explicit name_to_string boundaries');
+      assert(result.fixture.proposedSource.startsWith(source.slice(0,functionStart))&&result.fixture.proposedSource.endsWith(source.slice(nextDoc)),
+        'The real proposal may change only name_to_string, preserving the rest of bibtex.jl');
+    }else assert(candidateBytes<baselineBytes,'The real Julia candidate reduces measured allocations');
     await click('Open full diff');
     await eventually(()=>vscode.window.visibleTextEditors.some(editor=>editor.document.languageId==='diff'&&editor.document.getText()===proposal.patch),'The real native diff editor displays the entire collected patch',30000);
+    if(bibliography)await capture('full-diff');
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
     await click('Apply reviewed changes');await eventually(async()=>!((await state()).busy)&&(await state()).proposal?.applied,'Actual Apply completes');
-    assert.notEqual(await fs.readFile(sourceFile,'utf8'),source);assert.equal(await probe(root),candidateBytes);
+    assert.notEqual(await fs.readFile(sourceFile,'utf8'),source);
+    const appliedProbe=await probe(root);
+    if(bibliography){
+      assert.equal(appliedProbe.sourceSha256,candidateProbe.sourceSha256);assert.equal(appliedProbe.dependencyGraphSha256,baselineProbe.dependencyGraphSha256);
+      result.fixture.applied=appliedProbe;await capture('applied');await measureBibliography('applied');
+      await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
+      await view.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
+    }else assert.equal(appliedProbe,candidateBytes);
     assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),index);assert.equal(await git('rev-parse','HEAD'),head);
     await click('Restore previous code');await eventually(async()=>!((await state()).busy)&&!(await state()).proposal?.applied,'Actual Restore completes');
-    assert.equal(await probe(root),baselineBytes);await preserved();
-    checks.push('real Prepare/checkpoint/diff clicks; Julia empty/signed/range oracles and allocation reduction before Apply; actual Apply/Restore preserve staging/HEAD');
+    const restoredProbe=await probe(root);
+    if(bibliography){
+      assert.deepEqual(restoredProbe,baselineProbe);result.fixture.restored=restoredProbe;await capture('restored');
+      checks.push('Bibliography: exact source/entrypoint in baseline/candidate/Apply/Restore; independent 10 literal name cases and Unicode/multi-entry/nonmutation export oracles; identical full dependency graph; actual benchmark100/chairmark100/profile_alloc3 measurements before and after Apply; no improvement assumed');
+    }else assert.equal(restoredProbe,baselineBytes);
+    await preserved();
+    checks.push('real Prepare/checkpoint/diff clicks; independent Julia oracles before Apply; actual Apply/Restore preserve staging/HEAD');
 
     await view.getByRole('tab',{name:'01 · Advice',exact:true}).click();
-    await view.locator('#chat-question').fill('Advice only, no tools or edits. Give a detailed explanation of remaining floating-point correctness and benchmark uncertainty in this Julia optimization, including NaN/Infinity, signed zero, reduction order and stable allocation measurement.');
+    await view.locator('#chat-question').fill(bibliography?
+      'Advice only, no tools or edits. Explain the remaining limits of this bounded bibliography name-string experiment: partial names, Unicode, separator preservation, non-mutation, sampler uncertainty, separate collectors and why one fixture does not establish universal BibTeX equivalence.':
+      'Advice only, no tools or edits. Give a detailed explanation of remaining floating-point correctness and benchmark uncertainty in this Julia optimization, including NaN/Infinity, signed zero, reduction order and stable allocation measurement.');
     await click('Send question');
     owned=await eventually(async()=>{
       const current=await observe();return (await state()).busy&&current.cli&&current.worker&&current.agent?current:undefined;
@@ -186,17 +311,35 @@ exports.run=async()=>{
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected,false);
     assert.equal(server.listening,false);await assert.rejects(fetch(endpoint,{method:'POST',body:'{}',signal:AbortSignal.timeout(5000)}));await preserved();
     checks.push('actual Disconnect closes the listener and preserves original disabled configuration/file/tool');
-    Object.assign(result,{status:'passed',adviceTurns:2,adviceCharacters,oracle:{empty:0,signed:14,range1000:333833500},
+    Object.assign(result,{status:'passed',adviceTurns:2,adviceCharacters,oracle:bibliography?{independentNameCases:10,Unicode:true,multiEntryExport:true,nonMutation:true,historicalOracleUnchanged:true}:{empty:0,signed:14,range1000:333833500},
       allocationBaselineBytes:baselineBytes,allocationCandidateBytes:candidateBytes,changedFiles:proposal.files,
       ownedRequestPids:{cli:owned.cli,worker:owned.worker,codex:owned.agent},ownedDeadBeforeCleanup:true,socketClosedBeforeCleanup:true,
       remoteInferenceCancellation:'Not established; UI accurately preserves the remote-work caveat'});
-  }catch(error){primaryError=error;Object.assign(result,{status:'failed',error:String(error),stack:error.stack});}
+  }catch(error){
+    primaryError=error;Object.assign(result,{status:'failed',error:String(error),stack:error.stack});
+    try{result.failureChat=chatOutcome(await state());}catch(snapshotError){result.failureChatError=String(snapshotError);}
+    try{result.failureObservedProcesses=(await observe()).identities;}catch(snapshotError){result.failureObservationError=String(snapshotError);}
+    const failedDeadline=suiteDeadline,diagnosticDeadline=Date.now()+10000;
+    suiteDeadline=diagnosticDeadline;
+    try{if(browser){view=await findChat();await capture('failure-before-cleanup',Math.max(1,diagnosticDeadline-Date.now()));}}
+    catch(snapshotError){result.failureCaptureError=String(snapshotError);}
+    finally{suiteDeadline=failedDeadline;}
+  }
   finally{
     suiteDeadline=Date.now()+30000;
     // Failure cleanup uses the same owning controls and does not turn teardown into a PASS oracle.
     try{
-      if(browser){view=await findChat();if((await state()).busy){await click('Cancel request');await idle('Failure cleanup finishes the owned request');}
-        if((await state()).connection){await click('Disconnect Codex');await eventually(async()=>!((await state()).connection),'Failure cleanup disconnects the local connector');}}
+      if(browser){
+        const current=await state();
+        if(current.busy||current.connection)view=await findChat();
+        if(current.busy){
+          result.failureCancellation={before:chatOutcome(current)};
+          await click('Cancel request');await idle('Failure cleanup finishes the owned request');
+          result.failureCancellation.after=chatOutcome(await state());
+        }
+        if((await state()).connection){await click('Disconnect Codex');await eventually(async()=>!((await state()).connection),'Failure cleanup disconnects the local connector');}
+        if(primaryError)result.failureAfterCleanup=chatOutcome(await state());
+      }
     }catch(error){result.cleanupError=String(error);primaryError??=error;result.status='failed';}
     clearInterval(observer);
     try{await observation;await observe();}

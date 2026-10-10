@@ -951,7 +951,7 @@ exports.runStartStop = async context => {
   assert.equal(await fs.realpath(context.workspace),path.join(session,'workspace'));assert(profile.startsWith(session+path.sep));
   const executable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA),known=new Map(),groups=new Set(),errors=[];let inventorySignature;
   const provenance=JSON.parse(process.env.PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT);
-  assert.equal(provenance.packages.PerfChecker.tree,context.core.tree);assert.equal(provenance.companion.tree,'9bc464202aa5b60262be9483bda5968bacd2960a');
+  assert.equal(provenance.packages.PerfChecker.tree,context.core.tree);assert.equal(provenance.companion.tree,'7ad6a3a84b8284fec905753e02a2877d3762ba9e');
   const project=await fs.realpath(path.resolve(context.workspace,context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace)).get('plutoProject','perf/pluto')));
   const environmentDigest=async()=>Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async leaf=>[leaf,createHash('sha256').update(await fs.readFile(path.join(project,leaf))).digest('hex')])));
   const environmentHashes=await environmentDigest();

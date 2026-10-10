@@ -9,17 +9,24 @@ import path from 'node:path';
 import os from 'node:os';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 const client=path.dirname(path.dirname(fileURLToPath(import.meta.url))),execute=promisify(execFile);
-const vsixSha='b899ea751d7baf1d99c150271721f935aa4591f6292dbf41f224b5bd2016664c';
-const coreTree='309e12d55896cbe5b9aed2b07e39421793c7248f';
+const vsixSha='1af8108bfe2c491684da2435e4b9bc5430b33e8f8a6d8f02699790074d249de4';
+const coreTree='920bd59cee056970d2c2ab03ef0d9103e071c536';
+const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
 if(process.env.CI)throw new Error('Authenticated Codex qualification is local-only. Never transfer authentication to CI.');
 if(process.platform!=='linux')throw new Error('This isolated display qualification currently requires Linux and a private Xvfb.');
 for(const name of ['PERFCHECKER_TEST_CONTROLLER','PERFCHECKER_TEST_CODEX','PERFCHECKER_TEST_JULIA','PERFCHECKER_TEST_VSIX'])
   if(!process.env[name]||!path.isAbsolute(process.env[name]))throw new Error(`Provide an absolute ${name} path.`);
 const archive=await fs.realpath(process.env.PERFCHECKER_TEST_VSIX);
 assert.equal(createHash('sha256').update(await fs.readFile(archive)).digest('hex'),vsixSha,'Use the approved VSIX bytes, not a development build');
-assert.equal((await fs.stat(archive)).size,1029741);
+assert.equal((await fs.stat(archive)).size,1068437);
+if(bibliography){
+  assert(path.isAbsolute(bibliography),'Provide an absolute private Bibliography pilot path');
+  assert.match(await fs.readFile('/proc/self/status','utf8'),/^Cpus_allowed_list:\s*16-17\s*$/m,'The real-package driver must inherit the approved two-CPU pool');
+  Object.assign(process.env,{JULIA_NUM_THREADS:'2',JULIA_NUM_PRECOMPILE_TASKS:'1',JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',OMP_NUM_THREADS:'1'});
+  assert(process.env.PERFCHECKER_TEST_RESULTS&&path.isAbsolute(process.env.PERFCHECKER_TEST_RESULTS),'Provide an explicit absolute proof destination for the Bibliography qualification');
+}
 process.env.PERFCHECKER_CODEX_HOST_ONLY='1';
-const {prepareJuliaCodexFixture,stopObservedCodexProcesses,ownedProcessState}=await import('./codex-real.test.mjs');
+const {prepareJuliaCodexFixture,prepareBibliographyCodexFixture,stopObservedCodexProcesses,ownedProcessState}=await import('./codex-real.test.mjs');
 const sdk=await import(process.env.PERFCHECKER_TEST_ELECTRON?pathToFileURL(process.env.PERFCHECKER_TEST_ELECTRON).href:'@vscode/test-electron');
 const session=await fs.mkdtemp(path.join(os.tmpdir(),'perfchecker-codex-host-'));
 let displayChild,displayExit,sessionMayRemove=true,expired=false,forceDeadline;
@@ -29,19 +36,41 @@ let displayChild,displayExit,sessionMayRemove=true,expired=false,forceDeadline;
 const deadline=setTimeout(()=>{
   expired=true;process.emit('SIGINT');
   forceDeadline=setTimeout(()=>process.emit('SIGINT'),45000);
-},18*60*1000);
+},(bibliography?25:18)*60*1000);
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 try{
   const root=path.join(session,'workspace'),profile=path.join(session,'profile'),extensions=path.join(session,'extensions');
-  await fs.mkdir(path.join(root,'.vscode'),{recursive:true});await fs.mkdir(path.join(root,'perf'));
+  if(bibliography){
+    const revision='2e86892401536ca4cfd20eb45c00e98168b482a3',tree='877ce28d85f3ac37d43f8e19a41b25a3f262c04c';
+    const gitEnv={...process.env,GIT_NO_LAZY_FETCH:'1'};
+    assert.equal((await execute('git',['rev-parse','HEAD'],{cwd:bibliography,env:gitEnv})).stdout.trim(),revision,'Use the reviewed private pilot revision');
+    await execute('git',['diff','--exit-code','HEAD'],{cwd:bibliography,env:gitEnv});
+    // The pilot is a worktree of a partial clone. A local object-directory copy
+    // loses its promisor configuration and leaves historical blobs missing.
+    await execute('git',['clone','--quiet','--no-checkout','https://github.com/JuliaBibliographies/Bibliography.jl.git',root],{env:gitEnv});
+    await execute('git',['fetch','--quiet','--no-tags',await fs.realpath(bibliography),revision],{cwd:root,env:gitEnv});
+    await execute('git',['checkout','--quiet','--detach',revision],{cwd:root,env:gitEnv});
+    assert.equal((await execute('git',['rev-parse','HEAD'],{cwd:root,env:gitEnv})).stdout.trim(),revision);
+    assert.equal((await execute('git',['rev-parse','HEAD^{tree}'],{cwd:root,env:gitEnv})).stdout.trim(),tree);
+    await execute('git',['fsck','--full','--no-dangling'],{cwd:root,env:gitEnv,maxBuffer:2000000});
+    await execute('git',['remote','remove','origin'],{cwd:root});
+    for(const file of ['correctness.jl','timing/scenarios.toml','allocation/scenarios.toml','worker/Project.toml']){
+      const target=path.join(root,'perf','episode-05a',file);await fs.mkdir(path.dirname(target),{recursive:true});
+      await fs.copyFile(path.join(bibliography,'perf','episode-05a',file),target);
+    }
+  }
+  await fs.mkdir(path.join(root,'.vscode'),{recursive:true});await fs.mkdir(path.join(root,'perf'),{recursive:true});
   await fs.writeFile(path.join(root,'.perfchecker-test-fixture'),'sacrificial\n');
   await fs.writeFile(path.join(root,'perf','advisor.json'),JSON.stringify({protocol:'mcp_http',endpoint:'https://previous.example.invalid/mcp',mcp_tool:'previous_advice'}));
   await fs.writeFile(path.join(root,'.vscode','settings.json'),JSON.stringify({
-    'perfchecker.runnerProject':process.env.PERFCHECKER_TEST_CONTROLLER,'perfchecker.scenarioProject':process.env.PERFCHECKER_TEST_CONTROLLER,
+    'perfchecker.runnerProject':process.env.PERFCHECKER_TEST_CONTROLLER,'perfchecker.scenarioProject':bibliography?'perf/episode-05a/worker':process.env.PERFCHECKER_TEST_CONTROLLER,
     'perfchecker.juliaExecutable':process.env.PERFCHECKER_TEST_JULIA,'perfchecker.codexExecutable':process.env.PERFCHECKER_TEST_CODEX,
     'perfchecker.advisorConfig':'perf/advisor.json','perfchecker.advisorEnabled':false,'perfchecker.advisorImplementationMcpTool':'previous_agent','perfchecker.advisorTimeout':180,
+    ...(bibliography?{'perfchecker.scenarioCatalog':'perf/episode-05a/timing/scenarios.toml','perfchecker.scenarioSamples':100,
+      'perfchecker.scenarioThreads':2,'perfchecker.analysisTimeout':120}:{}),
     'telemetry.telemetryLevel':'off','workbench.startupEditor':'none','window.restoreWindows':'none'}));
-  const fixture=await prepareJuliaCodexFixture(root,{julia:process.env.PERFCHECKER_TEST_JULIA,project:process.env.PERFCHECKER_TEST_CONTROLLER,coreVersion:'1.0.1',coreTree});
+  const fixture=await (bibliography?prepareBibliographyCodexFixture:prepareJuliaCodexFixture)(root,
+    {julia:process.env.PERFCHECKER_TEST_JULIA,project:process.env.PERFCHECKER_TEST_CONTROLLER,coreVersion:'1.0.1',coreTree});
   await execute('unzip',['-q',archive,'-d',path.join(session,'archive')]);
   const archiveExtension=path.join(session,'archive','extension');
   assert.equal(JSON.parse(await fs.readFile(path.join(archiveExtension,'package.json'),'utf8')).version,'1.0.1');
@@ -77,7 +106,7 @@ try{
   // neutral manifest supplies it without loading any development product code.
   const driver=path.join(session,'driver');await fs.mkdir(driver);
   await fs.writeFile(path.join(driver,'package.json'),JSON.stringify({name:'perfchecker-local-authentication-driver',publisher:'qualification',version:'0.0.0',engines:{vscode:'^1.96.0'}}));
-  assert(!expired,'The local runner exceeded its eighteen-minute total deadline before launch');
+  assert(!expired,'The local runner exceeded its total deadline before launch');
   await sdk.runTests({vscodeExecutablePath,extensionDevelopmentPath:driver,extensionTestsPath:path.join(client,'test','codex-vscode-host.cjs'),
     launchArgs:[root,'--new-window','--disable-workspace-trust','--skip-welcome','--skip-release-notes','--disable-gpu',
       ...privateProfile,`--remote-debugging-port=${port}`,'--remote-debugging-address=127.0.0.1'],
@@ -85,9 +114,11 @@ try{
       PERFCHECKER_HOST_SESSION:session,PERFCHECKER_HOST_ARCHIVE:archive,PERFCHECKER_HOST_ARCHIVE_EXTENSION:archiveExtension,
       PERFCHECKER_HOST_VSIX_SHA:vsixSha,PERFCHECKER_HOST_CDP_PORT:String(port),PERFCHECKER_HOST_BASELINE_BYTES:String(fixture.baselineBytes),
       PERFCHECKER_HOST_CORE:JSON.stringify(fixture.core),PERFCHECKER_CODEX_HOST_ONLY:'1',
-      JULIA_NUM_THREADS:'1',JULIA_NUM_PRECOMPILE_TASKS:'1',JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1'}});
+      ...(bibliography?{PERFCHECKER_HOST_BIBLIOGRAPHY:JSON.stringify(fixture.probe)}:{}),
+      ...(process.env.PERFCHECKER_TEST_RESULTS?{PERFCHECKER_HOST_PROOFS:process.env.PERFCHECKER_TEST_RESULTS}:{}),
+      JULIA_NUM_THREADS:bibliography?'2':'1',JULIA_NUM_PRECOMPILE_TASKS:'1',JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',OMP_NUM_THREADS:'1'}});
   const result=JSON.parse(await fs.readFile(path.join(session,'result.json'),'utf8'));
-  assert(!expired,'The local runner exceeded its eighteen-minute total deadline');
+  assert(!expired,'The local runner exceeded its total deadline');
   assert.equal(result.runner,'codex-vscode-host.cjs');assert.equal(result.hostExecuted,true);
   assert.equal(result.cleanupSafeToRemove,true);
   assert.equal(result.vsixSha256,vsixSha);assert.equal(result.status,'passed');console.log(JSON.stringify(result));
@@ -106,10 +137,17 @@ try{
   throw error;
 }finally{
   clearTimeout(deadline);clearTimeout(forceDeadline);
-  if(displayChild?.pid&&displayChild.exitCode===null&&displayChild.signalCode===null){
-    displayChild.kill('SIGTERM');await Promise.race([displayExit,delay(2000)]);
-    if(displayChild.exitCode===null&&displayChild.signalCode===null){displayChild.kill('SIGKILL');await displayExit;}
+  try{
+    if(process.env.PERFCHECKER_TEST_RESULTS){
+      await fs.mkdir(process.env.PERFCHECKER_TEST_RESULTS,{recursive:true});
+      await fs.copyFile(path.join(session,'result.json'),path.join(process.env.PERFCHECKER_TEST_RESULTS,'result.json')).catch(error=>{if(error.code!=='ENOENT')throw error;});
+    }
+  }finally{
+    if(displayChild?.pid&&displayChild.exitCode===null&&displayChild.signalCode===null){
+      displayChild.kill('SIGTERM');await Promise.race([displayExit,delay(2000)]);
+      if(displayChild.exitCode===null&&displayChild.signalCode===null){displayChild.kill('SIGKILL');await displayExit;}
+    }
+    if(sessionMayRemove)await fs.rm(session,{recursive:true,force:true});
+    else console.error(`Failed session preserved while process cleanup is unresolved: ${session}`);
   }
-  if(sessionMayRemove)await fs.rm(session,{recursive:true,force:true});
-  else console.error(`Failed session preserved while process cleanup is unresolved: ${session}`);
 }

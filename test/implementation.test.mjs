@@ -86,6 +86,55 @@ test('linked worktrees and split index are supported without moving the branch',
     assert.deepEqual(await fs.readFile(indexPath),before);
   } finally {await git(root,'worktree','remove','--force',linked); await fs.rm(parent,{recursive:true,force:true});}
 }));
+test('partial clone checkpoints preserve original history without hydrating historical blobs',()=>fixture(async source=>{
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'perfchecker-promisor-test-'));
+  const origin=path.join(directory,'origin.git'),root=path.join(directory,'partial');
+  const previousLazyFetch=process.env.GIT_NO_LAZY_FETCH;
+  let checkout;
+  try{
+    const historical=(await git(source,'rev-parse','HEAD:source.jl')).trim();
+    await fs.writeFile(path.join(source,'source.jl'),'current HEAD\n');await git(source,'add','.');await git(source,'commit','--quiet','-m','Current source');
+    await git(directory,'clone','--quiet','--bare',source,origin);
+    await git(origin,'config','uploadpack.allowFilter','true');
+    await execute('git',['clone','--quiet','--no-local','--filter=blob:none',origin,root],
+      {cwd:directory,env:{...process.env,GIT_NO_LAZY_FETCH:'0'}});
+    process.env.GIT_NO_LAZY_FETCH='1';
+    assert.equal((await git(root,'config','remote.origin.promisor')).trim(),'true');
+    assert.equal((await git(root,'rev-parse','--is-shallow-repository')).trim(),'false');
+    assert((await git(root,'rev-list','--objects','--missing=print','HEAD')).split('\n').includes(`?${historical}`));
+    await assert.rejects(git(root,'cat-file','-e',historical));
+    await git(root,'fsck','--full','--no-dangling');
+    await fs.writeFile(path.join(root,'source.jl'),'staged source\n');await git(root,'add','source.jl');
+    await fs.writeFile(path.join(root,'source.jl'),'saved before implementation\n');
+    const head=(await git(root,'rev-parse','HEAD')).trim(),index=await fs.readFile(path.join(root,'.git','index'));
+    const refs=await git(root,'for-each-ref','--format=%(refname) %(objectname)'),before=await git(root,'status','--porcelain');
+    checkout=await createImplementationCheckout(root);
+    assert.equal(await fs.readFile(path.join(checkout.workspace,'source.jl'),'utf8'),'saved before implementation\n');
+    assert.equal((await git(checkout.workspace,'rev-parse','--is-shallow-repository')).trim(),'true');
+    await fs.writeFile(path.join(checkout.workspace,'source.jl'),'reviewed candidate\n');
+    const proposal=await checkout.collect();
+    assert.deepEqual(proposal.files,['source.jl']);
+    assert.equal((await git(root,'rev-parse',`${proposal.base}^`)).trim(),head,'The original checkpoint retains its real parent');
+    assert.equal((await git(root,'rev-parse',`${proposal.candidate}^`)).trim(),proposal.base,'The candidate retains the checkpoint parent');
+    await checkout.dispose();checkout=undefined;
+    await applyImplementation(proposal);
+    assert.equal(await fs.readFile(path.join(root,'source.jl'),'utf8'),'reviewed candidate\n');
+    const recovered=await recoverImplementationProposal(root,proposal.backupRef,proposal.candidateRef,false);
+    assert.equal(recovered.applied,true);assert.equal(recovered.patch,proposal.patch);
+    await applyImplementation(recovered,true);
+    assert.equal(await fs.readFile(path.join(root,'source.jl'),'utf8'),'saved before implementation\n');
+    assert.equal((await git(root,'rev-parse','HEAD')).trim(),head);assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),index);
+    assert.equal(await git(root,'status','--porcelain'),before);
+    assert.equal((await git(root,'for-each-ref','--format=%(refname) %(objectname)')).split('\n').filter(line=>!line.startsWith('refs/perfchecker/')).join('\n'),refs);
+    assert.equal((await git(root,'rev-parse','--is-shallow-repository')).trim(),'false');
+    await assert.rejects(git(root,'cat-file','-e',historical),'No historical blob was hydrated');
+    await git(root,'fsck','--full','--no-dangling');
+  }finally{
+    await checkout?.dispose();
+    if(previousLazyFetch===undefined)delete process.env.GIT_NO_LAZY_FETCH;else process.env.GIT_NO_LAZY_FETCH=previousLazyFetch;
+    await fs.rm(directory,{recursive:true,force:true});
+  }
+}));
 test('non-UTF8 text patches preserve exact bytes through reviewed apply and restart restoration',()=>fixture(async root=>{
   const original=Buffer.from([99,97,102,233,10]),candidate=Buffer.from([99,97,102,233,32,97,108,116,101,114,233,10]);
   await fs.writeFile(path.join(root,'latin1.txt'),original);await git(root,'add','latin1.txt');

@@ -512,7 +512,7 @@ test('Cancel while native executable validation is pending starts no process or 
 }));
 
 test('shared connection registry: failed tool selection and workspace/trust changes retire the real server',()=>fixture(async({root,options})=>{
-  const callbacks=new Map(),subscriptions=[];
+  const callbacks=new Map(),subscriptions=[],shownErrors=[];
   const folder={name:'Private fixture',uri:{scheme:'file',fsPath:root,toString:()=>`file://${root}`}};
   const workspace={isTrusted:true,workspaceFolders:[folder],onDidChangeWorkspaceFolders:()=>({dispose(){}})};
   let panel;
@@ -521,7 +521,7 @@ test('shared connection registry: failed tool selection and workspace/trust chan
   workspace.getConfiguration=()=>({get:(name,fallback)=>name==='codexExecutable'?path.join(root,'absent-codex-fixture'):name==='advisorConfig'?'provider.json':fallback,
     update(){throw new Error('A temporary connector must not write settings.');}});
   const vscode={workspace,Uri:{joinPath:(uri,...parts)=>({fsPath:path.join(uri.fsPath,...parts)})},ViewColumn:{One:1},
-    commands:{registerCommand:(name,callback)=>{callbacks.set(name,callback);return{dispose(){}};},executeCommand:(name,...args)=>callbacks.get(name)(...args)},window:{showErrorMessage(){},showInformationMessage(){},
+    commands:{registerCommand:(name,callback)=>{callbacks.set(name,callback);return{dispose(){}};},executeCommand:(name,...args)=>callbacks.get(name)(...args)},window:{showErrorMessage(message){shownErrors.push(String(message));},showInformationMessage(){},
       createWebviewPanel:()=>{let disposed;panel={disposed:false,webview:{asWebviewUri:uri=>uri.fsPath,cspSource:'fixture',onDidReceiveMessage(){},async postMessage(){}},
         onDidDispose:callback=>{disposed=callback;},dispose(){this.disposed=true;disposed?.();}};return panel;}}};
   const original=Module._load;
@@ -568,7 +568,13 @@ test('shared connection registry: failed tool selection and workspace/trust chan
     await Promise.race([preparing,sending.then(error=>{throw error;})]);
     const other={name:'Other folder',uri:{scheme:'file',fsPath:path.join(root,'other'),toString:()=>`file://${root}/other`}};
     workspace.workspaceFolders=[folder,other];selectWorkspaceFolder(workspace.workspaceFolders,other);
-    chat.cancel();await until(async()=>!await alive(replacementServer)&&!localAdvisorConnection(folder.uri.toString()));release();
+    try {
+      chat.cancel();await until(async()=>!await alive(replacementServer)&&!localAdvisorConnection(folder.uri.toString()));
+    }catch(error){
+      const processState=process.platform==='linux'?await readFile(`/proc/${replacementServer}/stat`,'utf8').catch(value=>({code:value.code})):undefined;
+      throw new Error(`Pre-HTTP Cancel did not retire its connection: ${JSON.stringify({pid:replacementServer,
+        alive:await alive(replacementServer),registered:Boolean(localAdvisorConnection(folder.uri.toString())),processState,shownErrors})}`,{cause:error});
+    }finally{release();}
     assert.match((await sending).message,/before Julia or HTTP/);
     assert.equal(localAdvisorConnection(folder.uri.toString()),undefined);
     assert.equal(await readFile(path.join(root,'provider.json'),'utf8'),savedProvider);
