@@ -214,7 +214,7 @@ test('Codex owns an observed detached/reparented cohort through timeout, HTTP ab
       if(!m||/^[ZX]/.test(m[5]))return undefined;
       const mapped=await exec('/usr/sbin/lsof',['-a','-p',String(pid),'-d','txt','-Fn']);
       const filename=mapped.split('\n').find(x=>x.startsWith('n/'))?.slice(1);assert(filename);
-      return{pid,parent:Number(m[2]),group:Number(m[3]),session:m[4],start:m[6],exe:await realpath(filename)};
+      return{pid,parent:Number(m[2]),group:Number(m[3]),session:m[4],state:m[5],start:m[6],exe:await realpath(filename)};
     }catch(error){if(['ENOENT','ESRCH'].includes(error.code)||error.code===1)return undefined;throw error;}
   };
   for(const mode of ['timeout','cancel','dispose','natural-exit'])await t.test(mode,async()=>{
@@ -230,7 +230,13 @@ test('Codex owns an observed detached/reparented cohort through timeout, HTTP ab
         const current=await identity(pid);assert(current,'Every ancestor is alive before reparenting');qualified.push(current);
       }
       assert.equal(qualified[1].parent,leader.leader);assert.equal(qualified[2].parent,cohort.middle);assert.equal(qualified[3].parent,cohort.detached);
-      assert.notEqual(qualified[2].group,qualified[0].group);assert.notEqual(qualified[2].session,qualified[0].session);
+      assert.notEqual(qualified[2].group,qualified[0].group);
+      if(process.platform==='linux')assert.notEqual(qualified[2].session,qualified[0].session);
+      else{
+        // Darwin ps sess exposes the kernel e_sess pointer, which XNU leaves
+        // zero. Its stat 's' is the actual EPROC_SLEADER session-leader flag.
+        assert.equal(qualified[2].group,qualified[2].pid);assert.match(qualified[2].state,/s/);
+      }
       const owner=connector.owners?.values().next().value;
       if(owner?.cohort)await until(()=>{assert(qualified.every(row=>owner.cohort.known.get(row.pid)?.start===row.start));return true;});
       await writeFile(path.join(root,'release-middle'),'release');

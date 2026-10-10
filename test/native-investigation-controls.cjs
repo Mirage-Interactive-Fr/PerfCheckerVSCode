@@ -26,7 +26,7 @@ function configuration(context) {
 async function view(context) {
   await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
   const result = await context.findFrame('#app nav[aria-label="Investigation views"]');
-  await result.locator('#app .status').waitFor({state: 'visible'});
+  await result.locator('#app p.status').waitFor({state: 'visible'});
   return result;
 }
 
