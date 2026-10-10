@@ -792,12 +792,19 @@ end`;
   assert(gpu,'The rendered native canvas has a live WebGL context');
   const before=await drawnCanvas(context,canvas,'distribution');
   await frontend.snapshot('distribution-drawn');
-  const slider=firstDocument.frame.getByRole('slider',{name:'Inspect measured point'});
+  const pointInput=firstDocument.frame.getByRole('spinbutton',{name:'Recorded point index'});
+  const recordedPoint=(text,index,measured)=>{
+    const prefix=`Point ${index+1}: ${measured.versions[index]} · `;
+    if(!text.startsWith(prefix))return false;
+    const value=/^(\S+) (.*)$/.exec(text.slice(prefix.length));
+    return value&&Number(value[1])===measured.values[index]&&value[2]===measured.unit;
+  };
   const distinct=distinctMeasuredPoint(data);
   const selectedIndex=distinct<0?1:distinct;
-  await slider.focus();for(let step=0;step<selectedIndex;step++)await slider.press('ArrowRight');
-  const expected=`Point ${selectedIndex+1}: ${data.values[selectedIndex]} ${data.unit} · ${data.versions[selectedIndex]}`;
-  await eventually(async()=>await firstDocument.frame.locator('#point-readout').innerText()===expected,'A real native slider gesture inspects the chosen measured sample');
+  await pointInput.focus();for(let step=0;step<selectedIndex;step++)await pointInput.press('ArrowUp');
+  await eventually(async()=>recordedPoint(await firstDocument.frame.locator('#point-readout').innerText(),selectedIndex,data),
+    'A real native number-input gesture inspects the exact chosen version, value and unit');
+  const expected=await firstDocument.frame.locator('#point-readout').innerText();
   const after=await drawnCanvas(context,canvas,'highlight',distinct<0?undefined:before);
   await frontend.snapshot('distribution-point-inspected');
   await capture(context,'pluto-rendered-distribution');
@@ -805,10 +812,8 @@ end`;
   const second=await eventually(async()=>{const current=await evidence();return current.selectedLabel===trajectory.label&&current;},'The real plot selector regenerates the version-series figure');
   assert.equal(second.kind,'version_series');assert(second.selected.startsWith('version-series-'));
   const secondDocument=await plotDocument(state,firstDocument);
-  await eventually(async()=>{
-    const text=await secondDocument.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
-    return match&&Number(match[1])===second.values[0]&&match[2]===second.unit&&match[3]===second.versions[0];
-  },'The newly rendered trajectory inspector identifies its actual measured value');
+  await eventually(async()=>recordedPoint(await secondDocument.frame.locator('#point-readout').innerText(),0,second),
+    'The newly rendered trajectory inspector identifies its exact version, measured value and unit');
   await frontend.snapshot('trajectory-readout-ready');
   const trajectoryPixels=await drawnCanvas(context,secondDocument.canvas,'trajectory');
   await capture(context,'pluto-rendered-version-series');
@@ -818,10 +823,8 @@ end`;
   const returnedDocument=await plotDocument(state,secondDocument);
   assert.notEqual(returnedDocument.token,firstDocument.token,'Even a cached plot creates a new document identity');
   assert.equal(returnedDocument.htmlSha256,firstDocument.htmlSha256,'The unchanged cached HTML is reused without patching queues or providers');
-  await eventually(async()=>{
-    const text=await returnedDocument.frame.locator('#point-readout').innerText(),match=/^Point 1: (\S+) (.*?) · (.*)$/.exec(text);
-    return match&&Number(match[1])===data.values[0]&&match[2]===data.unit&&match[3]===data.versions[0];
-  },'The returned document starts with its own initial inspector state');
+  await eventually(async()=>recordedPoint(await returnedDocument.frame.locator('#point-readout').innerText(),0,data),
+    'The returned document starts with its own exact version, measured value and unit');
   const returnedPixels=await drawnCanvas(context,returnedDocument.canvas,'distribution-returned');
   await frontend.snapshot('distribution-returned');
   // Keep the allocation plot, including legitimate coincident samples. A
@@ -838,10 +841,11 @@ end`;
     const point=distinctMeasuredPoint(temporal);
     assert(point>=0,'The measured wall-time coordinates coincide; required pixel movement cannot be qualified');
     const index=point;
-    const temporalSlider=temporalDocument.frame.getByRole('slider',{name:'Inspect measured point'});
-    await temporalSlider.focus();for(let step=0;step<index;step++)await temporalSlider.press('ArrowRight');
-    const readout=`Point ${index+1}: ${temporal.values[index]} ${temporal.unit} · ${temporal.versions[index]}`;
-    await eventually(async()=>await temporalDocument.frame.locator('#point-readout').innerText()===readout,'A native gesture inspects the actual wall-time sample');
+    const temporalInput=temporalDocument.frame.getByRole('spinbutton',{name:'Recorded point index'});
+    await temporalInput.focus();for(let step=0;step<index;step++)await temporalInput.press('ArrowUp');
+    await eventually(async()=>recordedPoint(await temporalDocument.frame.locator('#point-readout').innerText(),index,temporal),
+      'A native number-input gesture inspects the exact wall-time version, measured value and unit');
+    const readout=await temporalDocument.frame.locator('#point-readout').innerText();
     const moved=await drawnCanvas(context,temporalCanvas,'wall-time-highlight',initial);
     await capture(context,'pluto-rendered-wall-time-highlight');
     temporalInteraction={available:true,selected:temporal.selected,measuredSamples:temporal.values.length,nativeKeyboard:true,
@@ -1185,7 +1189,7 @@ exports.runPlots = async context => {
     }
     throw new Error('The existing 45 second Close/Stop budget expired before positive plot shutdown evidence');
   };
-  try{await suite(context,directory,true,process.platform==='darwin'?{
+  try{await suite(context,directory,true,['darwin','win32'].includes(process.platform)?{
     created:async state=>{port=Number(new URL(state.frame.url()).port);owner=await sessionOwner(context,state);known=owner.descendants;},
     beforeClose:()=>collectBefore('plots-before-native-close'),
     afterClose:deadline=>inspectAfter('plots-after-native-close-before-teardown',deadline)
