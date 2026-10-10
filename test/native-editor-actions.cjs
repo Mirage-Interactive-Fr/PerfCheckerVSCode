@@ -214,7 +214,14 @@ async function resource(context,workspace,controller,threads,previousEditorActio
     const action=windowPage.getByText('Read evidence and verification steps',{exact:true});
     await action.waitFor({state:'visible',timeout:30000});
     if(context.editorQualification)context.log('native-editor-visible-quickfix',{entries:await action.count(),label:'Read evidence and verification steps',visible:await action.isVisible()});
-    await action.click();
+    const menu=windowPage.locator('.action-widget:visible');assert.equal(await menu.count(),1);
+    const entries=await menu.getByRole('option').count();assert(entries>0);
+    const focused=()=>action.evaluate(node=>node.closest('.monaco-list-row')?.classList.contains('focused')===true);
+    let next=0;
+    while(!await focused()&&next<entries){await windowPage.keyboard.press('ArrowDown');next++;}
+    assert(await focused(),'Native keyboard navigation focuses the exact visible PerfChecker quick fix');
+    context.log('native-editor-quickfix-keyboard',{label:'Read evidence and verification steps',options:entries,arrowDown:next,exactRowFocused:true});
+    await windowPage.keyboard.press('Enter');
     frame=await context.findFrame('#app');
     await eventually(async()=>(await frame.locator('body').innerText()).includes('native_editor_branch'),
       'The chosen native quick fix opens the evidence for the same workspace');
@@ -295,7 +302,10 @@ exports.runSuiteLog=async context=>{
   const canonicalController=await fs.realpath(controller);
   // Monaco only renders the current viewport. Reveal the first physical log
   // line with a native editor gesture before asserting its visible contents.
-  await output.locator('.view-lines').click();
+  assert((await vscode.commands.getCommands(true)).includes('workbench.action.focusPanel'));
+  await vscode.commands.executeCommand('workbench.action.focusPanel');
+  await eventually(()=>output.evaluate(element=>element.contains(document.activeElement)),
+    'The native Focus into Panel command focuses the actual visible Output editor',30000);
   await windowPage.keyboard.press(process.platform==='darwin'?'Meta+Home':'Control+Home');
   const file=`native-${process.platform}-vscode-${vscode.version}-suite-worker-output.png`;
   await windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,file)});

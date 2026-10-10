@@ -152,11 +152,22 @@ async function nativeIdentity(pid,expectedExecutable,observe=()=>{},expectedIden
   return {pid,parent:after.parent,group:after.group,start:after.start,executable:expectedExecutable};
 }
 const nativeParentObservations=new WeakMap();
-async function observeNativeIdentityGone(identity,observe){
-  const current=await nativeIdentity(identity.pid,identity.executable,observe,identity);
-  if(!current)return true;
-  assert.equal(current.start,identity.start,'PID reuse is recorded as an identity mismatch, never silently accepted');
+async function observeNativeIdentityGone(identity,observe,extinctions){
   const incarnation=({parent,...value})=>value;
+  const key=JSON.stringify([identity.pid,identity.start,identity.executable]);
+  const previous=extinctions?.get(key);
+  if(previous){
+    assert.deepEqual(incarnation(identity),previous.identity,'An extinction receipt belongs only to the exact established incarnation');
+    if(!previous.reused){previous.reused=true;observe({kind:'prior-extinction-receipt',identity:previous.identity,
+      extinctionObservedAt:previous.observedAt,observedAt:new Date().toISOString(),currentPidNotInspectedOrAdopted:true});}
+    return true;
+  }
+  const current=await nativeIdentity(identity.pid,identity.executable,observe,identity);
+  if(!current){
+    const receipt={identity:incarnation(identity),observedAt:new Date().toISOString(),reused:false};
+    extinctions?.set(key,receipt);observe({kind:'extinction-qualified',identity:receipt.identity,observedAt:receipt.observedAt});return true;
+  }
+  assert.equal(current.start,identity.start,'PID reuse is recorded as an identity mismatch, never silently accepted');
   assert.deepEqual(incarnation(current),incarnation(identity),'The established incarnation retains its PID, start, executable and private group');
   if(current.parent!==identity.parent&&nativeParentObservations.get(identity)!==current.parent){
     nativeParentObservations.set(identity,current.parent);
@@ -580,7 +591,8 @@ exports.run = async (context,options={}) => {
   if(general100){assert.equal(context.core.mode,'general100');assert.equal(context.core.version,'1.0.0');assert.equal(options.stdio,undefined);assert.equal(options.customArguments,undefined);}
   if(options.stdio){const handoff=await stdioHandoff();if(handoff)return resumeStdioReload(context,handoff);}
   const {vscode, workspace, findFrame, log, proof} = context;
-  const sameNativeIdentityGone=identity=>observeNativeIdentityGone(identity,observation=>log('native-mcp-stdio-identity-observation',observation));
+  const extinctions=new Map();
+  const sameNativeIdentityGone=identity=>observeNativeIdentityGone(identity,observation=>log('native-mcp-stdio-identity-observation',observation),extinctions);
   const uri = vscode.Uri.file(workspace);
   const settings = () => vscode.workspace.getConfiguration('perfchecker', uri);
   const measurementProject=await fs.realpath(path.join(workspace,'worker-environment'));
@@ -707,6 +719,7 @@ exports.run = async (context,options={}) => {
     advisorImplementationMcpTool: implementationTool, advisorTimeout: 180,
     advisorMcpPromptArgument:adviceArgument,advisorMcpArguments:additional,
     advisorImplementationMcpPromptArgument:implementationArgument,advisorImplementationMcpWorkspaceArgument:workspaceArgument,
+    advisorImplementationMcpArguments:implementationAdditional,
     codexExecutable: path.join(workspace, 'not-installed-codex')};
   values.scenarioSamples=general100?3:100;
   const persistedSettings=[];
@@ -964,8 +977,12 @@ exports.run = async (context,options={}) => {
     if(!stdio){
       await view.getByText('Configure the MCP implementation tool', {exact: true}).click();
       await view.getByRole('textbox', {name: 'Implementation tool name', exact: true}).fill(implementationTool);
+      await view.getByRole('textbox',{name:'Other implementation tool arguments (JSON)',exact:true}).fill(JSON.stringify(implementationAdditional));
       await view.getByRole('button', {name: 'Save implementation tool', exact: true}).click();
       await eventually(async () => /Implementation tool saved/.test((await state()).status), 'The native tool configuration is saved');
+      assert.deepEqual(settings().inspect('advisorImplementationMcpArguments')?.workspaceFolderValue,implementationAdditional,
+        'The real implementation form persists its explicit independent arguments in the owning folder');
+      assert.deepEqual((await state()).implementation.arguments,implementationAdditional);
     }else{
       assert.deepEqual((await state()).implementation,{tool:implementationTool,promptArgument:implementationArgument,workspaceArgument,arguments:implementationAdditional});
     }
@@ -1027,9 +1044,16 @@ exports.run = async (context,options={}) => {
     const alternate=path.join(path.dirname(workspace),'chat-alternate-workspace');
     await fs.mkdir(alternate,{recursive:true});await fs.writeFile(path.join(alternate,'Project.toml'),'name="AlternateChatFixture"\n');
     alternateFolder=vscode.Uri.file(alternate);
-    assert(vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length,0,{uri:alternateFolder,name:'Chat alternate folder'}));
-    await eventually(()=>vscode.workspace.workspaceFolders.some(folder=>folder.uri.toString()===alternateFolder.toString()),
-      'The real workspace has added the independent alternate folder');
+    let alternateAcknowledged=false;
+    const alternateChanged=vscode.workspace.onDidChangeWorkspaceFolders(event=>{
+      if(event.added.some(folder=>folder.uri.toString()===alternateFolder.toString()))alternateAcknowledged=true;
+    });
+    try{
+      assert(vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length,0,{uri:alternateFolder,name:'Chat alternate folder'}));
+      await eventually(()=>alternateAcknowledged,'The workbench acknowledges the alternate folder and its configuration model',30000);
+    }finally{alternateChanged.dispose();}
+    assert.equal(vscode.workspace.getWorkspaceFolder(alternateFolder)?.uri.toString(),alternateFolder.toString());
+    log('native-mcp-alternate-workspace-acknowledged',{resource:alternateFolder.toString(),actualWorkspaceEvent:true});
     if(stdio){
       const root=path.join(await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION),'persisted-stdio-b');await fs.mkdir(root);
       // A second real executable path distinguishes command scope too; this
@@ -1039,7 +1063,16 @@ exports.run = async (context,options={}) => {
       const fixture={workspace:alternate,root,values:persistedStdioValues(command,values.advisorEndpoint,root,'b')};
       persistedSettings.push(fixture);
       const alternateSettings=vscode.workspace.getConfiguration('perfchecker',alternateFolder);
-      for(const [key,value]of Object.entries(fixture.values))await alternateSettings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
+      for(const [key,value]of Object.entries(fixture.values)){
+        const detail={stage:'alternate-stdio-resource-setup',key,resource:alternateFolder.toString(),
+          owner:vscode.workspace.getWorkspaceFolder(alternateFolder)?.uri.toString(),
+          extensionHostFolders:vscode.workspace.workspaceFolders.map(folder=>folder.uri.toString()),
+          workspaceFile:vscode.workspace.workspaceFile?.toString(),chatWorkspace:(await state()).workspace};
+        log('native-mcp-scoped-setting-before',detail);
+        try{await alternateSettings.update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);}
+        catch(error){log('native-mcp-scoped-setting-failure',{...detail,errorClass:error.name,code:error.code,message:String(error)});throw error;}
+        log('native-mcp-scoped-setting-after',{stage:detail.stage,key,resource:detail.resource});
+      }
     }
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',alternateFolder);
     const alternateStudio=await findFrame('#studio-root');
