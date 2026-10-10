@@ -18,6 +18,46 @@ const product=()=>({
 // Read-only status observations must not refresh Git's index stat cache after restore.
 const git=async(root,...args)=>(await execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout;
 
+if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('bounded Bibliography projection preserves actual summaries and complete selected allocation events',()=>{
+  const {bibliographyAllocationProjection:project,bibliographyAdviceQuestion:question}=require('./codex-vscode-host.cjs');
+  const sites=[
+    {bytes:55,file:'src/名字.jl',line:7,stack:[{function:'name_to_string',file:'src/名字.jl',line:7},{function:'export_bibtex',file:'src/bibtex.jl',line:207}]},
+    {bytes:120,file:'base/io.jl',line:3,stack:[{function:'StringMemory',file:'base/io.jl',line:3}]},
+    {bytes:55,file:'src/名字.jl',line:7,stack:[{function:'name_to_string',file:'src/名字.jl',line:7}]},
+  ];
+  const metadata={schema_version:'perfchecker-allocation-profile/1',status:'complete',retained_allocations:3,
+    retained_sampled_bytes:230,profile_evaluations:3,total_bytes:999,total_allocations:8,
+    total_semantics:'independent operation evaluations',weight_semantics:'raw sampled bytes across all profile evaluations'};
+  const report={runs:[{run_id:'real-run',collector:'profile_alloc',profile:{kind:'profile_alloc',allocation_profile:metadata,allocation_sites:sites,truncated:false}}]};
+  const summaries=[{collector:'profile_alloc',run_id:'real-run',metric:'julia.alloc.bytes',unit:'By',median:999},
+    {collector:'profile_alloc',run_id:'real-run',metric:'julia.alloc.count',unit:'1',median:8}];
+  const bytes=Buffer.from(JSON.stringify(report)),advice=Buffer.from(JSON.stringify({measurement_summaries:summaries}));
+  const original=Buffer.from(bytes),sources={run:path.resolve('run.json'),advice:path.resolve('advice.json')};
+  const result=project(bytes,advice,sources);
+  assert.deepEqual(result.measurement_summaries,summaries);assert.deepEqual(result.allocation_profile,metadata);
+  assert.deepEqual(result.allocation_events,[{source_index:1,event:sites[1]},{source_index:0,event:sites[0]}]);
+  assert.equal(result.selection.available_events,3);assert.equal(result.selection.selected_events,2);assert.equal(result.selection.omitted_events,1);
+  assert.equal(result.selection.selected_sampled_bytes,175);assert.equal(result.selection.omitted_sampled_bytes,55);
+  assert.deepEqual(result.selection.byte_fraction,{numerator:175,denominator:230});assert.deepEqual(result.selection.event_fraction,{numerator:2,denominator:3});
+  assert.equal(result.selection.unit,'By');assert.equal(result.sources.run_json.path,sources.run);
+  assert.equal(result.sources.run_json.sha256,createHash('sha256').update(bytes).digest('hex'));assert.deepEqual(bytes,original);
+  const message=question('module Bibliography\n# αβ\nend',result);assert(message.includes(JSON.stringify(result)));assert(message.includes('αβ'));
+  assert.throws(()=>question('界'.repeat(6000),result),/complete native question/,'The full UTF8 message is refused without hidden truncation');
+  sites[1].stack=[{function:'name_to_string',file:'src/bibtex.jl',line:3}];
+  const duplicate=project(Buffer.from(JSON.stringify(report)),advice,sources);
+  assert.deepEqual(duplicate.allocation_events.map(item=>item.source_index),[1],'The same recorded event is never sent twice');
+  for(const site of sites)site.stack=[{function:'unknown',file:site.file,line:site.line}];
+  const unattributed=project(Buffer.from(JSON.stringify(report)),advice,sources);
+  assert.equal(unattributed.selection.target_frame_available,false);assert.deepEqual(unattributed.allocation_events,[]);
+  assert.equal(unattributed.selection.omitted_events,3);assert.deepEqual(unattributed.measurement_summaries,summaries);
+  metadata.retained_sampled_bytes=229;
+  assert.throws(()=>project(Buffer.from(JSON.stringify(report)),advice,sources),/230/,'Unknown or inconsistent sampled weight accounting cannot become invented attribution');
+  const empty=structuredClone(report);empty.runs[0].profile.allocation_sites=[];
+  assert.throws(()=>project(Buffer.from(JSON.stringify(empty)),advice,sources),/must contain recorded events/);
+  const zero=structuredClone(report);for(const site of zero.runs[0].profile.allocation_sites)site.bytes=0;
+  assert.throws(()=>project(Buffer.from(JSON.stringify(zero)),advice,sources),/positive recorded sampled weight/);
+});
+
 // Passive test-only observation of the real connector's JSONL. No command,
 // assistant text, error body, token, environment or tool argument is retained.
 export function observeCodexEvents(stream,identity,record){

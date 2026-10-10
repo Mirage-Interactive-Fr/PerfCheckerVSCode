@@ -54,6 +54,46 @@ async function captureConversationReply(view,record,capture){
   assert(record.complete,'The complete real advice reply is visible across the retained native scroll captures');
 }
 exports.captureConversationReply=captureConversationReply;
+// The native Chat attaches one real timing report. This separate, explicitly
+// partial allocation context is pasted by the user gesture, not a forged bundle.
+function bibliographyAllocationProjection(runBytes,adviceBytes,sources){
+  for(const name of ['run','advice'])assert(path.isAbsolute(sources[name]),'Evidence paths must identify the actual saved files');
+  const report=JSON.parse(runBytes.toString('utf8')),advice=JSON.parse(adviceBytes.toString('utf8'));
+  assert.equal(report.runs.length,1);const run=report.runs[0],profile=run.profile;
+  assert.equal(run.collector,'profile_alloc');assert.equal(profile.kind,'profile_alloc');
+  const metadata=profile.allocation_profile,sites=profile.allocation_sites;
+  assert.equal(metadata.schema_version,'perfchecker-allocation-profile/1');assert.equal(metadata.status,'complete');
+  assert.equal(profile.truncated,false);assert(Array.isArray(sites)&&sites.length>0,'Bibliography allocation evidence must contain recorded events');
+  assert(Array.isArray(advice.measurement_summaries)&&advice.measurement_summaries.length>0);
+  assert(advice.measurement_summaries.every(item=>item.collector==='profile_alloc'&&item.run_id===run.run_id));
+  for(const site of sites){
+    assert(Number.isSafeInteger(site.bytes)&&site.bytes>=0);assert(Array.isArray(site.stack));
+    assert(site.stack.every(frame=>typeof frame.function==='string'&&typeof frame.file==='string'&&Number.isInteger(frame.line)));
+  }
+  const totalBytes=sites.reduce((sum,site)=>sum+site.bytes,0);assert(Number.isSafeInteger(totalBytes)&&totalBytes>0,'Bibliography allocation evidence must have positive recorded sampled weight');
+  assert.equal(sites.length,metadata.retained_allocations);assert.equal(totalBytes,metadata.retained_sampled_bytes);
+  const ranked=sites.map((site,index)=>({site,index})).sort((a,b)=>b.site.bytes-a.site.bytes||a.index-b.index);
+  const target=ranked.find(item=>item.site.stack.some(frame=>frame.function==='name_to_string'));
+  const chosen=target?[ranked[0],target].filter((item,index,items)=>items.findIndex(other=>other.index===item.index)===index):[];
+  const selectedBytes=chosen.reduce((sum,item)=>sum+item.site.bytes,0);
+  return {schema_version:'perfchecker-bounded-allocation-context/1',
+    sources:{run_json:{path:sources.run,sha256:hash(runBytes)},advice_json:{path:sources.advice,sha256:hash(adviceBytes)}},
+    measurement_summaries:advice.measurement_summaries,allocation_profile:metadata,
+    selection:{policy:'Hypothesis-oriented: largest recorded event overall, then largest event with an exact name_to_string frame; ties use source order; duplicate events are omitted.',
+      source_index_base:0,target_frame_available:Boolean(target),unit:'By',available_events:sites.length,
+      selected_events:chosen.length,omitted_events:sites.length-chosen.length,
+      retained_sampled_bytes:totalBytes,selected_sampled_bytes:selectedBytes,omitted_sampled_bytes:totalBytes-selectedBytes,
+      event_fraction:{numerator:chosen.length,denominator:sites.length},byte_fraction:{numerator:selectedBytes,denominator:totalBytes},
+      limit:'Partial recorded events across all profile evaluations, not whole-operation totals. No extrapolation or exhaustive attribution. Without a recorded target frame only metadata is supplied.'},
+    allocation_events:chosen.map(item=>({source_index:item.index,event:item.site}))};
+}
+function bibliographyAdviceQuestion(source,projection){
+  const question=`Advice only: no tools, commands or edits. The attached real timing evidence contains BenchmarkTools and Chairmarks measurements for one Bibliography export. The allocation context below is a bounded projection of separate saved evidence, with full summaries, recorded stacks, selection limits, source paths and SHA256. Distinguish whole-operation totals from sampled weights. Explain whether name_to_string is a plausible bounded allocation experiment; distinguish measured attribution from hypotheses and do not claim any gain. Source: ${source}\nAllocation context: ${JSON.stringify(projection)}`;
+  assert(Buffer.byteLength(question,'utf8')<16000,'The complete native question, source and allocation context must fit below16KB; never truncate evidence');
+  return question;
+}
+exports.bibliographyAllocationProjection=bibliographyAllocationProjection;
+exports.bibliographyAdviceQuestion=bibliographyAdviceQuestion;
 async function packagedFiles(root){
   const files={};
   const visit=async relative=>{
@@ -490,13 +530,20 @@ exports.run=async()=>{
       return receipts;
     };
     const baselineMeasurements=bibliography?await measureBibliography('baseline'):undefined;
+    let allocationContext,allocationQuestion;
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
     if(bibliography){
-      const evidenceId=baselineMeasurements.at(-1).id;
-      await eventually(async()=>(await state()).evidence.some(item=>item.id===evidenceId),'Actual saved Bibliography allocation evidence appears in Chat');
+      const timing=baselineMeasurements.filter(item=>item.report.runs.length===2&&item.report.runs.some(run=>run.collector==='benchmark')&&item.report.runs.some(run=>run.collector==='chairmark'));
+      const allocation=baselineMeasurements.filter(item=>item.report.runs.length===1&&item.report.runs[0].collector==='profile_alloc');
+      assert.equal(timing.length,1);assert.equal(allocation.length,1);
+      const runFile=path.join(allocation[0].directory,'run.json'),adviceFile=path.join(allocation[0].directory,'advice','advice.json');
+      allocationContext=bibliographyAllocationProjection(await fs.readFile(runFile),await fs.readFile(adviceFile),{run:runFile,advice:adviceFile});
+      allocationQuestion=bibliographyAdviceQuestion(source,allocationContext);
+      const evidenceId=timing[0].id;
+      await eventually(async()=>(await state()).evidence.some(item=>item.id===evidenceId),'Actual saved Bibliography timing evidence appears in Chat');
       await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(evidenceId);
       await eventually(async()=>(await state()).evidenceId===evidenceId,'Native evidence selection reaches the product');
-      result.fixture={kind:'bibliography',baseline:baselineProbe,selectedEvidenceId:evidenceId};
+      result.fixture={kind:'bibliography',baseline:baselineProbe,selectedEvidenceId:evidenceId,allocationContext,questionBytes:Buffer.byteLength(allocationQuestion,'utf8')};
     }
     await view.locator('summary').filter({hasText:'Optional Codex CLI connector'}).click();
     const beforeServers=new Set(loopbackServers());await click('Connect Codex CLI');
@@ -511,7 +558,7 @@ exports.run=async()=>{
     checks.push('installed immutable candidate path/version/runtime hashes; genuine Connect control; saved disabled provider unchanged; unauthenticated HTTP refused');
 
     const questions=bibliography?[
-      `Advice only: no tools, commands or edits. The attached real measurements concern one Bibliography export. The source below is src/bibtex.jl. Explain whether name_to_string is a plausible bounded allocation experiment; distinguish measured attribution from hypotheses and do not claim any gain. Source: ${source}`,
+      allocationQuestion,
       `Continue the same conversation. Review a change ONLY to name_to_string in src/bibtex.jl that preserves all separators and partial Name values, Unicode, first/middle/particle/junior/last fields, and input non-mutation. The independent literal oracle is perf/episode-05a/correctness.jl; the original perf/media/export-workload.jl oracle and both episode05a catalogues must stay unchanged. On the later explicit implementation request, edit ONLY src/bibtex.jl in the supplied isolated checkout, and test that actual checkout using ${process.env.PERFCHECKER_TEST_JULIA} --startup-file=no --history-file=no --project=perf/episode-05a/worker. Its Project pins BenchmarkTools1.7.0, Chairmarks1.3.1, BibInternal792d8c709169505f998f7d70bfa092551dd4089f and BibParsercf1eb4446b986a23ed444963dcdb4c6ecc2da90f. Its ignored Manifest is intentionally absent: instantiate there with update_registry=false and allow_autoprecomp=false, assert realpath(pkgdir(Bibliography))==realpath(pwd()) and pathof points to that copy's src/Bibliography.jl, then include correctness.jl and the unchanged export oracle. Never reuse the original checkout's Manifest. Create no helper files, change no Project/oracle/catalogue, install nothing outside the private environment, run no external services or push. All descendants must retain CPU16–17, Julia2threads/GC1/precompile1/BLAS1/OMP1. Advice only for this turn; implementation follows separately.`
     ]:[
       `Advice only, no tools, commands or file changes. This real Julia function allocated ${baselineBytes} bytes after warming on1000 Float64 inputs: ${source}. Explain removing its intermediate squared array and what remains unmeasured. When I later explicitly request implementation, modify ONLY ${relative}, preserve the module and @noinline API, create no other files, and use ONLY the existing Julia executable ${process.env.PERFCHECKER_TEST_JULIA} with --startup-file=no --history-file=no -e for checks. Never install packages or call external services.`,
