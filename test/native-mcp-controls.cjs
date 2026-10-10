@@ -992,8 +992,15 @@ exports.run = async (context,options={}) => {
     log('native-ui-action',{surface:'MCP implementation',action:'Prepare implementation after review'});
     await view.getByRole('button', {name: 'I reviewed the advice · Prepare implementation', exact: true}).click();
     await eventually(async () => {const value = await state(); return !value.busy && value.proposal?.files.includes('src/PerfCheckerNativeFixture.jl');}, 'The real implementation worker returns its Git proposal', 240000);
+    const proposal=(await state()).proposal;
+    await fs.writeFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'native-mcp-reviewed-proposal.patch'),proposal.patch);
+    log('native-mcp-reviewed-proposal',{files:proposal.files,patchBytes:Buffer.byteLength(proposal.patch),patchSha256:hash(Buffer.from(proposal.patch))});
+    assert.deepEqual(proposal.files,['src/PerfCheckerNativeFixture.jl'],'The controlled provider edits exactly one source file; no checkpoint content may disappear');
     assert.equal(await fs.readFile(source, 'utf8'), original);
     assert.match((await state()).backupRef, /^refs\/perfchecker\/checkpoints\//);
+    for(const command of ['workbench.action.closeSidebar','workbench.action.closePanel'])await vscode.commands.executeCommand(command);
+    await eventually(async()=>!await context.windowPage.locator('[id="workbench.parts.sidebar"]').isVisible()&&!await context.windowPage.locator('[id="workbench.parts.panel"]').isVisible(),
+      'Native workbench actions expose the full editor review viewport');
     const proposedChanges=view.getByLabel('Proposed changes',{exact:true});
     assert((await proposedChanges.innerText()).includes('init=zero'),'The real proposed patch is populated before the review capture');
     await proposedChanges.scrollIntoViewIfNeeded();

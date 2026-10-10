@@ -721,7 +721,8 @@ exports.run = async () => {
           return;
         }
         await eventually(()=>fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false),'Explicit first-use setup creates a real suite',600000);
-        await eventually(()=>vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject')==='perf/controller','Controller setting is saved only after successful setup');
+        await eventually(()=>vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject')===path.join('perf','controller'),'Controller setting is saved only after successful setup');
+        assert.equal(await fs.realpath(path.resolve(workspace,vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject'))),await fs.realpath(path.join(workspace,'perf','controller')));
         await controls.runSelection(context);
         proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:'General 1.0.1',nativeStudioClick:true});
       });

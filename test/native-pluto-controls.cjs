@@ -751,12 +751,12 @@ async function renderedPlots(context,state,selector,completedRoot){
   const cell=state.frame.locator(`pluto-cell[id="${cellId(state.source,'## Performance curves')}"]`);
   const editor=await interactiveEditor(context,state,cell,'measured plot diagnostic');
   const diagnostic=`let p = performance_plot(plot_bundle, selected_plot), modules = Dict(k.name => m for (k,m) in Base.loaded_modules)
-    @assert all(haskey(modules,n) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito"))
+    @assert all(haskey(modules,n) for n in ("PerfCheckerMakie","PerfCheckerPluto","WGLMakie","Makie","Bonito"))
     @assert Base.get_extension(modules["PerfCheckerMakie"],:WGLMakieExt) !== nothing
     f = performance_figure(p)
     @assert f isa getfield(modules["Makie"],:Figure)
     entry = only(filter(entry -> entry["id"] == selected_plot, plot_entries))
-    info = Dict("selected"=>selected_plot,"selectedLabel"=>entry["title"] * " · " * entry["label"],"kind"=>string(p.kind),"values"=>[row["value"] for row in p.data],"versions"=>[row["version"] for row in p.data],"unit"=>p.options["unit"],"figure"=>string(typeof(f)),"extension"=>true,"providers"=>Dict(n=>Dict("version"=>string(Base.pkgversion(modules[n])),"source"=>pathof(modules[n])) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito")))
+    info = Dict("selected"=>selected_plot,"selectedLabel"=>entry["title"] * " · " * entry["label"],"kind"=>string(p.kind),"values"=>[row["value"] for row in p.data],"versions"=>[row["version"] for row in p.data],"unit"=>p.options["unit"],"figure"=>string(typeof(f)),"extension"=>true,"providers"=>Dict(n=>Dict("version"=>string(Base.pkgversion(modules[n])),"source"=>pathof(modules[n])) for n in ("PerfCheckerMakie","PerfCheckerPluto","WGLMakie","Makie","Bonito")))
     HTML("<pre id=\\"native-plot-evidence\\" hidden>" * replace(sprint(PerfChecker.JSON.print,info),"&"=>"&amp;","<"=>"&lt;",">"=>"&gt;") * "</pre>")
 end`;
   // Use the real private runner clipboard and native CodeMirror paste. Typing
@@ -776,10 +776,18 @@ end`;
   const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent();return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',360000);
   const data=await evidence();assert.equal(data.kind,'distribution');assert(data.selected.startsWith('distribution-'));assert.equal(data.selectedLabel,distribution.label);assert(data.values.length>=2);
   const providerProvenance=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'pluto-plot-provider-provenance.json'),'utf8'));
-  assert.equal(providerProvenance.pins.makieCommit,context.core.commit);
+  assert.equal(providerProvenance.pins.makieCommit,'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642');
+  assert.equal(providerProvenance.makieRevision,context.core.mode==='candidate'?providerProvenance.pins.makieCommit:'v1.0.1');
   assert.equal(providerProvenance.providers.PerfCheckerMakie.tree,'18b54d832a73df6ffa72d1c7f07ddb5cb9eb1e3a');
   assert.equal(providerProvenance.pins.makieTree,providerProvenance.providers.PerfCheckerMakie.tree);
   assert.equal(providerProvenance.providers.PerfCheckerMakie.version,'1.0.1');
+  for(const name of ['PerfCheckerMakie','PerfCheckerPluto']){
+    const info=providerProvenance.providers[name];assert.equal(info.gitSource,'https://github.com/Mirage-Interactive-Fr/PerfChecker.jl');
+    assert.equal(data.providers[name].version,'1.0.1');
+    assert.equal(info.gitRevision,providerProvenance.makieRevision);assert.equal(info.repoSubdir,`packages/${name}`);
+    assert.equal(info.trackingRepo,true);assert.equal(info.trackingPath,false);
+    assert.equal(info.pkgdir,await fs.realpath(info.source));assert.equal(info.pathof,await fs.realpath(data.providers[name].source));
+  }
   for(const [name,version] of Object.entries({PerfCheckerMakie:providerProvenance.providers.PerfCheckerMakie.version,WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'}))assert.equal(data.providers[name].version,version);
   const diagnosticViewport=stage=>cell.evaluate((node,stage)=>({stage,classes:node.className,
     focusedWithin:node.contains(document.activeElement),rectangle:node.getBoundingClientRect().toJSON(),
@@ -973,7 +981,8 @@ exports.runFreshInstall = async context => {
   assert.equal(process.env.PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE,'true');
   const {vscode,workspace,windowPage}=context,uri=vscode.Uri.file(workspace);
   const settings=vscode.workspace.getConfiguration('perfchecker',uri),project=path.join(workspace,'perf','pluto');
-  assert.equal(settings.get('runnerProject'),'perf/controller');
+  assert.equal(settings.get('runnerProject'),path.join('perf','controller'));
+  assert.equal(await fs.realpath(path.resolve(workspace,settings.get('runnerProject'))),await fs.realpath(path.join(workspace,'perf','controller')));
   assert.equal(settings.get('plutoProject','perf/pluto'),'perf/pluto');
   assert.equal(settings.inspect('plutoProject')?.workspaceFolderValue,undefined,'The published default Pluto project is not overridden');
   assert(!await fs.stat(project).then(()=>true).catch(error=>{if(error.code==='ENOENT')return false;throw error;}),'No Pluto environment was prepared');
@@ -986,7 +995,15 @@ exports.runFreshInstall = async context => {
     const dialog=windowPage.locator('.quick-input-widget').filter({has:windowPage.locator('.quick-input-title').filter({hasText:/^PerfChecker · Create Pluto notebook$/})});
     await dialog.waitFor({state:'visible',timeout:30000});
     const input=dialog.locator('input[type="text"]');await input.fill(file);await input.press('Enter');
-    const picker=windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:30000});
+    const picker=windowPage.locator('.quick-input-widget');let folderCreationConfirmed=false;
+    await eventually(async()=>{
+      const createFolder=picker.filter({hasText:'The folder notebooks does not exist. Would you like to create it?'});
+      if(!folderCreationConfirmed&&await createFolder.isVisible()){
+        await createFolder.getByRole('button',{name:'OK',exact:true}).click();folderCreationConfirmed=true;
+        context.log('native-ui-action',{surface:'Published Pluto save dialog',action:'Confirm creation of notebooks folder'});
+      }
+      return await picker.locator('.monaco-list-row').filter({hasText:'Feature suite'}).isVisible();
+    },'The real Save dialog finishes folder creation and shows notebook kinds',30000);
     await picker.locator('.monaco-list-row').filter({hasText:'Feature suite'}).click();
     const install=windowPage.getByRole('button',{name:'Install Pluto environment',exact:true});
     await install.waitFor({state:'visible',timeout:30000});await install.click();
