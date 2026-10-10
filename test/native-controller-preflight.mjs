@@ -12,9 +12,46 @@ for name in (:PerfChecker,:HTTP)
  println("CONTROLLER_IMPORT_AFTER ",name," elapsed=",time()-started," version=",Base.pkgversion(m)," source=",pathof(m));flush(stdout)
 end
 core=first(modules);extension=Base.get_extension(core,:HTTPAdvisorExt);@assert extension!==nothing
+function diagnose_controller_tree(m,root,source,tree,pinned)
+ println(join(["CONTROLLER_TREE_CHECK_V1",string(nameof(m)),string(Base.pkgversion(m)),bytes2hex(codeunits(root)),bytes2hex(codeunits(source)),tree,pinned],'\t'));flush(stdout)
+ tree==pinned&&return
+ println("CONTROLLER_TREE_MISMATCH_V1 ",nameof(m));flush(stdout)
+ config=Cmd(["git","-C",root,"config","--show-origin","--get-regexp","^core\\.(autocrlf|eol|filemode)$"])
+ try
+  process=open(pipeline(ignorestatus(config),stderr=devnull));value=""
+  try;value=read(process,String);wait(process)
+   println(join(["CONTROLLER_GIT_CONFIG_V1",string(nameof(m)),string(process.exitcode),bytes2hex(codeunits(first(value,min(length(value),8192))))],'\t'))
+  finally;close(process);end
+ catch error;println("CONTROLLER_GIT_CONFIG_UNKNOWN_V1 ",nameof(m)," ",nameof(typeof(error)));end
+ count=0;total=0
+ for (directory,subdirs,files) in walkdir(root)
+  filter!(name->name!=".git",subdirs)
+  names=sort!(vcat(filter(name->islink(joinpath(directory,name)),subdirs),filter(name->name!=".git",files)))
+  for name in names
+   file=joinpath(directory,name);count+=1;total+=islink(file) ? ncodeunits(readlink(file)) : filesize(file)
+   if count>5000||total>100_000_000
+    println("CONTROLLER_TREE_INVENTORY_UNKNOWN_V1 observation-budget files=",count," bytes=",total);flush(stdout);return
+   end
+   bytes=islink(file) ? Vector{UInt8}(codeunits(readlink(file))) : read(file)
+   hash=bytes2hex(Pkg.GitTools.SHA.sha1(vcat(codeunits("blob $(length(bytes))\0"),bytes)))
+   crlf=0;for i in 1:(length(bytes)-1);crlf+=(bytes[i]==0x0d&&bytes[i+1]==0x0a);end
+   normalized="-";value=String(copy(bytes))
+   if crlf>0&&isvalid(value)
+    value=replace(value,"\r\n"=>"\n");normalized=bytes2hex(Pkg.GitTools.SHA.sha1(vcat(codeunits("blob $(ncodeunits(value))\0"),codeunits(value))))
+   end
+   println(join(["CONTROLLER_TREE_FILE_V1",string(nameof(m)),bytes2hex(codeunits(relpath(file,root))),string(Pkg.GitTools.gitmode(file)),string(length(bytes)),hash,string(crlf),normalized],'\t'))
+  end
+ end
+ println("CONTROLLER_TREE_INVENTORY_COMPLETE_V1 ",nameof(m)," files=",count," bytes=",total);flush(stdout)
+end
 fields=String["CONTROLLER_IMPORT_RECEIPT_V1","",string(nameof(extension)),bytes2hex(codeunits(realpath(Base.active_project())))];deps=Pkg.dependencies()
-for m in modules
- root=realpath(pkgdir(m));source=realpath(pathof(m));tree=bytes2hex(Pkg.GitTools.tree_hash(root));pinned=string(deps[Base.PkgId(m).uuid].tree_hash);@assert tree==pinned
+identities=map(modules) do m
+ root=realpath(pkgdir(m));source=realpath(pathof(m));tree=bytes2hex(Pkg.GitTools.tree_hash(root));pinned=string(deps[Base.PkgId(m).uuid].tree_hash)
+ (m,root,source,tree,pinned)
+end
+for (m,root,source,tree,pinned) in identities;diagnose_controller_tree(m,root,source,tree,pinned);end
+for (m,root,source,tree,pinned) in identities
+ @assert tree==pinned
  append!(fields,[string(nameof(m)),string(Base.pkgversion(m)),bytes2hex(codeunits(root)),bytes2hex(codeunits(source)),tree,pinned])
 end
 fields[2]=string(time()-started);println(join(fields,'\t'));flush(stdout)`;
