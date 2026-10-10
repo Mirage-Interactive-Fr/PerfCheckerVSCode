@@ -15,6 +15,7 @@ async function eventually(read,label,timeout=210000){
 async function captureConversationReply(view,record,capture){
   const transcript=view.locator('.transcript'),reply=view.locator('.message.assistant').last();
   await transcript.scrollIntoViewIfNeeded();
+  let wheelUnitsPerCssPixel=1;
   const geometry=()=>reply.evaluate(node=>{
     const area=node.closest('.transcript'),a=area.getBoundingClientRect(),r=node.getBoundingClientRect();
     const visibleTop=Math.max(0,a.top),visibleBottom=Math.min(innerHeight,a.bottom);
@@ -22,33 +23,41 @@ async function captureConversationReply(view,record,capture){
       visibleTop,visibleBottom,visibleHeight:visibleBottom-visibleTop,start:Math.max(0,visibleTop-r.top),end:Math.min(r.height,visibleBottom-r.top),
       fontSize:getComputedStyle(node).fontSize,devicePixelRatio};
   });
-  const wheel=async(delta,label)=>{
+  const wheel=async(delta,label,deadline=Date.now()+5000)=>{
     await transcript.hover();const before=await geometry();
     const action={delta,before};record.wheels.push(action);
     await view.page().mouse.wheel(0,delta);
+    let lastScrollTop=before.scrollTop,stableSince=Date.now();
     await eventually(async()=>{
       action.after=await geometry();
-      return Math.sign(delta)*(action.after.scrollTop-before.scrollTop)>0;
-    },label,5000);
+      if(action.after.scrollTop!==lastScrollTop){lastScrollTop=action.after.scrollTop;stableSince=Date.now();}
+      return Math.sign(delta)*(action.after.scrollTop-before.scrollTop)>0&&Date.now()-stableSince>=100;
+    },label,Math.max(0,deadline-Date.now()));
+    // Native wheel input and the embedded webview's CSS pixels can differ at
+    // workbench zoom. Learn the actual movement, never infer it from DPR.
+    const ratio=delta/(action.after.scrollTop-before.scrollTop);
+    assert(Number.isFinite(ratio)&&ratio>0,'Native input has a qualified positive scroll displacement');
+    wheelUnitsPerCssPixel=Math.min(4,Math.max(.25,ratio));
+    return action.after;
   };
   const beginning=g=>g.start<5&&g.end>0&&(g.replyTop<=g.visibleTop+5||g.end>=g.height-2);
   record.initial=await geometry();
   // A long user message can leave the reply below the viewport; a prior
   // capture can leave its beginning above it. Use the native wheel both ways.
-  if(!beginning(record.initial)){
-    const delta=record.initial.replyTop-record.initial.visibleTop-2;
+  const positioningDeadline=Date.now()+5000;let position=record.initial;
+  for(let attempt=0;!beginning(position)&&attempt<8&&Date.now()<positioningDeadline;attempt++){
+    const delta=(position.replyTop-position.visibleTop-2)*wheelUnitsPerCssPixel;
     assert(Math.abs(delta)>2,'An obscured reply needs a nonzero native scroll');
-    await wheel(delta,'The native wheel moves the actual conversation toward the reply beginning');
+    position=await wheel(delta,'The native wheel moves the actual conversation toward the reply beginning',positioningDeadline);
   }
-  await eventually(async()=>beginning(await geometry()),
-    'The real transcript scroll exposes the reply beginning, or the entire short reply',5000);
+  assert(beginning(position),'The real transcript scroll exposes the reply beginning, or the entire short reply');
   const parts=record.parts;
   for(let part=1;part<=8;part++){
     const g=await geometry();assert(g.visibleHeight>0,'The actual transcript intersects the viewport');
     if(parts.length)assert(g.start<parts.at(-1).end,'Consecutive native captures retain strictly overlapping reply text');
     await capture(part,g);parts.push(g);
     if(g.end>=g.height-2)break;
-    await wheel(g.visibleHeight*.85,'The native transcript advances for the next readable reply section');
+    await wheel(g.visibleHeight*.85*wheelUnitsPerCssPixel,'The native transcript advances for the next readable reply section');
   }
   record.complete=parts[0].start<5&&parts.at(-1).end>=parts.at(-1).height-2;
   assert(record.complete,'The complete real advice reply is visible across the retained native scroll captures');
@@ -671,10 +680,34 @@ exports.run=async()=>{
     await view.locator('#chat-question').fill(bibliography?
       'Advice only, no tools or edits. Explain the remaining limits of this bounded bibliography name-string experiment: partial names, Unicode, separator preservation, non-mutation, sampler uncertainty, separate collectors and why one fixture does not establish universal BibTeX equivalence.':
       'Advice only, no tools or edits. Give a detailed explanation of remaining floating-point correctness and benchmark uncertainty in this Julia optimization, including NaN/Infinity, signed zero, reduction order and stable allocation measurement.');
-    await click('Send question');
-    owned=await eventually(async()=>{
-      const current=await observe();return (await state()).busy&&current.cli&&current.worker&&current.agent?current:undefined;
-    },'Observe the actual Julia controller, detached advisor worker and authenticated Codex exec alive before Cancel',30000);
+    const cancelStarted=Date.now();await click('Send question');
+    result.cancelObservation={startedAt:new Date(cancelStarted).toISOString(),preControllerBudgetMs:210000,
+      agentBudgetMs,uiBudgetMs,cleanupGraceMs,transitions:[]};
+    let lastCancel,cancelAccepted=false;
+    while(Date.now()<suiteDeadline){
+      const current=await observe(),value=await state(),outcome=chatOutcome(value),now=Date.now(),serialized=JSON.stringify(outcome);
+      cancelAccepted||=value.busy;
+      if(serialized!==lastCancel){result.cancelObservation.transitions.push({elapsedMs:now-cancelStarted,...outcome});lastCancel=serialized;}
+      for(const [role,pid,budget]of [['controller',current.cli,uiBudgetMs],['agent',current.agent,agentBudgetMs]]){
+        const identity=current.identities.find(item=>item.pid===pid);
+        if(identity&&!result.cancelObservation[role]){
+          const firstObserved=processStates.get(`${identity.pid}:${identity.start}`)?.firstSeen??now;
+          result.cancelObservation[role]={...identity,firstObservedAt:new Date(firstObserved).toISOString(),
+            deadlineAt:new Date(firstObserved+budget).toISOString()};
+        }
+      }
+      const liveRoles=[current.cli,current.worker,current.agent];
+      if(value.busy&&liveRoles.every(pid=>pid&&current.identities.some(identity=>identity.pid===pid))){owned=current;break;}
+      if(cancelAccepted)assert(value.busy,`The real request ended before a live agent could qualify Cancel: ${outcome.status}`);
+      const controller=result.cancelObservation.controller;
+      assert(controller||now<cancelStarted+210000,'The Cancel request did not reach its controller within the unchanged pre-controller budget');
+      if(controller)assert(now<Date.parse(controller.deadlineAt)+cleanupGraceMs,
+        'The Cancel request exceeded its actual UI budget and existing cleanup grace before a live agent was observed');
+      const agent=result.cancelObservation.agent;
+      if(agent)assert(now<Date.parse(agent.deadlineAt),'The observed agent reached its actual deadline before live Cancel qualification');
+      await delay(100);
+    }
+    assert(owned,'The unchanged host deadline expired before controller, worker and agent were observed alive for Cancel');
     assert(await view.getByRole('button',{name:'Disconnect Codex',exact:true}).isDisabled(),'The real Disconnect control requires the active request to be cancelled first');
     assert(await new Promise((resolve,reject)=>server.getConnections((error,count)=>error?reject(error):resolve(count>0))),'The Julia worker has an active real HTTP connection');
     await click('Cancel request');await idle('The actual Cancel waits for local worker cleanup');await noOwnedProcesses();
