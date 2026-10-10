@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {performance} from 'node:perf_hooks';
-import {flameModel, flameFramePath, flameGraph, profileGroups, flameViewportRange, flameViewportPercent} from '../dist/flame-plot.js';
+import {flameModel, flameFramePath, flameGraph, profileGroups, flameViewportRange, flameViewportPercent, flameFunctionName, flameFunctionColor} from '../dist/flame-plot.js';
 
 const observation=(stack,value,extra={})=>({case_id:'profile-case',target_id:'v1',metric:'julia.profile.samples',
   measurement_definition:'julia-profile-v1',unit:'1',value,attributes:{stack,...extra}});
@@ -79,6 +79,36 @@ test('complete inference metadata and hostile source names remain safe and uncha
   assert.equal(flameFramePath(model,2)[0],name);
   assert(!content.includes('<script>alert'));assert(content.includes('&lt;script&gt;'));
   assert.deepEqual(rows,before);
+});
+
+test('only recorded any, union or abstract inference is a warning; unknown remains metadata',()=>{
+  for(const status of [undefined,'','unknown','custom-status','concrete','any','union','abstract']){
+    const rows=[observation(['entry'],2,status===undefined?{}:{inference_status:[status]})],saved=structuredClone(rows);
+    const frame=flameModel(rows).frames[0];
+    assert.equal(frame.unstable,['any','union','abstract'].includes(status),String(status));
+    assert.deepEqual(frame.inferenceStatuses,status?[status]:[]);
+    assert.equal(frame.value,2);assert.equal(frame.x0,0);assert.equal(frame.x1,1);
+    assert.deepEqual(rows,saved);
+  }
+  const rows=['unknown','any','concrete','unknown'].map(status=>observation(['same'],1,{inference_status:[status]})),saved=structuredClone(rows);
+  const frame=flameModel(rows).frames[0];
+  assert(frame.unstable);assert.deepEqual(frame.inferenceStatuses,['any','concrete','unknown']);
+  assert.equal(frame.value,4);assert.deepEqual(rows,saved);
+});
+
+test('function labels follow the Core source suffix and retain all other names verbatim',()=>{
+  assert.equal(flameFunctionName('percolate_down! (src/heaps/arrays_as_heaps.jl:19)'),'percolate_down!');
+  assert.equal(flameFunctionName('macro expansion (C:/work/source.jl:42)'),'macro expansion');
+  assert.equal(flameFunctionName('operator (custom) (src/source.jl:7)'),'operator (custom)');
+  for(const name of ['Other sampled allocation stacks','custom (text:4)','caller (source.jl:0)',
+    'caller (source.jl:-1)','caller (source.jl:abc)','caller (path(with-parentheses).jl:2)',
+    'caller (source.jl:2) trailing','unsafe <script>frame</script>'])assert.equal(flameFunctionName(name),name);
+  const same=['percolate_down! (src/heaps/arrays_as_heaps.jl:19)','percolate_down! (changed/source.jl:201)'];
+  assert.equal(flameFunctionColor(same[0]),flameFunctionColor(same[1]),'Source relocation and line changes keep the function color');
+  const names=['pop!','heappop!','percolate_down!','BinaryHeap','heapify'];
+  assert(new Set(names.map(flameFunctionColor)).size>1,'Real function names receive a varied palette');
+  for(const name of names)assert.equal(flameFunctionColor(name),flameFunctionColor(name));
+  assert.equal(flameFunctionColor('custom label'),flameFunctionColor('custom label'));
 });
 
 test('zero, negative and non-finite weights never acquire fake area',()=>{

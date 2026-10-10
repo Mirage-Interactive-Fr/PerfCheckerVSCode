@@ -13,7 +13,7 @@ test('the production flame renderer exposes thin, coincident and deep frames at 
   skip:!process.env.PERFCHECKER_BROWSER_TESTS,
 },async t=>{
   const require=createRequire(import.meta.url),{chromium}=require(process.env.PERFCHECKER_PLAYWRIGHT||'playwright');
-  const browser=await chromium.launch({headless:true,args:['--no-sandbox'],...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{})});
+  const browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-gpu','--disable-software-rasterizer'],...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{})});
   try{
     const page=await browser.newPage({viewport:{width:390,height:844},hasTouch:true}),errors=[];
     page.on('pageerror',error=>errors.push(String(error)));
@@ -119,6 +119,57 @@ test('the production flame renderer exposes thin, coincident and deep frames at 
     assert.equal(await deepGraph.locator('svg').getAttribute('data-current-max'),'1');
     assert.equal(await deepGraph.getAttribute('data-flame'),deepPayload,'Deep-stack gestures preserve every original weight and coordinate');
     assert.deepEqual(await exactGeometry(deepGraph),deepGeometry,'Fit restores the exact rendered geometry of all 5000 frames');
+    const name='percolate_down! (src/heaps/arrays_as_heaps.jl:19)',other='percolate_down! (other/source.jl:201)';
+    const presentationRows=[observation(['pop! (src/heaps/binary_heap.jl:107)',name],7,{inference_status:['unknown','unknown']}),
+      observation(['other caller',other],3,{inference_status:['concrete','unknown']}),
+      observation(['dispatch'],1,{runtime_dispatch:[true]}),observation(['inference'],1,{inference_status:['abstract']}),
+      observation(['gc'],1,{gc_event:[true]})],savedRows=structuredClone(presentationRows);
+    for(const width of [360,390]){
+      await page.setViewportSize({width,height:844});await install(presentationRows);
+      const view=page.locator('.flame-view'),saved=await view.getAttribute('data-flame'),geometry=await exactGeometry(view),data=JSON.parse(saved);
+      const primary=data.frames.find(frame=>frame.name===name),secondary=data.frames.find(frame=>frame.name===other);
+      const frame=index=>view.locator(`.flame-node[data-frame-index="${index}"]`);
+      const fill=index=>frame(index).locator('rect').evaluate(node=>getComputedStyle(node).fill);
+      assert.equal(await view.getByLabel('Color by',{exact:true}).inputValue(),'function');
+      assert.equal(await view.getByLabel('Labels',{exact:true}).inputValue(),'function');
+      assert.equal(await fill(primary.index),await fill(secondary.index),'One function keeps its color across paths and source lines');
+      assert(new Set(await view.locator('.flame-node rect').evaluateAll(nodes=>nodes.map(node=>getComputedStyle(node).fill))).size>1);
+      assert.equal(await frame(primary.index).locator('text').textContent(),'percolate_down!');
+      assert.equal(await frame(primary.index).locator('text').evaluate(node=>getComputedStyle(node).display!=='none'),true);
+      assert((await frame(primary.index).getAttribute('aria-label')).includes(name));
+      await view.locator('[data-flame-index]').fill(String(primary.index));await view.locator('[data-flame-index]').press('Tab');
+      assert((await view.locator('.flame-detail').innerText()).includes(name));
+      assert.match(await view.locator('.flame-detail').innerText(),/Julia inference: unknown/);
+      assert.doesNotMatch(await view.locator('.flame-detail').innerText(),/Non-concrete inferred return/);
+      await view.getByLabel('Labels',{exact:true}).selectOption('full');
+      assert.equal(await frame(primary.index).locator('text').textContent(),name);
+      assert.equal(await frame(primary.index).locator('text').evaluate(node=>getComputedStyle(node).display),'none','A long complete label is hidden rather than cut');
+      await view.getByLabel('Labels',{exact:true}).selectOption('function');
+      const functionColors=await view.locator('.flame-node rect').evaluateAll(nodes=>nodes.map(node=>getComputedStyle(node).fill));
+      await view.getByLabel('Color by',{exact:true}).selectOption('diagnostics');
+      assert.match(await view.locator('.flame-legend').innerText(),/Unknown or missing inference information is not a warning/);
+      const statusColors=await Promise.all(['normal','dynamic','unstable','gc'].map(async status=>{
+        const node=status==='normal'?frame(primary.index):view.locator(`.flame-node.${status}`).first();
+        return node.locator('rect').evaluate(node=>getComputedStyle(node).fill);
+      }));assert.equal(new Set(statusColors).size,4,'Only actual diagnostics get their distinct diagnostic hues');
+      for(const mode of ['diagnostics','function']){
+        await view.getByLabel('Color by',{exact:true}).selectOption(mode);
+        const contrast=await view.locator('.flame-node').evaluateAll(nodes=>nodes.filter(node=>getComputedStyle(node.querySelector('text')).display!=='none').map(node=>{
+          const rect=node.querySelector('rect'),label=node.querySelector('text'),canvas=document.createElement('canvas');canvas.width=canvas.height=1;
+          const ctx=canvas.getContext('2d');ctx.fillStyle=getComputedStyle(rect).fill;ctx.filter=getComputedStyle(rect).filter;ctx.fillRect(0,0,1,1);
+          const l=color=>{const rgb=color.slice(0,3).map(value=>{const v=value/255;return v<=.04045?v/12.92:((v+.055)/1.055)**2.4;});return .2126*rgb[0]+.7152*rgb[1]+.0722*rgb[2];};
+          const background=l([...ctx.getImageData(0,0,1,1).data]);ctx.filter='none';ctx.fillStyle=getComputedStyle(label).fill;ctx.fillRect(0,0,1,1);
+          const text=l([...ctx.getImageData(0,0,1,1).data]);return (Math.max(text,background)+.05)/(Math.min(text,background)+.05);
+        }));assert(contrast.length&&contrast.every(ratio=>ratio>=4.5),JSON.stringify({width,mode,contrast}));
+      }
+      assert.deepEqual(await view.locator('.flame-node rect').evaluateAll(nodes=>nodes.map(node=>getComputedStyle(node).fill)),functionColors);
+      assert.equal(await view.getAttribute('data-flame'),saved);
+      assert.deepEqual(await exactGeometry(view),geometry,'Color and label modes preserve every saved weight and coordinate');
+      assert.equal(await view.evaluate(node=>node.scrollWidth<=node.clientWidth),true);
+      assert.equal(await view.locator('.flame-presentation select').evaluateAll(nodes=>nodes.every(node=>node.getBoundingClientRect().height>=44)),true);
+      await capture(`function-colors-${width}`,frame(primary.index));
+    }
+    assert.deepEqual(presentationRows,savedRows);
     assert.deepEqual(errors,[]);
     t.diagnostic(JSON.stringify({source:'production-flame-module',viewport:390,frames:model.frames.length,large,deepFrames:5000,deep,gesturesMs:gestures,fullPaths:true,realTouchControls:true}));
     assert(large.elapsedMs<60_000&&deep.elapsedMs<60_000,'The complete browser fixtures stay within the qualification budget');

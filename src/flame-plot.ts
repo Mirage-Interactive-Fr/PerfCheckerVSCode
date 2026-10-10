@@ -17,13 +17,13 @@ export interface ProfileObservation {
 
 interface FlameNode {
   name: string; value: number; children: Map<string, FlameNode>;
-  dynamic: boolean; unstable: boolean; gc: boolean; inferredTypes: Set<string>;
+  dynamic: boolean; unstable: boolean; gc: boolean; inferredTypes: Set<string>; inferenceStatuses: Set<string>;
 }
 
 export interface FlameFrame {
   index: number; parent: number | null; name: string; value: number;
   x0: number; x1: number; depth: number;
-  dynamic: boolean; unstable: boolean; gc: boolean; inferredTypes: string[];
+  dynamic: boolean; unstable: boolean; gc: boolean; inferredTypes: string[]; inferenceStatuses: string[];
 }
 
 export interface FlameModel {
@@ -34,7 +34,20 @@ export interface FlameModel {
 const html = (value: unknown): string => String(value ?? '').replace(/[&<>"']/g,
   character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]!));
 const freshNode = (name: string): FlameNode => ({name, value:0, children:new Map(),
-  dynamic:false, unstable:false, gc:false, inferredTypes:new Set()});
+  dynamic:false, unstable:false, gc:false, inferredTypes:new Set(), inferenceStatuses:new Set()});
+
+/** Core profile collectors emit `function (source.jl:positive-line)`; retain other labels verbatim. */
+export function flameFunctionName(name: string): string {
+  return /^(.+) \(([^()\r\n]+\.jl):([1-9]\d*)\)$/u.exec(name)?.[1] ?? name;
+}
+
+/** Stable function colors are presentation only; different names may share a palette color. */
+export function flameFunctionColor(name: string): string {
+  const palette = ['#3794ff', '#d7ba7d', '#4ec9b0', '#c586c0', '#ce9178', '#9cdcfe', '#b5cea8', '#dcdcaa'];
+  let hash = 2166136261;
+  for (const character of flameFunctionName(name)) hash = Math.imul(hash ^ character.codePointAt(0)!, 16777619) >>> 0;
+  return palette[hash % palette.length];
+}
 
 /** Preserve every profile/allocation group. The predicates match the Output views. */
 export function profileGroups(observations: ProfileObservation[], kind: 'flame' | 'allocation'): Map<string, ProfileObservation[]> {
@@ -66,7 +79,8 @@ export function flameModel(observations: ProfileObservation[]): FlameModel {
       node.value += observation.value;
       node.dynamic ||= observation.attributes.runtime_dispatch?.[index] === true;
       const inference = observation.attributes.inference_status?.[index];
-      node.unstable ||= Boolean(inference && inference !== 'concrete');
+      node.unstable ||= ['any', 'union', 'abstract'].includes(inference ?? '');
+      if (typeof inference === 'string' && inference) node.inferenceStatuses.add(inference);
       node.gc ||= observation.attributes.gc_event?.[index] === true;
       const inferred = observation.attributes.inferred_return_type?.[index];
       if (inferred) node.inferredTypes.add(inferred);
@@ -94,7 +108,7 @@ export function flameModel(observations: ProfileObservation[]): FlameModel {
     const index = model.frames.length+1;
     model.frames.push({index, parent, name:node.name, value:node.value,
       x0:left, x1:left+node.value/root.value, depth, dynamic:node.dynamic,
-      unstable:node.unstable, gc:node.gc, inferredTypes:[...node.inferredTypes]});
+      unstable:node.unstable, gc:node.gc, inferredTypes:[...node.inferredTypes], inferenceStatuses:[...node.inferenceStatuses].sort()});
     model.maximumDepth = Math.max(model.maximumDepth, depth);
     children(node, left, depth+1, index);
   }
@@ -137,7 +151,8 @@ export function flameGraph(observations: ProfileObservation[], id: string): stri
   const buttons = [['in','Zoom +','Zoom in flame graph'],['out','Zoom −','Zoom out flame graph'],
     ['left','←','Pan flame graph left'],['right','→','Pan flame graph right'],['fit','Fit','Fit all flame frames']]
     .map(([action,label,title]) => `<button type="button" data-flame-action="${action}" aria-label="${title}" title="${title}">${label}</button>`).join('');
-  return `<div class="flame-view" data-flame="${html(JSON.stringify(model))}" data-detail-target="${html(id)}"><div class="flame-toolbar" role="group" aria-label="Flame graph view">${buttons}<details class="flame-range"><summary>Range</summary><div>${['min','max'].map((bound,index) => `<label>${index ? 'End' : 'Start'} (% of total weight)<input type="number" min="0" max="100" step="any" value="${index ? 100 : 0}" data-flame-bound="${bound}"></label>`).join('')}</div></details></div><div class="flame-inspection"><label>Inspect frame<input type="number" min="1" max="${model.frames.length}" step="1" value="1" data-flame-index></label><label>Frame index<input type="range" min="1" max="${model.frames.length}" step="1" value="1" data-flame-slider></label><span>${model.frames.length} frames</span></div><p class="flame-scope">Frame width includes child calls. Zoom changes the view only; every frame remains available through Inspect frame.</p><p class="flame-range-error" role="alert"></p><div class="flame-wrap" tabindex="0" aria-label="Scrollable flame graph; use arrow keys to pan, plus and minus to zoom, and zero to fit"><svg class="flame" viewBox="0 0 1000 ${height}" width="1000" height="${height}" role="group" aria-label="Profile call stacks weighted by ${html(model.metric)}"><defs><clipPath id="${html(id)}-clip"><rect width="1000" height="${height}"></rect></clipPath></defs><g class="flame-frames" clip-path="url(#${html(id)}-clip)">${frames}</g></svg></div><pre class="flame-detail" id="${html(id)}" aria-live="polite">Use the frame index, or hover, tap or focus a frame, to inspect its full call path.</pre></div>`;
+  const presentation = `<div class="flame-presentation"><label>Color by<select data-flame-color aria-label="Color by"><option value="function">Function</option><option value="diagnostics">Diagnostics</option></select></label><label>Labels<select data-flame-label aria-label="Labels"><option value="function">Function name</option><option value="full">Full frame</option></select></label></div><p class="flame-legend" aria-live="polite"></p>`;
+  return `<div class="flame-view" data-flame="${html(JSON.stringify(model))}" data-detail-target="${html(id)}"><div class="flame-toolbar" role="group" aria-label="Flame graph view">${buttons}<details class="flame-range"><summary>Range</summary><div>${['min','max'].map((bound,index) => `<label>${index ? 'End' : 'Start'} (% of total weight)<input type="number" min="0" max="100" step="any" value="${index ? 100 : 0}" data-flame-bound="${bound}"></label>`).join('')}</div></details></div>${presentation}<div class="flame-inspection"><label>Inspect frame<input type="number" min="1" max="${model.frames.length}" step="1" value="1" data-flame-index></label><label>Frame index<input type="range" min="1" max="${model.frames.length}" step="1" value="1" data-flame-slider></label><span>${model.frames.length} frames</span></div><p class="flame-scope">Frame width includes child calls. Zoom changes the view only; every frame remains available through Inspect frame.</p><p class="flame-range-error" role="alert"></p><div class="flame-wrap" tabindex="0" aria-label="Scrollable flame graph; use arrow keys to pan, plus and minus to zoom, and zero to fit"><svg class="flame" viewBox="0 0 1000 ${height}" width="1000" height="${height}" role="group" aria-label="Profile call stacks weighted by ${html(model.metric)}"><defs><clipPath id="${html(id)}-clip"><rect width="1000" height="${height}"></rect></clipPath></defs><g class="flame-frames" clip-path="url(#${html(id)}-clip)">${frames}</g></svg></div><pre class="flame-detail" id="${html(id)}" aria-live="polite">Use the frame index, or hover, tap or focus a frame, to inspect its full call path.</pre></div>`;
 }
 
 export const flameChartStyle = String.raw`
@@ -151,16 +166,19 @@ export const flameChartStyle = String.raw`
 .flame-view .flame-node rect{fill:var(--vscode-charts-blue);stroke:none}.flame-view .flame-node.dynamic rect{fill:var(--vscode-charts-red)}.flame-view .flame-node.unstable rect{fill:var(--vscode-charts-purple)}.flame-view .flame-node.gc rect{fill:var(--vscode-charts-orange)}
 .flame-view .flame-node:hover rect,.flame-view .flame-node:focus rect,.flame-view .flame-node.selected rect{stroke:none;filter:brightness(1.3)}
 .flame-view .flame-node text{font-size:11px;pointer-events:none}.flame-view .flame-detail{overflow-wrap:anywhere;max-height:420px;overflow:auto}
-@media(max-width:400px){.flame-toolbar button,.flame-inspection input{min-height:44px}.flame-range>div{grid-template-columns:1fr}.flame-view .flame-detail{font-size:12px}}
+.flame-presentation{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.flame-presentation label{display:grid;gap:4px;min-width:0;flex:1 1 120px;font-size:12px}.flame-presentation select{font:inherit;box-sizing:border-box;min-width:0;max-width:100%;width:100%;padding:6px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border)}.flame-legend{font-size:12px;line-height:1.5;overflow-wrap:anywhere}.flame-legend .swatch{display:inline-block;width:12px;height:12px;margin:0 4px 0 8px;vertical-align:middle}
+@media(max-width:400px){.flame-toolbar button,.flame-inspection input,.flame-presentation select{min-height:44px}.flame-range>div{grid-template-columns:1fr}.flame-view .flame-detail{font-size:12px}}
 `;
 
 export const flameChartScript = String.raw`
 (() => {
   const viewportRange=${flameViewportRange.toString()},viewportPercent=${flameViewportPercent.toString()};
+  const flameFunctionName=${flameFunctionName.toString()},functionColor=${flameFunctionColor.toString()};
   for (const view of document.querySelectorAll('.flame-view')) {
     const model=JSON.parse(view.dataset.flame),svg=view.querySelector('svg.flame'),viewport=view.querySelector('.flame-wrap');
     const frames=[...svg.querySelectorAll('.flame-node')],detail=document.getElementById(view.dataset.detailTarget);
     const indexInput=view.querySelector('[data-flame-index]'),slider=view.querySelector('[data-flame-slider]'),error=view.querySelector('.flame-range-error');
+    const colorMode=view.querySelector('[data-flame-color]'),labelMode=view.querySelector('[data-flame-label]'),legend=view.querySelector('.flame-legend');
     const height=(model.maximumDepth+1)*25,minimumWidth=1e-6;
     const canvas=document.createElement('canvas');canvas.width=canvas.height=1;
     const colors=canvas.getContext('2d',{willReadFrequently:true}),inkCache=new Map();
@@ -186,7 +204,7 @@ export const flameChartScript = String.raw`
       const frame=model.frames[selected-1];
       indexInput.value=slider.value=String(selected);slider.setAttribute('aria-valuetext','Frame '+selected+': '+frame.name);
       detail.textContent='Frame '+selected+' / '+model.frames.length+'\nInclusive weight: '+frame.value+' '+model.unit+' ('+(100*frame.value/model.totalWeight)+'% of total)\nMetric: '+model.metric+'\nCall path:\n'+path(selected).join(' → ')+
-        (frame.dynamic?'\nRuntime dispatch detected':'')+(frame.unstable?'\nNon-concrete inferred return':'')+(frame.gc?'\nGC frame':'')+(frame.inferredTypes.length?'\nInferred: '+frame.inferredTypes.join(' | '):'');
+        (frame.dynamic?'\nRuntime dispatch detected':'')+(frame.unstable?'\nNon-concrete inferred return':'')+(frame.gc?'\nGC frame':'')+(frame.inferenceStatuses.length?'\nJulia inference: '+frame.inferenceStatuses.join(', '):'')+(frame.inferredTypes.length?'\nInferred: '+frame.inferredTypes.join(' | '):'');
       if(marked){frames[marked-1].classList.remove('selected');labelInk(frames[marked-1]);}
       frames[selected-1].classList.add('selected');labelInk(frames[selected-1]);marked=selected;
     };
@@ -200,8 +218,10 @@ export const flameChartScript = String.raw`
         const frame=model.frames[i],group=frames[i],rect=group.querySelector('rect');
         const x=(frame.x0-from)*width/span,w=(frame.x1-frame.x0)*width/span;
         rect.setAttribute('x',String(x));rect.setAttribute('width',String(w));
+        if(colorMode.value==='function')rect.style.fill=functionColor(frame.name);else rect.style.removeProperty('fill');
         let label=group.querySelector('text');
         if(!label){label=document.createElementNS('http://www.w3.org/2000/svg','text');label.textContent=frame.name;group.append(label);}
+        label.textContent=labelMode.value==='function'?flameFunctionName(frame.name):frame.name;
         const left=Math.max(0,x),right=Math.min(width,x+w),available=right-left-8;
         label.setAttribute('x',String(left+4));label.setAttribute('y',String(frame.depth*25+17));label.style.display='';
         labels.push({label,group,available});
@@ -219,6 +239,20 @@ export const flameChartScript = String.raw`
         button.disabled=(action==='in'&&span<=minimumWidth)||(action==='left'&&from===0)||(action==='right'&&to===1)||(['out','fit'].includes(action)&&from===0&&to===1);
       }
     };
+    const presentation=()=>{
+      legend.replaceChildren();
+      if(colorMode.value==='function')legend.textContent='Colors distinguish function names, not performance gains or diagnostics. Other frame labels keep their full name; different names may share a color.';
+      else{
+        legend.textContent='Recorded diagnostics: ';
+        for(const [variable,title]of [['blue','no observed diagnostic'],['red','runtime dispatch'],['purple','non-concrete inferred return'],['orange','garbage collection']]){
+          const swatch=document.createElement('span');swatch.className='swatch';swatch.style.backgroundColor='var(--vscode-charts-'+variable+')';
+          legend.append(swatch,document.createTextNode(title+'; '));
+        }
+        legend.append(document.createTextNode('Unknown or missing inference information is not a warning. Frame width includes child calls.'));
+      }
+      inkCache.clear();render();
+    };
+    colorMode.addEventListener('change',presentation);labelMode.addEventListener('change',render);
     const setRange=(start,end)=>{
       const range=viewportRange(start,end,minimumWidth);
       if(!range){error.textContent='Enter a finite start below the end.';render();return false;}
@@ -257,6 +291,6 @@ export const flameChartScript = String.raw`
     const themeObserver=new MutationObserver(()=>{inkCache.clear();render();});
     themeObserver.observe(document.body,{attributes:true,attributeFilter:['class','style','data-vscode-theme-id']});
     if(document.fonts)document.fonts.ready.then(render);
-    render();show();
+    presentation();show();
   }
 })();`;
