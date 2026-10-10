@@ -241,7 +241,18 @@ exports.run=async()=>{
       }
       await eventually(async()=>!await windowPage.locator('[id="workbench.parts.auxiliarybar"]').isVisible()&&
         !await windowPage.locator('[id="workbench.parts.sidebar"]').isVisible(),'Native close actions hide the private side bars',5000);
-      result.captureLayout={sideBarsClosed:true,nativeCommands:['workbench.action.closeAuxiliaryBar','workbench.action.closeSidebar']};
+      assert(commands.includes('workbench.action.toggleFullScreen'));
+      await vscode.commands.executeCommand('workbench.action.toggleFullScreen');
+      await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
+      result.captureLayout={sideBarsClosed:true,nativeCommands:['workbench.action.closeAuxiliaryBar','workbench.action.closeSidebar','workbench.action.toggleFullScreen']};
+      try{await eventually(async()=>await view.evaluate(()=>innerWidth>=1000),
+        'The real native fullscreen action reaches a wide PerfChecker Chat before measurements',5000);}
+      finally{
+        result.captureLayout.workbench=await windowPage.evaluate(()=>({width:innerWidth,height:innerHeight,devicePixelRatio}));
+        result.captureLayout.chat=await view.evaluate(()=>({width:innerWidth,height:innerHeight,devicePixelRatio,bodyFontSize:getComputedStyle(document.body).fontSize}));
+        result.captureLayout.editorWidth=result.captureLayout.chat.width;
+      }
+      assert(result.captureLayout.editorWidth>=1000,'Capture a wide real PerfChecker editor, rather than a narrow side column');
     }
     observer=setInterval(()=>{void observe().catch(error=>{result.observationError=String(error);});},200);
     const measureBibliography=async label=>{
@@ -300,8 +311,6 @@ exports.run=async()=>{
     const baselineMeasurements=bibliography?await measureBibliography('baseline'):undefined;
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
     if(bibliography){
-      result.captureLayout.editorWidth=await view.evaluate(()=>innerWidth);
-      assert(result.captureLayout.editorWidth>=1000,'Capture a wide real PerfChecker editor, rather than a narrow side column');
       const evidenceId=baselineMeasurements.at(-1).id;
       await eventually(async()=>(await state()).evidence.some(item=>item.id===evidenceId),'Actual saved Bibliography allocation evidence appears in Chat');
       await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(evidenceId);
