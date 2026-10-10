@@ -543,6 +543,37 @@ async function testFlameControls(context,view) {
   const callPath=[];for(let frame=narrow;frame;frame=frame.parent===null?undefined:model.frames[frame.parent-1])callPath.push(frame.name);
   const text=await detail.innerText();assert(text.includes(callPath.reverse().join(' → ')));
   assert(text.includes(`Inclusive weight: ${narrow.value} ${model.unit}`));
+  const colorMode=graph.getByRole('combobox',{name:'Color by',exact:true}),labelMode=graph.getByRole('combobox',{name:'Labels',exact:true});
+  assert.equal(await colorMode.inputValue(),'function');assert.equal(await labelMode.inputValue(),'function');
+  const functionLabels=model.frames.map(frame=>frame.name.replace(/ \([^()\r\n]+\.jl:[1-9]\d*\)$/u,''));
+  const labelsText=()=>svg.locator('.flame-node text').allTextContents();
+  assert.deepEqual(await labelsText(),functionLabels);
+  const functionColors=await svg.locator('.flame-node rect').evaluateAll(nodes=>nodes.map(node=>getComputedStyle(node).fill));
+  for(const [mode,expected]of [['full',model.frames.map(frame=>frame.name)],['function',functionLabels]]){
+    await labelMode.selectOption(mode);assert.deepEqual(await labelsText(),expected);
+    assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame'),payload);
+    assert.equal(await detail.innerText(),text,'Changing labels retains the selected full call path and measured weight');
+  }
+  await colorMode.selectOption('diagnostics');
+  assert.match(await graph.locator('.flame-legend').innerText(),/Unknown or missing inference information is not a warning/);
+  const diagnostics=await svg.locator('.flame-node').evaluateAll(nodes=>nodes.map(node=>({index:Number(node.dataset.frameIndex),
+    dynamic:node.classList.contains('dynamic'),unstable:node.classList.contains('unstable'),gc:node.classList.contains('gc')})));
+  for(const actual of diagnostics){
+    const saved=model.frames[actual.index-1];
+    assert.equal(saved.unstable,saved.inferenceStatuses.some(status=>['any','union','abstract'].includes(status)),
+      'Unknown inference alone must not acquire an unstable diagnostic in the installed VSIX');
+    assert.deepEqual(actual,{index:saved.index,dynamic:!saved.gc&&saved.dynamic,
+      unstable:!saved.gc&&!saved.dynamic&&saved.unstable,gc:saved.gc});
+  }
+  assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame'),payload);
+  await colorMode.selectOption('function');
+  assert.deepEqual(await svg.locator('.flame-node rect').evaluateAll(nodes=>nodes.map(node=>getComputedStyle(node).fill)),functionColors);
+  assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame'),payload);
+  assert.equal(await detail.innerText(),text);
+  context.proof('native-flame-presentation-modes',{source:'actual-installed-VSIX',colorModes:['function','diagnostics'],
+    labelModes:['function','full'],nativeSelectChanges:4,frames:model.frames.length,diagnosticFlagsChecked:diagnostics.length,
+    unknownInferenceFramesChecked:model.frames.filter(frame=>frame.inferenceStatuses.includes('unknown')&&!frame.unstable).length,
+    fullCallPathPreserved:true,modelByteExact:true,geometryExact:true});
   await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click();
   await eventually(async()=>Number(await svg.getAttribute('data-current-max'))-Number(await svg.getAttribute('data-current-min'))<1,'Native flame Zoom narrows only the viewport');
   await expectedGeometry();
@@ -598,6 +629,7 @@ async function testFlamePresentation(context,view,graph){
   const workbench=context.vscode.workspace.getConfiguration('workbench');
   const previousTheme=workbench.inspect('colorTheme')?.globalValue;
   const previousViewport=await context.windowPage.evaluate(()=>({width:innerWidth,height:innerHeight}));
+  const colorMode=graph.getByRole('combobox',{name:'Color by',exact:true}),previousColor=await colorMode.inputValue();
   const audits=[];
   const audit=async()=>{
     const presentation=await graph.locator('svg.flame').evaluate(svg=>({
@@ -641,34 +673,38 @@ async function testFlamePresentation(context,view,graph){
       await workbench.update('colorTheme',theme.id,context.vscode.ConfigurationTarget.Global);
       await eventually(async()=>context.vscode.window.activeColorTheme.kind===kind&&await view.locator('body').evaluate((body,name)=>body.classList.contains(name),bodyClass),
         `The real webview receives the ${theme.id} theme`);
-      await eventually(audit,'The rendered flame labels update their actual contrast after the theme changes');
-      const desktop=await audit();
-      await graph.locator('.flame-node').first().focus();const focused=await audit();
-      await graph.locator('.flame-node').first().hover();const hovered=await audit();
       const commands=await context.vscode.commands.getCommands(true);
       for(const command of ['workbench.action.closeSidebar','workbench.action.closeAuxiliaryBar','workbench.action.closePanel']){
         if(commands.includes(command))await context.vscode.commands.executeCommand(command);
       }
-      await context.windowPage.setViewportSize({width:390,height:844});
-      await eventually(async()=>await view.evaluate(()=>innerWidth)<=390,'The actual webview adopts the narrow workbench viewport');
-      const geometry=await graph.evaluate(node=>({viewport:innerWidth,width:node.getBoundingClientRect().width,
-        scrollWidth:node.scrollWidth,clientWidth:node.clientWidth,
-        buttons:[...node.querySelectorAll('.flame-toolbar button')].map(button=>({label:button.getAttribute('aria-label'),height:button.getBoundingClientRect().height}))}));
-      assert(geometry.width>=230&&geometry.width<=390,'The narrow qualification uses a readable editor after hiding disposable side panels');assert(geometry.scrollWidth<=geometry.clientWidth);
-      assert(geometry.buttons.every(button=>button.height>=44),'The narrow native flame controls retain touch-sized targets');
-      const mobile=await audit();
-      await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click();
-      await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
-      await graph.locator('.flame-toolbar').scrollIntoViewIfNeeded();
-      await capture(context,`flame-mobile-${uiTheme}-controls`);
-      await graph.locator('.flame-detail').scrollIntoViewIfNeeded();
-      await capture(context,`flame-mobile-${uiTheme}-readout`);
-      audits.push({theme:theme.id,desktop,focused,hovered,mobile,geometry});
-      await context.windowPage.setViewportSize(previousViewport);
+      for(const mode of ['function','diagnostics']){
+        await colorMode.selectOption(mode);
+        await eventually(audit,'The rendered flame labels update their actual contrast after the theme and color mode change');
+        const desktop=await audit();
+        await graph.locator('.flame-node').first().focus();const focused=await audit();
+        await graph.locator('.flame-node').first().hover();const hovered=await audit();
+        await context.windowPage.setViewportSize({width:390,height:844});
+        await eventually(async()=>await view.evaluate(()=>innerWidth)<=390,'The actual webview adopts the narrow workbench viewport');
+        const geometry=await graph.evaluate(node=>({viewport:innerWidth,width:node.getBoundingClientRect().width,
+          scrollWidth:node.scrollWidth,clientWidth:node.clientWidth,
+          buttons:[...node.querySelectorAll('.flame-toolbar button,.flame-presentation select')].map(control=>({label:control.getAttribute('aria-label'),height:control.getBoundingClientRect().height}))}));
+        assert(geometry.width>=230&&geometry.width<=390,'The narrow qualification uses a readable editor after hiding disposable side panels');assert(geometry.scrollWidth<=geometry.clientWidth);
+        assert(geometry.buttons.every(control=>control.height>=44),'The narrow native flame buttons and selects retain touch-sized targets');
+        const mobile=await audit();
+        await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click();
+        await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
+        await graph.locator('.flame-presentation').scrollIntoViewIfNeeded();
+        await capture(context,`flame-mobile-${uiTheme}-${mode}-controls`);
+        await graph.locator('.flame-detail').scrollIntoViewIfNeeded();
+        await capture(context,`flame-mobile-${uiTheme}-${mode}-readout`);
+        audits.push({theme:theme.id,colorMode:mode,desktop,focused,hovered,mobile,geometry});
+        await context.windowPage.setViewportSize(previousViewport);
+      }
     }
     context.proof('native-flame-theme-and-mobile-presentation',{source:'actual-installed-VSIX-and-built-in-VSCode-themes',audits});
   }finally{
     await context.windowPage.setViewportSize(previousViewport);
+    await colorMode.selectOption(previousColor);
     await workbench.update('colorTheme',previousTheme,context.vscode.ConfigurationTarget.Global);
   }
 }
