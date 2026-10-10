@@ -450,15 +450,21 @@ async function measuredEvidence(context) {
   const previousDiscovery=new Set(await entries());
   await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
   let frame=await context.findFrame('#app nav[aria-label="Investigation views"]');
+  let declared,discoveryId;
+  try{
   await frame.getByRole('button',{name:'Discover tests',exact:true}).click();
-  await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class')).includes('busy')&&
-    await frame.locator('.scenario-title strong').filter({hasText:/^advisor_sum_squares$/}).count()===1,'Actual Core discovers the distinct declared advisor allocation scenario',240000);
-  let declared;
+  await eventually(async()=>{
+  if((await frame.locator('#app .status').getAttribute('class')).includes('busy')||
+    await frame.locator('.scenario-title strong').filter({hasText:/^advisor_sum_squares$/}).count()!==1)return false;
+  const advisorCard=frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:/^advisor_sum_squares$/})})
+    .filter({has:frame.locator('.implementation',{hasText:/^allocating$/})});
+  if(await advisorCard.count()!==1)return false;
   for(const id of await entries()){
     if(previousDiscovery.has(id))continue;
     const bytes=await fs.readFile(path.join(root,id,'discovery.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
     if(!bytes)continue;
-    const discovery=JSON.parse(bytes),matches=discovery.declared.filter(scenario=>scenario.id==='advisor_sum_squares'&&scenario.implementation==='allocating');
+    let discovery;try{discovery=JSON.parse(bytes);}catch(error){if(error instanceof SyntaxError)continue;throw error;}
+    const matches=discovery.declared.filter(scenario=>scenario.id==='advisor_sum_squares'&&scenario.implementation==='allocating');
     if(!matches.length)continue;
     assert.equal(matches.length,1,'Discovery cannot ambiguously alias the advisor scenario');
     declared=matches[0];
@@ -467,10 +473,32 @@ async function measuredEvidence(context) {
     assert.equal(await fs.realpath(declared.source),await fs.realpath(path.join(context.workspace,'perf','cases.jl')));
     assert.deepEqual(discovery.declared.find(scenario=>scenario.id==='sum_squares'&&scenario.implementation==='allocating').collectors,
       ['benchmark','chairmark','profile','profile_alloc'],'The original catalogue retains all four collectors');
+    discoveryId=id;
   }
+  return Boolean(declared);
+  },'Actual Core saves a new exact advisor catalogue and finishes its visible discovery',240000);
   assert(declared,'The saved discovery must identify the exact single-collector catalogue before launch');
+  }catch(primary){
+    const diagnostic={stage:'discovery',errorClass:primary.name,message:String(primary),recoveryAfterFailure:true};
+    context.log('native-mcp-discovery-primary-failure-before-recovery',diagnostic);
+    try{
+      diagnostic.status={text:await frame.locator('#app .status').innerText(),className:await frame.locator('#app .status').getAttribute('class')};
+      diagnostic.newReportIds=(await entries()).filter(id=>!previousDiscovery.has(id));
+      diagnostic.screenshot=`native-${process.platform}-mcp-discovery-before-recovery.png`;
+      await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,diagnostic.screenshot)});
+    }catch(error){diagnostic.observationError=String(error);}
+    context.log('native-mcp-discovery-state-before-recovery',diagnostic);
+    try{
+      await context.vscode.commands.executeCommand('perfchecker.cancelInvestigation');
+      await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class')).includes('busy'),
+        'Explicit recovery waits for the failed discovery controller cleanup',120000);
+      context.log('native-mcp-discovery-recovery-after-failure',{cancelCommand:'perfchecker.cancelInvestigation',
+        status:await frame.locator('#app .status').innerText(),naturalCompletionClaimed:false,originalFailureRetained:true});
+    }catch(cleanup){throw new AggregateError([primary,cleanup],'Discovery failed and explicit recovery did not complete');}
+    throw primary;
+  }
   context.proof('native-mcp-benchmark-catalog-discovery',{id:declared.id,implementation:declared.implementation,catalog:declared.catalog,
-    source:declared.source,collectors:declared.collectors,originalFourCollectorsPreserved:true,assertedBeforeMeasurement:true});
+    source:declared.source,collectors:declared.collectors,discoveryId,newSavedDiscovery:true,originalFourCollectorsPreserved:true,assertedBeforeMeasurement:true});
   await frame.getByRole('button',{name:'Scenarios',exact:true}).click();
   await frame.getByRole('button',{name:'Clear selection',exact:true}).click();
   const selectedCard=frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:/^advisor_sum_squares$/})})
