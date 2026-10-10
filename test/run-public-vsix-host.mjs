@@ -33,7 +33,9 @@ const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
-if(stage==='focused'&&!['general100','narrative','mcp','mcp-stdio','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+if(stage==='focused'&&!['bootstrap','general100','narrative','mcp','mcp-stdio','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
+const bootstrapOnly=stage==='focused'&&caseGroup==='bootstrap';
+if(bootstrapOnly&&(mode!=='candidate'||coreMode!=='general'))throw new Error('Fresh production bootstrap requires the candidate VSIX and published General Core, without Git source overrides.');
 if(stage==='focused'&&caseGroup==='pluto-start-stop'&&process.platform!=='linux')throw new Error('The first prepared Pluto start/stop observation is explicitly Linux only.');
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 // The real game and SDKs are immutable fixtures, never development checkouts.
@@ -510,9 +512,15 @@ try {
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
-  const minimumAvailable=/^\["1\.0\.1"\]$/m.test(await minimumResponse.text());
+  const versionsText=await minimumResponse.text(),minimumSection=versionsText.split(/^\["1\.0\.1"\]\s*$/m)[1]?.split(/^\[/m)[0];
+  const minimumTree=/^git-tree-sha1\s*=\s*"([a-f0-9]{40})"/m.exec(minimumSection||'')?.[1];
+  const minimumAvailable=Boolean(minimumTree);
+  const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml');
+  if(!plutoTagResponse.ok&&plutoTagResponse.status!==404)throw new Error(`Cannot verify published Pluto companion tag: ${plutoTagResponse.status}`);
+  const plutoTagAvailable=plutoTagResponse.ok&&/^version\s*=\s*"1\.0\.1"\s*$/m.test(await plutoTagResponse.text());
   await fs.writeFile(path.join(output,'production-bootstrap-gate.json'),JSON.stringify({minimum:'1.0.1',registry:'General',available:minimumAvailable,
-    status:minimumAvailable?'native-positive-test-required':'awaiting-human-registration',candidateFunctions:coreProvenance},null,2));
+    tree:minimumTree,plutoTag:'v1.0.1',plutoTagAvailable,
+    status:minimumAvailable&&plutoTagAvailable?'native-positive-test-required':'awaiting-registration-or-tag',candidateFunctions:coreProvenance},null,2));
 
   const launch = async phase => {
     let recording,recorded,videoStartedAt,recordingError='',externalBrowser;
@@ -576,6 +584,8 @@ try {
         PERFCHECKER_NATIVE_EXPECTED_VERSION: expectedVersion, PERFCHECKER_NATIVE_JULIA_VERSION: runtime.version,
         PERFCHECKER_NATIVE_CORE_VERSION: expectedCoreVersion, PERFCHECKER_NATIVE_CORE_PROVENANCE:JSON.stringify(coreProvenance),
         PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE:String(minimumAvailable),
+        PERFCHECKER_NATIVE_GENERAL_MINIMUM_TREE:minimumTree||'',
+        PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE:String(plutoTagAvailable),
         PERFCHECKER_NATIVE_VIDEO_STARTED_AT:videoStartedAt||'',
         UV_THREADPOOL_SIZE: '4'};
       await new Promise((resolve,reject)=>{
@@ -645,7 +655,8 @@ try {
     }
   };
   // The first real launch has no PerfChecker settings, Julia or Jupyter extension.
-  if(completeCampaign)await launch('fresh');
+  if(completeCampaign||bootstrapOnly)await launch('fresh');
+  if(!bootstrapOnly){
   const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]!="landscape";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':'standard'],{timeout:landscapeOnly?900000:undefined});
   const installed=JSON.parse(installation.split(/\r?\n/).find(line=>line.startsWith('QUALIFIED_CORE_PROVENANCE ')).slice('QUALIFIED_CORE_PROVENANCE '.length));
   if(installed.version!==expectedCoreVersion||!/^[a-f0-9]{40}$/.test(installed.tree)||coreMode!=='candidate'&&!installed.registered||coreMode==='general100'&&installed.tree!==coreProvenance.tree)
@@ -814,6 +825,7 @@ end
     if(mode!=='candidate')throw new Error('Focused native controls require an explicit exact candidate archive.');
     await launch(caseGroup);
   }else await launch('prepared');
+  }
   if (phaseFailures.length) throw new Error(JSON.stringify(phaseFailures));
   }
 } catch(error){landscapePrimaryError=error;throw error;}

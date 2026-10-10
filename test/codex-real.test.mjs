@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
 import {execFile} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {promisify} from 'node:util';
 import {mkdtemp,writeFile,readFile,rm,mkdir,realpath as fsRealpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -97,8 +98,19 @@ export async function prepareBibliographyCodexFixture(root,{julia,project,coreTr
   await git(root,'config','user.name','PerfChecker qualification');await git(root,'config','user.email','qualification@example.invalid');
   await git(root,'add','.');await git(root,'commit','-m','Private Bibliography MCP qualification fixture');
   const core=JSON.parse((await execute(julia,['--startup-file=no',`--project=${project}`,'-e',
-    'using PerfChecker,Pkg,HTTP; info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; PerfChecker.JSON.print(Dict("uuid"=>string(Base.PkgId(PerfChecker).uuid),"version"=>string(Base.pkgversion(PerfChecker)),"tree"=>bytes2hex(Pkg.GitTools.tree_hash(pkgdir(PerfChecker))),"registered"=>info.is_tracking_registry,"http"=>string(Base.pkgversion(HTTP))))'],{timeout:60000})).stdout);
+    `using PerfChecker,Pkg,HTTP,SHA
+    info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]
+    project=realpath(Base.active_project()); manifest=realpath(joinpath(dirname(project),"Manifest.toml"))
+    PerfChecker.JSON.print(Dict("uuid"=>string(Base.PkgId(PerfChecker).uuid),"version"=>string(Base.pkgversion(PerfChecker)),
+      "tree"=>bytes2hex(Pkg.GitTools.tree_hash(pkgdir(PerfChecker))),"registered"=>info.is_tracking_registry,"http"=>string(Base.pkgversion(HTTP)),
+      "project"=>project,"root"=>realpath(pkgdir(PerfChecker)),"entrypoint"=>realpath(pathof(PerfChecker)),"manifest"=>manifest,
+      "projectSha256"=>bytes2hex(sha256(read(project))),"manifestSha256"=>bytes2hex(sha256(read(manifest)))))`],{timeout:60000})).stdout);
   assert.equal(core.uuid,'6309bf6b-a531-4b08-891e-8ee981e5c424');assert.equal(core.version,'1.0.1');assert.equal(core.tree,coreTree);
+  assert.equal(core.project,await fsRealpath(path.join(project,'Project.toml')),'Probe the requested dedicated controller');
+  assert.equal(core.manifest,await fsRealpath(path.join(project,'Manifest.toml')));
+  assert.equal(core.entrypoint,await fsRealpath(path.join(core.root,'src','PerfChecker.jl')),'The loaded module belongs to the tree-hashed Core');
+  for(const [file,expected] of [[core.project,core.projectSha256],[core.manifest,core.manifestSha256]])
+    assert.equal(createHash('sha256').update(await readFile(file)).digest('hex'),expected,'Retain hashes of the actual controller dependency files');
   return {kind:'bibliography',relative:'src/bibtex.jl',core,baselineBytes:probe.allocationBytes,probe};
 }
 

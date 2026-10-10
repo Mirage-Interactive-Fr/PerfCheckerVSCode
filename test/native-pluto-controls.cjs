@@ -944,6 +944,64 @@ exports.run = async context => {
   if (failures.length) throw new AggregateError(failures, 'Actual Pluto controls failed');
 };
 
+// Exercise the published setup buttons before any fixture environment is prepared.
+exports.runFreshInstall = async context => {
+  assert.equal(process.env.CI,'true');
+  assert.equal(process.env.PERFCHECKER_NATIVE_PHASE,'fresh');
+  assert.equal(process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE,'true');
+  assert.equal(process.env.PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE,'true');
+  const {vscode,workspace,windowPage}=context,uri=vscode.Uri.file(workspace);
+  const settings=vscode.workspace.getConfiguration('perfchecker',uri),project=path.join(workspace,'perf','pluto');
+  assert.equal(settings.get('runnerProject'),'perf/controller');
+  assert.equal(settings.get('plutoProject','perf/pluto'),'perf/pluto');
+  assert.equal(settings.inspect('plutoProject')?.workspaceFolderValue,undefined,'The published default Pluto project is not overridden');
+  assert(!await fs.stat(project).then(()=>true).catch(error=>{if(error.code==='ENOENT')return false;throw error;}),'No Pluto environment was prepared');
+  const controller=path.join(workspace,'perf','controller'),controllerBefore=await fingerprint(controller);
+  const file=path.join(workspace,'perf','notebooks','PublishedFirstUse.jl');
+  const filesSettings=vscode.workspace.getConfiguration('files',uri),oldDialog=filesSettings.inspect('simpleDialog.enable')?.globalValue;
+  try{
+    await filesSettings.update('simpleDialog.enable',true,vscode.ConfigurationTarget.Global);
+    await clickStudioAction(context,'notebook');
+    const dialog=windowPage.locator('.quick-input-widget').filter({has:windowPage.locator('.quick-input-title').filter({hasText:/^PerfChecker · Create Pluto notebook$/})});
+    await dialog.waitFor({state:'visible',timeout:30000});
+    const input=dialog.locator('input[type="text"]');await input.fill(file);await input.press('Enter');
+    const picker=windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:30000});
+    await picker.locator('.monaco-list-row').filter({hasText:'Feature suite'}).click();
+    const install=windowPage.getByRole('button',{name:'Install Pluto environment',exact:true});
+    await install.waitFor({state:'visible',timeout:30000});await install.click();
+    const source=await eventually(()=>fs.readFile(file,'utf8'),'The real published installer generates the first native notebook',600000);
+    assert(source.startsWith('### A Pluto.jl notebook ###'));
+    const state={source,...await view(context)};await ready(state.frame,'Launch selected checks');
+    await capture(context,'fresh-published-pluto');
+    await stop(context,state);
+    assert.deepEqual(await fingerprint(controller),controllerBefore,'The separate Pluto installer leaves the freshly installed controller byte-exact');
+    const retained=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'published-bootstrap');await fs.mkdir(retained,{recursive:true});
+    const environments={};
+    for(const [name,directory]of [['controller',controller],['pluto',project]]){
+      const result=await execute(process.env.PERFCHECKER_NATIVE_JULIA,['--startup-file=no','--history-file=no',`--project=${directory}`,'-e',
+        'using Pkg,PerfChecker; modules=Module[PerfChecker];if ARGS[1]=="pluto";using PerfCheckerPluto,Pluto;append!(modules,[PerfCheckerPluto,Pluto]);end;print("PUBLISHED_BOOTSTRAP_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>begin;i=Pkg.dependencies()[Base.PkgId(m).uuid];Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(i.tree_hash),"registered"=>i.is_tracking_registry,"revision"=>i.git_revision,"source"=>i.git_source,"pathof"=>pathof(m),"pkgdir"=>pkgdir(m));end for m in modules));println()',name],
+        {cwd:workspace,env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)},timeout:180000,maxBuffer:1000000});
+      const line=result.stdout.split(/\r?\n/).find(value=>value.startsWith('PUBLISHED_BOOTSTRAP_PROVENANCE '));assert(line,'The actual installed modules report their source provenance');
+      environments[name]=JSON.parse(line.slice('PUBLISHED_BOOTSTRAP_PROVENANCE '.length));
+      assert.equal(environments[name].PerfChecker.version,'1.0.1');assert.equal(environments[name].PerfChecker.registered,true);
+      assert.equal(environments[name].PerfChecker.tree,process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_TREE);
+      await fs.mkdir(path.join(retained,name),{recursive:true});
+      for(const leaf of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(directory,leaf),path.join(retained,name,leaf));
+    }
+    assert.equal(environments.pluto.PerfCheckerPluto.version,'1.0.1');assert.equal(environments.pluto.PerfCheckerPluto.revision,'v1.0.1');
+    assert.equal(environments.pluto.PerfCheckerPluto.tree,'7ad6a3a84b8284fec905753e02a2877d3762ba9e');
+    assert.equal(environments.pluto.PerfCheckerPluto.source,'https://github.com/Mirage-Interactive-Fr/PerfChecker.jl');
+    assert.equal(environments.pluto.Pluto.version,'1.0.4');assert.equal(environments.pluto.Pluto.registered,true);
+    await fs.copyFile(file,path.join(retained,path.basename(file)));
+    context.proof('bootstrap-pluto-published-install',{nativeStudioClick:true,nativeInstallConfirmation:true,noPreparedEnvironment:true,
+      sourceOverride:false,core:'General 1.0.1',companion:'PerfCheckerPluto subdir at v1.0.1',environments,
+      separateControllerPreserved:true,notebookGenerated:true,interactiveNotebookOpened:true,nativeStopClick:true,listenerClosed:true});
+  }finally{
+    await vscode.commands.executeCommand('perfchecker.stopNotebookSession',uri);
+    await filesSettings.update('simpleDialog.enable',oldDialog,vscode.ConfigurationTarget.Global);
+  }
+};
+
 // First server in an explicitly prepared environment, not a virgin package cache.
 exports.runStartStop = async context => {
   assert.equal(process.env.CI,'true');assert.equal(process.platform,'linux');

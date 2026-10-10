@@ -9,8 +9,8 @@ import path from 'node:path';
 import os from 'node:os';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 const client=path.dirname(path.dirname(fileURLToPath(import.meta.url))),execute=promisify(execFile);
-const vsixSha='1af8108bfe2c491684da2435e4b9bc5430b33e8f8a6d8f02699790074d249de4';
-const coreTree='920bd59cee056970d2c2ab03ef0d9103e071c536';
+const vsixSha='2607dc00a03ff343a953879af68d04f23f43bed8179360e223e76f93c36f2959';
+const coreTree='d3c96c70fa621ad7580e0c1c9b5010ecab9a79ea';
 const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
 if(process.env.CI)throw new Error('Authenticated Codex qualification is local-only. Never transfer authentication to CI.');
 if(process.platform!=='linux')throw new Error('This isolated display qualification currently requires Linux and a private Xvfb.');
@@ -18,7 +18,7 @@ for(const name of ['PERFCHECKER_TEST_CONTROLLER','PERFCHECKER_TEST_CODEX','PERFC
   if(!process.env[name]||!path.isAbsolute(process.env[name]))throw new Error(`Provide an absolute ${name} path.`);
 const archive=await fs.realpath(process.env.PERFCHECKER_TEST_VSIX);
 assert.equal(createHash('sha256').update(await fs.readFile(archive)).digest('hex'),vsixSha,'Use the approved VSIX bytes, not a development build');
-assert.equal((await fs.stat(archive)).size,1068437);
+assert.equal((await fs.stat(archive)).size,1068554);
 if(bibliography){
   assert(path.isAbsolute(bibliography),'Provide an absolute private Bibliography pilot path');
   assert.match(await fs.readFile('/proc/self/status','utf8'),/^Cpus_allowed_list:\s*16-17\s*$/m,'The real-package driver must inherit the approved two-CPU pool');

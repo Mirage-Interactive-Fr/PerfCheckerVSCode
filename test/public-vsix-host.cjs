@@ -33,7 +33,7 @@ function commandCoverage(commands,checks){
     openOutput:['result-controls'],showLog:['native-suite-worker-output'],openDesigner:['suite-selection-and-save'],openDesignerForWorkspace:['save-palette-command'],
     runLandscapeLiveForWorkspace:['landscape-live-prerequisite','native-landscape-command-completed','native-landscape-cancel-owned-renderer'],saveConfiguration:['save-palette-command','native-suite-save-palette'],
     openStudio:['native-open-studio-command'],openStudioForWorkspace:['controller-visible-in-studio','studio-inventory','bootstrap-existing-controller'],openChat:['native-mcp-advice-implementation-restore','native-mcp-configuration-only-conversation'],
-    openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save','pluto-studio-file-dialog-buttons'],openNotebook:['pluto-reactive-save-reload-close','pluto-studio-file-dialog-buttons'],
+    openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save','pluto-studio-file-dialog-buttons','bootstrap-pluto-published-install'],openNotebook:['pluto-reactive-save-reload-close','pluto-studio-file-dialog-buttons'],
     debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],applyImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],
     restoreImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
     connectMcpStdio:['native-mcp-stdio-connected-session'],disconnectMcpStdio:['native-mcp-stdio-modern-disconnect'],
@@ -90,6 +90,7 @@ function buttonCoverage(checks){
     'Investigation · Cancel active explanation / connection cleanup':['native-narrative-cancel-active-http'],
     'Workspace · actual extension-host reload / owned allocation cleanup':['native-reload-owned-allocation-cleanup'],
     'Pluto · reactive edit / evaluate / autosave / reload':['pluto-reactive-save-reload-close'],
+    'Pluto · published first install / native notebook / Stop':['bootstrap-pluto-published-install'],
     'Pluto · Launch selected checks / Refresh / Save reports':['pluto-suite-select-launch-save'],
     'Pluto · measured Makie/WGLMakie figures and point inspection':['pluto-rendered-measured-plots'],
     'Pluto · Launch selected investigation / Refresh':['pluto-investigation-real-run'],
@@ -605,7 +606,7 @@ exports.run = async () => {
     context.measureTestItem=options=>measureNativeTestItem(context,true,options);
     log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 
-    if(phase==='narrative'||process.env.PERFCHECKER_NATIVE_STAGE==='focused'){
+    if(phase!=='fresh'&&(phase==='narrative'||process.env.PERFCHECKER_NATIVE_STAGE==='focused')){
       const settings=vscode.workspace.getConfiguration('perfchecker',uri);
       const continuingStdio=phase==='mcp-stdio'&&await fs.stat(path.join(output,'mcp-stdio-reload-handoff.json')).then(stat=>stat.isFile()).catch(error=>{if(error.code==='ENOENT')return false;throw error;});
       if(!continuingStdio)for(const [key,value] of Object.entries({juliaExecutable:process.env.PERFCHECKER_NATIVE_JULIA,runnerProject:context.controller,scenarioProject:context.controller,
@@ -682,7 +683,7 @@ exports.run = async () => {
       await runCase('missing-julia-debug', async () => {
         await assert.rejects(vscode.commands.executeCommand('perfchecker.debugFile', uri), /Install the Julia VS Code extension/i);
       });
-      await runCase('missing-controller-initialize', async () => {
+      const bootstrapped=await runCase('missing-controller-initialize', async () => {
         if(process.env.PERFCHECKER_NATIVE_MODE==='public'){
           await assert.rejects(vscode.commands.executeCommand('perfchecker.initialize'), /controller Project\.toml not found.*perfchecker\.runnerProject/i);
           log('bootstrap-prerequisite', {controllerAbsent: true, initializeCurrentlyBlocked: true});return;
@@ -721,6 +722,15 @@ exports.run = async () => {
         await eventually(()=>vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject')==='perf/controller','Controller setting is saved only after successful setup');
         await controls.runSelection(context);
         proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:'General 1.0.1',nativeStudioClick:true});
+      });
+      if(process.env.PERFCHECKER_NATIVE_MODE==='candidate')await runCase('fresh-pluto-published-install',async()=>{
+        if(!bootstrapped)throw Object.assign(new Error('Blocked by failed production controller bootstrap'),{blockedBy:'missing-controller-initialize'});
+        if(process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE!=='true'||process.env.PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE!=='true'){
+          proof('bootstrap-pluto-awaiting-publication',{status:'prerequisite',core:'General 1.0.1',companion:'PerfCheckerPluto subdir at v1.0.1',positiveBootstrapQualified:false});
+          if(process.env.PERFCHECKER_NATIVE_CASE_GROUP==='bootstrap')throw new Error('Published General 1.0.1 and companion tag v1.0.1 are required for this positive bootstrap qualification');
+          return;
+        }
+        await pluto.runFreshInstall(context);
       });
     } else {
       const settings = vscode.workspace.getConfiguration('perfchecker', uri);

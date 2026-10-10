@@ -16,7 +16,7 @@ on:
       case_group:
         description: Native controls to exercise on a clean fixture (focused stage only)
         type: choice
-        options: [general100, narrative, mcp, mcp-stdio, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
+        options: [bootstrap, general100, narrative, mcp, mcp-stdio, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
         default: narrative
       backend_julia:
         description: Core runtime for a manual qualification; automatic PR coverage remains latest
@@ -120,8 +120,8 @@ jobs:
           }
           if(newOrigin&&(e.NATIVE_EVENT!=='workflow_dispatch'||requested))throw Error('A new candidate origin requires an explicit manual run without archive-reuse inputs');
           if(JSON.parse(fs.readFileSync('package.json')).version==='1.0.1'&&!requested&&!newOrigin){
-            // Product commit 1b85c323911bc75a9d05109017a9a131f7f31f22, tree bf52b4da07bc77a8ea47e4a1dbdeef55b5e6cf76.
-            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=37911260825\nREUSE_NAME=native-candidate-1b85c323911bc75a9d05109017a9a131f7f31f22\nREUSE_SHA=9ac2837ebf0d3da06ab9025547152a2ce8f45f8de990e09ccaab97500a918652\n');
+            // Product commit 4fab779eae49968b3233fab6ed1d48e4acfbd1b3, tree 442cf563ca0b8474423e3c87fb36b05712ac55e9.
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38009248531\nREUSE_NAME=native-candidate-4fab779eae49968b3233fab6ed1d48e4acfbd1b3\nREUSE_SHA=2607dc00a03ff343a953879af68d04f23f43bed8179360e223e76f93c36f2959\n');
             console.log('Release 1.0.1 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
           }
           NODE
@@ -194,8 +194,8 @@ jobs:
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || '52a0d0cd12472606632645700781d02d650f6694') || '' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || 'df1077cac855f04bd7f11b92b0732804ddb6f748') || '' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || '2ea69694e4b8a4e2d9fe097c665108887342dca1') || '' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || 'd3c96c70fa621ad7580e0c1c9b5010ecab9a79ea') || '' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'

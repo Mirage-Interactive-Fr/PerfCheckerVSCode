@@ -118,7 +118,7 @@ exports.run=async()=>{
     for(const file of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(directory,'perf','episode-05a','worker',file),path.join(target,file));}};
   try{
     result.vsixSha256=hash(await fs.readFile(process.env.PERFCHECKER_HOST_ARCHIVE));
-    assert.equal(result.vsixSha256,'1af8108bfe2c491684da2435e4b9bc5430b33e8f8a6d8f02699790074d249de4');
+    assert.equal(result.vsixSha256,'2607dc00a03ff343a953879af68d04f23f43bed8179360e223e76f93c36f2959');
     const extension=vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');assert(extension,'Load the installed product');
     const installed=await fs.realpath(extension.extensionPath);
     assert(installed.startsWith(path.join(session,'extensions')+path.sep),'The product must not come from the source checkout or human extension directory');
@@ -129,7 +129,7 @@ exports.run=async()=>{
     await extension.activate();assert(extension.isActive);
     assert.equal(settings().get('runnerProject'),process.env.PERFCHECKER_TEST_CONTROLLER);
     assert.equal(settings().get('juliaExecutable'),process.env.PERFCHECKER_TEST_JULIA);
-    result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'920bd59cee056970d2c2ab03ef0d9103e071c536');assert.equal(result.core.version,'1.0.1');
+    result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'d3c96c70fa621ad7580e0c1c9b5010ecab9a79ea');assert.equal(result.core.version,'1.0.1');
     process.env.PERFCHECKER_CODEX_HOST_ONLY='1';
     const {probeJuliaCodexFixture,probeBibliographyCodexFixture}=await import(pathToFileURL(path.join(__dirname,'codex-real.test.mjs')).href);
     const probe=directory=>bibliography?probeBibliographyCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA,{prepare:true}):probeJuliaCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA);
