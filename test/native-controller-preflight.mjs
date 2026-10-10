@@ -2,6 +2,57 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {TextDecoder} from 'node:util';
 
+// Pkg's LibGit2 checkout reads its own configuration search path. The Git CLI's
+// GIT_CONFIG_GLOBAL alone does not select that file for the embedded library.
+export const candidateGitSetupScript=String.raw`using LibGit2
+if Sys.iswindows()
+ @assert get(ENV,"CI","")=="true" && get(ENV,"GITHUB_ACTIONS","")=="true"
+ config=realpath(ENV["PERFCHECKER_NATIVE_GIT_CONFIG"]);@assert basename(config)==".gitconfig"
+ LibGit2.ensure_initialized()
+ result=ccall((:git_libgit2_opts,LibGit2.libgit2),Cint,(Cint,Cint,Cstring),LibGit2.Consts.SET_SEARCH_PATH,LibGit2.Consts.CONFIG_LEVEL_GLOBAL,dirname(config));@assert result==0
+ @assert LibGit2.getconfig("core.autocrlf",true)==false
+ @assert LibGit2.getconfig("core.eol","")=="lf"
+ println("CANDIDATE_GIT_CONFIG_V1 path=",bytes2hex(codeunits(config))," sha256=",bytes2hex(Pkg.GitTools.SHA.sha256(read(config)))," autocrlf=false eol=lf library=",LibGit2.VERSION);flush(stdout)
+end`;
+
+// NTFS ACLs inherited by LibGit2's checkout can mark every file executable.
+// Pkg.set_readonly deliberately retains that access. Restore the immutable
+// Git modes, without rewriting bytes, then require Pkg's ORIGINAL whole-tree hash.
+export const candidateCheckoutPermissionsScript=String.raw`if Sys.iswindows()
+ @assert get(ENV,"CI","")=="true" && get(ENV,"GITHUB_ACTIONS","")=="true"
+ info=only(info for info in values(Pkg.dependencies()) if info.name=="PerfChecker")
+ @assert string(info.tree_hash)==ARGS[3]
+ root=realpath(info.source);depot=realpath(first(DEPOT_PATH));@assert startswith(root,depot*Base.Filesystem.path_separator)
+ count=Ref(0);changed=Ref(0);bytecount=Ref(Int64(0));before_modes=Dict{String,Int}()
+ function restore_candidate_modes(tree,directory)
+  entries=[tree[i] for i in 1:LibGit2.count(tree)]
+  @assert sort(readdir(directory))==sort(LibGit2.filename.(entries))
+  for entry in entries
+   name=LibGit2.filename(entry);@assert basename(name)==name && name!="." && name!=".."
+   file=joinpath(directory,name);mode=LibGit2.filemode(entry)
+   if mode==0o040000
+    @assert isdir(file) && !islink(file)
+    LibGit2.with(LibGit2.GitTree,entry) do child;restore_candidate_modes(child,file);end
+   else
+    @assert mode in (0o100644,0o100755) && isfile(file) && !islink(file)
+    count[]+=1;bytecount[]+=filesize(file);before=string(Pkg.GitTools.gitmode(file));before_modes[before]=get(before_modes,before,0)+1
+    chmod(file,mode==0o100644 ? 0o444 : 0o555)
+    @assert string(Pkg.GitTools.gitmode(file))==string(mode;base=8)
+    changed[]+=before!=string(mode;base=8)
+   end
+  end
+ end
+ LibGit2.with(LibGit2.GitRepo,Pkg.Types.add_repo_cache_path("https://github.com/Mirage-Interactive-Fr/PerfChecker.jl")) do repo
+  @assert LibGit2.getconfig(repo,"core.autocrlf",true)==false && LibGit2.getconfig(repo,"core.eol","")=="lf"
+  LibGit2.with(LibGit2.GitTree,repo,ARGS[3]) do tree
+   @assert string(LibGit2.GitHash(tree))==ARGS[3]
+   restore_candidate_modes(tree,root)
+  end
+ end
+ actual=bytes2hex(Pkg.GitTools.tree_hash(root));@assert actual==ARGS[3]
+ println("CANDIDATE_CHECKOUT_V1 tree=",actual," files=",count[]," bytes=",bytecount[]," aclChanged=",changed[]," beforeModes=",join([k*":"*string(v) for (k,v) in sort!(collect(before_modes))],",")," contentRewritten=false complete=true");flush(stdout)
+end`;
+
 // Emit primitive fields rather than compiling a generic JSON writer after the
 // cold HTTP import. All loading, identity checks and the 180 s budget remain real.
 export const controllerPreflightScript=String.raw`println("CONTROLLER_PREFLIGHT_READY ",getpid());flush(stdout);readline(stdin)

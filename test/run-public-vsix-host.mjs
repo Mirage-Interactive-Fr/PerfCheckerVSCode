@@ -11,7 +11,7 @@ import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 import {nativeCoreContract} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
-import {controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -29,7 +29,7 @@ const coreTree=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_TREE 
 const coreProvenance=nativeCoreContract({core:coreMode,artifact:mode,stage:process.env.PERFCHECKER_NATIVE_STAGE||'smoke',
   group:process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative',commit:process.env.PERFCHECKER_NATIVE_CORE_COMMIT||'',tree:process.env.PERFCHECKER_NATIVE_CORE_TREE||''});
 const expectedCoreVersion=coreProvenance.version;
-const installCore=coreMode==='candidate'?'Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]))':`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))${coreMode==='general100'?'; Pkg.pin(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))':''}`;
+const installCore=coreMode==='candidate'?`${candidateGitSetupScript};Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]));${candidateCheckoutPermissionsScript}`:`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))${coreMode==='general100'?'; Pkg.pin(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))':''}`;
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
@@ -41,10 +41,17 @@ if(stage==='focused'&&caseGroup==='pluto-start-stop'&&process.platform!=='linux'
 const landscapeOnly=stage==='focused'&&caseGroup==='landscape';
 // The real game and SDKs are immutable fixtures, never development checkouts.
 // A trailing delimiter expands only Julia's system depots, excluding the human depot.
+const candidateGitConfig=process.platform==='win32'&&coreMode==='candidate'?path.join(session,'git-config','.gitconfig'):undefined;
+if(candidateGitConfig){
+  assert.equal(process.env.CI,'true');assert.equal(process.env.GITHUB_ACTIONS,'true');
+  await fs.mkdir(path.dirname(candidateGitConfig));
+  await fs.writeFile(candidateGitConfig,'[core]\n\tautocrlf = false\n\teol = lf\n',{flag:'wx'});
+}
 const runnerEnvironment=landscapeOnly?{...process.env,JULIA_DEPOT_PATH:path.join(session,'landscape-depot')+path.delimiter,
   JULIA_LOAD_PATH:'@:@stdlib',JULIA_PKG_PRECOMPILE_AUTO:'0',JULIA_NUM_THREADS:'1',JULIA_NUM_PRECOMPILE_TASKS:'1',
   JULIA_PKG_SERVER:'https://pkg.julialang.org',JULIA_PKG_OFFLINE:'false',XDG_RUNTIME_DIR:path.join(session,'runtime'),
-  JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',GIT_TERMINAL_PROMPT:'0',GIT_OPTIONAL_LOCKS:'0',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_SYSTEM:'/dev/null'}:process.env;
+  JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',GIT_TERMINAL_PROMPT:'0',GIT_OPTIONAL_LOCKS:'0',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_SYSTEM:'/dev/null'}:
+  candidateGitConfig?{...process.env,GIT_CONFIG_GLOBAL:candidateGitConfig,PERFCHECKER_NATIVE_GIT_CONFIG:candidateGitConfig}:process.env;
 if(landscapeOnly)for(const key of ['DISPLAY','WAYLAND_DISPLAY','XAUTHORITY','DBUS_SESSION_BUS_ADDRESS',
   'ETENDUE_SDL3_LIBRARY','ETENDUE_SDL3_DLSS_LIBRARY','ETENDUE_JOLTC_LIBRARY'])delete runnerEnvironment[key];
 let landscapeFixture,landscapeObserver,landscapePrimaryError;
