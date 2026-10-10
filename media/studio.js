@@ -4,6 +4,7 @@ function mountPerfCheckerStudio(root, send, logo) {
   const heading = node('div'); heading.append(node('p', 'PERFCHECKER STUDIO', 'eyebrow'), node('h1', 'Make performance visible.'), node('p', 'Measure real code. Understand the evidence. Improve with confidence.', 'subtitle')); hero.append(heading); root.append(hero);
   const workspace = node('div', '', 'workspace'); const name = node('strong', 'Choose a workspace'); const environment = node('span', '', 'subtle'); workspace.append(node('span', '●', 'dot'), name, environment); root.append(workspace);
   const warning = node('p', '', 'notice'); warning.hidden = true; root.append(warning);
+  const setup=node('button','Set up workspace and create suite','secondary');setup.id='setup-workspace';setup.type='button';setup.hidden=true;setup.addEventListener('click',()=>send({type:'studioAction',action:'initialize'}));root.append(setup);
   const groups = [
     {title:'01 / Measure', description:'One workspace, from individual tests to complete feature suites.', items:[
       ['suite','Feature suite','Configure checks, targets and collectors in the visual editor.','↗'],
@@ -28,9 +29,9 @@ function mountPerfCheckerStudio(root, send, logo) {
     }
     section.append(grid); root.append(section);
   }
-  const lab = node('section', '', 'lab'); lab.append(node('h2','Your Julia workbench'),node('p','The PerfChecker terminal uses this workspace’s controller. Notebook cells activate it explicitly. The Julia extension REPL keeps the environment selected in Julia’s status bar; check it before running code.','subtle'));
+  const lab = node('section', '', 'lab'); lab.append(node('h2','Your Julia workbench'),node('p','The PerfChecker terminal uses this workspace’s controller. Pluto dashboards use a separate environment and launch checks only when you click Run. The Julia extension REPL keeps the environment selected in Julia’s status bar; check it before running code.','subtle'));
   const toolbar = node('div','','toolbar');
-  for (const [action,label] of [['notebook','New investigation notebook'],['openNotebook','Open notebook'],['terminal','PerfChecker terminal'],['julia','Julia extension REPL'],['tasks','Project tasks']]) {
+  for (const [action,label] of [['notebook','New Pluto notebook'],['openNotebook','Open Pluto notebook'],['terminal','PerfChecker terminal'],['julia','Julia extension REPL'],['tasks','Project tasks']]) {
     const button=node('button',label,'secondary');button.type='button';button.addEventListener('click',()=>send({type:'studioAction',action}));toolbar.append(button);
   }
   lab.append(toolbar);root.append(lab);
@@ -40,8 +41,9 @@ function mountPerfCheckerStudio(root, send, logo) {
     if(value?.type==='studioError'){status.textContent=value.message;return;}
     if(value?.type!=='studioState')return;
     name.textContent=value.workspace;environment.textContent=value.trusted?'Trusted workspace':'Workspace trust required for execution';path.textContent=value.project||value.problem;
+    setup.hidden=!value.problem&&value.suiteAvailable;
     warning.hidden=!value.problem;warning.textContent=value.problem?'Configure a controller environment containing PerfChecker to measure, plot or start the workbench.':'';
-    status.textContent=value.juliaAvailable?'Julia extension available · notebook cells and debugging use Julia’s own tools.':'Notebook creation is available. Install the Julia extension to execute Julia cells and debug code.';
+    status.textContent=value.juliaAvailable?'Julia extension available · Pluto dashboards, Julia REPL and debugging ready.':'Pluto runs with the configured Julia executable. Install the Julia extension for its REPL and debugger.';
   }};
 }
 if (typeof module !== 'undefined') module.exports = {mountPerfCheckerStudio};

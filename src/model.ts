@@ -175,22 +175,39 @@ export function logicalFeature(run: Pick<PlanRun, 'feature' | 'backend' | 'workl
   return run.feature;
 }
 
-function versionParts(value: string): number[] | undefined {
+function versionParts(value: string): {parts: bigint[]; prerelease: string[] | undefined} | undefined {
   const normalized = value.startsWith('dev@') ? value.slice(4) : value;
-  const match = normalized.match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
-  return match ? [Number(match[1]), Number(match[2] ?? 0), Number(match[3] ?? 0)] : undefined;
+  const match = normalized.match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/);
+  return match ? {parts: [BigInt(match[1]), BigInt(match[2] ?? 0), BigInt(match[3] ?? 0)],
+    prerelease: match[4]?.split('.')} : undefined;
 }
 
-export function compareVersions(left: string, right: string): number {
+export function compareVersions(left: string, right: string, precedenceOnly = false): number {
   if (left === right) return 0;
   if (left === 'dev') return 1;
   if (right === 'dev') return -1;
   const a = versionParts(left);
   const b = versionParts(right);
-  if (!a || !b) return left.localeCompare(right);
+  // Numeric versions, opaque Git labels, then bare dev form fixed buckets.
+  // Mixing numeric and lexical pairwise comparisons creates ordering cycles.
+  if (!a || !b) return a ? -1 : b ? 1 : left.localeCompare(right);
   for (let index = 0; index < 3; index += 1) {
-    if (a[index] !== b[index]) return a[index] - b[index];
+    if (a.parts[index] !== b.parts[index]) return a.parts[index] < b.parts[index] ? -1 : 1;
   }
+  if (!!a.prerelease !== !!b.prerelease) return a.prerelease ? -1 : 1;
+  if (a.prerelease && b.prerelease) {
+    for (let index = 0; index < Math.max(a.prerelease.length, b.prerelease.length); index += 1) {
+      const x = a.prerelease[index], y = b.prerelease[index];
+      if (x === undefined || y === undefined) return x === undefined ? -1 : 1;
+      if (x === y) continue;
+      const numericX = /^\d+$/.test(x), numericY = /^\d+$/.test(y);
+      if (numericX !== numericY) return numericX ? -1 : 1;
+      const order = numericX ? (BigInt(x) < BigInt(y) ? -1 : BigInt(x) > BigInt(y) ? 1 : 0) : (x < y ? -1 : x > y ? 1 : 0);
+      if (order) return order;
+    }
+  }
+  // Release bounds compare semantic precedence, ignoring spelling and build metadata.
+  if (precedenceOnly) return 0;
   const leftDev = left.startsWith('dev@');
   const rightDev = right.startsWith('dev@');
   if (leftDev !== rightDev) return leftDev ? 1 : -1;
@@ -204,8 +221,8 @@ export function filterRuns(runs: PlanRun[], filter: RunFilter): PlanRun[] {
     if (filter.features?.length && !filter.features.includes(run.feature) &&
         !filter.features.includes(logicalFeature(run))) return false;
     if (filter.backends?.length && !filter.backends.includes(run.backend)) return false;
-    if (run.target_kind === 'release' && filter.fromVersion && compareVersions(run.version, filter.fromVersion) < 0) return false;
-    if (run.target_kind === 'release' && filter.toVersion && compareVersions(run.version, filter.toVersion) > 0) return false;
+    if (run.target_kind === 'release' && filter.fromVersion && compareVersions(run.version, filter.fromVersion, true) < 0) return false;
+    if (run.target_kind === 'release' && filter.toVersion && compareVersions(run.version, filter.toVersion, true) > 0) return false;
     return !needle || [run.package, logicalFeature(run), run.feature, run.backend, run.version, run.description]
       .some(value => value.toLocaleLowerCase().includes(needle));
   });

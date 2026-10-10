@@ -30,6 +30,34 @@ let readAdvisorConfiguration,AdvisorSetup,AdvisorChat;
 try{({readAdvisorConfiguration,AdvisorSetup}=require('../dist/advisorSetup.js'));({AdvisorChat}=require('../dist/advisorChat.js'));}finally{Module._load=original;}
 const {setLocalAdvisorConnection,localAdvisorConnection}=require('../dist/advisorConnection.js');
 
+test('explicit stdio Open activates only its draft when the saved advisor is disabled',async()=>{
+  const root=await mkdtemp(path.join(tmpdir(),'perfchecker-disabled-advisor-')),key=`file://${root}`;
+  const folder={uri:{fsPath:root,toString:()=>key}},context={extensionUri:folder.uri,subscriptions:[]};
+  const bytes=JSON.stringify({protocol:'mcp_http',endpoint:'https://previous.example.test/mcp',mcp_tool:'previous_advice'})+'\n';
+  await writeFile(path.join(root,'advisor.json'),bytes);
+  const previous={...saved},beforeSpawn=spawned;
+  Object.assign(saved,{advisorEnabled:false,advisorMcpStdioCommand:process.execPath,
+    advisorMcpStdioArguments:['server fixture.js','--label=<fixture>'],advisorMcpStdioDirectory:root});
+  const settingsBefore=JSON.stringify(saved),setup=new AdvisorSetup(context);setup.folder=()=>folder;
+  const formData=()=>JSON.parse(panel.webview.html.match(/m=>api\.postMessage\(m\),(\{.*\})\);window\.addEventListener/)[1]);
+  try {
+    await setup.open();const ordinary=formData();
+    assert.equal(ordinary.enabled,false);assert.equal(ordinary.config.protocol,'mcp_http');
+    await setup.open({stdio:true});const explicit=formData();
+    assert.equal(explicit.enabled,true);assert.equal(explicit.config.protocol,'mcp_stdio');
+    assert.equal(explicit.config.stdio_command,process.execPath);
+    assert.deepEqual(explicit.config.stdio_args,saved.advisorMcpStdioArguments);assert.equal(explicit.config.stdio_cwd,root);
+    assert.equal(ordinary.config.protocol,'mcp_http','Opening stdio never mutates the saved-provider draft');
+    assert.equal(JSON.stringify(saved),settingsBefore);assert.equal(spawned,beforeSpawn);
+    assert.equal(localAdvisorConnection(key),undefined);assert.equal(await readFile(path.join(root,'advisor.json'),'utf8'),bytes);
+    assert.deepEqual(await readdir(root),['advisor.json']);
+    panel.dispose();await setup.open();assert.equal(formData().enabled,false,'Normal settings remain disabled after closing the stdio draft');
+  } finally {
+    setup.dispose();for(const name of Object.keys(saved))delete saved[name];Object.assign(saved,previous);
+    await rm(root,{recursive:true,force:true});
+  }
+});
+
 test('explicit local connection overrides a saved file in memory and restores it byte for byte',async()=>{
   const root=await mkdtemp(path.join(tmpdir(),'perfchecker-connection-')), key=`file://${root}`;
   const folder={name:'fixture',uri:{fsPath:root,toString:()=>key}};
@@ -69,7 +97,7 @@ test('disconnect closes a temporary configuration form and stale Save preserves 
     assert.equal(opened.disposed,false);
     setLocalAdvisorConnection(key);assert.equal(opened.disposed,true);
     setup.invoke=()=>{throw new Error('A retired endpoint must be rejected before a worker starts.');};
-    await assert.rejects(setup.action({action:'save',config:stale}),/temporary Codex endpoint must not be saved/);
+    await assert.rejects(setup.action({action:'save',config:stale}),/temporary local connector endpoint must not be saved/);
     assert.equal(await readFile(path.join(root,'advisor.json'),'utf8'),bytes);
     assert.equal((await readAdvisorConfiguration(folder)).mcp_tool,'previous_advice');
   } finally {setLocalAdvisorConnection(key);setup.dispose();await rm(root,{recursive:true,force:true});}
@@ -126,4 +154,65 @@ test('ordinary validated Save still persists the chosen provider and only its ca
     assert.ok(updates.some(update=>update.name==='advisorConfig'&&update.value==='advisor.json'));
     assert.ok(updates.some(update=>update.name==='advisorEnabled'&&update.value===true));
   } finally {vscode.workspace.getConfiguration=originalConfiguration;setup.dispose();await rm(root,{recursive:true,force:true});}
+});
+
+test('manual implementation arguments preserve unset providers, replace explicitly and reject reserved collisions before edits',()=>{
+  const {implementationMcpArguments,assertSavedAdvisorConfiguration}=require('../dist/advisorConnection.js');
+  const previous={model_options:{temperature:0},flavour:'advice'};
+  const inherited=implementationMcpArguments(previous,undefined,'request','directory');
+  assert.deepEqual(inherited,previous);inherited.model_options.temperature=1;assert.equal(previous.model_options.temperature,0);
+  assert.deepEqual(implementationMcpArguments(previous,{},'request','directory'),{});
+  assert.deepEqual(implementationMcpArguments(previous,{style:'patch'},'request','directory'),{style:'patch'});
+  for(const value of [{request:'unexpected'}, {directory:'/foreign'}, [], null, {large:'x'.repeat(12001)}])
+    assert.throws(()=>implementationMcpArguments(previous,value,'request','directory'),/Implementation arguments/);
+  assert.throws(()=>implementationMcpArguments({directory:'/foreign'},undefined,'request','directory'),/Implementation arguments/);
+  for(const api_key_env of ['PERFCHECKER_MCP_TOKEN_RETIRED','PERFCHECKER_CODEX_TOKEN_RETIRED'])
+    assert.throws(()=>assertSavedAdvisorConfiguration({api_key_env}),/temporary local connector/);
+});
+
+test('implementation arguments snapshot configuration proxies without modifying their saved JSON values',()=>{
+  const {implementationMcpArguments}=require('../dist/advisorConnection.js');
+  // WorkspaceConfiguration.get returns recursive clone-on-write proxies whose
+  // toJSON getter exposes a plain snapshot (extHostConfiguration.ts).
+  const configurationProxy=target=>new Proxy(target,{get(value,key){
+    if(key==='toJSON')return ()=>JSON.parse(JSON.stringify(value));
+    const result=Reflect.get(value,key);
+    return result&&typeof result==='object'?configurationProxy(result):result;
+  }});
+  for(const wrap of [value=>new Proxy(value,{}),configurationProxy]) {
+    const saved={model_options:{temperature:0,stops:['end']},flavour:'advice'};
+    const original=JSON.stringify(saved),proxy=wrap(saved);
+    for(const [previous,override] of [[proxy,undefined],[{unused:true},proxy]]) {
+      const result=implementationMcpArguments(previous,override,'request','directory');
+      assert.deepEqual(result,saved);
+      assert.doesNotThrow(()=>structuredClone(result));
+      result.model_options.temperature=1;result.model_options.stops.push('changed');
+      assert.equal(JSON.stringify(saved),original);
+    }
+    for(const value of [{request:'unexpected'},{directory:'/foreign'},{large:'x'.repeat(12001)}])
+      assert.throws(()=>implementationMcpArguments({},wrap(value),'request','directory'),/Implementation arguments/);
+  }
+  const nested={options:new Proxy({stops:new Proxy(['end'],{})},{})};
+  assert.deepEqual(implementationMcpArguments(nested,undefined,'request','directory'),{options:{stops:['end']}});
+});
+
+test('implementation argument JSON snapshots retain shape, reserved-field and size checks',()=>{
+  const {implementationMcpArguments}=require('../dist/advisorConnection.js');
+  for(const projected of [null,[],42,undefined,{request:'unexpected'},{directory:'/foreign'},{large:'x'.repeat(12001)}])
+    assert.throws(()=>implementationMcpArguments({}, {toJSON:()=>projected},'request','directory'),/Implementation arguments/);
+  const cyclic={};cyclic.self=cyclic;
+  assert.throws(()=>implementationMcpArguments({},cyclic,'request','directory'),/Implementation arguments/);
+});
+
+test('failed Disconnect retains the exact owner and cleanup handle for an explicit retry',async()=>{
+  const {disconnectLocalAdvisorConnection}=require('../dist/advisorConnection.js');
+  const key='file:///retry-private-fixture';let attempts=0;
+  setLocalAdvisorConnection(key,{kind:'stdio',label:'Neutral fixture',config:{endpoint:'http://127.0.0.1:1/mcp'},
+    implementation:{tool:'modify',promptArgument:'request',workspaceArgument:'directory'}},async()=>{
+    if(++attempts===1)throw new Error('Observed cleanup failure');
+  });
+  await assert.rejects(disconnectLocalAdvisorConnection(key),/Observed cleanup failure/);
+  assert.equal(localAdvisorConnection(key).label,'Neutral fixture');
+  await disconnectLocalAdvisorConnection(key);
+  assert.equal(attempts,2);assert.equal(localAdvisorConnection(key),undefined);
 });

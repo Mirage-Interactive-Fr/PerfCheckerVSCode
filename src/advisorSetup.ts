@@ -6,6 +6,7 @@ import {spawn, ChildProcess} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
 import {assertSavedAdvisorConfiguration, localAdvisorConnection, onLocalAdvisorConnectionChanged} from './advisorConnection';
+import {cancellableJulia,controllerCancellation} from './controllerCancellation';
 
 const mapping: Record<string, [string, unknown]> = {
   endpoint: ['advisorEndpoint', 'http://127.0.0.1:8081/v1/chat/completions'], model: ['advisorModel', 'local'],
@@ -31,15 +32,24 @@ export async function readAdvisorConfiguration(folder: vscode.WorkspaceFolder): 
 export class AdvisorSetup implements vscode.Disposable {
   private panel?: vscode.WebviewPanel;
   private child?: ChildProcess;
+  private stopController?: ReturnType<typeof controllerCancellation>;
   private cancelled = false;
   private busy = false;
+  private stdioActive = false;
+  private stdioWorkspace?: string;
+  private connectionPanelClosing = false;
   private panelWorkspace?: string;
   private connectionGenerations = new Map<string, number>();
   private unsubscribeConnection: () => void;
   constructor(private context: vscode.ExtensionContext) {
     this.unsubscribeConnection = onLocalAdvisorConnectionChanged(workspace => {
       this.connectionGenerations.set(workspace, this.connectionGeneration(workspace) + 1);
-      if (this.panelWorkspace === workspace) this.panel?.dispose();
+      if (this.panelWorkspace === workspace) {
+        // Save may first retire an older local connection before publishing
+        // the replacement. Both changes belong to this captured operation.
+        this.connectionPanelClosing = this.stdioActive;
+        try {this.panel?.dispose();} finally {this.connectionPanelClosing = false;}
+      }
     });
   }
   private folder() {return currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders);}
@@ -56,15 +66,26 @@ export class AdvisorSetup implements vscode.Disposable {
     const settings = this.settings(), file = settings.get<string>('advisorConfig', '');
     const config = await readAdvisorConfiguration(this.folder());
     const local = localAdvisorConnection(this.folder().uri.toString());
-    return {config, config_location: local ? 'Temporary local Codex connection; disconnect before editing saved settings' : path.resolve(this.root(), file || 'perf/advisor.json'), enabled: local ? true : settings.get('advisorEnabled', true), investigates: local ? false : settings.get('advisorInvestigates', false),
+    return {config: local?.connectionConfiguration ?? config, stdioSupported: true,
+      config_location: local ? `Temporary ${local.label}; disconnect before editing saved settings` : path.resolve(this.root(), file || 'perf/advisor.json'), enabled: local ? true : settings.get('advisorEnabled', true), investigates: local ? false : settings.get('advisorInvestigates', false),
       max_experiments: settings.get('investigationMaxExperiments', 4), budget_seconds: settings.get('investigationBudgetSeconds', 300)};
   }
-  async open() {
+  async open(options?: {stdio?: boolean}) {
     const workspace = this.folder().uri.toString();
     if (this.panel && this.panelWorkspace !== workspace) this.panel.dispose();
-    if (this.panel) {this.panel.reveal(); return;}
+    if (this.panel) {
+      if (!options?.stdio) {this.panel.reveal(); return;}
+      if (this.busy) throw new Error('Finish or cancel the current connection setup before opening local MCP settings.');
+      this.panel.dispose();
+    }
     const generation = this.connectionGeneration(workspace);
     const initial = await this.initial();
+    if (options?.stdio && !localAdvisorConnection(workspace)) {
+      initial.enabled = true;
+      initial.config = {...initial.config, protocol: 'mcp_stdio',
+        stdio_command: this.settings().get('advisorMcpStdioCommand', ''), stdio_args: this.settings().get('advisorMcpStdioArguments', []),
+        stdio_cwd: this.settings().get('advisorMcpStdioDirectory', '') || this.root()};
+    }
     this.assertWorkspace(workspace);
     if (generation !== this.connectionGeneration(workspace)) throw new Error('Advisor connection changed. Reopen settings to load your provider.');
     this.panelWorkspace = workspace;
@@ -73,14 +94,19 @@ export class AdvisorSetup implements vscode.Disposable {
     const panel = this.panel, webview = panel.webview, nonce = randomUUID();
     const resource = (name: string) => webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', name));
     const data = JSON.stringify(initial).replace(/</g, '\\u003c');
-    this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.svg');
+    this.panel.iconPath = {light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker-dark.svg')};
     webview.html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';"><link rel="stylesheet" href="${resource('investigation.css')}"><link rel="stylesheet" href="${resource('advisor-panel.css')}"><title>Advisor and models</title></head><body><header class="advisor-brand"><img src="${resource('perfchecker.png')}" alt="PerfChecker"><span>PerfChecker · Connections and models</span></header><main id="advisor-root"></main><script nonce="${nonce}" src="${resource('advisor-panel.js')}"></script><script nonce="${nonce}">const api=acquireVsCodeApi();const panel=mountAdvisorPanel(document.getElementById('advisor-root'),m=>api.postMessage(m),${data});window.addEventListener('message',e=>panel.receive(e.data));</script></body></html>`;
-    this.panel.onDidDispose(() => {this.cancel(); this.panel = undefined;});
+    this.panel.onDidDispose(() => {if (!this.connectionPanelClosing) this.cancel(); this.panel = undefined;
+      if (!this.connectionPanelClosing && this.stdioWorkspace === workspace && localAdvisorConnection(workspace)?.kind !== 'stdio')
+        void vscode.commands.executeCommand('perfchecker.closeMcpStdioDiscovery', workspace)
+          .then(undefined, error => {void vscode.window.showErrorMessage(`PerfChecker: ${error}`);});});
     webview.onDidReceiveMessage(async message => {
       try {
         if (this.panel !== panel) throw new Error('Advisor connection changed. Reopen settings to load your saved provider.');
         if (this.folder().uri.toString() !== workspace) throw new Error('PerfChecker folder changed. Reopen advisor settings.');
         if (message.type === 'advisorCancel') this.cancel();
+        else if (message.type === 'advisorDisconnectStdio') await vscode.commands.executeCommand('perfchecker.disconnectMcpStdio');
         else if (message.type === 'advisorHelp') await vscode.env.openExternal(vscode.Uri.parse('https://docs.ollama.com/quickstart'));
         else if (message.type === 'advisorAction') {
           const result = await this.action(message);
@@ -93,7 +119,15 @@ export class AdvisorSetup implements vscode.Disposable {
     const folder = this.folder(), workspace = folder.uri.toString(), root = folder.uri.fsPath;
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri), generation = this.connectionGeneration(workspace);
     const file = path.resolve(root, settings.get<string>('advisorConfig', '') || 'perf/advisor.json');
-    if (localAdvisorConnection(workspace)) throw new Error('Disconnect the local Codex connector before editing or testing saved provider settings. Its temporary endpoint must not be saved.');
+    if (input?.config?.protocol === 'mcp_stdio') {
+      if (!vscode.workspace.isTrusted || this.busy) throw new Error('Trust the workspace and finish the current setup operation.');
+      if (!['probe', 'save'].includes(input.action)) throw new Error('Local MCP supports discovery and an explicit session connection.');
+      this.busy = true; this.stdioActive = true; this.stdioWorkspace = workspace;
+      try {return await vscode.commands.executeCommand(input.action === 'probe' ? 'perfchecker.discoverMcpStdio' : 'perfchecker.connectMcpStdio', input.config);}
+      finally {this.busy = false; this.stdioActive = false;}
+    }
+    const local = localAdvisorConnection(workspace);
+    if (local) throw new Error(`Disconnect ${local.label} before editing or testing saved provider settings. Its temporary endpoint must not be saved.`);
     assertSavedAdvisorConfiguration(input?.config);
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before connecting an advisor.');
     if (this.busy) throw new Error('A setup operation is already running.');
@@ -147,16 +181,18 @@ export class AdvisorSetup implements vscode.Disposable {
       if (this.cancelled) return {status: 'cancelled', message: 'Setup operation cancelled before starting a worker.'};
       return await new Promise((resolve, reject) => {
         const child = spawn(julia, ['--startup-file=no', `--project=${project}`,
-          '-e', 'using PerfChecker; exit(perfchecker_main(ARGS))', '--', 'advisor-setup', `--source=${file}`, `--project=${project}`],
-        {cwd: root, windowsHide: true, detached: process.platform !== 'win32'});
+          '-e', cancellableJulia('using PerfChecker; exit(perfchecker_main(ARGS))'), '--', 'advisor-setup', `--source=${file}`, `--project=${project}`],
+        {cwd: root, windowsHide: true, detached: process.platform !== 'win32',env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)}});
         this.child = child;
+        const stop=controllerCancellation(child,(message,forced)=>{if(forced)void vscode.window.showWarningMessage(message);});this.stopController=stop;
         let output = '', error = '';
         const timeout = setTimeout(() => this.cancel(), (Math.min(Number(input.config?.timeout) || 120, 3600) + 60) * 1000);
         child.stdout?.on('data', data => {output += data.toString(); if (output.length > 2_000_000) this.cancel();});
         child.stderr?.on('data', data => {error = (error + data.toString()).slice(-4000);});
-        child.on('error', e => {clearTimeout(timeout); reject(e);});
+        child.on('error', e => {clearTimeout(timeout);stop.dispose();if(this.stopController===stop)this.stopController=undefined;reject(e);});
         child.on('close', code => {
           clearTimeout(timeout);
+          stop.dispose();if(this.stopController===stop)this.stopController=undefined;
           if (this.cancelled) return resolve({status: 'cancelled', message: 'Operation cancelled. The server may retain partial files; refresh its inventory.'});
           try {resolve(JSON.parse(output));} catch {reject(new Error(code ? error || 'Julia setup worker failed.' : 'Invalid setup response.'));}
         });
@@ -167,12 +203,16 @@ export class AdvisorSetup implements vscode.Disposable {
     }
   }
   cancel() {
+    if (this.stdioActive) {
+      void vscode.commands.executeCommand('perfchecker.cancelMcpStdio', this.stdioWorkspace)
+        .then(undefined, error => {void vscode.window.showErrorMessage(`PerfChecker: ${error}`);});
+      return;
+    }
     if (this.busy) this.cancelled = true;
     const child = this.child;
     if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
     this.cancelled = true;
-    if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {windowsHide: true}).on('error', () => child.kill());
-    else {try {process.kill(-child.pid, 'SIGKILL');} catch {child.kill('SIGKILL');}}
+    this.stopController?.request();
   }
   dispose() {this.unsubscribeConnection(); this.cancel(); this.panel?.dispose();}
 }
@@ -180,7 +220,7 @@ export class AdvisorSetup implements vscode.Disposable {
 export function registerAdvisorSetup(context: vscode.ExtensionContext) {
   const setup = new AdvisorSetup(context);
   context.subscriptions.push(setup,
-    vscode.commands.registerCommand('perfchecker.configureAdvisor', () => setup.open()),
+    vscode.commands.registerCommand('perfchecker.configureAdvisor', options => setup.open(options)),
     vscode.commands.registerCommand('perfchecker.advisorSetupAction', input => setup.action(input)),
     vscode.commands.registerCommand('perfchecker.cancelAdvisorSetup', () => setup.cancel()));
 }

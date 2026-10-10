@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {runInNewContext} from 'node:vm';
 import {compareVersions, comparisonsForRuns, filterRuns, logicalFeature, moveRun, outputsForRuns, parseGitReference, seriesForRuns} from '../dist/model.js';
 
 const runs = [
@@ -13,6 +15,56 @@ test('semantic versions and dev order naturally', () => {
   assert.ok(compareVersions('dev', '99.0.0') > 0);
   assert.ok(compareVersions('dev@1.10.0', '1.10.0') > 0);
   assert.ok(compareVersions('dev@1.10.0', '2.0.0') < 0);
+});
+
+const designerSource=readFileSync(new URL('../media/designer.js',import.meta.url),'utf8');
+const designerCompare=runInNewContext(designerSource.slice(designerSource.indexOf('function compareVersion('),
+  designerSource.indexOf('\nfunction visibleRuns('))+'\ncompareVersion');
+const comparators={model:compareVersions,designer:designerCompare};
+
+test('model and actual Designer consistently order numeric versions, opaque Git labels and dev',()=>{
+  const expected=['dev@0.1.0','0.5.0','1.2.0','dev@1.2.0','1.10.0','4eec7f3','baseline','dev@fast-sort','dev'];
+  for(const [name,compare] of Object.entries(comparators)){
+    for(const a of expected)for(const b of expected){
+      assert.equal(compare(a,b)>0,compare(b,a)<0,`${name}: antisymmetry ${a}, ${b}`);
+      for(const c of expected)if(compare(a,b)<=0&&compare(b,c)<=0)
+        assert(compare(a,c)<=0,`${name}: transitivity ${a} <= ${b} <= ${c}`);
+    }
+    assert.deepEqual([...expected].reverse().sort(compare),expected,name);
+    const cycle=['dev@0.1.0','0.5.0','baseline'];
+    for(const first of cycle)for(const second of cycle.filter(value=>value!==first)){
+      const third=cycle.find(value=>value!==first&&value!==second);
+      assert.deepEqual([first,second,third].sort(compare),cycle,`${name}: every original-cycle permutation`);
+    }
+  }
+  for(const a of expected)for(const b of expected)
+    assert.equal(Math.sign(compareVersions(a,b)),Math.sign(designerCompare(a,b)),`Model/Designer parity: ${a}, ${b}`);
+});
+
+test('numeric version grammar is anchored and retains prerelease, build, v and dev@ labels',()=>{
+  const expected=['1','v1','dev@1','1.2','1.2.3-A','1.2.3-a','1.2.3-alpha.2','1.2.3-alpha.10','1.2.3-beta','1.2.3',
+    '1.2.3+build.7','dev@1.2.3','1.2.4','1.2.x','4eec7f3','feature/1.2.3','dev'];
+  for(const [name,compare] of Object.entries(comparators)){
+    assert.deepEqual([...expected].reverse().sort(compare),expected,name);
+    for(const a of expected)for(const b of expected)
+      assert.equal(Math.sign(compare(a,b)),Math.sign(compareVersions(a,b)),`${name}: grammar parity ${a}, ${b}`);
+  }
+});
+
+test('release bounds include equivalent v/build labels while keeping prerelease precedence',()=>{
+  const versions=['1.2.3-A','1.2.3-a','1.2.3-rc.2','1.2.3','v1.2.3','1.2.3+build.7','1.2.4','4eec7f3','dev@1.2.3','dev'];
+  const planned=versions.map((version,index)=>({...runs[0],id:String(index),version,
+    target_kind:version==='4eec7f3'||version.startsWith('dev')?'git':'release'}));
+  const actual=filterRuns(planned,{fromVersion:'1.2.3',toVersion:'1.2.3'}).map(run=>run.version);
+  assert.deepEqual(actual,['1.2.3','v1.2.3','1.2.3+build.7','4eec7f3','dev@1.2.3','dev']);
+  for(const [name,compare] of Object.entries(comparators)){
+    for(const bound of ['1.2.3','v1.2.3','1.2.3+build.7'])
+      for(const version of ['1.2.3','v1.2.3','1.2.3+build.7'])assert.equal(compare(version,bound,true),0,name);
+    assert(compare('1.2.3-A','1.2.3-a',true)<0,name+': ASCII prerelease order');
+    assert(compare('1.2.3-rc.2','1.2.3',true)<0,name+': prerelease precedes release');
+    for(const a of versions)for(const b of versions)
+      assert.equal(Math.sign(compare(a,b,true)),Math.sign(compareVersions(a,b,true)),name+': precedence parity');
+  }
 });
 
 test('filters and sorts the common plan', () => {

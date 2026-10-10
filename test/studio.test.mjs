@@ -15,13 +15,14 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
   const first={name:'first',uri:uri(path.join(temporary,'first'))};
   const second={name:'second',uri:uri(path.join(temporary,process.platform === 'win32' ? "second $workspace 'quotes'" : 'second $workspace "quotes"'))};
   const commands=new Map(),panels=[],terminals=[],notebooks=[],debugged=[],invocations=[],scopes=[];
-  let closeTerminal,changeEditor,chosen,hasJulia=false;
+  let closeTerminal,changeEditor,chosen,hasJulia=false,initializeAction,changeConfiguration;
   const vscode={
     Uri:{joinPath:(root,...pieces)=>uri(path.join(root.fsPath,...pieces))},ThemeIcon:class{constructor(id){this.id=id;}},
     ViewColumn:{One:1},NotebookCellKind:{Markup:1,Code:2},
     NotebookCellData:class{constructor(kind,value,languageId){Object.assign(this,{kind,value,languageId});}},
     NotebookData:class{constructor(cells){this.cells=cells;}},
     workspace:{isTrusted:true,workspaceFolders:[first,second],getWorkspaceFolder:source=>source.fsPath.startsWith(second.uri.fsPath)?second:first,
+      onDidChangeConfiguration:callback=>{changeConfiguration=callback;return disposable();},
       getConfiguration:(_name,resource)=>{scopes.push(resource.toString());return{get:(_key,fallback)=>fallback,inspect:()=>undefined};},
       openNotebookDocument:async(type,data)=>{notebooks.push({type,data});return{uri:{scheme:'untitled'},getCells:()=>data.cells};},
       openTextDocument:async source=>({uri:source,languageId:'julia',isDirty:false}),
@@ -40,7 +41,7 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
       },
       createTerminal:options=>{const terminal={options,show(){this.visible=true;},dispose(){this.disposed=true;}};terminals.push(terminal);return terminal;},
     },
-    commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async(...args)=>invocations.push(args)},
+    commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async(...args)=>{invocations.push(args);if(args[0]==='perfchecker.initialize')await initializeAction?.();}},
     extensions:{getExtension:()=>hasJulia?{activate:async()=>undefined}:undefined},
     debug:{startDebugging:async(folder,configuration)=>{debugged.push({folder,configuration});return true;}},
   };
@@ -49,6 +50,8 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await writeFile(path.join(second.uri.fsPath,'perf','controller','Project.toml'),'name="Controller"\n');
     const original=Module._load;
     Module._load=function(name,...args){return name==='vscode'?vscode:original.call(this,name,...args);};
+    const plutoCalls=[];const PlutoNotebooks=class{create(folder,options){plutoCalls.push({action:'create',folder,options});return Promise.resolve(undefined);}open(folder){plutoCalls.push({action:'open',folder});}stopWorkspace(folder){plutoCalls.push({action:'stop',folder});}dispose(){}};
+    Module._load=function(name,...args){if(name==='./plutoNotebook')return{PlutoNotebooks};return name==='vscode'?vscode:original.call(this,name,...args);};
     let register;try{({registerStudio:register}=require('../dist/studio.js'));}finally{Module._load=original;}
     const context={subscriptions:[],extensionUri:uri(path.resolve('media','..'))};register(context);
     assert.equal(panels.length,0);assert.equal(terminals.length,0);assert.equal(notebooks.length,0);assert.equal(scopes.length,0);
@@ -64,12 +67,12 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await panels[0].send({type:'studioAction',action:'notebook'});
     assert.equal(invocations.at(-1)[0],'perfchecker.newNotebook');assert.equal(invocations.at(-1)[1],second.uri);
     await panels[0].send({type:'studioAction',action:'__proto__'});assert.equal(invocations.length,1);
+    await panels[0].send({type:'studioAction',action:'testing'});
+    assert.equal(invocations.at(-1)[0],'workbench.view.extension.test','Testing opens its supported view container command');
     await panels[0].send({type:'studioAction',action:'julia'});assert.match(panels[0].messages.at(-1).message,/Julia VS Code extension/);
     await commands.get('perfchecker.newNotebook')(second.uri);
-    assert.equal(notebooks[0].type,'jupyter-notebook');assert.equal(notebooks[0].data.cells.length,8);
-    const code=notebooks[0].data.cells[1].value;
-    assert.match(code,/\\\$workspace/);assert.match(code,process.platform === 'win32' ? /'quotes'/ : /\\"quotes\\"/);assert.doesNotMatch(code,/instantiate|Pkg.add/);
-    assert.equal(notebooks[0].data.metadata.metadata.language_info.name,'julia');
+    assert.deepEqual(plutoCalls,[{action:'create',folder:second.uri,options:undefined}]);
+    assert.equal(notebooks.length,0,'The primary notebook route delegates to Pluto, without a Jupyter document');
     assert.deepEqual(await readdir(second.uri.fsPath),['perf']);
     const terminal=await commands.get('perfchecker.openTerminal')(second.uri);
     assert.equal(terminal.options.cwd,second.uri);
@@ -81,7 +84,8 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await assert.rejects(commands.get('perfchecker.debugFile')(second.uri),/Julia VS Code extension/);
     hasJulia=true;chosen=[uri(path.join(second.uri.fsPath,'case.jl'))];
     assert.equal(await commands.get('perfchecker.debugFile')(second.uri),true);
-    assert.equal(debugged[0].configuration.juliaEnv,path.join(second.uri.fsPath,'perf','controller'));
+    assert.equal(debugged[0].configuration.project,path.join(second.uri.fsPath,'perf','controller'),
+      'The official Julia debugger reads project; juliaEnv is ignored and would select the active workspace instead');
     assert.equal(debugged[0].configuration.program,chosen[0].fsPath);
     assert.equal(debugged[0].configuration.stopOnEntry,true);
     changeEditor({document:{uri:chosen[0],languageId:'julia'}});chosen=undefined;
@@ -92,7 +96,26 @@ test('Studio is side effect free and scopes notebooks, terminals and Julia debug
     await assert.rejects(commands.get('perfchecker.debugFile')(second.uri),/Save the Julia/);
     await commands.get('perfchecker.openStudioForWorkspace')(first.uri);assert.equal(panels[0].disposed,true);
     assert.equal(panels.length,2);await panels[1].send({type:'studioReady'});assert.match(panels[1].messages.at(-1).problem,/Project.toml not found/);
-    assert.equal(terminals.length,2);assert.equal(notebooks.length,1);
+    initializeAction=async()=>{
+      await mkdir(path.join(first.uri.fsPath,'perf','controller'),{recursive:true});
+      await writeFile(path.join(first.uri.fsPath,'perf','controller','Project.toml'),'name="Controller"\n');
+    };
+    await panels[1].send({type:'studioAction',action:'initialize'});
+    assert.equal(panels[1].messages.at(-1).project,path.join(first.uri.fsPath,'perf','controller'),
+      'The same Studio refreshes its controller state after the explicit setup action finishes');
+    assert.equal(panels[1].messages.at(-1).problem,'');
+    let started,finish;
+    const initialized=new Promise(resolve=>{started=resolve;});
+    initializeAction=()=>new Promise(resolve=>{finish=resolve;started();});
+    const previousPanel=panels[1],beforeRefresh=previousPanel.messages.length;
+    const pending=previousPanel.send({type:'studioAction',action:'initialize'});await initialized;
+    await commands.get('perfchecker.openStudioForWorkspace')(second.uri);await panels[2].send({type:'studioReady'});
+    finish();await pending;
+    assert.equal(previousPanel.messages.length,beforeRefresh,'An action finishing in a replaced panel cannot publish stale state');
+    assert.equal(panels[2].messages.at(-1).workspace,'second','A completed setup must not replace another folder’s displayed context');
+    await changeConfiguration({affectsConfiguration:(_section,resource)=>resource.toString()===second.uri.toString()});
+    assert.equal(panels[2].messages.at(-1).project,path.join(second.uri.fsPath,'perf','controller'));
+    assert.equal(terminals.length,2);assert.equal(notebooks.length,0);
     assert.ok(scopes.every(scope=>[first.uri.toString(),second.uri.toString()].includes(scope)));
     context.subscriptions.forEach(item=>item.dispose());
   }finally{await rm(temporary,{recursive:true,force:true});}

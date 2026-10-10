@@ -2,7 +2,7 @@
   "name": "perfchecker-vscode",
   "displayName": "PerfChecker",
   "description": "Measure Julia performance, explore interactive results and improve code with a connected agent.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "mirage-interactive-fr",
   "author": "Mirage Interactive",
   "repository": {
@@ -62,7 +62,7 @@
       },
       {
         "command": "perfchecker.configureAdvisor",
-        "title": "PerfChecker: Configure advisor and manage models",
+        "title": "PerfChecker: Configure MCP connection and models",
         "icon": "$(settings-gear)"
       },
       {
@@ -85,6 +85,11 @@
         "command": "perfchecker.openInvestigations",
         "title": "PerfChecker: Open investigations",
         "icon": "$(inspect)"
+      },
+      {
+        "command": "perfchecker.openDiagnosticReport",
+        "title": "PerfChecker: Open saved diagnostic report",
+        "icon": "$(file-code)"
       },
       {
         "command": "perfchecker.discoverScenarios",
@@ -198,12 +203,12 @@
       },
       {
         "command": "perfchecker.newNotebook",
-        "title": "PerfChecker: New investigation notebook",
+        "title": "PerfChecker: New Pluto notebook",
         "icon": "$(notebook)"
       },
       {
         "command": "perfchecker.openNotebook",
-        "title": "PerfChecker: Open Julia notebook",
+        "title": "PerfChecker: Open Pluto notebook",
         "icon": "$(notebook)"
       },
       {
@@ -227,6 +232,16 @@
         "icon": "$(discard)"
       },
       {
+        "command": "perfchecker.connectMcpStdio",
+        "title": "PerfChecker: Connect local MCP server (stdio)",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "perfchecker.disconnectMcpStdio",
+        "title": "PerfChecker: Disconnect local MCP server",
+        "icon": "$(debug-disconnect)"
+      },
+      {
         "command": "perfchecker.connectCodex",
         "title": "PerfChecker: Connect authenticated Codex CLI",
         "icon": "$(plug)"
@@ -235,6 +250,11 @@
         "command": "perfchecker.disconnectCodex",
         "title": "PerfChecker: Disconnect local Codex",
         "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "perfchecker.stopNotebookSession",
+        "title": "PerfChecker: Stop Pluto notebook sessions",
+        "icon": "$(debug-stop)"
       }
     ],
     "viewsContainers": {
@@ -709,11 +729,41 @@
           "scope": "resource",
           "description": "Name of the MCP implementation tool argument receiving the isolated checkout path. The agent must honor this path."
         },
+        "perfchecker.advisorImplementationMcpArguments": {
+          "type": "object",
+          "scope": "resource",
+          "description": "Additional JSON arguments for the selected MCP implementation tool, independent of the advice tool. Omit the reserved prompt and workspace arguments and never include secrets. When unset, existing advice arguments remain in use."
+        },
+        "perfchecker.advisorMcpStdioCommand": {
+          "type": "string",
+          "scope": "resource",
+          "default": "",
+          "description": "Optional initial absolute native executable for the local MCP stdio connection form. Servers launch only after explicit Discover or Connect; arguments are passed without shell interpretation or expansion."
+        },
+        "perfchecker.advisorMcpStdioArguments": {
+          "type": "array",
+          "items": {"type": "string"},
+          "scope": "resource",
+          "default": [],
+          "description": "Initial argument array for the local MCP server form. Never put secrets here; the server inherits the extension host environment except private connector tokens."
+        },
+        "perfchecker.advisorMcpStdioDirectory": {
+          "type": "string",
+          "scope": "resource",
+          "default": "",
+          "description": "Initial absolute working directory for an explicitly launched local MCP server. Empty initializes the form to the selected workspace. The live connection remains session-only."
+        },
         "perfchecker.codexExecutable": {
           "type": "string",
           "default": "codex",
           "scope": "resource",
           "description": "Authenticated Codex CLI executable. Connect explicitly from Chat. Requires exec support for ephemeral, ignore-user-config, ignore-rules and sandbox flags; custom Codex configuration and profiles are not inherited."
+        },
+        "perfchecker.plutoProject": {
+          "type": "string",
+          "scope": "resource",
+          "default": "perf/pluto",
+          "description": "Separate Julia environment for interactive Pluto notebooks. Installation is explicit and uses Pluto 1.0.4 and the official PerfChecker Pluto companion. Keep it separate from an HTTP 2 MCP controller."
         }
       }
     }

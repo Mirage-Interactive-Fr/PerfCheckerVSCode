@@ -17,7 +17,7 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
   const ensureController = (folder: vscode.WorkspaceFolder) => {
     const existing = controls.get(folder.uri.toString());
     if (existing) return existing;
-    const tests = vscode.tests.createTestController(`perfchecker.testitems.${folder.uri.toString()}`, `PerfChecker — mesures · ${folder.name}`);
+    const tests = vscode.tests.createTestController(`perfchecker.testitems.${folder.uri.toString()}`, `PerfChecker — measures · ${folder.name}`);
     context.subscriptions.push(tests);
     let declarations: NativeItem[] = [];
     let busy = false;
@@ -80,6 +80,10 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
       if (busy) throw new Error('A native test item run is already active in this folder.');
       busy = true;
       const execution = tests.createTestRun(request);
+      const appendDiagnostic = (message: string, item?: vscode.TestItem) => {
+        execution.appendOutput(`${message.replace(/\r?\n/g, '\r\n')}\r\n`, undefined, item);
+        output.appendLine(message);
+      };
       let selected: vscode.TestItem[] = [];
       try {
         if (token.isCancellationRequested) return;
@@ -99,22 +103,31 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
             `--samples=${samples}`,`--timeout=${setting('analysisTimeout',120)}`],token);
           if (token.isCancellationRequested) {execution.skipped(item);continue;}
           const rows = payload?.schema_version==='perfchecker-testitem-run/1' ? payload.runs?.filter((r:any)=>r.item?.id===item.id) : undefined;
-          if (code !== 0) execution.errored(item,new vscode.TestMessage(`Test item process exited with code ${code}. Inspect the output channel.`));
-          else if (rows?.length !== 1) execution.errored(item,new vscode.TestMessage('Missing or ambiguous current item evidence.'));
+          const details=rows?.[0]?.samples?.map((sample:any)=>sample.message).filter((message:any)=>typeof message==='string').join('\n')??'';
+          const project=resolveControllerProject(folder.uri.fsPath,vscode.workspace.getConfiguration('perfchecker',folder.uri)).project;
+          const message=`Item failed, skipped, timed out or had no passing assertions (exit ${code}). ${details}\nTestItemRunner executes in ${project}. Ensure the package under test and its test dependencies are available in that controller environment, then discover and run again. Controller setup installs PerfChecker and collectors only; it does not install your package. See https://perfchecker.mirageinteractive.fr/interfaces/vscode.html and the PerfChecker test items output.`;
+          if (code !== 0) {execution.errored(item,new vscode.TestMessage(message));appendDiagnostic(message,item);}
+          else if (rows?.length !== 1) {
+            const evidenceMessage=`Missing or ambiguous current item evidence (exit ${code}). Inspect the output channel.`;
+            execution.errored(item,new vscode.TestMessage(evidenceMessage));appendDiagnostic(evidenceMessage,item);
+          }
           else if (rows[0].status==='validated' && payload.passed === true) {
             const duration = nativeItemDuration(rows[0].samples, samples);
             execution.passed(item, duration);
             execution.appendOutput(`${item.label}: ${duration.toFixed(2)} ms measured across ${samples} sample(s), including setup and assertions. Correctness validated; performance has not been compared to a budget.\r\n`,undefined,item);
-          } else execution.failed(item,new vscode.TestMessage('Item failed, skipped, timed out or had no passing assertions. Inspect PerfChecker test items output.'));
+          } else {
+            execution.failed(item,new vscode.TestMessage(message));appendDiagnostic(message,item);
+          }
         }
       } catch (error) {
-        selected.forEach(item=>execution.errored(item,new vscode.TestMessage(String(error))));
-        output.appendLine(String(error)); output.show(true);
+        selected.forEach(item=>{execution.errored(item,new vscode.TestMessage(String(error)));appendDiagnostic(String(error),item);});
+        if (!selected.length) appendDiagnostic(String(error));
+        output.show(true);
       } finally {execution.end();busy=false;}
     };
     tests.resolveHandler = () => refresh();
     tests.refreshHandler = () => refresh();
-    tests.createRunProfile('PerfChecker — mesures',vscode.TestRunProfileKind.Run,run,true);
+    tests.createRunProfile('PerfChecker — measures',vscode.TestRunProfileKind.Run,run,true);
     const control = {refresh,run};
     controls.set(folder.uri.toString(),control);
     return control;

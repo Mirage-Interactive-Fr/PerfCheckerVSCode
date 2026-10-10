@@ -5,7 +5,10 @@ const path=require('node:path');
   const browser=await chromium.launch({headless:true,...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{})});
   const page=await browser.newPage({viewport:{width:1250,height:1000}}),errors=[];
   page.on('pageerror',error=>errors.push(String(error)));
-  const state={type:'chatState',workspace:'Julia demo',messages:[],evidence:[{id:'safe',label:'Saved evidence'}],evidenceId:'',pending:'',busy:false,status:'Ready',implementation:{tool:'implement',promptArgument:'prompt',workspaceArgument:'workspace'}};
+  const state={type:'chatState',workspace:'Julia demo',messages:[],evidence:[{id:'safe',label:'Saved evidence'},
+    {id:'suite:workspace-run',label:'Suite · saved measured run'},
+    {id:'suite-unavailable:workspace',label:'Suite evidence unavailable · Missing integrity',unavailable:true}],
+    evidenceId:'',pending:'',busy:false,status:'Ready',implementation:{tool:'implement',promptArgument:'prompt',workspaceArgument:'workspace'}};
   try {
     await page.setContent('<!doctype html><html lang="en"><body><main id="chat-root"></main></body></html>');
     await page.addStyleTag({path:path.join(__dirname,'../media/advisor-chat.css')});
@@ -13,6 +16,11 @@ const path=require('node:path');
     await page.evaluate(()=>{globalThis.requests=[];globalThis.panel=mountAdvisorChat(document.getElementById('chat-root'),message=>requests.push(message));});
     await page.evaluate(value=>panel.receive(value),state);
     assert.equal((await page.evaluate(()=>requests)).length,0);
+    assert.equal(await page.locator('select[aria-label="Attach saved evidence"] option[value="suite-unavailable:workspace"]').evaluate(option=>option.disabled),true);
+    await page.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption('suite:workspace-run');
+    assert.deepEqual(await page.evaluate(()=>requests.at(-1)),{type:'chatClear',evidenceId:'suite:workspace-run'});
+    state.evidenceId='suite:workspace-run';
+    await page.locator('summary').filter({hasText:'Optional Codex CLI connector'}).click();
     await page.getByRole('button',{name:'Connect Codex CLI',exact:true}).click();
     assert.equal((await page.evaluate(()=>requests.at(-1))).type,'chatConnectCodex');
     state.connection='codex-cli 0.159.2 · local connector';await page.evaluate(value=>panel.receive(value),state);
@@ -23,6 +31,7 @@ const path=require('node:path');
     await page.getByRole('textbox',{name:'Ask about configuration'}).fill('How can I reduce allocations?');
     await page.getByRole('textbox',{name:'Ask about configuration'}).press('Control+Enter');
     assert.equal((await page.evaluate(()=>requests.at(-1))).type,'chatSend');
+    assert.equal((await page.evaluate(()=>requests.at(-1))).evidenceId,'suite:workspace-run');
     assert.ok(await page.getByRole('button',{name:'Send question',exact:true}).isDisabled());
     await page.getByRole('button',{name:'Cancel request',exact:true}).click();
     assert.equal((await page.evaluate(()=>requests.at(-1))).type,'chatCancel');

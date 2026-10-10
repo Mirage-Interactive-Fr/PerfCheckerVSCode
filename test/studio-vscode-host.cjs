@@ -50,7 +50,7 @@ exports.run=async()=>{
       const stop=await timeout(stopped,'Julia debugger pauses on the saved fixture',90000);
       const stack=await session.customRequest('stackTrace',{threadId:stop.threadId,startFrame:0,levels:10});
       assert.ok(stack.stackFrames.some(frame=>frame.source?.path===source));
-      assert.equal(session.configuration.cwd,root);assert.equal(session.configuration.juliaEnv,process.env.PERFCHECKER_TEST_CONTROLLER);
+      assert.equal(session.configuration.cwd,root);assert.equal(session.configuration.project,process.env.PERFCHECKER_TEST_CONTROLLER);
       await vscode.debug.stopDebugging(session);session=undefined;
       checks.push('Actual Julia debugger launches the last source behind Studio, pauses on it and uses the selected scenario environment');
     }

@@ -5,6 +5,9 @@ import path from 'node:path';
 import os from 'node:os';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {createHash} from 'node:crypto';
+import {createRequire} from 'node:module';
+import {unlinkSync} from 'node:fs';
 import {createImplementationCheckout, applyImplementation, recoverImplementationProposal, saveActiveImplementationProposal, recoverActiveImplementationProposal} from '../dist/implementation.js';
 const execute=promisify(execFile);
 const git=async(root,...args)=>(await execute('git',args,{cwd:root,maxBuffer:32_000_000})).stdout;
@@ -16,6 +19,148 @@ async function fixture(run) {
     await git(root,'add','.'); await git(root,'commit','--quiet','-m','base'); await run(root);
   } finally {await fs.rm(root,{recursive:true,force:true});}
 }
+test('generated report checkpoint retains the complete tree before a single source edit', {
+  skip:process.env.PERFCHECKER_TEST_CHECKPOINT_PATHS!=='1',timeout:60000
+},async t=>{
+  const session=await fs.mkdtemp(path.join(os.tmpdir(),'pc-vsix-')),root=path.join(session,'workspace');
+  const output=process.env.PERFCHECKER_TEST_CHECKPOINT_OUTPUT;
+  if(output)assert(path.isAbsolute(output),'Diagnostic output is explicitly owned by the runner');
+  const receipt={status:'running',platform:process.platform,pid:process.pid,temporaryRoot:os.tmpdir(),
+    canonicalTemporaryRoot:await fs.realpath(os.tmpdir()),gitProcesses:[],entries:[]};
+  const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+  const command=async(directory,...args)=>{
+    const pending=execute('git',args,{cwd:directory,timeout:10000,maxBuffer:32_000_000,
+      env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}});
+    const observation={pid:pending.child?.pid,operation:args[0]};receipt.gitProcesses.push(observation);
+    try{const result=await pending;observation.stderr=result.stderr;return result.stdout;}
+    catch(error){observation.stderr=error.stderr;observation.code=error.code;throw error;}
+  };
+  let checkout;
+  const indexes={};
+  const snapshot=async(label,directory)=>{
+    const index=path.join(directory,'.git','index');
+    indexes[label]=await fs.readFile(index);receipt[`${label}IndexSha256`]=hash(indexes[label]);
+    receipt[`${label}Status`]=await command(directory,'status','--porcelain=v1','-z','--untracked-files=all');
+    receipt[`${label}Stage`]=await command(directory,'ls-files','--stage','-z');
+  };
+  try{
+    await fs.mkdir(path.join(root,'src'),{recursive:true});
+    await command(root,'init','--quiet');await command(root,'config','user.name','Test');
+    await command(root,'config','user.email','test@localhost');await command(root,'config','commit.gpgsign','false');
+    const source='src/PerfCheckerNativeFixture.jl';await fs.writeFile(path.join(root,source),'original\n');
+    await command(root,'add','.');await command(root,'commit','--quiet','-m','base');
+    const prefix='perf/results/native-limits-native-limits-8ef20f95-6e5d-4bcd-84cd-df5ff86f31a5/';
+    // Exact path shapes and lengths of the 26 generated reports in the failed
+    // Windows native run. Contents are explicit diagnostic fixture bytes.
+    const paths=[
+      ...['investigation.json','investigation.md','selection.json'].map(name=>`2026-10-10T04-48-38.977Z-96e8c80a/${name}`),
+      ...['artifacts.json','diagnostics.jsonl','integrity.json','manifest.json','measurement-definitions.json','observations.jsonl']
+        .map(name=>`2026-10-10T04-48-38.977Z-96e8c80a/experiment-1/6a76d052-1e4d-45d5-8c8f-730afc3908a9/${name}`),
+      ...['run.json','run.md','selection.json','advice/advice.json','advice/advice.md'].map(name=>`2026-10-10T04-46-55.003Z-6b326748/${name}`),
+      ...['artifacts.json','diagnostics.jsonl','integrity.json','manifest.json','measurement-definitions.json','observations.jsonl']
+        .map(name=>`2026-10-10T04-46-55.003Z-6b326748/0c6e5eb4-6bc3-421e-b17b-a14ea5d9784e/${name}`),
+      ...['advisor-config.json','investigation.json','investigation.md','selection.json'].map(name=>`2026-10-10T04-46-13.959Z-663bc23b/${name}`),
+      ...['discovery.json','discovery.md'].map(name=>`2026-10-10T04-45-42.738Z-62a009b3/${name}`)
+    ].map(name=>prefix+name);
+    assert.equal(paths.length,26);
+    for(const file of paths){await fs.mkdir(path.dirname(path.join(root,file)),{recursive:true});await fs.writeFile(path.join(root,file),`fixture ${file}\n`);}
+    receipt.original=await fs.realpath(root);receipt.gitVersion=(await command(root,'--version')).trim();
+    const configuration=async()=>{const values={};
+      for(const key of ['core.longpaths','core.fscache','core.autocrlf','core.filemode','core.ignorecase']){
+        try{values[key]=(await command(root,'config','--show-origin','--get',key)).trim();}
+        catch(error){if(error.code!==1)throw error;values[key]=null;}
+      }return values;
+    };
+    receipt.configuration=await configuration();
+    const originalConfig=await fs.readFile(path.join(root,'.git','config'));receipt.originalConfigSha256=hash(originalConfig);
+    receipt.head=(await command(root,'rev-parse','HEAD')).trim();await snapshot('originalBefore',root);
+    checkout=await createImplementationCheckout(root);receipt.suppliedCheckout=checkout.workspace;
+    receipt.canonicalCheckout=await fs.realpath(checkout.workspace);receipt.backupRef=checkout.backupRef;
+    receipt.checkpoint=(await command(root,'rev-parse',checkout.backupRef)).trim();
+    const entries=(await command(root,'ls-tree','-r','-z',checkout.backupRef)).split('\0').filter(Boolean);
+    receipt.checkpointTreeEntries=entries;
+    assert.equal(entries.length,paths.length+1,'The checkpoint contains every report and the source');
+    assert.deepEqual(entries.map(entry=>entry.slice(entry.indexOf('\t')+1)).sort(),[...paths,source].sort());
+    await snapshot('privateBefore',checkout.workspace);
+    for(const entry of entries){
+      const [metadata,file]=entry.split('\t'),[mode,type,oid]=metadata.split(' ');
+      assert.equal(type,'blob');assert.equal(mode,'100644');
+      const original=await fs.readFile(path.join(root,file)),privateBytes=await fs.readFile(path.join(checkout.workspace,file));
+      receipt.entries.push({file,mode,oid,originalPathLength:path.join(receipt.original,file).length,
+        privatePathLength:path.join(receipt.canonicalCheckout,file).length,originalSha256:hash(original),privateSha256:hash(privateBytes)});
+      assert.deepEqual(privateBytes,original,`The actual private checkout preserves ${file} before provider edits`);
+    }
+    await fs.writeFile(path.join(checkout.workspace,source),'changed\n');
+    const proposal=await checkout.collect();receipt.files=proposal.files;receipt.patchSha256=hash(proposal.patchBytes);
+    receipt.patch=proposal.patch;await snapshot('privateAfter',checkout.workspace);await snapshot('originalAfter',root);
+    assert.deepEqual(proposal.files,[source],'Collect proposes only the source file actually edited by the provider');
+    assert.equal(await fs.readFile(path.join(root,source),'utf8'),'original\n','Collect preserves the original source bytes');
+    assert.equal((await command(root,'rev-parse','HEAD')).trim(),receipt.head);
+    assert.deepEqual(indexes.originalAfter,indexes.originalBefore,'The original complete index is byte-exact');
+    for(const file of paths)assert.equal(await fs.readFile(path.join(root,file),'utf8'),`fixture ${file}\n`);
+    await applyImplementation(proposal);assert.equal(proposal.applied,true);await snapshot('originalApplied',root);
+    assert.equal(await fs.readFile(path.join(root,source),'utf8'),'changed\n');
+    assert.deepEqual(indexes.originalApplied,indexes.originalBefore,'Apply preserves the complete original index');
+    for(const file of paths)assert.equal(await fs.readFile(path.join(root,file),'utf8'),`fixture ${file}\n`);
+    await applyImplementation(proposal,true);assert.equal(proposal.applied,false);await snapshot('originalRestored',root);
+    assert.equal(await fs.readFile(path.join(root,source),'utf8'),'original\n');
+    assert.equal((await command(root,'rev-parse','HEAD')).trim(),receipt.head);
+    assert.equal((await command(root,'rev-parse',checkout.backupRef)).trim(),receipt.checkpoint,'The recovery checkpoint is retained');
+    assert.deepEqual(indexes.originalRestored,indexes.originalBefore,'Restore preserves the complete original index');
+    assert.equal(receipt.originalRestoredStatus,receipt.originalBeforeStatus);
+    assert.equal(receipt.originalRestoredStage,receipt.originalBeforeStage);
+    for(const file of paths)assert.equal(await fs.readFile(path.join(root,file),'utf8'),`fixture ${file}\n`);
+    assert.deepEqual(await fs.readFile(path.join(root,'.git','config')),originalConfig,'Git configuration is never rewritten');
+    receipt.configurationAfter=await configuration();assert.deepEqual(receipt.configurationAfter,receipt.configuration,
+      'The effective user/repository Git configuration remains unchanged');
+    receipt.reviewedApplyAndRestore=true;receipt.originalConfigUnchanged=true;
+    receipt.status='passed';
+  }catch(error){
+    receipt.status='failed';receipt.error={name:error.name,message:error.message,code:error.code};
+    for(const [label,directory]of [['originalFailure',root],['privateFailure',checkout?.workspace]])if(directory){
+      try{await snapshot(label,directory);}catch(diagnostic){receipt[`${label}Error`]={name:diagnostic.name,code:diagnostic.code,message:diagnostic.message};}
+    }
+    throw error;
+  }finally{
+    try{
+      if(output){
+        await fs.mkdir(output,{recursive:true});
+        for(const [label,bytes]of Object.entries(indexes))await fs.writeFile(path.join(output,`${label}.index`),bytes);
+        await fs.writeFile(path.join(output,'checkpoint.json'),JSON.stringify(receipt,null,2));
+      }
+      t.diagnostic(JSON.stringify({status:receipt.status,entries:receipt.entries.length,files:receipt.files,output}));
+    }finally{await checkout?.dispose();await fs.rm(session,{recursive:true,force:true});}
+  }
+});
+test('an exit-zero checkout with a missing tracked file is refused before any agent request',async t=>fixture(async root=>{
+  const report='saved report.txt',contents='saved report bytes\r\n';await fs.writeFile(path.join(root,report),contents);
+  const head=await git(root,'rev-parse','HEAD'),index=await fs.readFile(path.join(root,'.git','index'));
+  const config=await fs.readFile(path.join(root,'.git','config'));
+  const status=await git(root,'--no-optional-locks','status','--porcelain=v1','-z','--untracked-files=all');
+  const childProcesses=createRequire(import.meta.url)('node:child_process'),spawn=childProcesses.spawn;
+  let isolated,accepted,successfulExitObserved=false;
+  t.mock.method(childProcesses,'spawn',(command,args,options)=>{
+    const child=spawn(command,args,options);
+    if(command==='git'&&args.includes('checkout')&&args.includes('--detach')&&path.basename(options.cwd)==='checkout'){
+      isolated=options.cwd;
+      // The actual Git command runs normally. Fault injection removes one real
+      // private file after its successful exit and before the product checks it.
+      child.prependOnceListener('close',code=>{successfulExitObserved=code===0;if(code===0)unlinkSync(path.join(isolated,report));});
+    }
+    return child;
+  });
+  try{
+    await assert.rejects(async()=>{accepted=await createImplementationCheckout(root);},/isolated checkout does not match.*Recovery checkpoint:/);
+    assert.equal(successfulExitObserved,true);assert(isolated);await assert.rejects(fs.access(isolated),{code:'ENOENT'});
+    const refs=(await git(root,'for-each-ref','--format=%(refname)','refs/perfchecker/checkpoints/')).trim().split('\n');
+    assert.equal(refs.length,1);assert.equal(await git(root,'show',`${refs[0]}:${report}`),contents);
+    assert.equal(await fs.readFile(path.join(root,'source.jl'),'utf8'),'original\n');
+    assert.equal(await fs.readFile(path.join(root,report),'utf8'),contents);
+    assert.equal(await git(root,'rev-parse','HEAD'),head);assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),index);
+    assert.deepEqual(await fs.readFile(path.join(root,'.git','config')),config);
+    assert.equal(await git(root,'--no-optional-locks','status','--porcelain=v1','-z','--untracked-files=all'),status);
+  }finally{t.mock.restoreAll();await accepted?.dispose();}
+}));
 test('checkpoint, reviewed apply, reload recovery and restore preserve HEAD and byte-identical staging',()=>fixture(async root=>{
   await fs.writeFile(path.join(root,'source.jl'),'staged\n'); await git(root,'add','source.jl');
   await fs.writeFile(path.join(root,'source.jl'),'dirty beyond staged\n');
@@ -85,6 +230,55 @@ test('linked worktrees and split index are supported without moving the branch',
     try {assert.equal(await fs.readFile(path.join(checkout.workspace,'source.jl'),'utf8'),'dirty linked\n');} finally {await checkout.dispose();}
     assert.deepEqual(await fs.readFile(indexPath),before);
   } finally {await git(root,'worktree','remove','--force',linked); await fs.rm(parent,{recursive:true,force:true});}
+}));
+test('partial clone checkpoints preserve original history without hydrating historical blobs',()=>fixture(async source=>{
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'perfchecker-promisor-test-'));
+  const origin=path.join(directory,'origin.git'),root=path.join(directory,'partial');
+  const previousLazyFetch=process.env.GIT_NO_LAZY_FETCH;
+  let checkout;
+  try{
+    const historical=(await git(source,'rev-parse','HEAD:source.jl')).trim();
+    await fs.writeFile(path.join(source,'source.jl'),'current HEAD\n');await git(source,'add','.');await git(source,'commit','--quiet','-m','Current source');
+    await git(directory,'clone','--quiet','--bare',source,origin);
+    await git(origin,'config','uploadpack.allowFilter','true');
+    await execute('git',['clone','--quiet','--no-local','--filter=blob:none',origin,root],
+      {cwd:directory,env:{...process.env,GIT_NO_LAZY_FETCH:'0'}});
+    process.env.GIT_NO_LAZY_FETCH='1';
+    assert.equal((await git(root,'config','remote.origin.promisor')).trim(),'true');
+    assert.equal((await git(root,'rev-parse','--is-shallow-repository')).trim(),'false');
+    assert((await git(root,'rev-list','--objects','--missing=print','HEAD')).split('\n').includes(`?${historical}`));
+    await assert.rejects(git(root,'cat-file','-e',historical));
+    await git(root,'fsck','--full','--no-dangling');
+    await fs.writeFile(path.join(root,'source.jl'),'staged source\n');await git(root,'add','source.jl');
+    await fs.writeFile(path.join(root,'source.jl'),'saved before implementation\n');
+    const head=(await git(root,'rev-parse','HEAD')).trim(),index=await fs.readFile(path.join(root,'.git','index'));
+    const refs=await git(root,'for-each-ref','--format=%(refname) %(objectname)'),before=await git(root,'status','--porcelain');
+    checkout=await createImplementationCheckout(root);
+    assert.equal(await fs.readFile(path.join(checkout.workspace,'source.jl'),'utf8'),'saved before implementation\n');
+    assert.equal((await git(checkout.workspace,'rev-parse','--is-shallow-repository')).trim(),'true');
+    await fs.writeFile(path.join(checkout.workspace,'source.jl'),'reviewed candidate\n');
+    const proposal=await checkout.collect();
+    assert.deepEqual(proposal.files,['source.jl']);
+    assert.equal((await git(root,'rev-parse',`${proposal.base}^`)).trim(),head,'The original checkpoint retains its real parent');
+    assert.equal((await git(root,'rev-parse',`${proposal.candidate}^`)).trim(),proposal.base,'The candidate retains the checkpoint parent');
+    await checkout.dispose();checkout=undefined;
+    await applyImplementation(proposal);
+    assert.equal(await fs.readFile(path.join(root,'source.jl'),'utf8'),'reviewed candidate\n');
+    const recovered=await recoverImplementationProposal(root,proposal.backupRef,proposal.candidateRef,false);
+    assert.equal(recovered.applied,true);assert.equal(recovered.patch,proposal.patch);
+    await applyImplementation(recovered,true);
+    assert.equal(await fs.readFile(path.join(root,'source.jl'),'utf8'),'saved before implementation\n');
+    assert.equal((await git(root,'rev-parse','HEAD')).trim(),head);assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),index);
+    assert.equal(await git(root,'status','--porcelain'),before);
+    assert.equal((await git(root,'for-each-ref','--format=%(refname) %(objectname)')).split('\n').filter(line=>!line.startsWith('refs/perfchecker/')).join('\n'),refs);
+    assert.equal((await git(root,'rev-parse','--is-shallow-repository')).trim(),'false');
+    await assert.rejects(git(root,'cat-file','-e',historical),'No historical blob was hydrated');
+    await git(root,'fsck','--full','--no-dangling');
+  }finally{
+    await checkout?.dispose();
+    if(previousLazyFetch===undefined)delete process.env.GIT_NO_LAZY_FETCH;else process.env.GIT_NO_LAZY_FETCH=previousLazyFetch;
+    await fs.rm(directory,{recursive:true,force:true});
+  }
 }));
 test('non-UTF8 text patches preserve exact bytes through reviewed apply and restart restoration',()=>fixture(async root=>{
   const original=Buffer.from([99,97,102,233,10]),candidate=Buffer.from([99,97,102,233,32,97,108,116,101,114,233,10]);

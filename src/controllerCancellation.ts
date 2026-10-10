@@ -2,15 +2,25 @@ import {ChildProcess, spawn} from 'node:child_process';
 
 export const CANCEL_REQUEST = 'PERFCHECKER_CANCEL/1';
 export const CANCELLATION_GRACE_MS = 60_000;
+const controllers = new Map<ChildProcess, {request: () => void; finished: Promise<void>}>();
+
+/** Deactivation waits for the same cooperative cleanup used by the Cancel buttons. */
+export async function shutdownControllerProcesses(): Promise<void> {
+  const active = [...controllers.values()];
+  for (const controller of active) controller.request();
+  await Promise.allSettled(active.map(controller => controller.finished));
+}
 
 /** The stdin reader runs in the controller, so cancellation unwinds its finally blocks. */
 export function cancellableJulia(code: string): string {
   return `
 const perfchecker_controller_task = current_task()
 @async begin
+    requested = false
     try
         for line in eachline(stdin)
             if line == "${CANCEL_REQUEST}"
+                requested = true
                 istaskdone(perfchecker_controller_task) ||
                     schedule(perfchecker_controller_task, InterruptException(); error=true)
                 break
@@ -18,6 +28,12 @@ const perfchecker_controller_task = current_task()
         end
     catch error
         error isa EOFError || println(stderr, "PerfChecker cancellation input: ", sprint(showerror, error))
+    finally
+        # This dedicated pipe belongs to the extension host. EOF means its
+        # owner disappeared; request the same cleanup once, without interrupting
+        # cleanup again after an explicit cancellation message.
+        requested || istaskdone(perfchecker_controller_task) ||
+            schedule(perfchecker_controller_task, InterruptException(); error=true)
     end
 end
 try
@@ -57,17 +73,21 @@ export function controllerCancellation(child: ChildProcess, notice: (message: st
   child.stdin?.on('error', error => {
     if (requested && alive()) notice(`Cancellation input unavailable: ${error.message}. Waiting before forced stop.`);
   });
-  return {
+  const cancellation = {
     get forced() {return forced;}, dispose,
     request() {
       if (requested || !alive()) return;
       requested = true;
       notice('Cancelling… waiting for workers and allocation cleanup.');
-      // Keep the pipe open until exit; EOF is not a cancellation request.
+      // Keep the pipe open through cleanup. EOF also signals a lost owner.
       child.stdin?.write(`${CANCEL_REQUEST}\n`, error => {
         if (error && alive()) notice(`Cancellation input unavailable: ${error.message}. Waiting before forced stop.`);
       });
       timer = setTimeout(force, graceMs);
     },
   };
+  const finished = new Promise<void>(resolve => {child.once('close', () => resolve());child.once('error', () => resolve());});
+  controllers.set(child, {request:cancellation.request, finished});
+  void finished.then(() => controllers.delete(child));
+  return cancellation;
 }

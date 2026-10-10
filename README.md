@@ -1,8 +1,8 @@
 # PerfChecker for VS Code
 
-PerfChecker 1.0 brings a full Studio, interactive plots, Julia tools, MCP
+PerfChecker 1.0.1 brings a full Studio, interactive plots, Julia tools, MCP
 conversation, and reviewed agent implementation with Git recovery into VS Code.
-Use a controller environment containing PerfChecker.jl 1.0.0 or later.
+Use a controller environment containing PerfChecker.jl 1.0.1 or later.
 
 The user guides are maintained with PerfChecker.jl on its existing documentation host:
 
@@ -11,15 +11,51 @@ The user guides are maintained with PerfChecker.jl on its existing documentation
 - [Plots, notebooks and Julia tools](https://perfchecker.mirageinteractive.fr/interfaces/vscode-workflows.html)
 - [MCP advice, implementation and recovery](https://perfchecker.mirageinteractive.fr/mcp-advisor.html)
 
+## First use
+
+Open a Julia package folder, then **PerfChecker: Open Studio**. Choose
+**Set up workspace and create suite** to select or explicitly create the measurement
+environment and starter suite. The setup explains which Julia project it will
+modify and asks before downloading packages. An existing package `Project.toml`
+alone does not make a measurement controller ready.
+
+Use **Create controller environment**, **Use an existing controller**, or **Read the setup guide**
+as appropriate. A controller needs registered PerfChecker.jl 1.0.1 or later.
+The starter installs measurement dependencies; add your package and its test
+dependencies explicitly to the selected controller before measuring test items.
+Add `HTTP` there for an MCP HTTP provider, a local MCP stdio server or the optional Codex connector. Optional
+analyzers and Julia debugging have their own prerequisites.
+
+The official Julia extension uses `julia.executablePath`, independently of
+PerfChecker's `perfchecker.juliaExecutable`. In the native qualification,
+Julia extension 1.174.2 with Julia 1.13.1 failed to start its language server
+with `KeyError: key :_apply not found` in SymbolServer. Keep that combination
+separate from PerfChecker runner support; select Julia 1.12 for the official
+REPL/debugger while using a newer Julia for PerfChecker if needed.
+
+For notebooks, select **New Pluto notebook** and choose **Feature suite** or
+**Investigation**. The extension uses real reactive Pluto `.jl` notebooks in an
+editor tab. Stable Pluto 1.0.4 and PerfCheckerPluto 1.0.1 use a separate `perf/pluto`
+Julia environment. Installing or upgrading it requires an explicit choice and
+does not modify the MCP controller.
+Opening the notebook or changing selectors does not launch measurements.
+Use its Launch/Cancel/Refresh controls, and **Save completed reports** in a suite
+notebook. Pluto saves edited cells to the `.jl` file; the header provides
+**Open source**, **Stop session**, and **Restart session**. Stop and closing the
+view wait for owned measurement workers and allocation cleanup.
+Pluto's Julia/HTML exports and links opened with a modifier or in a new context
+use your default browser. Normal notebook navigation stays in the editor tab.
+The Recent list asks for confirmation before shutting down a notebook.
+
 ## Measure existing Julia test items
 
 Set `perfchecker.runnerProject` to a Julia environment containing PerfChecker and
 TestItemRunner 1.3.2 or later in 1.x. Run **PerfChecker: Discover existing test items**,
-then select individual items in the **PerfChecker — mesures** Test Explorer controller.
+then select individual items in the **PerfChecker — measures** Test Explorer controller.
 The measurement controller is created only for the chosen folder when discovery is
 requested. In a multi-root workspace, the command prompts for a folder; companion
 extensions may pass an open folder URI directly to `perfchecker.discoverTestItems`.
-Its **PerfChecker — mesures** run profile measures items independently of the Julia
+Its **PerfChecker — measures** run profile measures items independently of the Julia
 extension's functional test controller; it does not intercept Julia test runs.
 Untagged items are shared, `:check_only` is measurement-only,
 `:perf_only` is its supported alias, and `:test_only` is functional-only. Shared
@@ -71,12 +107,15 @@ the Julia package or enter measured workers.
   Review the diff before applying; restore the checkpoint if the repository has
   not changed. Conversation is kept in memory; Git recovery survives editor restarts.
   Starting a new conversation preserves the current proposal and its restore action.
-- Connect an already authenticated Codex CLI from Chat for the same advice and
+- Connect an explicit local MCP server with its command, arguments and directory;
+  discover its tool schemas and choose separate advice and implementation tools.
+- Optionally connect an already authenticated Codex CLI from Chat for advice and
   reviewed implementation workflow. The temporary local connection preserves
   your saved provider configuration and ends when disconnected or the editor closes.
-- Open a folder-scoped Julia terminal, create an unsaved Julia investigation
-  notebook, open native notebooks, and debug saved Julia source using the Julia
-  extension. Select an installed notebook kernel explicitly.
+- Open a folder-scoped Julia terminal and interactive Pluto notebooks inside VS Code.
+  Create a feature-suite or investigation notebook with the official PerfCheckerPluto
+  interface, then explicitly launch checks. Pluto has a separate Julia environment;
+  installation requires your confirmation. Debug saved Julia source with the Julia extension.
 - Browse `package → business feature → check type → target` in the activity bar
   and native Test Explorer.
 - Select BenchmarkTools, Chairmarks, allocations, CPU/wall-time profiles and
@@ -90,13 +129,21 @@ the Julia package or enter measured workers.
 - Save selections, comparison policies and documentation blocks in the shared
   `perfchecker-ui-config/1` format.
 
+Version sorting puts numeric targets first, opaque Git labels in lexical order
+next, and the unversioned `dev` target last. Numeric targets accept `1`, `1.2`
+or `1.2.3`, optional `v` or `dev@` prefixes, and prerelease/build suffixes such
+as `1.2.3-rc.2+build.7`. Prereleases precede their release; build metadata does
+not change release-range inclusion, and `v` prefixes represent the same version.
+Sorting breaks equivalent numeric ties by target label, with a release before
+`dev@` at the same version.
+
 ## Requirements
 
 - VS Code 1.96 or newer.
 - Julia available as `julia`, or configured through
   `perfchecker.juliaExecutable`.
 - A controller environment in the opened package workspace, normally `perf`,
-  containing PerfChecker.jl 1.0.0 or later and a `suite.jl` with `build_suite()`.
+  containing PerfChecker.jl 1.0.1 or later and a `suite.jl` with `build_suite()`.
 
 The extension invokes the public PerfChecker CLI and reads only versioned JSON,
 JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundary.
@@ -107,8 +154,8 @@ JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundar
 Set-Location C:\path\to\PerfCheckerVSCode
 npm ci
 npm test
-npm run package -- --out perfchecker-vscode-1.0.0.vsix
-code --install-extension .\perfchecker-vscode-1.0.0.vsix --force
+npm run package -- --out perfchecker-vscode-1.0.1.vsix
+code --install-extension .\perfchecker-vscode-1.0.1.vsix --force
 ```
 
 Reload VS Code, open a Julia package workspace, then select the PerfChecker icon
@@ -162,7 +209,7 @@ the quality contract and `perf/live_provider.jl` before launch. The provider mus
 write `perfchecker-provider-result/1` JSON to `PERFCHECKER_OUTPUT`, using the
 explicit `--quality=<slug>` argument. It runs in the game project; PerfChecker runs
 in the folder's configured controller project. The controller must already contain
-PerfChecker.jl 1.0.0 or later. No package installation or suite factory runs automatically.
+PerfChecker.jl 1.0.1 or later. No package installation or suite factory runs automatically.
 
 The provider's `suite` is `etendu-beautiful-landscape-live`. Its `environment`
 contains `quality_profile`, effective `width` and `height`, `resolution_source`,
@@ -223,7 +270,7 @@ separate extension development profile before choosing a deployment.
 
 ### Extension host integration test (opt-in)
 
-Prepare a controller containing PerfChecker.jl 1.0.0 or later, SharedScenarioDemo,
+Prepare a controller containing PerfChecker.jl 1.0.1 or later, SharedScenarioDemo,
 BenchmarkTools, Chairmarks and JET. Then create a **new** scratch workspace:
 
 ```text
@@ -259,7 +306,7 @@ workspace named `/tmp/perfchecker-chat-host-*`, with an initial HEAD,
 `PRIVATE_NOT_ATTACHED` and stage a version of `source.jl` before changing its
 on-disk content. In `.vscode/settings.json`, set absolute `juliaExecutable`,
 `runnerProject` and `scenarioProject` paths. The prepared controller must contain
-PerfChecker.jl 1.0.0 or later and HTTP; no package installation occurs in
+PerfChecker.jl 1.0.1 or later and HTTP; no package installation occurs in
 these tests. Use new profile/extensions directories and keep their paths for the
 second process. Workspace-trust disabling below belongs only to these fixtures.
 
@@ -306,7 +353,7 @@ against an existing project or your normal editor profile.
 ```powershell
 npm ci
 npm test
-npm run package -- --out perfchecker-vscode.vsix
+npm run package -- --out perfchecker-vscode-1.0.1.vsix
 ```
 
 `npm test` compiles TypeScript and runs the model/contract tests. The generated
@@ -314,7 +361,7 @@ npm run package -- --out perfchecker-vscode.vsix
 
 ## Marketplace publication
 
-Publish the stable extension only after PerfChecker.jl 1.0.0 is available in
+Publish the stable extension only after PerfChecker.jl 1.0.1 is available in
 Julia's General registry. Build and test the exact VSIX before publishing it.
 
 The immutable Marketplace identity is
@@ -325,7 +372,7 @@ For a manual stable release:
 
 ```powershell
 npx vsce login mirage-interactive-fr
-npx vsce publish --packagePath .\perfchecker-vscode-1.0.0.vsix
+npx vsce publish --packagePath .\perfchecker-vscode-1.0.1.vsix
 ```
 
 Publishing requires a free Microsoft identity and Marketplace publisher, not a
@@ -339,8 +386,9 @@ MIT. See [LICENSE](LICENSE).
 
 ## Optional MCP advice
 
-Open **PerfChecker: Configure advisor and manage models** for the guided panel.
-Discover and configure an MCP HTTP advice tool in text mode, then open
+Open **PerfChecker: Configure MCP connection and models** for the guided panel.
+Choose an MCP HTTP endpoint or an explicit local MCP stdio server. Discover its
+tool schemas and select an advice tool in text mode, then open
 **PerfChecker: Chat with performance advisor**. Nothing is generated on opening.
 Source files are not attached automatically; typed messages and explicitly selected
 bounded evidence are sent when requested. Replies remain unverified advice.
@@ -350,24 +398,58 @@ Implementation requires a separate explicit tool configuration in the chat's
 use a trusted agent that respects the path and can access the local filesystem.
 Preparation creates a checkpoint; application requires a separate reviewed action.
 The extension uses the controller's public `chat` and `implement` commands, which
-are supplied by PerfChecker.jl 1.0.0 or later; an older controller fails
+are supplied by PerfChecker.jl 1.0.1 or later; an older controller fails
 visibly instead of providing an implementation fallback. The extension does not
-install an agent backend. Its explicit **Connect Codex CLI** action starts an
-authenticated installed CLI on demand through a temporary local MCP endpoint;
-generic external MCP agents remain supported.
+install an agent backend. An MCP server may supply ordinary tools without an LLM
+or an implementation tool. Choose tools whose documented inputs and capabilities
+match the requested operation. Codex CLI is an optional connector, not a prerequisite
+for MCP.
 
 See the canonical [MCP guide](https://perfchecker.mirageinteractive.fr/mcp-advisor.html)
 for provider configuration, credentials, supported revisions, transmission,
-cancellation and recovery. Stdio and OAuth login are not supported by this adapter.
+cancellation and recovery. Interactive OAuth login, roots, sampling, tasks and
+interactive `input_required` responses are not supported by the local adapter.
+
+### Connect a local MCP stdio server
+
+Choose **Local MCP server · stdio** in connection settings, or **Connect local MCP
+server** in Chat. Supply the absolute path of a native executable, its JSON array
+of arguments, and an absolute working directory. Arguments are passed directly,
+without shell interpretation or expansion. No agent name, installation or login
+command is inferred. The server inherits
+the extension host's environment, excluding private connector tokens. Windows
+requires a native executable rather than a `.cmd` or `.bat` launcher.
+
+Select revision **2025-11-25** (initialize handshake) or **2026-07-28** (server
+discovery); an unsupported revision fails without an automatic fallback. **Discover
+tools** displays the actual paginated inventory and schemas without calling a tool.
+Choose the advice tool and prompt argument, then optionally an implementation tool
+with its own prompt/workspace arguments and separate JSON arguments. A tool must
+actually support editing the supplied local checkout for implementation to work.
+
+**Connect for this editor session** starts one owned server. Probing that connection
+retains the same server. The command, selections, private HTTP bridge and token are
+session-only; saved provider settings are preserved. Optional
+`perfchecker.advisorMcpStdioCommand`, `perfchecker.advisorMcpStdioArguments` and
+`perfchecker.advisorMcpStdioDirectory` settings only prefill the form and never
+launch a server automatically. Reconnect explicitly after editor reload, server
+exit, timeout or cancellation. Closing the configuration panel after Connect keeps
+the connection active. Closing an unconnected discovery panel retires its server.
+Closing Chat also closes its local stdio connection; reconnect explicitly to use
+it again. Disconnect, cancellation and editor shutdown close the owned server and
+its observed descendants; this does not promise to reclaim an unseen daemon that
+escapes observation. External implementation tools remain responsible for respecting
+the supplied checkout path; it is not an operating-system sandbox.
 
 ### Connect an installed Codex CLI
 
 Authenticate your CLI using `codex login` in your own terminal. Set
 `perfchecker.codexExecutable` if `codex` is not on VS Code's PATH, open Chat, then
-choose **Connect Codex CLI**. Version, supported flags and login status are checked
+expand **Optional Codex CLI connector** and choose **Connect Codex CLI**. Version, supported flags and login status are checked
 without starting a model turn. This requires `--no-daemon`, `--ignore-user-config`
 and `--ignore-rules`, in addition to the standard `exec` sandbox/ephemeral/output
-flags; Codex CLI 0.159.2 was qualified. Unsupported executables fail explicitly.
+flags; Codex CLI 0.162.0-alpha.2 was qualified with a real authenticated local
+Julia implementation test. Unsupported executables fail explicitly.
 Windows requires the native `.exe`; npm `.cmd`/`.bat` launchers are unsupported.
 
 The connector uses the existing account and default CLI model. Custom user
@@ -396,6 +478,14 @@ This sends real model requests and verifies advice, isolated editing, Node
 semantics, diff, apply, byte-identical restoration and cancellation after a turn
 starts. It removes its temporary files. The default tests use a sacrificial CLI
 to verify errors, limits, process-tree termination and authentication separately.
+
+The separate `PERFCHECKER_TEST_CODEX_JULIA=1` opt-in test also requires
+`PERFCHECKER_TEST_JULIA` and `PERFCHECKER_TEST_JULIA_PROJECT`. It checks two advice
+turns and an actual Julia allocation change, empty and signed input oracles,
+reviewed Apply, exact source/index/HEAD restoration, cancellation and disconnect.
+Its final JSON identifies the Core source tree and whether that environment came
+from the registry. `PERFCHECKER_TEST_CORE_TREE` explicitly identifies an immutable
+candidate source when qualifying a Core fix before registration.
 
 The complete opt-in editor/controller qualification uses a prepared controller:
 

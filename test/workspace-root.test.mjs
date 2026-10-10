@@ -67,7 +67,8 @@ test('multi-root activation does not plan; explicit designer plans only the sele
     const configurationScopes = [];
     const vscode = {
       EventEmitter: class { event = () => undefined; fire() {} },
-      workspace: {
+      workspace: {onDidChangeWorkspaceFolders:()=>({dispose(){}}),
+        onDidChangeConfiguration:()=>({dispose(){}}),
         workspaceFolders: [first, second],
         getConfiguration: (_section, resource) => {
           configurationScopes.push(resource?.toString());
@@ -94,17 +95,18 @@ test('multi-root activation does not plan; explicit designer plans only the sele
       ProgressLocation: {Window: 1, Notification: 2},
     };
     const Module = require('node:module');
+    const nativeChildProcess = require('node:child_process');
     const originalLoad = Module._load;
     Module._load = function (id, parent, isMain) {
       if (id === 'vscode') return vscode;
       if (id === './investigation') return {registerInvestigations() {}};
       if (id === './testitems') return {registerNativeTestItems() {}};
-      if (id === 'node:child_process') return {spawn: (executable, args, options) => {
+      if (id === 'node:child_process') return {...nativeChildProcess, spawn: (executable, args, options) => {
         spawned.push({executable, args, options});
         const child = new EventEmitter();
         child.stdout = new EventEmitter(); child.stdout.setEncoding = () => undefined;
         child.stderr = new EventEmitter(); child.stderr.setEncoding = () => undefined;
-        queueMicrotask(() => child.emit('close', args.includes('using Pkg; Pkg.instantiate()') ? 0 : 2));
+        queueMicrotask(() => child.emit('close', args.some(value=>value.includes('using Pkg; Pkg.instantiate()')) ? 0 : 2));
         return child;
       }};
       return originalLoad.call(this, id, parent, isMain);
@@ -127,14 +129,14 @@ test('multi-root activation does not plan; explicit designer plans only the sele
     await assert.rejects(explicit(second), /plan failed/);
     assert.equal(spawned.length, 2);
     assert.equal(spawned[0].options.cwd, path.join(second.uri.fsPath, 'perf', 'controller'));
-    assert.ok(spawned[0].args.includes('using Pkg; Pkg.instantiate()'));
+    assert.ok(spawned[0].args.some(value=>value.includes('using Pkg; Pkg.instantiate()')&&value.includes('PERFCHECKER_CANCEL/1')));
     assert.ok(spawned[0].args.includes(`--project=${path.join(second.uri.fsPath, 'perf', 'controller')}`));
     assert.equal(spawned[1].options.cwd, second.uri.fsPath);
     assert.ok(spawned[1].args.includes(`--project=${path.join(second.uri.fsPath, 'perf', 'controller')}`));
     assert.ok(spawned[1].args.includes(`--suite=${path.join(second.uri.fsPath, 'perf', 'suite.jl')}`));
     assert.ok(spawned[1].args.includes('--factory=build_suite'));
     await assert.rejects(explicit(second), /plan failed/);
-    assert.equal(spawned.filter(call => call.args.includes('using Pkg; Pkg.instantiate()')).length, 1);
+    assert.equal(spawned.filter(call => call.args.some(value=>value.includes('using Pkg; Pkg.instantiate()'))).length, 1);
     assert.ok(configurationScopes.every(scope => scope === second.uri.toString() || scope === first.uri.toString()));
     assert.equal(configurationScopes.at(-1), second.uri.toString());
   } finally {

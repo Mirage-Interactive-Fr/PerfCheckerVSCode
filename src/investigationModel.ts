@@ -14,6 +14,7 @@ export interface InvestigationReport {
   ci?: any[]; corpora?: any[]; fingerprints?: Record<string, string>;
   analyzers?: {tool: string; scope: string; installation?: string}[];
   records?: any[]; recommendations?: any[]; configurations?: any[]; runs?: any[];
+  measurement_summaries?: any[];
   tools?: any[]; cards?: any[]; experiments?: any[]; unexecuted?: any[]; results?: any[]; coverage?: any[];
   status?: string; advice?: InvestigationReport; fallback?: InvestigationReport; discovery?: InvestigationReport;
   external_review?: string;
@@ -45,6 +46,49 @@ export function parseInvestigation(input: unknown): InvestigationReport {
     }
   }
   return value as unknown as InvestigationReport;
+}
+
+/** Validate saved diagnostic data for read-only presentation, without qualifying its claims. */
+export function parseDiagnosticReport(input: unknown): InvestigationReport {
+  const report = parseInvestigation(input);
+  if (report.schema_version !== 'perfchecker-diagnosis/1') throw new Error('Choose a PerfChecker diagnostic report (perfchecker-diagnosis/1).');
+  const measured = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  const bytes = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+  for (const record of report.records!) {
+    if (['scenario', 'implementation', 'tool', 'status'].some(key => typeof record[key] !== 'string' || !record[key].trim())) {
+      throw new Error('Invalid diagnostic record identity or status.');
+    }
+    if (record.measurements !== undefined && (!record.measurements || typeof record.measurements !== 'object' || Array.isArray(record.measurements))) {
+      throw new Error('Invalid diagnostic measurements.');
+    }
+    if (record.findings !== undefined && (!Array.isArray(record.findings) || record.findings.some((finding: unknown) => !finding || typeof finding !== 'object' || Array.isArray(finding)))) {
+      throw new Error('Invalid diagnostic findings.');
+    }
+    if (['summary', 'message', 'measurement_scope', 'correctness', 'quality', 'performance'].some(key => record[key] !== undefined && typeof record[key] !== 'string') ||
+        record.limitations !== undefined && (!Array.isArray(record.limitations) || record.limitations.some((limit: unknown) => typeof limit !== 'string'))) {
+      throw new Error('Invalid diagnostic summary, scope or limitations.');
+    }
+    if (record.configuration !== undefined && (!record.configuration || typeof record.configuration !== 'object' || Array.isArray(record.configuration) ||
+        record.configuration.project !== undefined && typeof record.configuration.project !== 'string')) {
+      throw new Error('Invalid diagnostic configuration.');
+    }
+    if (record.status !== 'complete') continue;
+    const pending: unknown[] = [record.measurements];
+    while (pending.length) {
+      const value = pending.pop();
+      if (typeof value === 'number' && !Number.isFinite(value)) throw new Error('Complete diagnostic measurements must be finite.');
+      if (value && typeof value === 'object') for (const child of Object.values(value)) pending.push(child);
+    }
+    if (record.tool === 'latency' && ['load_seconds', 'first_case_seconds', 'warm_case_seconds'].some(key => !measured(record.measurements?.[key]))) {
+      throw new Error('A complete latency record must contain finite, nonnegative loading, first-lifecycle and warm-lifecycle durations.');
+    }
+    if (record.tool === 'memory' && (!Array.isArray(record.measurements?.samples) || !record.measurements.samples.length ||
+        record.measurements.samples.some((sample: any) => !sample || typeof sample !== 'object' || Array.isArray(sample) ||
+          ['state_before_bytes', 'state_after_bytes', 'state_and_result_bytes'].some(key => !bytes(sample[key]))))) {
+      throw new Error('A complete memory record must contain nonnegative safe integer reachable-state and combined byte measurements.');
+    }
+  }
+  return report;
 }
 
 export function scenarioKey(value: Pick<Scenario, 'id' | 'implementation'>): string {
@@ -132,7 +176,8 @@ export function reportSummary(report: InvestigationReport): string {
   if (report.records) return `${report.records.filter(r => r.status === 'complete').length}/${report.records.length} analyses completed`;
   if (report.recommendations) return `${report.recommendations.length} evidence-based recommendations`;
   if (report.configurations) return `${report.configurations.length} separate configurations`;
-  return `${report.runs?.length ?? 0} measurements`;
+  const count = report.runs?.length ?? 0;
+  return `${count} ${count === 1 ? 'measurement' : 'measurements'}`;
 }
 
 /** Total measured item time for VS Code's duration field, excluding process startup. */

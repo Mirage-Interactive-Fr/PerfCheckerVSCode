@@ -1,0 +1,317 @@
+name: Published VSIX native workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact:
+        description: Public release for reproduction, or candidate from this commit
+        type: choice
+        options: [public, candidate]
+        default: candidate
+      stage:
+        description: Smoke, full, reload/narrative, selected native controls, or Core-only regression
+        type: choice
+        options: [smoke, full, targeted, focused, core-external, connector-workers]
+        default: full
+      case_group:
+        description: Native controls to exercise on a clean fixture (focused stage only)
+        type: choice
+        options: [bootstrap, general100, narrative, mcp, mcp-stdio, mcp-documented-install, mcp-pluto, pluto-plots, pluto, pluto-start-stop, workbench, advisor, saved-report, investigation, investigation-limits, diagnosis, studio, suite, studio-ordering, studio-color, editor, testitems, testitems-ready, restricted]
+        default: narrative
+      backend_julia:
+        description: Core runtime for a manual qualification; automatic PR coverage remains latest
+        type: choice
+        options: ['1', '1.10']
+        default: '1'
+      scope:
+        description: All supported hosts, or an explicit focused platform
+        type: choice
+        options: [all, linux, linux-stable, windows, windows-stable, macos-stable]
+        default: all
+      core:
+        description: Published General minimum, explicit legacy compatibility, or a pinned candidate
+        type: choice
+        options: [general, candidate, general100]
+        default: general
+      core_commit:
+        description: Immutable Core candidate commit (candidate mode only)
+        type: string
+      core_tree:
+        description: Expected Git tree for that Core candidate (candidate mode only)
+        type: string
+      candidate_run:
+        description: Optional original run ID to reuse its exact candidate bytes
+        type: string
+      candidate_name:
+        description: Artifact name from that original run (requires candidate_run and candidate_sha)
+        type: string
+      candidate_sha:
+        description: Full SHA256 of the original candidate (never repackage when supplied)
+        type: string
+      new_candidate_origin:
+        description: Explicitly declare a new 1.0.1 candidate origin after product changes; otherwise reuse the frozen release archive
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - '.github/workflows/native-vsix.yml'
+      - 'test/**'
+      - 'src/**'
+      - 'media/**'
+      - 'resources/**'
+      - 'package*.json'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  connector-workers:
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'connector-workers'
+    needs: package
+    name: Real CLI ownership (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.scope == 'macos-stable' && '["macos-15-intel"]' || (inputs.scope == 'windows' || inputs.scope == 'windows-stable') && '["windows-latest"]' || (inputs.scope == 'linux' || inputs.scope == 'linux-stable') && '["ubuntu-latest"]' || '["ubuntu-latest","windows-latest","macos-15-intel"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v7
+        with:
+          name: native-candidate-${{ github.sha }}
+      - name: Load the exact immutable product modules and Windows resource
+        shell: bash
+        env:
+          EXPECTED_VSIX_SHA: ${{ needs.package.outputs.sha }}
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),crypto=require('crypto'),path=require('path'),yauzl=require('yauzl');
+          const hash=bytes=>crypto.createHash('sha256').update(bytes).digest('hex');
+          const archive=fs.readFileSync('candidate.vsix'),p=JSON.parse(fs.readFileSync('candidate.provenance.json'));
+          const sha=hash(archive);
+          if(sha!==process.env.EXPECTED_VSIX_SHA||p.sha256!==sha)throw Error('Immutable connector archive digest mismatch');
+          fs.rmSync('dist',{recursive:true,force:true});fs.mkdirSync('dist');
+          const entries=[],seen=new Set();let total=0;
+          new Promise((resolve,reject)=>yauzl.open('candidate.vsix',{lazyEntries:true},(error,zip)=>{
+            if(error)return reject(error);zip.on('error',reject);zip.on('end',resolve);
+            zip.on('entry',entry=>{
+              if(!/^extension\/(dist\/[^/]+\.js(?:\.map)?|resources\/windows-owned-process\.ps1)$/.test(entry.fileName)){zip.readEntry();return;}
+              const target=entry.fileName.slice('extension/'.length);
+              if(seen.has(target)||entry.uncompressedSize>2000000||(entry.externalFileAttributes>>>16&0xf000)===0xa000){zip.close();reject(Error('Invalid immutable product entry'));return;}
+              seen.add(target);total+=entry.uncompressedSize;
+              if(total>20000000){zip.close();reject(Error('Immutable product extraction exceeds its explicit byte budget'));return;}
+              zip.openReadStream(entry,(error,stream)=>{
+                if(error){zip.close();reject(error);return;}const chunks=[];
+                stream.on('error',reject);stream.on('data',chunk=>chunks.push(chunk));stream.on('end',()=>{
+                  const bytes=Buffer.concat(chunks);if(bytes.length!==entry.uncompressedSize){zip.close();reject(Error('Immutable entry size mismatch'));return;}
+                  fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,bytes);
+                  entries.push({path:target,bytes:bytes.length,sha256:hash(bytes)});zip.readEntry();
+                });
+              });
+            });zip.readEntry();
+          })).then(()=>{
+            for(const required of ['dist/posixProcessCohort.js','dist/codexConnector.js','dist/mcpStdioConnector.js','dist/windowsOwnedProcess.js','resources/windows-owned-process.ps1'])
+              if(!seen.has(required))throw Error('Missing immutable product entry: '+required);
+            fs.mkdirSync('native-qualification-results',{recursive:true});
+            fs.writeFileSync('native-qualification-results/connector-workers-archive.json',JSON.stringify({sha256:sha,bytes:archive.length,origin:p,compiled:false,entries},null,2));
+          }).catch(error=>{console.error(error);process.exitCode=1;});
+          NODE
+      - name: Observe CLI ownership before fixture teardown (no VS Code, models or credentials)
+        shell: bash
+        run: |
+          mkdir -p native-qualification-results
+          node --test --test-concurrency=1 test/windows-owned-process.test.mjs test/codex-connector.test.mjs test/mcp-stdio.test.mjs > native-qualification-results/connector-workers.tap 2>&1
+      - name: Verify complete Windows checkpoint paths on the immutable product
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          PERFCHECKER_TEST_CHECKPOINT_PATHS: '1'
+          PERFCHECKER_TEST_CHECKPOINT_OUTPUT: ${{ github.workspace }}/native-qualification-results/checkpoint-paths
+        run: node --test --test-name-pattern='generated report checkpoint' test/implementation.test.mjs > native-qualification-results/checkpoint-paths.tap 2>&1
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: connector-workers-${{ matrix.os }}
+          path: native-qualification-results/
+
+  package:
+    name: Package the exact candidate once
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.digest.outputs.sha }}
+    env:
+      NATIVE_EVENT: ${{ github.event_name }}
+      NATIVE_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
+      NATIVE_NEW_ORIGIN: ${{ inputs.new_candidate_origin || 'false' }}
+      REUSE_RUN: ${{ inputs.candidate_run }}
+      REUSE_NAME: ${{ inputs.candidate_name }}
+      REUSE_SHA: ${{ inputs.candidate_sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select the declared archive origin for qualification
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),e=process.env;
+          const requested=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA].some(Boolean),newOrigin=e.NATIVE_NEW_ORIGIN==='true';
+          if(e.NATIVE_VSIX_MODE==='public'){
+            if(requested||newOrigin)throw Error('Public reproduction uses its published release, not candidate-origin inputs');
+            process.exit(0);
+          }
+          if(newOrigin&&(e.NATIVE_EVENT!=='workflow_dispatch'||requested))throw Error('A new candidate origin requires an explicit manual run without archive-reuse inputs');
+          if(JSON.parse(fs.readFileSync('package.json')).version==='1.0.1'&&!requested&&!newOrigin){
+            // Product commit 53d22da767664e1072bdfa576dd13bbfa05b7dc5, tree 6218e2ce0d8d590f3e825cc1f89f97ed8585f96d.
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38036054665\nREUSE_NAME=native-candidate-53d22da767664e1072bdfa576dd13bbfa05b7dc5\nREUSE_SHA=e68a9264c301292568edbae21b7165f893bbeec59097233676d9de3983ba21b3\n');
+            console.log('Release 1.0.1 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
+          }
+          NODE
+      - name: Validate optional exact-archive reuse
+        if: env.NATIVE_VSIX_MODE != 'public'
+        run: |
+          node -e "const e=process.env,v=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA];if(v.some(Boolean)&&(!/^\d+$/.test(e.REUSE_RUN)||!/^native-candidate-[a-f0-9]{40}$/.test(e.REUSE_NAME)||! /^[a-f0-9]{64}$/.test(e.REUSE_SHA)))throw Error('Supply the original run, artifact name and full SHA256 together')"
+      - name: Download the immutable candidate for additional qualification
+        if: env.NATIVE_VSIX_MODE != 'public' && env.REUSE_RUN != ''
+        uses: actions/download-artifact@v7
+        with:
+          run-id: ${{ env.REUSE_RUN }}
+          name: ${{ env.REUSE_NAME }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@v7
+        if: env.NATIVE_VSIX_MODE != 'public'
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        if: env.NATIVE_VSIX_MODE != 'public' && env.REUSE_RUN == ''
+      - run: npm run package -- --out candidate.vsix
+        if: env.NATIVE_VSIX_MODE != 'public' && env.REUSE_RUN == ''
+      - name: Verify archive digest and unchanged production sources
+        if: env.NATIVE_VSIX_MODE != 'public' && env.REUSE_RUN != ''
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),cp=require('child_process'),crypto=require('crypto'),e=process.env;
+          const p=JSON.parse(fs.readFileSync('candidate.provenance.json'));
+          const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');
+          if(sha!==e.REUSE_SHA||p.sha256!==sha||p.version!==JSON.parse(fs.readFileSync('package.json')).version||
+            String(p.run)!==e.REUSE_RUN||p.commit!==e.REUSE_NAME.slice('native-candidate-'.length)||
+            !/^[a-f0-9]{40}$/.test(p.commit)||!/^[a-f0-9]{40}$/.test(p.tree))throw Error('Original archive origin/provenance/digest mismatch');
+          cp.execFileSync('git',['fetch','--depth=1','origin',p.commit]);
+          const tree=cp.execFileSync('git',['rev-parse',p.commit+'^{tree}'],{encoding:'utf8'}).trim();
+          if(p.tree!==tree)throw Error('Original archive tree does not match its Git commit');
+          const changed=cp.execFileSync('git',['diff','--name-only','-z',p.commit,'HEAD'],{encoding:'utf8'}).split('\0').filter(Boolean);
+          const forbidden=changed.filter(file=>!file.startsWith('test/')&&file!=='.github/workflows/native-vsix.yml');
+          if(forbidden.length)throw Error('Frozen release product/package inputs changed (including tsconfig and every non-qualification file): '+forbidden.join(', ')+'. Declare and qualify a new candidate origin explicitly.');
+          console.log('EXACT_VSIX_REUSED '+sha+' originalRun='+p.run+' originalCommit='+p.commit+' originalTree='+p.tree+' qualificationRevision='+e.GITHUB_SHA);
+          NODE
+      - id: digest
+        name: Record the shared package digest
+        if: env.NATIVE_VSIX_MODE != 'public'
+        run: |
+          node -e "const fs=require('fs'),crypto=require('crypto'),cp=require('child_process');const sha=crypto.createHash('sha256').update(fs.readFileSync('candidate.vsix')).digest('hex');fs.appendFileSync(process.env.GITHUB_OUTPUT,'sha='+sha+'\n');fs.writeFileSync('candidate.vsix.sha256',sha+'  candidate.vsix\n');if(!process.env.REUSE_RUN)fs.writeFileSync('candidate.provenance.json',JSON.stringify({sha256:sha,version:JSON.parse(fs.readFileSync('package.json')).version,commit:cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),tree:cp.execFileSync('git',['rev-parse','HEAD^{tree}'],{encoding:'utf8'}).trim(),packagedOnceOn:'Linux',run:process.env.GITHUB_RUN_ID},null,2))"
+      - uses: actions/upload-artifact@v7
+        if: env.NATIVE_VSIX_MODE != 'public'
+        with:
+          name: native-candidate-${{ github.sha }}
+          path: |
+            candidate.vsix
+            candidate.vsix.sha256
+            candidate.provenance.json
+          compression-level: 0
+
+  native-workflows:
+    if: github.event_name != 'workflow_dispatch' || inputs.stage != 'connector-workers'
+    needs: package
+    name: Native VSIX (${{ matrix.os }}, VS Code ${{ matrix.vscode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-stable' && '[{"os":"macos-15-intel","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows' && '[{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ (github.event_name != 'workflow_dispatch' || inputs.stage == 'full') && 180 || 150 }}
+    env:
+      PERFCHECKER_VSCODE_VERSION: ${{ matrix.vscode }}
+      PERFCHECKER_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
+      PERFCHECKER_NATIVE_CANDIDATE_SHA: ${{ needs.package.outputs.sha }}
+      PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
+      PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
+      PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'general' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name == 'workflow_dispatch' && inputs.core == 'candidate') && (inputs.core_commit || 'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642') || '' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name == 'workflow_dispatch' && inputs.core == 'candidate') && (inputs.core_tree || '00c133336911b8600d63a8d6c59ce1befc5ce690') || '' }}
+      PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
+      PERFCHECKER_TEST_JULIA: julia
+      JULIA_NUM_THREADS: '1'
+      JULIA_NUM_PRECOMPILE_TASKS: '1'
+      JULIA_NUM_GC_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      JULIA_PKG_PRECOMPILE_AUTO: '0'
+      PERFCHECKER_UUID: 00000000-0000-4000-8000-000000000001
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: julia-actions/setup-julia@v3
+        id: runner-julia
+        with:
+          version: ${{ github.event_name == 'workflow_dispatch' && inputs.backend_julia || '1' }}
+          arch: x64
+      - uses: julia-actions/setup-julia@v3
+        id: official-julia
+        with:
+          version: '1.12'
+          arch: x64
+      - name: Preserve separate runtimes for PerfChecker and official Julia integration
+        env:
+          RUNNER_JULIA_BINDIR: ${{ steps.runner-julia.outputs.julia-bindir }}
+          OFFICIAL_JULIA_BINDIR: ${{ steps.official-julia.outputs.julia-bindir }}
+        run: node -e "const fs=require('fs'),path=require('path'),exe=process.platform==='win32'?'julia.exe':'julia';fs.appendFileSync(process.env.GITHUB_ENV,'PERFCHECKER_TEST_JULIA='+path.join(process.env.RUNNER_JULIA_BINDIR,exe)+'\nPERFCHECKER_NATIVE_OFFICIAL_JULIA='+path.join(process.env.OFFICIAL_JULIA_BINDIR,exe)+'\n');fs.appendFileSync(process.env.GITHUB_PATH,process.env.RUNNER_JULIA_BINDIR+'\n')"
+      - run: npm ci
+      - name: Retrieve the same candidate bytes on every host
+        if: env.PERFCHECKER_VSIX_MODE == 'candidate'
+        uses: actions/download-artifact@v7
+        with:
+          name: native-candidate-${{ github.sha }}
+      - name: Add the browser protocol client (no browser installation)
+        run: npm install --no-save --ignore-scripts --package-lock=false playwright@1.62.1 @iarna/toml@2.2.5
+      - name: Install the disposable default-browser fixture runtime
+        if: runner.os == 'Linux' && matrix.vscode == 'stable' && (env.PERFCHECKER_NATIVE_STAGE == 'full' || env.PERFCHECKER_NATIVE_CASE_GROUP == 'mcp-pluto')
+        run: npx playwright install chromium
+      - name: Install screen capture tooling in the disposable Linux stable host
+        if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_VIDEO == '1'
+        timeout-minutes: 15
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version
+      - name: Install native colour-picker tools in the disposable Linux host
+        if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_STAGE == 'focused' && env.PERFCHECKER_NATIVE_CASE_GROUP == 'studio-color'
+        timeout-minutes: 15
+        run: |
+          if ! command -v xdotool >/dev/null 2>&1 || ! command -v xwd >/dev/null 2>&1 || ! command -v xwininfo >/dev/null 2>&1 || ! command -v convert >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends xdotool x11-apps x11-utils imagemagick
+          fi
+          xvfb-run -a xdotool version
+      - name: Run isolated native workflows on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" node test/run-public-vsix-host.mjs
+      - name: Run isolated native workflows on Windows
+        if: runner.os == 'Windows'
+        run: node test/run-public-vsix-host.mjs
+      - name: Run isolated native workflows on Intel macOS
+        if: runner.os == 'macOS'
+        run: node test/run-public-vsix-host.mjs
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-workflows-${{ matrix.os }}-${{ matrix.vscode }}
+          path: native-qualification-results/

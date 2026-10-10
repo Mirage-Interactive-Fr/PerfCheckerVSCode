@@ -23,7 +23,7 @@ test('explicit live command keeps multi-root quality and bundle separate from th
     await writeFile(path.join(bundle,'manifest.json'),JSON.stringify({
       schema_version:'perfchecker-run-bundle/1',state:'complete',
       environment:{quality_profile:'desktop-natif'}}));
-    const workspace = {isTrusted:true,workspaceFolders:[first,second],
+    const workspace = {onDidChangeWorkspaceFolders:()=>({dispose(){}}),onDidChangeConfiguration:()=>({dispose(){}}),isTrusted:true,workspaceFolders:[first,second],
       openTextDocument:async value=>value,
       getConfiguration: (_name,resource) => {scopes.push(resource.toString());return {
         get:(key,fallback) => ({runnerProject:'perf',juliaExecutable:'julia'})[key]??fallback,

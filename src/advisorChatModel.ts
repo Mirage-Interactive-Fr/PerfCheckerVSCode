@@ -21,10 +21,15 @@ export function prepareChatMessages(history: readonly ChatMessage[], question: u
   return {messages, omitted};
 }
 
-export function chatReply(input: unknown): string {
+export function chatReply(input: unknown, timeoutSeconds?: number): string {
   const report = parseInvestigation(input);
   const data = input as Record<string, unknown>;
   if (report.schema_version !== 'perfchecker-narrative/1') throw new Error('Unsupported chat response. Update the PerfChecker controller.');
+  if (report.status === 'timeout') {
+    const duration = Number.isFinite(timeoutSeconds) && timeoutSeconds! > 0 ? ` after ${timeoutSeconds} seconds` : '';
+    const diagnostic = String(data.message || data.error || 'Advisor worker timed out.');
+    throw new Error(`Global request timed out${duration} (including worker startup). PerfChecker did not apply changes to your project. Details: ${diagnostic}`);
+  }
   if (report.status !== 'complete') throw new Error(String(data.message || data.error || `Advisor request ${report.status ?? 'failed'}. Check the connection and controller version.`));
   if (data.authority !== 'unverified_narrative' || data.reference_status !== 'unstructured_not_verified' ||
       typeof report.external_review !== 'string' || !report.external_review.trim()) throw new Error('Invalid MCP chat response.');

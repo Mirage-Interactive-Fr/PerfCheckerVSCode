@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import path from 'node:path';
 
 const require = createRequire(import.meta.url), original = Module._load;
-const {CodexConnector} = require('../dist/codexConnector.js');
+const {CodexConnector, shutdownCodexPreflights} = require('../dist/codexConnector.js');
 const {localAdvisorConnection} = require('../dist/advisorConnection.js');
 const deferred = () => {let resolve; const promise = new Promise(r => {resolve = r;}); return {promise, resolve};};
 let gate, ready, connector, folderChanged;
@@ -22,7 +22,7 @@ class DelayedConnector extends CodexConnector {
 Module._load = function(name, ...args) {
   if (name === 'vscode') return vscode;
   // Only CLI preflight is replaced; startup, token lifetime and HTTP disposal are real.
-  if (name === './codexConnector') return {CodexConnector: DelayedConnector, inspectCodex: async () => 'qualified fixture CLI'};
+  if (name === './codexConnector') return {CodexConnector: DelayedConnector, inspectCodex: async () => 'qualified fixture CLI', shutdownCodexPreflights};
   return original.call(this, name, ...args);
 };
 let registerCodexConnections, shutdownCodexConnections;
@@ -61,3 +61,31 @@ for (const mode of ['removed', 'removed then reopened', 'replaced', 'trust revok
     }
   });
 }
+
+
+test('extension shutdown reports failed cleanup and retains the live endpoint and disconnect handle for retry', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'perfchecker-codex-shutdown-'));
+  const folder = {uri: {scheme: 'file', fsPath: root, toString: () => `file://${root}`}}, key = folder.uri.toString();
+  const context = {subscriptions: []}; gate = deferred(); ready = deferred(); gate.resolve();
+  vscode.workspace.workspaceFolders = [folder]; vscode.workspace.isTrusted = true;
+  registerCodexConnections(context, () => false, () => {});
+  await commands.get('perfchecker.connectCodex')();
+  const live = connector, dispose = live.dispose.bind(live); let fail = true, attempts = 0;
+  live.dispose = async () => {attempts++; if (fail) throw new Error('Controlled physical cleanup unavailable'); await dispose();};
+  try {
+    await assert.rejects(shutdownCodexConnections(), error => {
+      assert(error instanceof AggregateError); assert.match(error.message, /cleanup is incomplete/);
+      assert(error.errors.some(cause => /Controlled physical cleanup unavailable/.test(String(cause)))); return true;
+    });
+    assert.equal(localAdvisorConnection(key)?.kind, 'codex');
+    assert.equal(process.env[live.keyEnvironment], live.token);
+    assert.equal((await fetch(live.endpoint, {method: 'POST'})).status, 401, 'No false extinction while cleanup is rejected');
+    fail = false; await shutdownCodexConnections();
+    assert.equal(attempts, 2); assert.equal(localAdvisorConnection(key), undefined);
+    assert.equal(process.env[live.keyEnvironment], undefined); await assert.rejects(fetch(live.endpoint));
+  } finally {
+    fail = false; await shutdownCodexConnections();
+    for (const subscription of context.subscriptions) subscription.dispose();
+    await shutdownCodexConnections(); await rm(root, {recursive: true, force: true});
+  }
+});

@@ -1,0 +1,19 @@
+{
+  "name": "perfchecker-qualification-host",
+  "displayName": "PerfChecker native qualification host",
+  "publisher": "perfchecker-tests",
+  "version": "0.0.0",
+  "private": true,
+  "main": "./activate.cjs",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  }
+}

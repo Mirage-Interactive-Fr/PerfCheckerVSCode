@@ -7,6 +7,57 @@ import {mkdtemp,mkdir,writeFile,readFile,rm,access} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 
+test('saved diagnostic cards retain reported values and read-only boundaries at 360px', {
+  skip: !process.env.PERFCHECKER_BROWSER_TESTS,
+}, async()=>{
+  const require=createRequire(import.meta.url),{chromium}=require(process.env.PERFCHECKER_PLAYWRIGHT||'playwright');
+  const browser=await chromium.launch({headless:true,args:['--no-sandbox'],...(process.env.PERFCHECKER_BROWSER?{executablePath:process.env.PERFCHECKER_BROWSER}:{})});
+  try{
+    const page=await browser.newPage({viewport:{width:360,height:640}}),errors=[];
+    page.on('pageerror',error=>errors.push(error.message));
+    await page.addInitScript(()=>{
+      window.messages=[];window.acquireVsCodeApi=()=>({getState:()=>undefined,setState(){},postMessage:message=>window.messages.push(message)});
+    });
+    await page.route('http://perfchecker.test/**',async route=>{
+      const filename=new URL(route.request().url()).pathname.slice(1);
+      if(['investigation.css','investigation.js'].includes(filename))return route.fulfill({body:await readFile(path.resolve('media',filename)),contentType:filename.endsWith('.css')?'text/css':'application/javascript'});
+      return route.fulfill({contentType:'text/html',body:`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src http://perfchecker.test; script-src 'nonce-fixture';"><link rel="stylesheet" href="/investigation.css"></head><body><div id="app"></div><script nonce="fixture" src="/investigation.js"></script></body></html>`});
+    });
+    await page.goto('http://perfchecker.test/');
+    const base={scenario:'oxygen-heap',implementation:'oxygen',status:'complete',correctness:'passed',quality:'not_checked',performance:'not_compared',summary:'',
+      findings:[{rule_id:'fixture',message:'<img src=x onerror=alert(1)>',location:{file:'/untrusted/source.jl',line:1}}],
+      artifacts:[{kind:'unsafe-source',path:'/untrusted/artifact'}],measurement_scope:'Full lifecycle including preparation, operation, verification and cleanup.',
+      limitations:['Reported values are not independently verified.'],configuration:{project:'/recorded/oxygen-1.10.2'}};
+    const latency={...base,tool:'latency',measurements:{load_seconds:7.331050373,first_case_seconds:0.822117922,warm_case_seconds:0.000143314}};
+    const memory={...base,tool:'memory',measurements:{samples:Array.from({length:5},()=>({state_before_bytes:1304,state_after_bytes:2294,state_and_result_bytes:2310}))}};
+    const importedDiagnostic={path:'/external/long-directory-name/another-very-long-directory-name/saved-diagnosis.json',sha256:'a'.repeat(64),loadedAt:'2026-10-10T00:00:00Z'};
+    const state={type:'state',report:{schema_version:'perfchecker-diagnosis/1',records:[latency,memory],cards:{ignored:'not a narrative report'}},history:[],importedDiagnostic,busy:false};
+    await page.evaluate(state=>window.dispatchEvent(new MessageEvent('message',{data:state})),state);
+    assert.match(await page.locator('.imported-diagnostic').innerText(),/not measured or independently verified/);
+    assert.match(await page.locator('.imported-diagnostic').innerText(),/does not certify their origin/);
+    assert.deepEqual(await page.locator('.diagnostic-values dd').allTextContents(),['7.331050373 s','0.822117922 s','0.000143314 s']);
+    assert.equal(await page.locator('.diagnostic-memory tbody tr').count(),5);
+    assert.deepEqual(await page.locator('.diagnostic-memory tbody tr').evaluateAll(rows=>rows.map(row=>[...row.cells].map(cell=>cell.textContent))),
+      Array.from({length:5},(_,index)=>[String(index+1),'1304','2294','2310']));
+    assert.match(await page.locator('.diagnostic-memory caption').innerText(),/not total allocations or process RSS/);
+    assert.equal(await page.getByRole('button',{name:'Advise from saved evidence',exact:true}).isDisabled(),true);
+    assert.equal(await page.getByRole('button',{name:'Explain with configured model',exact:true}).isDisabled(),true);
+    assert.equal(await page.getByRole('button',{name:'Open unsafe-source',exact:true}).count(),0);
+    assert.equal(await page.getByRole('button',{name:'/untrusted/source.jl:1',exact:true}).count(),0);
+    assert.equal(await page.locator('#app img').count(),0,'Imported strings render as text, never markup');
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'Long snapshot identity and exact numeric values stay within the portrait viewport');
+    await page.getByRole('button',{name:'Open imported JSON snapshot',exact:true}).click();
+    await page.getByRole('button',{name:'Open saved diagnostic report',exact:true}).click();
+    assert.deepEqual(await page.evaluate(()=>window.messages.slice(-2)),[{type:'importedJson'},{type:'importDiagnostic'}]);
+    const unavailable={scenario:'missing-tool',implementation:'baseline',tool:'latency',status:'unavailable',message:'Analyzer unavailable; no measurements collected'};
+    await page.evaluate(state=>window.dispatchEvent(new MessageEvent('message',{data:state})),{...state,report:{schema_version:'perfchecker-diagnosis/1',records:[unavailable]},importedDiagnostic:{...importedDiagnostic,sha256:'b'.repeat(64)}});
+    assert.match(await page.locator('article.card').innerText(),/Availability: unavailable/);
+    assert.equal(await page.locator('.diagnostic-values,.diagnostic-memory').count(),0);
+    assert.equal(await page.locator('article.card').getByText('Recorded project:',{exact:true}).count(),0,'No version or project identity is inferred from the snapshot filename');
+    assert.deepEqual(errors,[]);
+  }finally{await browser.close();}
+});
+
 // Opt in with an installed Playwright and browser; the extension has no browser runtime dependency.
 test('real webviews preserve full selection, handle Git targets and render interactive plots under their CSP',{
   skip: !process.env.PERFCHECKER_BROWSER_TESTS,
@@ -17,7 +68,8 @@ test('real webviews preserve full selection, handle Git targets and render inter
   const root=path.join(temporary,'workspace'),reports=path.join(root,'perf','results','vscode');
   const uri=fsPath=>({scheme:'file',fsPath,toString:()=>`file://${fsPath}`});
   const folder={name:'Example',uri:uri(root)};
-  const commands=new Map(),panels=[];
+  const commands=new Map(),panels=[],spawned=[],advisorSettings={};
+  let heldPlan;
   const disposable=()=>({dispose(){}});
   const items=()=>({add(){},replace(){},forEach(){}});
   const backends=['benchmark','chairmark','alloc','profile_alloc','profile','wall_profile','network','network_interface','network_isolated'];
@@ -29,26 +81,31 @@ test('real webviews preserve full selection, handle Git targets and render inter
   const plan={schema_version:'perfchecker-suite-plan/1',suite:'Example',description:'Performance explorer',profile:'quick',plan_revision:'fixture',runs};
   const vscode={EventEmitter:class{event=()=>disposable();fire(){}dispose(){}},Uri:{file:uri,joinPath:(value,...parts)=>uri(path.join(value.fsPath,...parts))},
     TestTag:class{constructor(id){this.id=id;}},TestRunProfileKind:{Run:1},ProgressLocation:{Window:1,Notification:2},ViewColumn:{One:1},
-    workspace:{isTrusted:true,workspaceFolders:[folder],getConfiguration:()=>({get:(key,fallback)=>({juliaExecutable:'julia',runnerProject:'perf',suite:'perf/suite.jl',
-      factory:'build_suite',profile:'quick',reports:'perf/results/vscode',uiConfiguration:'perf/perfchecker-ui.json'})[key]??fallback,inspect:()=>undefined}),
-      textDocuments:[],getWorkspaceFolder:()=>folder},
+    workspace:{onDidChangeWorkspaceFolders:()=>disposable(),onDidChangeConfiguration:()=>disposable(),isTrusted:true,workspaceFolders:[folder],getConfiguration:()=>({get:(key,fallback)=>({juliaExecutable:'julia',runnerProject:'perf',suite:'perf/suite.jl',
+      factory:'build_suite',profile:'quick',reports:'perf/results/vscode',uiConfiguration:'perf/perfchecker-ui.json',...advisorSettings})[key]??fallback,inspect:()=>undefined,
+      update:()=>{throw new Error('Opening a connection form must not write settings.');}}),
+      textDocuments:[],getWorkspaceFolder:()=>folder,asRelativePath:value=>path.relative(root,value)},
     window:{onDidCloseTerminal:()=>disposable(),onDidChangeActiveTextEditor:()=>disposable(),
       createOutputChannel:()=>({...disposable(),show(){},append(){},appendLine(){}}),
       createTreeView:()=>({...disposable(),onDidChangeCheckboxState:()=>disposable()}),
-      withProgress:(_options,callback)=>callback({report(){}}),showErrorMessage:()=>undefined,
+      withProgress:(_options,callback)=>callback({report(){}}),showErrorMessage:()=>undefined,showInformationMessage:()=>undefined,
       createWebviewPanel:(type,title,column,options)=>{
         const panel={type,title,column,options,messages:[],webview:{cspSource:'http://perfchecker.test',asWebviewUri:value=>`http://perfchecker.test/media/${path.basename(value.fsPath)}`,
           onDidReceiveMessage:callback=>{panel.receive=callback;return disposable();},postMessage:async message=>panel.messages.push(message)},onDidDispose:callback=>{panel.close=callback;return disposable();},reveal(){},dispose(){this.disposed=true;this.close?.();}};
         panels.push(panel);return panel;
       }},
     tests:{createTestController:()=>({...disposable(),items:items(),createRunProfile(){},createTestItem:(id,label)=>({id,label,children:items()})})},
-    commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();}},
+    commands:{registerCommand:(name,callback)=>{commands.set(name,callback);return disposable();},executeCommand:async(name,...args)=>{
+      assert(commands.has(name),`Unexpected command: ${name}`);return commands.get(name)(...args);
+    }},
     extensions:{getExtension:()=>undefined},
   };
   const spawn=(_executable,args)=>{
+    spawned.push(args);
     const child=new EventEmitter();child.stdout=new PassThrough();child.stderr=new PassThrough();
     void(async()=>{
       await new Promise(resolve=>setImmediate(resolve));
+      if(heldPlan&&args.includes('plan')){const held=heldPlan;heldPlan=undefined;held.started();await held.finished;}
       const destination=args.find(arg=>arg.startsWith('--output='));
       if(destination)await writeFile(destination.slice(9),JSON.stringify(plan));
       child.stdout.end();child.stderr.end();child.emit('close',0);
@@ -61,21 +118,44 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await writeFile(path.join(reports,'suite-result.json'),JSON.stringify({schema_version:'perfchecker-suite-result/1',suite:'Example',profile:'quick',finished_at:'2026-10-03',runs:runs.map(run=>({...run,status:'pass',elapsed_seconds:.02,summary:{median_time:120,memory_bytes:64},message:''}))}));
     const overlay={kind:'normalized_metrics',title:'Time and allocations',description:'Minimum of each metric = 1',options:{package:'Example',feature:'sort',workload:'sort',collector:'benchmarktools-v1',versions:['1.0.0','1.1.0'],reference_version:'minimum'},
       data:['julia.wall.time','julia.alloc.bytes'].flatMap(metric=>[{version:'1.0.0',metric,value:20,unit:'ns',ratio:2,normalization_status:'ratio'},{version:'1.1.0',metric,value:10,unit:'ns',ratio:1,normalization_status:'ratio'}])};
-    await writeFile(path.join(reports,'version-series.json'),JSON.stringify({schema_version:'perfchecker-version-series/1',series:[{package:'Example',feature:'sort',workload:'sort',metric:'julia.wall.time',unit:'ns',measurement_definition:'julia.wall.time/benchmarktools-v1',points:[{version:'1.0.0',median:20,samples:10},{version:'1.1.0',median:10,samples:10}]}],plots:[overlay]}));
+    // Nine synthetic versions qualify the real viewer's controls; these are not measured media data.
+    const versionFixture=Array.from({length:9},(_,index)=>String(index+1).repeat(40));
+    versionFixture[8]='<img src=x onerror=alert(1)>';
+    const metricFixture=['julia.wall.time','julia.<script>alert(1)</script>'];
+    const interactive={...overlay,title:'Nine-version control fixture',options:{...overlay.options,versions:versionFixture},
+      data:metricFixture.flatMap((metric,metricIndex)=>versionFixture.map((version,index)=>({version,metric,value:index+1,unit:'ns',ratio:metricIndex===1&&index===4?null:index+1,normalization_status:metricIndex===1&&index===4?'unavailable':'ratio'})))};
+    await writeFile(path.join(reports,'version-series.json'),JSON.stringify({schema_version:'perfchecker-version-series/1',series:[{package:'Example',feature:'sort',workload:'sort',metric:'julia.wall.time',unit:'ns',measurement_definition:'julia.wall.time/benchmarktools-v1',points:[{version:'1.0.0',median:20,samples:10},{version:'1.1.0',median:10,samples:10}]}],plots:[overlay,interactive]}));
     const base={record_type:'observation',case_id:'sort|with-pipe',target_id:'1.0.0',attributes:{package:'Example',feature:'sort',workload:'sort',version:'1.0.0'}};
-    const observations=[...[10,11,12,20].map(value=>({...base,metric:'julia.wall.time',measurement_definition:'julia.wall.time/benchmarktools-v1',unit:'ns',value})),
+    const numeric=(value,extra={})=>({...base,comparison_key:'sort/v1',metric:'julia.wall.time',measurement_definition:'julia.wall.time/benchmarktools-v1',unit:'ns',value,...extra});
+    const observations=[...[10,11,12,20].map(value=>numeric(value)),
+      ...[20,30,40,...Array(321).fill(25)].map(value=>numeric(value,{case_id:'sort|compatible-variant',target_id:'1.1.0',attributes:{...base.attributes,version:'1.1.0'}})),
+      ...[20,200].map(value=>numeric(value,{comparison_key:'different-implementation'})),
+      ...[20,100].map(value=>numeric(value,{measurement_definition:'julia.wall.time/chairmarks-v1'})),
+      ...[20,50].map(value=>numeric(value,{metric:'other.metric'})),
+      ...[20,60].map(value=>numeric(value,{unit:'s'})),
+      // Sixty qualification samples exercise mobile exploration in the real viewer;
+      // they are synthetic controls data, never a claimed Oxygen measurement.
+      ...Array.from({length:30},(_,index)=>numeric(index===29?98:10+index/10,{case_id:'mobile-baseline',comparison_key:'mobile/plain/v1'})),
+      ...Array.from({length:30},(_,index)=>numeric(index===29?81:8+index/5,{case_id:'mobile-candidate',comparison_key:'mobile/plain/v1',target_id:'1.1.0',attributes:{...base.attributes,version:'1.1.0'}})),
+      ...[0,0].map(value=>numeric(value,{case_id:'constant-zero',comparison_key:'constant-zero',metric:'julia.gc.time'})),
+      numeric(7,{case_id:'single-point',comparison_key:'single-point'}),
+      ...[...Array.from({length:10000},(_,index)=>index),1e9].map(value=>numeric(value,{comparison_key:'huge-separate-series'})),
       {...base,metric:'julia.alloc.bytes',measurement_definition:'julia.alloc.bytes/profile-allocs-v1',unit:'By',value:64,attributes:{...base.attributes,source_file:'sort.jl',source_line:12,stack:['sort','allocate']}},
       {...base,metric:'julia.cpu.samples',measurement_definition:'julia.cpu.samples/profile-v1',unit:'1',value:3,attributes:{...base.attributes,stack:['sort','partition'],runtime_dispatch:[false,true]}},
     ];
     await mkdir(path.join(reports,'bundles','run-fixture'),{recursive:true});
-    await writeFile(path.join(reports,'bundles','run-fixture','observations.jsonl'),observations.map(value=>JSON.stringify(value)).join('\n'));
-    const original=Module._load;Module._load=function(name,...args){return name==='vscode'?vscode:name==='./investigation'?{registerInvestigations(){}}:name==='./testitems'?{registerNativeTestItems(){}}:name==='node:child_process'?{spawn}:original.call(this,name,...args);};
+    const observationFile=path.join(reports,'bundles','run-fixture','observations.jsonl'),observationBytes=observations.map(value=>JSON.stringify(value)).join('\n');
+    await writeFile(observationFile,observationBytes);
+    const original=Module._load;Module._load=function(name,...args){return name==='vscode'?vscode:name==='./investigation'?{registerInvestigations(context){
+      require('../dist/advisorSetup.js').registerAdvisorSetup(context);
+      require('../dist/mcpStdioIntegration.js').registerMcpStdioConnections(context,()=>false,()=>{});
+    }}:name==='./testitems'?{registerNativeTestItems(){}}:name==='node:child_process'?{...original.call(this,name,...args),spawn}:original.call(this,name,...args);};
     try{require('../dist/extension.js').activate({subscriptions:[],extensionUri:uri(path.resolve('.')),globalStorageUri:uri(path.join(temporary,'storage'))});}finally{Module._load=original;}
     await commands.get('perfchecker.openDesignerForWorkspace')(folder.uri);
     await commands.get('perfchecker.openOutput')();
     await commands.get('perfchecker.openStudioForWorkspace')(folder.uri);
     browser=await chromium.launch({...(process.env.PERFCHECKER_BROWSER ? {executablePath:process.env.PERFCHECKER_BROWSER} : {}),headless:true,args:['--no-sandbox']});
-    const page=await browser.newPage({viewport:{width:1440,height:1100}}),errors=[];
+    const page=await browser.newPage({viewport:{width:1440,height:1100},hasTouch:true}),errors=[];
     page.on('pageerror',error=>errors.push(error.message));page.on('console',message=>{if(message.type()==='error')errors.push(message.text());});
     await page.addInitScript(()=>{
       window.messages=[];window.acquireVsCodeApi=()=>({postMessage:message=>window.messages.push(message)});
@@ -96,12 +176,19 @@ test('real webviews preserve full selection, handle Git targets and render inter
       const name=path.basename(pathname);const contentType=name.endsWith('.js')?'application/javascript':name.endsWith('.css')?'text/css':'image/png';
       await route.fulfill({contentType,body:await readFile(path.resolve('media',name))});
     });
-    const load=async type=>{html=panels.find(panel=>panel.type===type).webview.html;await page.goto('http://perfchecker.test/view');};
+    const load=async type=>{html=panels.findLast(panel=>panel.type===type&&!panel.disposed).webview.html;await page.goto('http://perfchecker.test/view');};
     const send=message=>page.evaluate(value=>{
       if(value.type==='targetOptions' && value.requestId===undefined)value.requestId=window.messages.findLast(item=>item.type==='discoverTargets').requestId;
       window.dispatchEvent(new MessageEvent('message',{data:value}));
     },message);
-    await load('perfchecker.designer');await send({type:'plan',workspace:folder.uri.toString(),plan});
+    const designer=panels.find(panel=>panel.type==='perfchecker.designer');
+    const hydrateDesigner=async()=>{
+      const requests=await page.evaluate(()=>window.messages.filter(message=>message.type==='designerReady'));
+      assert.equal(requests.length,1,'Each real document load requests its own current host state');
+      designer.messages.length=0;await designer.receive(requests[0]);
+      for(const message of designer.messages)await send(message);
+    };
+    await load('perfchecker.designer');await hydrateDesigner();
     await page.waitForFunction(()=>document.querySelectorAll('.check-type').length===9);
     assert.equal(await page.locator('#cards .card').count(),3);
     assert.match(await page.locator('#count').innerText(),/27 selected/);
@@ -149,16 +236,188 @@ test('real webviews preserve full selection, handle Git targets and render inter
     assert.deepEqual(comparison.comparisons[0].baselines,['1.0.0','1.1.0']);assert.deepEqual(comparison.comparisons[0].candidates,['dev@fast-sort']);
     await page.locator('#baseline-targets input[value="dev@fast-sort"]').check();await page.locator('#add-comparison').click();assert.match(await page.locator('#comparison-error').innerText(),/different targets/);
     await send({type:'designerBusy',busy:true});assert.equal(await page.locator('#run').isDisabled(),true);await send({type:'designerBusy',busy:false});
+    await page.locator('#reset-filters').click();
+    await page.locator('#cards .card').first().locator('input.label').fill('#1266aa');
+    await page.locator('#save').click();
+    const savedMessage=await page.evaluate(()=>window.messages.findLast(message=>message.type==='save'));
+    await designer.receive(savedMessage);
+    const savedConfiguration=JSON.parse(await readFile(path.join(root,'perf','perfchecker-ui.json'),'utf8'));
+    assert.equal(savedConfiguration.selection.run_ids.length,26);
+    assert(Object.values(savedConfiguration.selection.labels).includes('#1266aa'));
+    const beforeReload=spawned.length;
+    await page.reload();await hydrateDesigner();
+    assert.equal(spawned.length,beforeReload,'Reload requests the cached plan without another Julia worker');
+    await page.locator('#save').click();
+    assert.deepEqual((await page.evaluate(()=>window.messages.findLast(message=>message.type==='save'))).configuration.selection,
+      savedConfiguration.selection,'A real page reload restores exact saved labels, selected IDs and order');
+    let planStarted,releasePlan;
+    const started=new Promise(resolve=>{planStarted=resolve;});
+    heldPlan={started:planStarted,finished:new Promise(resolve=>{releasePlan=resolve;})};
+    const refreshing=designer.receive({type:'refresh'});await started;
+    const beforeBusyReload=spawned.length;
+    try{
+      await page.reload();await hydrateDesigner();
+      assert.equal(spawned.length,beforeBusyReload,'Reload during an existing action starts no extra worker');
+      assert.equal(await page.locator('#run').isDisabled(),true,'Reload reflects the current host busy state');
+    }finally{releasePlan();await refreshing;}
+    await send(designer.messages.findLast(message=>message.type==='designerBusy'));
+    assert.equal(await page.locator('#run').isDisabled(),false);
     if(process.env.PERFCHECKER_QA_DIR){await mkdir(process.env.PERFCHECKER_QA_DIR,{recursive:true});await page.screenshot({path:path.join(process.env.PERFCHECKER_QA_DIR,'designer.png'),fullPage:true});}
+    const mixedLabels=['baseline','0.5.0','dev@0.1.0','4eec7f3','0.5.0-rc.2','0.5.0-rc.10','v0.5.0','0.5.0+build.7','dev'];
+    const expectedVersions=['dev@0.1.0','0.5.0-rc.2','0.5.0-rc.10','0.5.0','0.5.0+build.7','v0.5.0','4eec7f3','baseline','dev'];
+    const mixedRuns=mixedLabels.map((version,index)=>({...runs[0],id:`mixed-${index}`,version,
+      target_kind:/^v?0\.5\./.test(version)?'release':'git'}));
+    let permutation=0;
+    for(const first of ['baseline','0.5.0','dev@0.1.0'])for(const second of ['baseline','0.5.0','dev@0.1.0'].filter(value=>value!==first)){
+      const third=['baseline','0.5.0','dev@0.1.0'].find(value=>value!==first&&value!==second);
+      const versions=[first,second,third,...mixedLabels.filter(value=>![first,second,third].includes(value))];
+      await send({type:'plan',workspace:`mixed-version-order-${permutation++}`,plan:{...plan,runs:versions.map(version=>mixedRuns.find(run=>run.version===version))}});
+      await page.locator('#reset-filters').click();await page.locator('#sort').selectOption('version');
+      await page.waitForFunction(expected=>JSON.stringify([...document.querySelectorAll('#cards .card .version')].map(node=>node.textContent))===JSON.stringify(expected),expectedVersions);
+      assert.deepEqual(await page.locator('#cards .card').evaluateAll(nodes=>nodes.map(node=>node.dataset.id)),
+        expectedVersions.map(version=>mixedRuns.find(run=>run.version===version).id));
+      assert.deepEqual(await page.locator('#target-filter option').evaluateAll(nodes=>nodes.map(node=>node.value)),['',...expectedVersions]);
+      assert.deepEqual(await page.locator('#versions option').evaluateAll(nodes=>nodes.map(node=>node.value)),expectedVersions);
+      assert.match(await page.locator('#count').innerText(),/9 selected · 9\/9 visible/);
+    }
+    await page.locator('#from').fill('0.5.0-rc.10');await page.locator('#to').fill('0.5.0');
+    const bounded=expectedVersions.filter(version=>version!=='0.5.0-rc.2');
+    await page.waitForFunction(expected=>JSON.stringify([...document.querySelectorAll('#cards .card .version')].map(node=>node.textContent))===JSON.stringify(expected),bounded);
+    assert.match(await page.locator('#count').innerText(),/9 selected · 8\/9 visible · 1 selected outside filters/);
+    await page.locator('#from').fill('0.5.0');await page.locator('#to').fill('0.5.0');
+    const exactBounded=expectedVersions.filter(version=>!version.includes('-rc.'));
+    await page.waitForFunction(expected=>JSON.stringify([...document.querySelectorAll('#cards .card .version')].map(node=>node.textContent))===JSON.stringify(expected),exactBounded);
+    assert.match(await page.locator('#count').innerText(),/9 selected · 7\/9 visible · 2 selected outside filters/);
+    await page.locator('#target-filter').selectOption('4eec7f3');
+    await page.waitForFunction(()=>document.querySelectorAll('#cards .card').length===1);
+    assert.deepEqual(await page.locator('#cards .card .version').allTextContents(),['4eec7f3']);
+    assert.match(await page.locator('#count').innerText(),/9 selected · 1\/9 visible · 8 selected outside filters/);
+    await page.locator('#reset-filters').click();
+    assert.deepEqual(await page.locator('#cards .card .version').allTextContents(),expectedVersions);
+    assert.match(await page.locator('#count').innerText(),/9 selected · 9\/9 visible/);
     const large={...plan,runs:Array.from({length:1000},(_,index)=>({...runs[0],id:`large-${index}`,feature:`work-${index}`,workload:`work-${index}`}))};
     await send({type:'plan',workspace:'new-workspace',plan:large});await page.locator('#reset-filters').click();
     assert.equal(await page.locator('#cards .card').count(),120);await page.locator('#clear-all').click();assert.equal(await page.locator('#run').isDisabled(),true);
     await page.locator('#select-visible').click();assert.match(await page.locator('#count').innerText(),/1000 selected/);await page.locator('#show-more').click();assert.equal(await page.locator('#cards .card').count(),240);
+    await page.locator('#sort').selectOption('suite');
+    const dragIds=await page.locator('#cards .card').evaluateAll(cards=>cards.slice(0,3).map(card=>card.dataset.id));
+    await page.locator('#cards').evaluate(element=>{
+      element.nativeDragEvents=[];
+      for(const type of ['dragstart','dragover','drop'])element.addEventListener(type,event=>element.nativeDragEvents.push({type,id:event.target.closest('.card')?.dataset.id}));
+    });
+    await page.locator('#cards .card').first().locator('.feature-heading strong').dragTo(page.locator('#cards .card').nth(2).locator('.feature-heading strong'));
+    const nativeDragEvents=await page.locator('#cards').evaluate(element=>element.nativeDragEvents);
+    assert(nativeDragEvents.some(event=>event.type==='dragstart'),'A real pointer gesture starts the draggable card');
+    assert(nativeDragEvents.some(event=>event.type==='drop'),'The browser delivers a real drop to the destination card');
+    await page.locator('#save').click();
+    const dragConfiguration=await page.evaluate(()=>window.messages.findLast(message=>message.type==='save').configuration);
+    assert.deepEqual(dragConfiguration.selection.run_ids.slice(0,3),[dragIds[1],dragIds[0],dragIds[2]],'The saved order reflects the real browser drop');
+    assert.equal(dragConfiguration.selection.run_ids.length,1000);
     await page.setViewportSize({width:420,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
-    await load('perfchecker.output');assert.equal(await page.locator('.distribution .sample').count(),4);assert.equal(await page.locator('.pie-slice').count(),1);
+    await load('perfchecker.output');assert.equal(await page.locator('.distribution .sample').count(),911);assert.equal(await page.locator('.pie-slice').count(),1);
     assert.equal(await page.locator('.pie-slice').getAttribute('fill'),'#4f8cff');assert.match(await page.locator('.pie-slice').getAttribute('d'),/A82 82 0 1 1 100 182/);
     await page.locator('.pie-slice').focus();assert.match(await page.locator('#allocation-0').innerText(),/64 B · 100.00%/);
-    assert.equal(await page.locator('.normalized-chart .hover-value').count(),4);await page.locator('.normalized-chart .hover-value').first().focus();assert.match(await page.locator('#normalized-0').innerText(),/ratio 2/);
+    const charts=page.locator('.normalized-plot'),firstChart=charts.nth(0),chart=charts.nth(1);
+    assert.equal(await firstChart.locator('.hover-value').count(),4);await firstChart.locator('.hover-value').first().focus();assert.match(await page.locator('#normalized-0').innerText(),/ratio 2/);
+    assert.equal(await chart.locator('.hover-value').count(),17);assert.equal(await chart.locator('img,script').count(),0);
+    assert.equal(await chart.locator('.normalized-labels text').first().getAttribute('aria-label'),versionFixture[0]);
+    assert.match(await chart.locator('.normalized-labels text').first().textContent(),/1111111$/);
+    const point=chart.locator('[data-metric="0"][data-version="'+versionFixture[2]+'"]');
+    const originalY=await point.getAttribute('cy');
+    await chart.locator('[data-normalized-from]').selectOption('2');await chart.locator('[data-normalized-to]').selectOption('6');
+    assert.equal(await chart.locator('.hover-value').count(),9);assert.equal(await point.getAttribute('cy'),originalY,'Filtering never renormalizes or changes Y');
+    assert.equal(await chart.locator('.normalized-series path').count(),3,'The missing ratio still splits its metric into two paths');
+    assert.match(await point.getAttribute('data-detail'),/ratio 3/);
+    assert.equal(await firstChart.locator('.hover-value').count(),4,'Each chart has independent controls');
+    await point.focus();await chart.locator('[data-normalized-metric="0"]').uncheck();
+    assert.match(await chart.locator('.plot-detail').innerText(),/^Hover or focus/,'Hiding the inspected metric clears stale detail');
+    assert.equal(await chart.locator('.hover-value').count(),4);
+    // A redraw with point focus retains focus when possible and falls back to its metric control otherwise.
+    await chart.locator('[data-metric="1"]').first().focus();
+    await chart.locator('[data-normalized-to]').evaluate(control=>{control.value='5';control.dispatchEvent(new Event('change',{bubbles:true}));});
+    assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('data-metric')),'1');
+    await chart.locator('[data-normalized-from]').evaluate(control=>{control.value='5';control.dispatchEvent(new Event('change',{bubbles:true}));});
+    assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('data-normalized-metric')),'1');
+    assert.equal(await chart.locator('.normalized-chart .hover-value').first().getAttribute('cx'),'465','A single selected version is centered');
+    await chart.locator('[data-normalized-reset]').click();
+    assert.equal(await chart.locator('.hover-value').count(),17);assert.equal(await chart.locator('[data-normalized-from]').inputValue(),'0');assert.equal(await chart.locator('[data-normalized-to]').inputValue(),'8');
+    assert.match(await chart.locator('.plot-detail').innerText(),/^Hover or focus/);
+    assert.equal(await chart.locator('img,script').count(),0,'Escaped labels remain inert after reconstruction');
+    const distributions=await page.locator('.distribution').evaluateAll(svgs=>svgs.map(svg=>({
+      values:[...svg.querySelectorAll('.sample')].map(node=>Number(node.dataset.value)),
+      ranks:[...svg.querySelectorAll('.sample')].map(node=>Number(node.dataset.rank)),
+      x20:svg.querySelector('[data-value="20"]')?.getAttribute('cx'),scale:svg.parentElement.querySelector('.distribution-scale').textContent,
+      sampling:svg.parentElement.querySelector('.distribution-sampling')?.textContent,
+    })));
+    const baseline=distributions.find(row=>row.values.length===4&&row.values.includes(11)&&row.values.includes(20)),candidate=distributions.find(row=>row.values.length===324);
+    assert(baseline&&candidate,'Every sample remains present above the former 320-point sampling threshold');
+    assert.equal(baseline.x20,candidate.x20,'The same sample has the same X in compatible versions');
+    for(const row of distributions.filter(row=>row!==baseline&&row!==candidate))assert.notEqual(row.x20,baseline.x20,'Different identity, collector, metric or unit retains a separate scale');
+    assert.match(baseline.scale,/10 ns.*40 ns.*\(ns\)/);assert.deepEqual(baseline.values,[10,11,12,20]);
+    assert.equal(candidate.values.filter(value=>value===40).length,1,'The largest outlier is retained');
+    assert.equal(baseline.sampling,undefined);assert.equal(candidate.sampling,undefined,'Ordinary sample sets remain fully visible');
+    const largeDistribution=distributions.find(row=>row.values.includes(1e9));assert(largeDistribution);
+    assert.equal(largeDistribution.values.length,512,'Large distributions have a bounded SVG point count');
+    assert.deepEqual(largeDistribution.ranks,Array.from({length:512},(_,index)=>Math.round(index*10000/511)+1));
+    assert.equal(largeDistribution.values[0],0);assert.equal(largeDistribution.values.at(-1),1e9);
+    assert.equal(largeDistribution.sampling,'512 of 10001 samples plotted; all samples in JSON.');
+    const mobileBase=page.locator('.distribution-view').filter({has:page.locator('svg[data-max="98"]')});
+    const mobileCandidate=page.locator('.distribution-view').filter({has:page.locator('svg[data-max="81"]')});
+    const domain=async view=>view.locator('svg').evaluate(svg=>[Number(svg.dataset.currentMin),Number(svg.dataset.currentMax)]);
+    const raw=async view=>view.evaluate(element=>({values:element.distributionValues,points:[...element.querySelectorAll('.sample')].map(point=>[point.dataset.value,point.dataset.rank]),stats:element.querySelector('.distribution-stats').textContent}));
+    const rawBefore=await raw(mobileBase),candidateBefore=await raw(mobileCandidate);
+    assert.equal(rawBefore.values.length,30);assert.equal(candidateBefore.values.length,30);
+    assert.deepEqual(await domain(mobileBase),[8,98]);assert.deepEqual(await domain(mobileCandidate),[8,98]);
+    await page.setViewportSize({width:360,height:800});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    const svgSize=await mobileBase.locator('svg').boundingBox();assert(Math.abs(svgSize.height-svgSize.width/7)<1,'SVG has proportional height rather than mobile letterboxing');
+    assert.equal(await mobileBase.locator('..').locator('.distribution-unit').evaluate(node=>getComputedStyle(node).whiteSpace),'nowrap');
+    assert.equal(await mobileBase.locator('.distribution-stats dd').evaluateAll(nodes=>nodes.every(node=>node.scrollWidth<=node.clientWidth)),true,'All five statistics remain readable at360px');
+    await mobileBase.locator('.sample[data-value="12"]').focus();
+    await mobileBase.getByRole('button',{name:'Zoom in',exact:true}).focus();await page.keyboard.press('Enter');
+    assert.deepEqual(await domain(mobileBase),[8,53],'Zoom centers on the inspected sample, clamped to the full domain');
+    assert.deepEqual(await domain(mobileCandidate),[8,53],'Compatible versions share the current range');
+    assert.equal(await mobileBase.locator('.sample[data-value="12"]').getAttribute('cx'),await mobileCandidate.locator('.sample[data-value="12"]').getAttribute('cx'));
+    assert.match(await mobileBase.locator('.distribution-visible').innerText(),/29 \/ 30 samples in view/);
+    await mobileCandidate.getByRole('button',{name:'Pan right',exact:true}).tap();
+    assert.deepEqual(await domain(mobileBase),[19.25,64.25]);assert.deepEqual(await domain(mobileCandidate),[19.25,64.25]);
+    assert.match(await mobileBase.locator('.distribution-visible').innerText(),/0 \/ 30 samples in view/);
+    assert.match(await mobileBase.locator('.plot-detail').innerText(),/^Hover, tap or focus/,'Panning clears a readout that is now outside the view');
+    await mobileBase.getByRole('button',{name:'Pan left',exact:true}).tap();
+    await mobileBase.locator('.sample[data-value="12"]').click();assert.match(await mobileBase.locator('.plot-detail').innerText(),/12 ns.*sorted sample/);
+    const tapBox=await mobileBase.locator('svg').boundingBox();
+    await mobileBase.locator('svg').tap({position:{x:tapBox.width/2,y:tapBox.height/2}});
+    assert.match(await mobileBase.locator('.plot-detail').innerText(),/sorted sample/,'A touch on the chart inspects its nearest visible point');
+    await mobileBase.getByText('Range',{exact:true}).click();
+    await mobileBase.locator('[data-distribution-bound="max"]').fill('20');await mobileBase.locator('[data-distribution-bound="max"]').press('Tab');
+    assert.deepEqual(await domain(mobileBase),[8,20]);assert.deepEqual(await domain(mobileCandidate),[8,20]);
+    await mobileBase.locator('[data-distribution-slider="min"]').focus();await page.keyboard.press('ArrowRight');
+    assert((await domain(mobileBase))[0]>8);assert.deepEqual(await domain(mobileBase),await domain(mobileCandidate));
+    await mobileCandidate.getByRole('button',{name:'Fit all samples',exact:true}).click();
+    assert.deepEqual(await domain(mobileBase),[8,98]);assert.deepEqual(await domain(mobileCandidate),[8,98]);
+    await mobileBase.locator('.sample[data-value="98"]').hover();
+    assert.match(await mobileBase.locator('.plot-detail').innerText(),/98 ns.*sorted sample/);
+    await mobileBase.getByRole('button',{name:'Zoom in',exact:true}).click();
+    assert.deepEqual(await domain(mobileBase),[53,98],'Hover anchors Zoom around the inspected outlier without removing it');
+    assert.deepEqual(await domain(mobileCandidate),[53,98]);
+    await mobileBase.getByRole('button',{name:'Pan left',exact:true}).click();
+    assert.deepEqual(await domain(mobileBase),[41.75,86.75]);
+    assert.match(await mobileBase.locator('.plot-detail').innerText(),/^Hover, tap or focus/,'Panning clears an inspected hover point outside the view');
+    await mobileBase.getByRole('button',{name:'Fit all samples',exact:true}).click();
+    assert.deepEqual(await domain(mobileBase),[8,98]);assert.deepEqual(await domain(mobileCandidate),[8,98]);
+    assert.deepEqual(await raw(mobileBase),rawBefore);assert.deepEqual(await raw(mobileCandidate),candidateBefore,'Zoom/pan/Fit never mutate samples, ranks or statistics');
+    assert.deepEqual(await page.locator('.distribution-view').filter({has:page.locator('svg[data-min="10"][data-max="20"]')}).locator('svg').evaluate(svg=>[Number(svg.dataset.currentMin),Number(svg.dataset.currentMax)]),[10,40],'An incompatible group is independent');
+    for(const value of ['0','7']){
+      const constant=page.locator('.distribution-view').filter({has:page.locator('svg[data-min="'+value+'"][data-max="'+value+'"]')});
+      assert.equal(await constant.locator('[data-distribution-action]:enabled').count(),0);
+      assert.equal(await constant.locator('[data-distribution-bound]:enabled,[data-distribution-slider]:enabled').count(),0);
+      assert.deepEqual(await domain(constant),[Number(value),Number(value)]);
+      assert.equal(await constant.locator('.sample').evaluateAll(points=>points.every(point=>point.getAttribute('cx')==='350')),true);
+    }
+    const outlier=page.locator('.distribution .sample[data-value="1000000000"]');await outlier.focus();
+    assert.match(await page.locator('#'+await outlier.getAttribute('data-target')).innerText(),/sorted sample 10001\/10001/);
+    assert.equal(await readFile(observationFile,'utf8'),observationBytes,'Presentation preserves every original JSON sample');
+    await page.setViewportSize({width:390,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     await page.locator('.flame-node.dynamic').focus();assert.match(await page.locator('#flame-1').innerText(),/Runtime dispatch detected/);
     await page.locator('#result-kind').selectOption('allocation');assert.equal(await page.locator('[data-result-item]:visible').count(),1);
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
@@ -167,6 +426,38 @@ test('real webviews preserve full selection, handle Git targets and render inter
     await page.locator('[data-action="chat"]').focus();await page.keyboard.press('Enter');assert.equal((await page.evaluate(()=>window.messages.at(-1))).action,'chat');
     if(process.env.PERFCHECKER_QA_DIR)await page.screenshot({path:path.join(process.env.PERFCHECKER_QA_DIR,'studio.png'),fullPage:true});
     await page.setViewportSize({width:420,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+    const advisorFile=path.join(root,'perf','advisor.json');
+    const advisorBytes=JSON.stringify({protocol:'mcp_http',endpoint:'https://previous.example.test/mcp',mcp_tool:'previous_advice'})+'\n';
+    await writeFile(advisorFile,advisorBytes);
+    Object.assign(advisorSettings,{advisorEnabled:false,advisorConfig:'perf/advisor.json',advisorMcpStdioCommand:process.execPath,
+      advisorMcpStdioArguments:['server fixture.js','--label=<fixture>'],advisorMcpStdioDirectory:root});
+    const savedAdvisorSettings=JSON.stringify(advisorSettings),beforeOpen=spawned.length;
+    const {localAdvisorConnection}=require('../dist/advisorConnection.js');
+    await commands.get('perfchecker.configureAdvisor')();await load('perfchecker.advisorSetup');
+    assert.equal(await page.locator('#advisor-protocol').inputValue(),'none');
+    assert.equal(await page.getByRole('button',{name:'Test connection / discover',exact:true}).isDisabled(),true);
+    // Exercise the real explicit command -> AdvisorSetup.open -> generated HTML under its CSP.
+    await commands.get('perfchecker.connectMcpStdio')();
+    const stdioPanel=panels.findLast(panel=>panel.type==='perfchecker.advisorSetup'&&!panel.disposed);
+    const stdioInitial=JSON.parse(stdioPanel.webview.html.match(/m=>api\.postMessage\(m\),(\{.*\})\);window\.addEventListener/)[1]);
+    assert.equal(stdioInitial.enabled,true);assert.equal(stdioInitial.config.protocol,'mcp_stdio');
+    await load('perfchecker.advisorSetup');
+    assert.equal(await page.locator('#advisor-protocol').inputValue(),'mcp_stdio');
+    assert.equal(await page.locator('#advisor-stdio_command').inputValue(),process.execPath);
+    assert.deepEqual(JSON.parse(await page.locator('#advisor-stdio_args').inputValue()),advisorSettings.advisorMcpStdioArguments);
+    assert.equal(await page.locator('#advisor-stdio_cwd').inputValue(),root);
+    assert.equal(await page.locator('#advisor-stdio_command').isVisible(),true);
+    assert.equal(await page.getByRole('button',{name:'Test connection / discover',exact:true}).isEnabled(),true);
+    assert.equal(await page.getByRole('button',{name:'Cancel operation',exact:true}).isDisabled(),true);
+    assert.equal(await page.getByRole('status').innerText(),'Ready.');
+    assert.deepEqual(await page.evaluate(()=>window.messages),[],'Opening the form sends no discovery or connection request');
+    assert.equal(spawned.length,beforeOpen);assert.equal(JSON.stringify(advisorSettings),savedAdvisorSettings);
+    assert.equal(await readFile(advisorFile,'utf8'),advisorBytes);assert.equal(localAdvisorConnection(folder.uri.toString()),undefined);
+    stdioPanel.dispose();await commands.get('perfchecker.configureAdvisor')();await load('perfchecker.advisorSetup');
+    assert.equal(await page.locator('#advisor-protocol').inputValue(),'none','Closing the explicit draft preserves the disabled saved provider');
+    assert.equal(spawned.length,beforeOpen);assert.equal(await readFile(advisorFile,'utf8'),advisorBytes);
+    assert.equal(localAdvisorConnection(folder.uri.toString()),undefined);
+    panels.findLast(panel=>panel.type==='perfchecker.advisorSetup'&&!panel.disposed).dispose();
     assert.deepEqual(errors,[]);
     const other={name:'other',uri:uri(path.join(temporary,'other'))};vscode.workspace.workspaceFolders.push(other);
     await commands.get('perfchecker.openStudioForWorkspace')(other.uri);

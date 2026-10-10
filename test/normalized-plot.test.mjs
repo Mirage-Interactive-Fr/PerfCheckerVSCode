@@ -36,3 +36,12 @@ test('overlay follows the declared version order, preserves gaps and bounds only
   assert.ok(chart.indexOf('v1 · time') < chart.indexOf('v3 · time'));
   assert.doesNotMatch(chart,/1e\+100/);
 });
+
+test('one measured version is centered before client interaction',()=>{
+  const chart=normalizedChart({description:'One measurement',options:{versions:['only'],reference_version:'minimum'},data:[
+    {version:'only',metric:'time',ratio:1,value:10,unit:'ns',normalization_status:'ratio'},
+  ]},'single');
+  assert.match(chart,/<circle[^>]*cx="465"/);
+  assert.match(chart,/<text x="465" y="310"/);
+  assert.doesNotMatch(chart,/NaN|Infinity/);
+});
