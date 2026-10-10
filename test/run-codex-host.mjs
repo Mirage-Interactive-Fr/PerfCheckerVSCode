@@ -67,7 +67,20 @@ const inspectAffinity=async()=>{
           const children=await fs.readFile(path.join(directory,'children'),'utf8');
           const after=await fs.readFile(path.join(directory,'stat'),'utf8');
           if(after.slice(after.lastIndexOf(') ')+2).trim().split(/\s+/)[19]!==start)continue;
-          assert(/^\d+$/.test(start));assert.equal(cpus,'16-17',`Private PID ${identity.pid} TID ${tid} left the approved CPU pool`);
+          assert(/^\d+$/.test(start));
+          if(cpus!=='16-17'){
+            // Preserve the offending observation before the assertion aborts this
+            // scan. This metadata never grants permission to signal a process.
+            const violation={at:new Date().toISOString(),pid:identity.pid,start:identity.start,parent:identity.parent,
+              executable,tid:Number(tid),tidStart:start,cpus};
+            try{violation.cgroup=await fs.readFile(path.join(directory,'cgroup'),'utf8');}
+            catch(error){violation.cgroupUnavailable=String(error.code??error.name);}
+            affinityReceipt.violation=violation;
+            record.threads[`${tid}:${start}`]={tid:Number(tid),start,cpus};record.lastObservedAt=violation.at;
+            affinityProcesses.set(key,record);
+            await fs.writeFile(path.join(session,'affinity-observed.json'),JSON.stringify({processes:[...affinityProcesses.values()],violation}));
+          }
+          assert.equal(cpus,'16-17',`Private PID ${identity.pid} TID ${tid} left the approved CPU pool`);
           record.threads[`${tid}:${start}`]={tid:Number(tid),start,cpus};
           for(const child of children.trim().split(/\s+/).filter(Boolean)){
             assert(/^\d+$/.test(child));const current=await processBirth(Number(child));
@@ -79,7 +92,7 @@ const inspectAffinity=async()=>{
       record.lastObservedAt=new Date().toISOString();affinityProcesses.set(key,record);queue.push(...next);
     }
     affinityReceipt.observations++;
-    await fs.writeFile(path.join(session,'affinity-observed.json'),JSON.stringify({processes:[...affinityProcesses.values()]}));
+    await fs.writeFile(path.join(session,'affinity-observed.json'),JSON.stringify({processes:[...affinityProcesses.values()],violation:affinityReceipt.violation}));
   })();
   try{return await affinityPending;}finally{affinityPending=undefined;}
 };
