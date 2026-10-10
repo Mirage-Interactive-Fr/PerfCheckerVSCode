@@ -751,12 +751,15 @@ async function renderedPlots(context,state,selector,completedRoot){
   const cell=state.frame.locator(`pluto-cell[id="${cellId(state.source,'## Performance curves')}"]`);
   const editor=await interactiveEditor(context,state,cell,'measured plot diagnostic');
   const diagnostic=`let p = performance_plot(plot_bundle, selected_plot), modules = Dict(k.name => m for (k,m) in Base.loaded_modules)
-    @assert all(haskey(modules,n) for n in ("PerfCheckerMakie","PerfCheckerPluto","WGLMakie","Makie","Bonito"))
+    @assert all(haskey(modules,n) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito"))
     @assert Base.get_extension(modules["PerfCheckerMakie"],:WGLMakieExt) !== nothing
     f = performance_figure(p)
     @assert f isa getfield(modules["Makie"],:Figure)
     entry = only(filter(entry -> entry["id"] == selected_plot, plot_entries))
-    info = Dict("selected"=>selected_plot,"selectedLabel"=>entry["title"] * " · " * entry["label"],"kind"=>string(p.kind),"values"=>[row["value"] for row in p.data],"versions"=>[row["version"] for row in p.data],"unit"=>p.options["unit"],"figure"=>string(typeof(f)),"extension"=>true,"providers"=>Dict(n=>Dict("version"=>string(Base.pkgversion(modules[n])),"source"=>pathof(modules[n])) for n in ("PerfCheckerMakie","PerfCheckerPluto","WGLMakie","Makie","Bonito")))
+    pluto = only(info for info in values(Pkg.dependencies()) if info.name == "PerfCheckerPluto")
+    pluto_source = Base.find_package("PerfCheckerPluto")
+    @assert pluto_source !== nothing
+    info = Dict("selected"=>selected_plot,"selectedLabel"=>entry["title"] * " · " * entry["label"],"kind"=>string(p.kind),"values"=>[row["value"] for row in p.data],"versions"=>[row["version"] for row in p.data],"unit"=>p.options["unit"],"figure"=>string(typeof(f)),"extension"=>true,"providers"=>Dict(n=>Dict("version"=>string(Base.pkgversion(modules[n])),"source"=>pathof(modules[n])) for n in ("PerfCheckerMakie","WGLMakie","Makie","Bonito")),"installedCompanions"=>Dict("PerfCheckerPluto"=>Dict("version"=>string(pluto.version),"source"=>pluto_source,"tree"=>string(pluto.tree_hash),"gitSource"=>pluto.git_source,"gitRevision"=>pluto.git_revision,"trackingRepo"=>pluto.is_tracking_repo,"trackingPath"=>pluto.is_tracking_path,"loaded"=>haskey(modules,"PerfCheckerPluto"))))
     HTML("<pre id=\\"native-plot-evidence\\" hidden>" * replace(sprint(PerfChecker.JSON.print,info),"&"=>"&amp;","<"=>"&lt;",">"=>"&gt;") * "</pre>")
 end`;
   // Use the real private runner clipboard and native CodeMirror paste. Typing
@@ -782,11 +785,20 @@ end`;
   assert.equal(providerProvenance.pins.makieTree,providerProvenance.providers.PerfCheckerMakie.tree);
   assert.equal(providerProvenance.providers.PerfCheckerMakie.version,'1.0.1');
   for(const name of ['PerfCheckerMakie','PerfCheckerPluto']){
+    // The generated notebook is standalone: Pluto generates/hosts it in the
+    // server, while the notebook worker only imports the rendering providers.
+    const installed=name==='PerfCheckerPluto'?data.installedCompanions[name]:data.providers[name];
     const info=providerProvenance.providers[name];assert.equal(info.gitSource,'https://github.com/Mirage-Interactive-Fr/PerfChecker.jl');
-    assert.equal(data.providers[name].version,'1.0.1');
+    assert.equal(installed.version,'1.0.1');
     assert.equal(info.gitRevision,providerProvenance.makieRevision);assert.equal(info.repoSubdir,`packages/${name}`);
     assert.equal(info.trackingRepo,true);assert.equal(info.trackingPath,false);
-    assert.equal(info.pkgdir,await fs.realpath(info.source));assert.equal(info.pathof,await fs.realpath(data.providers[name].source));
+    assert.equal(info.pkgdir,await fs.realpath(info.source));assert.equal(info.pathof,await fs.realpath(installed.source));
+    if(name==='PerfCheckerPluto'){
+      assert.equal(installed.tree,providerProvenance.pins.plutoTree);
+      for(const key of ['gitSource','gitRevision','trackingRepo','trackingPath'])assert.equal(installed[key],info[key]);
+      context.log('pluto-installed-companion-in-notebook',{...installed,source:await fs.realpath(installed.source),
+        scope:'Installed public companion; loaded is observed separately, not required by the standalone notebook'});
+    }
   }
   for(const [name,version] of Object.entries({PerfCheckerMakie:providerProvenance.providers.PerfCheckerMakie.version,WGLMakie:'0.13.15',Makie:'0.24.15',Bonito:'4.2.0'}))assert.equal(data.providers[name].version,version);
   const diagnosticViewport=stage=>cell.evaluate((node,stage)=>({stage,classes:node.className,
@@ -1184,7 +1196,9 @@ exports.runPlots = async context => {
   const directory=path.join(context.workspace,'perf','notebooks');await fs.mkdir(directory,{recursive:true});
   let owner,port,known=[];const failures=[];
   const collectBefore=async stage=>{
+    context.log('pluto-plot-shutdown-phase',{stage:`${stage}:inventory-begin`});
     const before=await sessionInventory(context,stage,port,known);
+    context.log('pluto-plot-shutdown-phase',{stage:`${stage}:inventory-end`});
     const owned=new Set(known.filter(prior=>before.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt)).map(row=>row.pid));
     for(let changed=true;changed;){changed=false;for(const row of before.rows)if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
     const identities=new Map(known.map(row=>[`${row.pid}/${row.createdAt}`,row]));
@@ -1192,6 +1206,7 @@ exports.runPlots = async context => {
     known=[...identities.values()];assert.equal(before.errors?.length||0,0,'Before Close/Stop, owned plot process inspection is qualified');
   };
   const inspectAfter=async(stage,deadline)=>{
+    context.log('pluto-plot-shutdown-phase',{stage:`${stage}:inspection-begin`,remainingMilliseconds:deadline-Date.now()});
     while(Date.now()<deadline){
       const after=await sessionInventory(context,stage,port,known);
       const gone=known.every(prior=>identityGone(after,prior)),listeners=after.listeners.filter(row=>row.port===port);
@@ -1257,7 +1272,11 @@ exports.runPlots = async context => {
     if(owner)try{
       await collectBefore('plots-before-stop');
     }catch(error){failures.push(error);context.log('pluto-plot-ownership-error',{stage:'before-stop',message:String(error)});}
-    try{await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));}
+    try{
+      context.log('pluto-plot-shutdown-phase',{stage:'stop-command-begin',remainingMilliseconds:stopDeadline-Date.now()});
+      await context.vscode.commands.executeCommand('perfchecker.stopNotebookSession',context.vscode.Uri.file(context.workspace));
+      context.log('pluto-plot-shutdown-phase',{stage:'stop-command-end',remainingMilliseconds:stopDeadline-Date.now()});
+    }
     catch(error){failures.push(error);}
     if(owner)try{
       await inspectAfter('plots-after-stop-before-teardown',stopDeadline);

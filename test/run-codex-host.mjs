@@ -15,6 +15,8 @@ const execute=(command,args,options={})=>rawExecute(command,args,{timeout:60000,
 const vsixSha='c4b32567105fac62d53e7c58cf467de9359a93a81a123c4a53b32a32da7d87ca';
 const coreTree='00c133336911b8600d63a8d6c59ce1befc5ce690';
 const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
+const capturePreflightOnly=process.env.PERFCHECKER_TEST_CAPTURE_PREFLIGHT_ONLY==='1';
+if(capturePreflightOnly)assert(bibliography,'The capture-only preflight uses the explicit private Bibliography fixture');
 // This explicit real-package demo includes a cold isolated Julia environment.
 // Forced timeout/cancellation fixtures retain their separate 180 second budget.
 const advisorTimeout=bibliography?600:180;
@@ -27,6 +29,7 @@ assert.equal(createHash('sha256').update(await fs.readFile(archive)).digest('hex
 assert.equal((await fs.stat(archive)).size,1076115);
 if(bibliography){
   assert(path.isAbsolute(bibliography),'Provide an absolute private Bibliography pilot path');
+  assert(!process.env.WAYLAND_DISPLAY,'Remove WAYLAND_DISPLAY before launching this private X11 test');
   assert.match(await fs.readFile('/proc/self/status','utf8'),/^Cpus_allowed_list:\s*16-17\s*$/m,'The real-package driver must inherit the approved two-CPU pool');
   Object.assign(process.env,{JULIA_NUM_THREADS:'2',JULIA_NUM_PRECOMPILE_TASKS:'1',JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',OMP_NUM_THREADS:'1'});
   assert(process.env.PERFCHECKER_TEST_RESULTS&&path.isAbsolute(process.env.PERFCHECKER_TEST_RESULTS),'Provide an explicit absolute proof destination for the Bibliography qualification');
@@ -53,7 +56,8 @@ const inspectAffinity=async()=>{
       const prior=queue.shift(),identity=await processBirth(prior.pid);if(!identity||prior.start&&identity.start!==prior.start)continue;
       const key=`${identity.pid}:${identity.start}`;if(seen.has(key))continue;seen.add(key);
       assert(affinityProcesses.size<10000||affinityProcesses.has(key),'Affinity observation identity budget exceeded');
-      const known=affinityProcesses.get(key),record={...(known||{...identity,firstObservedAt:new Date().toISOString()}),threads:{...known?.threads}},next=[];
+      let executable;try{executable=await fs.readlink(`/proc/${identity.pid}/exe`);}catch(error){if(gone(error))continue;throw error;}
+      const known=affinityProcesses.get(key),record={...(known||{...identity,firstObservedAt:new Date().toISOString()}),executable,threads:{...known?.threads}},next=[];
       let tids;try{tids=await fs.readdir(`/proc/${identity.pid}/task`);}catch(error){if(gone(error))continue;throw error;}
       for(const tid of tids){
         assert(/^\d+$/.test(tid));const directory=`/proc/${identity.pid}/task/${tid}`;
@@ -71,10 +75,11 @@ const inspectAffinity=async()=>{
           }
         }catch(error){if(!gone(error))throw error;}
       }
-      if((await processBirth(identity.pid))?.start!==identity.start)continue;
+      if((await processBirth(identity.pid))?.start!==identity.start||await fs.readlink(`/proc/${identity.pid}/exe`).catch(error=>{if(!gone(error))throw error;})!==executable)continue;
       record.lastObservedAt=new Date().toISOString();affinityProcesses.set(key,record);queue.push(...next);
     }
     affinityReceipt.observations++;
+    await fs.writeFile(path.join(session,'affinity-observed.json'),JSON.stringify({processes:[...affinityProcesses.values()]}));
   })();
   try{return await affinityPending;}finally{affinityPending=undefined;}
 };
@@ -94,7 +99,7 @@ const requestStop=reason=>{
   if(sdkRunning)process.emit('SIGINT');else preparationAbort.abort(reason);
 };
 const checkPreparation=()=>{preparationAbort.signal.throwIfAborted();assert(!expired,'The local runner exceeded its total deadline before launch');};
-const deadline=setTimeout(()=>requestStop(new Error('The local runner exceeded its total deadline')),(bibliography?25:18)*60*1000);
+const deadline=setTimeout(()=>requestStop(new Error('The local runner exceeded its total deadline')),(capturePreflightOnly?5:bibliography?25:18)*60*1000);
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 try{
   if(bibliography){
@@ -137,8 +142,9 @@ try{
       'perfchecker.scenarioThreads':2,'perfchecker.analysisTimeout':120,'window.zoomLevel':2.75}:{}),
     'telemetry.telemetryLevel':'off','workbench.startupEditor':'none','window.restoreWindows':'none'}));
   checkPreparation();
-  const fixture=await (bibliography?prepareBibliographyCodexFixture:prepareJuliaCodexFixture)(root,
-    {julia:process.env.PERFCHECKER_TEST_JULIA,project:process.env.PERFCHECKER_TEST_CONTROLLER,coreVersion:'1.0.1',coreTree,signal:preparationAbort.signal});
+  const fixture=capturePreflightOnly?{probe:{mode:'capture-only',oracleExecuted:false}}:
+    await (bibliography?prepareBibliographyCodexFixture:prepareJuliaCodexFixture)(root,
+      {julia:process.env.PERFCHECKER_TEST_JULIA,project:process.env.PERFCHECKER_TEST_CONTROLLER,coreVersion:'1.0.1',coreTree,signal:preparationAbort.signal});
   if(affinityError)throw affinityError;checkPreparation();
   await execute('unzip',['-q',archive,'-d',path.join(session,'archive')]);
   const archiveExtension=path.join(session,'archive','extension');
@@ -155,7 +161,7 @@ try{
     displayChild.stdio[3].on('data',chunk=>{output+=chunk;const match=output.match(/^(\d+)\s*$/);if(match)finish(undefined,`:${match[1]}`);});
     displayChild.stderr.resume();
   });
-  const privateEnv={...process.env,DISPLAY:display,XAUTHORITY:''};
+  const privateEnv={...process.env,DISPLAY:display,XAUTHORITY:'',XDG_SESSION_TYPE:'x11'};delete privateEnv.WAYLAND_DISPLAY;
   checkPreparation();
   const vscodeExecutablePath=await sdk.downloadAndUnzipVSCode({version:'1.141.0',cachePath:path.join(session,'vscode'),timeout:30000});
   checkPreparation();assert(vscodeExecutablePath.startsWith(session+path.sep),'Use only the temporary VS Code download');
@@ -172,7 +178,7 @@ try{
   assert.equal(new Set(directories.map(([,directory])=>directory)).size,6,'Use six distinct canonical private Code directories');
   const privateProfile=directories.map(([flag,directory])=>`--${flag}=${directory}`);
   const [cli,...cliArgs]=sdk.resolveCliArgsFromVSCodeExecutablePath(vscodeExecutablePath);
-  await execute(cli,[...cliArgs,...privateProfile,'--install-extension',archive],{env:privateEnv,timeout:120000});
+  await execute(cli,[...cliArgs,'--ozone-platform=x11',...privateProfile,'--install-extension',archive],{env:privateEnv,timeout:120000});
   const portServer=createServer();await new Promise((resolve,reject)=>{portServer.once('error',reject);portServer.listen(0,'127.0.0.1',resolve);});
   const port=portServer.address().port;await new Promise(resolve=>portServer.close(resolve));
   // VS Code requires a development location to execute its test runner. This
@@ -181,13 +187,14 @@ try{
   await fs.writeFile(path.join(driver,'package.json'),JSON.stringify({name:'perfchecker-local-authentication-driver',publisher:'qualification',version:'0.0.0',engines:{vscode:'^1.96.0'}}));
   checkPreparation();sdkRunning=true;
   try{await sdk.runTests({vscodeExecutablePath,extensionDevelopmentPath:driver,extensionTestsPath:path.join(client,'test','codex-vscode-host.cjs'),
-    launchArgs:[root,'--new-window','--disable-workspace-trust','--skip-welcome','--skip-release-notes','--disable-gpu',
+    launchArgs:[root,'--new-window','--ozone-platform=x11','--disable-workspace-trust','--skip-welcome','--skip-release-notes','--disable-gpu',
       ...privateProfile,`--remote-debugging-port=${port}`,'--remote-debugging-address=127.0.0.1'],
-    extensionTestsEnv:{DISPLAY:display,XAUTHORITY:'',PERFCHECKER_HOST_RESULT:path.join(session,'result.json'),
+    extensionTestsEnv:{DISPLAY:display,XAUTHORITY:'',XDG_SESSION_TYPE:'x11',PERFCHECKER_HOST_RESULT:path.join(session,'result.json'),
       PERFCHECKER_HOST_SESSION:session,PERFCHECKER_HOST_ARCHIVE:archive,PERFCHECKER_HOST_ARCHIVE_EXTENSION:archiveExtension,
-      PERFCHECKER_HOST_VSIX_SHA:vsixSha,PERFCHECKER_HOST_CDP_PORT:String(port),PERFCHECKER_HOST_BASELINE_BYTES:String(fixture.baselineBytes),
-      PERFCHECKER_HOST_CORE:JSON.stringify(fixture.core),PERFCHECKER_CODEX_HOST_ONLY:'1',
+      PERFCHECKER_HOST_VSIX_SHA:vsixSha,PERFCHECKER_HOST_CDP_PORT:String(port),PERFCHECKER_CODEX_HOST_ONLY:'1',
+      ...(!capturePreflightOnly?{PERFCHECKER_HOST_BASELINE_BYTES:String(fixture.baselineBytes),PERFCHECKER_HOST_CORE:JSON.stringify(fixture.core)}:{}),
       PERFCHECKER_HOST_PRIVATE_DIRECTORIES:JSON.stringify(directories),PERFCHECKER_HOST_ADVISOR_TIMEOUT:String(advisorTimeout),
+      ...(capturePreflightOnly?{PERFCHECKER_HOST_CAPTURE_PREFLIGHT_ONLY:'1'}:{}),
       ...(bibliography?{PERFCHECKER_HOST_BIBLIOGRAPHY:JSON.stringify(fixture.probe)}:{}),
       ...(process.env.PERFCHECKER_TEST_RESULTS?{PERFCHECKER_HOST_PROOFS:process.env.PERFCHECKER_TEST_RESULTS}:{}),
       JULIA_NUM_THREADS:bibliography?'2':'1',JULIA_NUM_PRECOMPILE_TASKS:'1',JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',OMP_NUM_THREADS:'1'}});}
@@ -197,6 +204,7 @@ try{
   assert(!expired,'The local runner exceeded its total deadline');
   assert.equal(result.runner,'codex-vscode-host.cjs');assert.equal(result.hostExecuted,true);
   assert.equal(result.cleanupSafeToRemove,true);
+  if(capturePreflightOnly)assert.equal(result.mode,'landscape-capture-preflight-only');
   assert.equal(result.vsixSha256,vsixSha);assert.equal(result.status,'passed');console.log(JSON.stringify(result));
 }catch(error){
   const primary=affinityError??error;
@@ -227,6 +235,21 @@ try{
     if(displayChild?.pid&&displayChild.exitCode===null&&displayChild.signalCode===null){
       displayChild.kill('SIGTERM');await Promise.race([displayExit,delay(2000)]);
       if(displayChild.exitCode===null&&displayChild.signalCode===null){displayChild.kill('SIGKILL');await displayExit;}
+    }
+    if(capturePreflightOnly){
+      const living=[];
+      for(const record of affinityProcesses.values())if(record.pid!==process.pid&&(await processBirth(record.pid))?.start===record.start)
+        living.push({pid:record.pid,start:record.start});
+      affinityReceipt.afterSdkAndDisplayCleanup={at:new Date().toISOString(),observedLiving:living,
+        neverObservedDescendants:'Not established by a sampling observer'};
+      if(process.env.PERFCHECKER_TEST_RESULTS)await fs.writeFile(path.join(process.env.PERFCHECKER_TEST_RESULTS,'cpu-affinity.json'),JSON.stringify(affinityReceipt,null,2));
+      const outcome=await fs.readFile(path.join(session,'result.json'),'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;});
+      if(outcome){const result=JSON.parse(outcome);result.driverCleanup=affinityReceipt.afterSdkAndDisplayCleanup;
+        if(living.length)Object.assign(result,{status:'failed',cleanupSafeToRemove:false,cleanupError:'Observed private preflight descendants remain alive'});
+        await fs.writeFile(path.join(session,'result.json'),JSON.stringify(result,null,2));
+        if(process.env.PERFCHECKER_TEST_RESULTS)await fs.copyFile(path.join(session,'result.json'),path.join(process.env.PERFCHECKER_TEST_RESULTS,'result.json'));}
+      if(living.length){sessionMayRemove=false;console.error(`Private preflight session retained: ${session}`);
+        throw new Error('Observed private preflight descendants remain alive; preserve the session instead of claiming extinction');}
     }
     if(sessionMayRemove)await fs.rm(session,{recursive:true,force:true});
     else console.error(`Failed session preserved while process cleanup is unresolved: ${session}`);

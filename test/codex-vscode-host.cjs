@@ -87,7 +87,8 @@ exports.run=async()=>{
   assert.equal(await fs.readFile(path.join(root,'.perfchecker-test-fixture'),'utf8'),'sacrificial\n');
   const checks=[],result={runner:'codex-vscode-host.cjs',hostExecuted:true,hostPid:process.pid,status:'running',checks};
   const bibliography=process.env.PERFCHECKER_HOST_BIBLIOGRAPHY?JSON.parse(process.env.PERFCHECKER_HOST_BIBLIOGRAPHY):undefined;
-  suiteDeadline=Date.now()+(bibliography?21:14)*60*1000;result.maximumHostMinutes=bibliography?21:14;
+  const capturePreflightOnly=process.env.PERFCHECKER_HOST_CAPTURE_PREFLIGHT_ONLY==='1';
+  suiteDeadline=Date.now()+(capturePreflightOnly?5:bibliography?21:14)*60*1000;result.maximumHostMinutes=capturePreflightOnly?5:bibliography?21:14;
   // This sentinel must be written by the actual extension host, never by the outer SDK.
   await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result));
   const configFile=path.join(root,'perf','advisor.json'),settingsFile=path.join(root,'.vscode','settings.json');
@@ -97,6 +98,26 @@ exports.run=async()=>{
   const settings=()=>vscode.workspace.getConfiguration('perfchecker',folder.uri);
   const git=async(...args)=>(await execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})).stdout;
   const head=await git('rev-parse','HEAD'),state=()=>vscode.commands.executeCommand('perfchecker.chatState');
+  const captureWorkingState=async()=>{
+    const rawGit=async args=>{
+      const {stdout,stderr}=await execute('git',args,{cwd:root,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'},encoding:'buffer',timeout:5000,maxBuffer:4_000_000});
+      assert.equal(stderr.length,0,'The read-only capture fixture inspection has no unqualified Git warning');return stdout;
+    };
+    const status=await rawGit(['status','--porcelain=v1','-z','--untracked-files=all']);
+    const untracked=await rawGit(['ls-files','--others','--exclude-standard','-z']),files=[];
+    for(let position=0;position<untracked.length;){
+      const end=untracked.indexOf(0,position);assert(end>position,'Every untracked path has its complete raw NUL terminator');
+      const relative=untracked.subarray(position,end),filename=Buffer.concat([Buffer.from(root+path.sep),relative]);
+      const type=await fs.lstat(filename);assert(!type.isSymbolicLink(),'Untracked symlinks are unsupported by this private capture fixture');
+      assert(type.isFile(),'Every untracked capture fixture entry must be a regular file');
+      files.push({pathHex:relative.toString('hex'),type:'regular',mode:type.mode&0o7777,bytes:type.size,sha256:hash(await fs.readFile(filename))});position=end+1;
+    }
+    return {porcelainV1NulHex:status.toString('hex'),files};
+  };
+  // Capture-only deliberately skips the Julia fixture preparation/commit. Its
+  // seven setup files must remain byte-exact, rather than disappear from Git.
+  const captureWorkingStateBefore=capturePreflightOnly?await captureWorkingState():undefined;
+  if(capturePreflightOnly)result.captureWorkingStateBefore=captureWorkingStateBefore;
   let browser,view,windowPage,endpoint,server,owned,primaryError,observer,observation;
   const observed=new Map(),cliObservers=new Map(),processStates=new Map();let passiveCli;
   const observe=async()=>{
@@ -138,7 +159,10 @@ exports.run=async()=>{
   const preserved=async()=>{
     assert.equal(await fs.readFile(sourceFile,'utf8'),source);assert.deepEqual(await fs.readFile(configFile),saved);
     assert.deepEqual(await fs.readFile(settingsFile),savedSettings);assert.deepEqual(await fs.readFile(path.join(root,'.git','index')),index);
-    assert.equal(await git('rev-parse','HEAD'),head);assert.equal(await git('status','--porcelain'),'');
+    assert.equal(await git('rev-parse','HEAD'),head);
+    if(capturePreflightOnly){
+      result.captureWorkingStateAfter=await captureWorkingState();assert.deepEqual(result.captureWorkingStateAfter,captureWorkingStateBefore);
+    }else assert.equal(await git('status','--porcelain'),'');
     assert.equal(settings().get('advisorEnabled'),false);assert.equal(settings().get('advisorImplementationMcpTool'),'previous_agent');
   };
   const findView=selector=>eventually(async()=>{
@@ -177,13 +201,50 @@ exports.run=async()=>{
     const proof={label,sha256:hash(bytes),...parsed};result.indexProofs??=[];result.indexProofs.push(proof);
     return {bytes,...proof};
   };
+  const nativeCodeWindow=async stage=>{
+    assert(/^:\d+$/.test(process.env.DISPLAY),'Inspect only the disposable driver-owned X display');
+    const {stdout:tree}=await execute('/usr/bin/xwininfo',['-display',process.env.DISPLAY,'-root','-tree'],{timeout:5000,maxBuffer:1000000});
+    const observed=await eventually(async()=>{
+      try{return JSON.parse(await fs.readFile(path.join(session,'affinity-observed.json'),'utf8'));}
+      catch(error){if(error.code==='ENOENT'||error instanceof SyntaxError)return;throw error;}
+    },'Read the private driver cohort before inspecting any native window',5000);
+    const windows=[];
+    for(const line of tree.split('\n')){
+      const match=/^\s+(0x[\da-f]+).*?\s(\d+)x(\d+)[+-]\d+[+-]\d+\s+([+-]\d+)([+-]\d+)\s*$/i.exec(line);
+      if(!match||Number(match[2])<1000||Number(match[3])<500)continue;
+      const {stdout:properties}=await execute('/usr/bin/xprop',['-display',process.env.DISPLAY,'-id',match[1],'WM_CLASS','_NET_WM_PID'],{timeout:5000,maxBuffer:100000});
+      const pid=Number(/^_NET_WM_PID\(CARDINAL\) = (\d+)$/m.exec(properties)?.[1]);
+      const item={id:match[1],pid:Number.isSafeInteger(pid)&&pid>0?pid:null,
+        rawTreeLine:line,rawProperties:properties,
+        wmClass:/^WM_CLASS\(STRING\) = (.*)$/m.exec(properties)?.[1]??null,
+        width:Number(match[2]),height:Number(match[3]),x:Number(match[4]),y:Number(match[5]),qualified:false};
+      windows.push(item);const known=observed.processes.find(process=>process.pid===item.pid);
+      if(!known)continue;
+      try{
+        const start=await processIdentity(known.pid),executable=await fs.readlink(`/proc/${known.pid}/exe`);
+        assert.equal(start,known.start,'The X11 window PID is the incarnation already observed in the private driver cohort');
+        assert.equal(executable,known.executable);assert(executable.startsWith(path.join(session,'vscode')+path.sep));
+        assert.equal(await processIdentity(known.pid),start);
+        assert.equal(await fs.readlink(`/proc/${known.pid}/exe`),executable);
+        const {stdout:info}=await execute('/usr/bin/xwininfo',['-display',process.env.DISPLAY,'-id',item.id],{timeout:5000,maxBuffer:100000});
+        item.mapped=/Map State: IsViewable/.test(info);item.identity={pid:known.pid,start,executable};item.qualified=true;
+      }catch(error){item.qualificationError={name:error.name,message:String(error.message).slice(0,1000)};}
+    }
+    // Preserve native properties before an assertion can fail. WM_CLASS is
+    // informative: identity comes from the private observed PID incarnation.
+    result.nativeWindowObservations??=[];result.nativeWindowObservations.push({stage,observedAt:new Date().toISOString(),display:process.env.DISPLAY,windows});
+    assert(result.nativeWindowObservations.length<=100,'Native window diagnostics remain bounded');
+    const candidates=windows.filter(item=>item.qualified&&item.mapped);
+    assert.equal(candidates.length,1,'Exactly one large native Code window must render on the disposable X11 display');
+    return candidates[0];
+  };
   const capture=async(name,timeout=30000)=>{
     if(!proofs)return;
     await fs.mkdir(proofs,{recursive:true});const filename=path.join(proofs,`${name}.png`);
     if(!bibliography){await view.page().screenshot({path:filename,timeout});return;}
     assert(/^:\d+$/.test(process.env.DISPLAY),'Capture only the disposable driver-owned X display');
     assert(windowPage,'Resolve the private host workbench before framebuffer capture');
-    // ImageMagick reads the actual X framebuffer, without CSS scaling or crops.
+    // ImageMagick reads the actual X framebuffer, without image scaling or crops.
     await execute('/usr/bin/import',['-display',process.env.DISPLAY,'-silent','-window','root',`PNG:${filename}`],{timeout,maxBuffer:1000000});
     const bytes=await fs.readFile(filename),dimensions=png=>{
       assert.deepEqual(png.subarray(0,8),Buffer.from([137,80,78,71,13,10,26,10]));
@@ -192,10 +253,15 @@ exports.run=async()=>{
     const framebuffer=dimensions(bytes),viewport=await windowPage.evaluate(()=>({width:innerWidth,height:innerHeight,
       outerWidth,outerHeight,screenWidth:screen.width,screenHeight:screen.height,devicePixelRatio}));
     const renderer=dimensions(await windowPage.screenshot({scale:'device',timeout}));
-    const record={file:path.basename(filename),display:process.env.DISPLAY,source:'private X11 root framebuffer; no resize, crop or image transform',
-      ...framebuffer,sha256:hash(bytes),viewport,renderer,pixelsPerCssX:framebuffer.width/viewport.width,pixelsPerCssY:framebuffer.height/viewport.height};
+    const nativeWindow=await nativeCodeWindow(`capture:${name}`);
+    const record={file:path.basename(filename),display:process.env.DISPLAY,source:'private X11 root framebuffer; no image resize, crop or transform',
+      ...framebuffer,sha256:hash(bytes),viewport,renderer,rendererDimensions:'informative CDP screenshot dimensions, not a physical-pixel measurement',
+      nativeWindow,pixelsPerCssX:framebuffer.width/viewport.width,pixelsPerCssY:framebuffer.height/viewport.height};
     result.framebufferCaptures??=[];result.framebufferCaptures.push(record);
-    assert.deepEqual(renderer,framebuffer,'The full native renderer must fit the actual framebuffer without clipping');
+    assert.deepEqual({width:nativeWindow.width,height:nativeWindow.height,x:nativeWindow.x,y:nativeWindow.y},{...framebuffer,x:0,y:0},
+      'The mapped private X11 Code window covers the whole framebuffer without clipping');
+    assert.deepEqual({width:viewport.outerWidth,height:viewport.outerHeight},framebuffer);
+    assert.deepEqual({width:viewport.screenWidth,height:viewport.screenHeight},framebuffer);
     assert(Math.abs(record.pixelsPerCssX-record.pixelsPerCssY)<=1/Math.min(viewport.width,viewport.height),
       'The actual framebuffer and fullscreen viewport establish one unscaled pixel mapping');
     return record;
@@ -271,8 +337,9 @@ exports.run=async()=>{
     await extension.activate();assert(extension.isActive);
     assert.equal(settings().get('runnerProject'),process.env.PERFCHECKER_TEST_CONTROLLER);
     assert.equal(settings().get('juliaExecutable'),process.env.PERFCHECKER_TEST_JULIA);
-    result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'00c133336911b8600d63a8d6c59ce1befc5ce690');assert.equal(result.core.version,'1.0.1');
-    if(bibliography)assert.equal(result.core.registered,true);
+    if(capturePreflightOnly)result.core={loaded:false,probed:false,configuredProject:settings().get('runnerProject')};
+    else{result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'00c133336911b8600d63a8d6c59ce1befc5ce690');assert.equal(result.core.version,'1.0.1');
+      if(bibliography)assert.equal(result.core.registered,true);}
     const directories=JSON.parse(process.env.PERFCHECKER_HOST_PRIVATE_DIRECTORIES);
     assert.deepEqual(directories.map(([flag])=>flag),['user-data-dir','extensions-dir','shared-data-dir','agent-plugins-dir','agents-user-data-dir','agents-extensions-dir']);
     for(const [,directory]of directories){assert.equal(await fs.realpath(directory),directory);assert(directory.startsWith(session+path.sep));}
@@ -282,10 +349,11 @@ exports.run=async()=>{
     const {probeJuliaCodexFixture,probeBibliographyCodexFixture,observeCodexEvents}=await import(pathToFileURL(path.join(__dirname,'codex-real.test.mjs')).href);
     passiveCli=observeCodexEvents;
     const probe=directory=>bibliography?probeBibliographyCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA,{prepare:true}):probeJuliaCodexFixture(directory,process.env.PERFCHECKER_TEST_JULIA);
-    const baselineProbe=await probe(root),baselineBytes=bibliography?baselineProbe.allocationBytes:baselineProbe;
-    assert.equal(baselineBytes,Number(process.env.PERFCHECKER_HOST_BASELINE_BYTES));
-    if(bibliography)assert.deepEqual(baselineProbe,bibliography);
-    if(bibliography)await preserveWorker('baseline-worker',root);
+    const baselineProbe=capturePreflightOnly?undefined:await probe(root),baselineBytes=bibliography?baselineProbe?.allocationBytes:baselineProbe;
+    if(!capturePreflightOnly){assert.equal(baselineBytes,Number(process.env.PERFCHECKER_HOST_BASELINE_BYTES));
+      if(bibliography)assert.deepEqual(baselineProbe,bibliography);
+      if(bibliography)await preserveWorker('baseline-worker',root);}
+    const preflightIndex=capturePreflightOnly?await indexProof('capture-preflight-before'):undefined;
     const {chromium}=await import(process.env.PERFCHECKER_TEST_PLAYWRIGHT?pathToFileURL(process.env.PERFCHECKER_TEST_PLAYWRIGHT).href:'playwright');
     browser=await chromium.connectOverCDP(`http://127.0.0.1:${process.env.PERFCHECKER_HOST_CDP_PORT}`);
     if(bibliography){
@@ -301,6 +369,18 @@ exports.run=async()=>{
       await vscode.commands.executeCommand('workbench.action.toggleFullScreen');
       await vscode.commands.executeCommand('perfchecker.openChat');view=await findChat();
       result.captureLayout={sideBarsClosed:true,nativeCommands:['workbench.action.closeAuxiliaryBar','workbench.action.closeSidebar','workbench.action.toggleFullScreen']};
+      const initialWindow=await nativeCodeWindow('before-native-sizing');
+      const xdotool=process.env.PERFCHECKER_TEST_XDOTOOL;assert(xdotool&&path.isAbsolute(xdotool),'Provide the existing native X11 window control binary');
+      await execute(xdotool,['windowmove','--sync',initialWindow.id,'0','0'],{timeout:5000});
+      const movedWindow=await nativeCodeWindow('after-native-move');
+      assert.deepEqual(movedWindow.identity,initialWindow.identity);assert.equal(movedWindow.id,initialWindow.id);
+      await execute(xdotool,['windowsize','--sync',movedWindow.id,'1920','1080'],{timeout:5000});
+      await eventually(async()=>{
+        const current=await nativeCodeWindow('await-native-size');
+        assert.deepEqual(current.identity,initialWindow.identity);assert.equal(current.id,initialWindow.id);
+        return current.x===0&&current.y===0&&current.width===1920&&current.height===1080;
+      },'The verified private X11 window reaches the exact framebuffer bounds',5000);
+      result.captureLayout.nativeWindowActions=['windowmove 0 0','windowsize 1920 1080'];
       try{await eventually(async()=>await view.evaluate(()=>innerWidth>=1000),
         'The real native fullscreen action reaches a wide PerfChecker Chat before measurements',5000);}
       finally{
@@ -311,6 +391,25 @@ exports.run=async()=>{
       assert(result.captureLayout.editorWidth>=1000,'Capture a wide real PerfChecker editor, rather than a narrow side column');
       result.captureLayout.framebuffer=await capture('capture-layout-preflight',5000);
     }
+    if(capturePreflightOnly){
+      assert(bibliography&&proofs,'The explicit preflight preserves native framebuffer evidence');
+      await view.locator('#chat-question').fill('How can I compare two versions of this package while preserving correctness?');
+      await view.locator('#chat-question').scrollIntoViewIfNeeded();
+      const font=await view.locator('#chat-question').evaluate(node=>({fontSize:getComputedStyle(node).fontSize,
+        bodyFontSize:getComputedStyle(document.body).fontSize,text:node.value}));
+      const framebuffer=await capture('capture-preflight-unsent-draft',5000);
+      assert.equal(font.fontSize,font.bodyFontSize,'The real composer and inherited conversation typography share the same size');
+      font.nativePixels=parseFloat(font.fontSize)*framebuffer.pixelsPerCssY;
+      result.preflightTypography=font;
+      assert(font.nativePixels>=22&&font.nativePixels<=24,'IHDR-qualified native text must be 22–24 pixels');
+      await view.locator('#chat-question').fill('');
+      const current=await state();assert.equal(current.busy,false);assert.equal(current.connection,undefined);assert.equal(current.messages.length,0);
+      await preserved();const after=await indexProof('capture-preflight-after');assert.deepEqual(after.bytes,preflightIndex.bytes);
+      assert.deepEqual(after.entries,preflightIndex.entries);
+      checks.push('installed archive and six private Code directories; native fullscreen/framebuffer typography; unsent draft cleared; exact source/config/index retained');
+      Object.assign(result,{status:'passed',mode:'landscape-capture-preflight-only',preflightTypography:font,
+        notExecuted:['Julia controller/probe','measurements','CLI connection','model request','implementation','assistant transcript scrolling','portrait Short capture']});
+    }else{
     observer=setInterval(()=>{void observe().catch(error=>{result.observationError=String(error);});},200);
     const measureBibliography=async label=>{
       const beforeIndex=await indexProof(`${label}-before-measurements`);
@@ -537,6 +636,7 @@ exports.run=async()=>{
       allocationBaselineBytes:baselineBytes,allocationCandidateBytes:candidateBytes,changedFiles:proposal.files,
       ownedRequestPids:{cli:owned.cli,worker:owned.worker,codex:owned.agent},ownedDeadBeforeCleanup:true,socketClosedBeforeCleanup:true,
       remoteInferenceCancellation:'Not established; UI accurately preserves the remote-work caveat'});
+    }
   }catch(error){
     primaryError=error;Object.assign(result,{status:'failed',error:String(error),stack:error.stack});
     try{await indexProof('failure-before-cleanup');}catch(snapshotError){result.failureIndexError=String(snapshotError);}

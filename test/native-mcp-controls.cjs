@@ -1036,6 +1036,22 @@ exports.run = async (context,options={}) => {
     const proposedChanges=view.getByLabel('Proposed changes',{exact:true});
     assert((await proposedChanges.innerText()).includes('init=zero'),'The real proposed patch is populated before the review capture');
     await proposedChanges.scrollIntoViewIfNeeded();
+    const reviewGeometry=()=>proposedChanges.evaluate(element=>({rectangle:element.getBoundingClientRect().toJSON(),
+      viewport:{width:innerWidth,height:innerHeight},documentScroll:{x:scrollX,y:scrollY},
+      content:{height:element.scrollHeight,clientHeight:element.clientHeight,scrollTop:element.scrollTop}}));
+    log('native-mcp-review-viewport',{stage:'before-native-scroll',...await reviewGeometry()});
+    for(let attempt=0;attempt<4;attempt++){
+      const current=await reviewGeometry();
+      if(current.rectangle.top>=0&&current.rectangle.bottom<=current.viewport.height)break;
+      const box=await proposedChanges.boundingBox();assert(box,'The real proposed patch has native mouse coordinates');
+      const page=await context.windowPage.evaluate(()=>({width:innerWidth,height:innerHeight}));
+      const top=Math.max(0,box.y),bottom=Math.min(page.height,box.y+box.height);
+      assert(bottom>top,'A visible part of the real patch receives the native wheel gesture');
+      await context.windowPage.mouse.move(Math.max(1,Math.min(page.width-1,box.x+box.width/2)),(top+bottom)/2);
+      await context.windowPage.mouse.wheel(0,Math.ceil(current.rectangle.top<0?current.rectangle.top-24:current.rectangle.bottom-current.viewport.height+24));
+      await delay(150);
+      log('native-mcp-review-viewport',{stage:'after-native-scroll',attempt:attempt+1,...await reviewGeometry()});
+    }
     await eventually(async()=>proposedChanges.evaluate(element=>{const box=element.getBoundingClientRect();return box.top>=0&&box.bottom<=innerHeight;}),'The actual proposed patch fits the native review viewport');
     await view.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-${vscode.version}-mcp-reviewed-proposal.png`)});await hold();
