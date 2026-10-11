@@ -35,7 +35,7 @@ function commandCoverage(commands,checks){
     openStudio:['native-open-studio-command'],openStudioForWorkspace:['controller-visible-in-studio','studio-inventory','bootstrap-existing-controller'],openChat:['native-mcp-advice-implementation-restore','native-mcp-configuration-only-conversation'],
     openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save','pluto-studio-file-dialog-buttons','bootstrap-pluto-published-install'],openNotebook:['pluto-reactive-save-reload-close','pluto-studio-file-dialog-buttons'],
     debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],applyImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],
-    restoreImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
+    restoreImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],connectCodex:['codex-missing-native-prerequisite','native-codex-authenticated-connect'],disconnectCodex:['codex-disconnected-command','native-codex-active-disconnect'],
     connectMcpStdio:['native-mcp-stdio-connected-session'],disconnectMcpStdio:['native-mcp-stdio-modern-disconnect'],
     stopNotebookSession:['native-pluto-without-jupyter','pluto-stop-active-owned-worker'],
   };
@@ -43,11 +43,12 @@ function commandCoverage(commands,checks){
     const name=command.replace(/^perfchecker\./,''),proof=checks.filter(check=>check.assertionsCompleted===true&&(effects[name]||[]).includes(check.name));
     const narrativeEnabled=proof.some(check=>check.name==='native-narrative-controlled-response');
     const landscapeExecuted=proof.some(check=>check.name==='native-landscape-command-completed');
-    const externalPrerequisite=name==='connectCodex'||name==='runLandscapeLiveForWorkspace'&&!landscapeExecuted||name==='narrateAdvice'&&!narrativeEnabled;
+    const codexConnected=proof.some(check=>check.name==='native-codex-authenticated-connect');
+    const externalPrerequisite=name==='connectCodex'&&!codexConnected||name==='runLandscapeLiveForWorkspace'&&!landscapeExecuted||name==='narrateAdvice'&&!narrativeEnabled;
     const prerequisite=externalPrerequisite||(proof.length>0&&proof.every(check=>['prerequisite','unavailable'].includes(check.status)));
     return {command,registered:true,status:proof.length?(prerequisite?'prerequisite-verified':'effect-verified'):'unverified',evidence:proof.map(check=>({name:check.name,outcome:check.status||'validated-effect',case:check.case,prerequisite:check.prerequisite})),
       ...(prerequisite?{limit:name==='narrateAdvice'?'No configured narrative model; enabled model execution is not qualified.':name==='connectCodex'?'No human Codex authentication in CI; authenticated CLI/General integration is covered by the separate local opt-in test.':name==='runLandscapeLiveForWorkspace'?'No physical Étendue/GPU renderer in this disposable package; only its explicit prerequisites are verified.':'Only explicit prerequisites were validated; this execution was unavailable.'}:{}),
-      ...(name==='disconnectCodex'?{limit:'The native test verifies the explicit disconnected return state and preserved saved configuration after a failed temporary connection. An active authenticated CLI disconnect is covered separately by the local opt-in test.'}:{}),
+      ...(name==='disconnectCodex'&&!proof.some(check=>check.name==='native-codex-active-disconnect')?{limit:'The native test verifies the explicit disconnected return state and preserved saved configuration after a failed temporary connection. An active authenticated CLI disconnect is covered separately by the local opt-in test.'}:{}),
       ...(name==='narrateAdvice'&&narrativeEnabled?{limit:'The actual native button, Core worker and request/response contract use a clearly identified local protocol fixture. This is not evidence of authenticated model inference.'}:{}),
       ...(name==='runLandscapeLiveForWorkspace'&&landscapeExecuted?{limit:'Real immutable Landscape tag and SDKs through the installed command, SDL/Vulkan llvmpipe software rendering. GPU timing and physical presentation remain unavailable. Cancellation is separate evidence.'}:{}),
       route:'Evidence records actual palette/API or webview backend effects; registration alone is never execution proof.'};
@@ -152,7 +153,7 @@ function configurationCoverage(properties,checks){
     suite:['suite-selection-and-save'],factory:['suite-selection-and-save'],profile:['all-supported-collectors-measured'],reports:['result-controls','computed-reference-aggregation'],
     uiConfiguration:['save-palette-command','native-suite-save-palette'],gitTargets:['git-reference-controls'],comparisonPolicies:['computed-reference-aggregation'],
     advisorImplementationMcpTool:['native-mcp-advice-implementation-restore'],advisorImplementationMcpPromptArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],
-    advisorImplementationMcpWorkspaceArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],codexExecutable:['codex-missing-native-prerequisite'],
+    advisorImplementationMcpWorkspaceArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],codexExecutable:['codex-missing-native-prerequisite','native-codex-authenticated-connect'],
     ...Object.fromEntries(['advisorImplementationMcpArguments','advisorMcpStdioCommand','advisorMcpStdioArguments','advisorMcpStdioDirectory'].map(key=>[key,['native-mcp-persisted-stdio-settings-after-reload']])),
     plutoProject:['native-pluto-without-jupyter','pluto-investigation-real-run','pluto-stop-active-owned-worker'],
   };
@@ -175,14 +176,15 @@ function configurationCoverage(properties,checks){
     const key=option.replace(/^perfchecker\./,''),evidence=checks.filter(check=>check.assertionsCompleted===true&&(paths[key]||[]).includes(check.name));
     const deadlineVerified=evidence.some(check=>({advisorTimeout:'native-narrative-configured-deadline',analysisTimeout:'native-analysis-configured-deadline',
       investigationBudgetSeconds:'native-investigation-elapsed-budget',advisorInvestigates:'native-investigation-enabled-model-decision'})[key]===check.name);
-    const status=!evidence.length?'unverified':key==='codexExecutable'?'prerequisite-verified':pathOnly.has(key)&&!deadlineVerified?'path-exercised':'effect-verified';
+    const authenticatedCodex=evidence.some(check=>check.name==='native-codex-authenticated-connect');
+    const status=!evidence.length?'unverified':key==='codexExecutable'&&!authenticatedCodex?'prerequisite-verified':pathOnly.has(key)&&!deadlineVerified?'path-exercised':'effect-verified';
     const qualifiedLimit=deadlineVerified?({advisorTimeout:'One actual 45-second request expiry is asserted; other configured limits are not implied.',
       analysisTimeout:'One actual 45-second sleeping scenario expires; every analyzer and deadline value is not implied.',
       investigationBudgetSeconds:'One real 45-second elapsed budget interrupts a running scenario and leaves experiments unexecuted.',
       advisorInvestigates:'One controlled structured MCP stop decision is asserted with preserved custom fields; external inference is not qualified.'})[key]:undefined;
     return {option,status,evidence:evidence.map(check=>({name:check.name,case:check.case,status:check.status||'validated-effect'})),
       scope:'Actual values asserted by the cited case only; API-written test settings and native UI changes are not interchangeable.',
-      ...(qualifiedLimit||limits[key]?{limit:qualifiedLimit||limits[key]}:{})};
+      ...(key==='codexExecutable'&&authenticatedCodex?{limit:'Selected native CLI, real authenticated Connect and active Disconnect only; no model inference or implementation was requested.'}:qualifiedLimit||limits[key]?{limit:qualifiedLimit||limits[key]}:{})};
   });
 }
 
@@ -597,6 +599,10 @@ exports.run = async () => {
     for (const command of commands) assert(registered.has(command), `Contributed command is registered: ${command}`);
     log('installed-extension', {version: extension.packageJSON.version, vscode: vscode.version, commands: commands.length,
       settings: Object.keys(extension.packageJSON.contributes.configuration.properties).length, vsixSha256: process.env.PERFCHECKER_NATIVE_SHA});
+    if(phase==='codex-connect'){
+      await runCase('native-codex-connect-disconnect',()=>require('./native-codex-controls.cjs').run({
+        vscode,windowPage,workspace,session,output,extension,log,proof,findFrame}));
+    }else{
     const uri = vscode.Uri.file(workspace);
     const context = {vscode, browser, windowPage, workspace,
       controller: process.env.PERFCHECKER_NATIVE_CONTROLLER, target: process.env.PERFCHECKER_NATIVE_TARGET,
@@ -832,6 +838,7 @@ exports.run = async () => {
           });
         }
       }
+    }
     }
     }
   } catch (error) {failures.push({name: 'host-bootstrap', message: String(error), stack: error.stack});}

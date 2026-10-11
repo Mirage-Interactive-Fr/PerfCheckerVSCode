@@ -203,6 +203,9 @@ async function observeNativeIdentityGone(identity,observe,extinctions){
   }
   return false;
 }
+// Shared by the separately opted-in authenticated, no-model native CLI case.
+exports.nativeIdentity=nativeIdentity;
+exports.observeNativeIdentityGone=observeNativeIdentityGone;
 async function ownedStdioJuliaProcesses(){
   const expected=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
   let rows;
