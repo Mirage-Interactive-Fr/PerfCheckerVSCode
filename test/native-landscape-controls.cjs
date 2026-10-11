@@ -36,6 +36,33 @@ async function bounded(promise,label,timeout,deadline){
     timer=setTimeout(()=>reject(new Error(label)),Math.max(1,Math.min(timeout,deadline-Date.now())));
   })]);}finally{clearTimeout(timer);}
 }
+function nativeFailureDetail(error,{maxNodes=16,maxDepth=4,maxFieldChars=6000}={}){
+  const seen=new Set();let nodes=0;
+  const text=value=>{
+    const content=String(value);if(content.length<=maxFieldChars)return content;
+    const half=Math.floor(maxFieldChars/2);
+    return content.slice(0,half)+`\n[truncated ${content.length-maxFieldChars} characters]\n`+content.slice(-half);
+  };
+  const visit=(value,depth)=>{
+    if(depth>maxDepth)return {truncated:'depth-limit'};
+    if(nodes++>=maxNodes)return {truncated:'node-limit'};
+    if(!value||typeof value!=='object')return {message:text(value)};
+    if(seen.has(value))return {truncated:'repeated-error'};seen.add(value);
+    const result={};
+    for(const key of ['name','message','stack','code','signal','killed','cmd','stdout','stderr']){
+      const item=value[key];if(item===undefined)continue;
+      result[key]=item===null||['boolean','number'].includes(typeof item)?item:text(item);
+    }
+    if(value.cause!==undefined)result.cause=visit(value.cause,depth+1);
+    if(Array.isArray(value.errors)){
+      result.errors=value.errors.slice(0,8).map(item=>visit(item,depth+1));
+      if(value.errors.length>8)result.omittedErrors=value.errors.length-8;
+    }
+    return result;
+  };
+  return visit(error,0);
+}
+exports.nativeFailureDetail=nativeFailureDetail;
 async function command(executable,args,options={}){
   const result=await execute(executable,args,{encoding:'utf8',timeout:120000,maxBuffer:4000000,...options});
   return result.stdout.trim();
@@ -205,7 +232,15 @@ exports.run=async context=>{
     for(const [key,value]of Object.entries({juliaExecutable:julia,runnerProject:controller}))await settings().update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
     observer=observe(root,reports,records);
     const workerCode='using EtenduBeautifulLandscape,EtenduContracts,EtenduNativeArtifacts,EtenduRender,EtenduRuntime,EtenduSDLGPU,JSON3; println("NATIVE_LANDSCAPE_SDK "*JSON3.write([Dict("name"=>string(nameof(m)),"version"=>string(Base.pkgversion(m)),"root"=>pkgdir(m)) for m in (EtenduContracts,EtenduNativeArtifacts,EtenduRender,EtenduRuntime,EtenduSDLGPU)]))';
-    const worker=await command(julia,['--startup-file=no','--history-file=no',`--project=${root}`,'-e',workerCode,'--',root,reports],{env:{...process.env,JULIA_LOAD_PATH:'@:@stdlib'}});
+    const sdkStartedAt=new Date().toISOString(),sdkStarted=Date.now();let worker;
+    context.log('native-landscape-sdk-import',{status:'started',startedAt:sdkStartedAt,timeoutMilliseconds:120000});
+    try{
+      worker=await command(julia,['--startup-file=no','--history-file=no',`--project=${root}`,'-e',workerCode,'--',root,reports],{env:{...process.env,JULIA_LOAD_PATH:'@:@stdlib'}});
+      context.log('native-landscape-sdk-import',{status:'passed',startedAt:sdkStartedAt,elapsedMilliseconds:Date.now()-sdkStarted,timeoutMilliseconds:120000});
+    }catch(error){
+      context.log('native-landscape-sdk-import',{status:'failed',startedAt:sdkStartedAt,elapsedMilliseconds:Date.now()-sdkStarted,timeoutMilliseconds:120000,error:nativeFailureDetail(error)});
+      throw error;
+    }
     resolved=JSON.parse(worker.match(/^NATIVE_LANDSCAPE_SDK (.+)$/m)?.[1]||'null');
     assert.equal(resolved?.length,5);
     for(const dependency of resolved){assert(sdk[dependency.name]);assert.equal(dependency.version,'0.1.1');assert.equal(digest((await sourceDigest(dependency.root)).join('')),sdk[dependency.name][1]);}
@@ -273,7 +308,7 @@ exports.run=async context=>{
       core:context.core,vsixSha256:process.env.PERFCHECKER_NATIVE_SHA,gameCommit,ownedBefore,pidsDeadBeforeHarnessCleanup:true,
       changedSceneBuffers:true,sampledColors:changed.sampledColors,unrelatedProcessPreserved:true,preExistingMemPreserved:true,noNewMem:true,
       cancelledReportsUnchanged:true,scope:'Owned native controller/provider and fixture .mem inventory; no physical GPU or arbitrary user callback guarantee'});
-  }catch(error){primaryError=error;throw error;}
+  }catch(error){primaryError=error;context.log('native-landscape-primary-failure',{error:nativeFailureDetail(error)});throw error;}
   finally{
     const errors=[];let observerFailed=false;
     if(!settled&&invocation)try{await cancel();await bounded(invocation,'Failure cancellation finishes',75000,Date.now()+75000);}catch(error){errors.push(error);}
@@ -306,6 +341,10 @@ exports.run=async context=>{
       try{await fs.rm(sentinel,{force:true});assert.deepEqual(await memSnapshot(roots),baselineMem);}catch(error){errors.push(error);}
       for(const key of keys)try{await settings().update(key,previous[key],vscode.ConfigurationTarget.WorkspaceFolder);}catch(error){errors.push(error);}
     }
-    if(errors.length)throw new AggregateError(primaryError?[primaryError,...errors]:errors,'Native Landscape failed or its owned cleanup remained incomplete');
+    if(errors.length){
+      const failure=new AggregateError(primaryError?[primaryError,...errors]:errors,'Native Landscape failed or its owned cleanup remained incomplete');
+      context.log('native-landscape-aggregate-failure',{error:nativeFailureDetail(failure)});
+      throw failure;
+    }
   }
 };
