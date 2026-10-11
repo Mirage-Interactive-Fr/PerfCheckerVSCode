@@ -80,6 +80,9 @@ const runnerEnvironment=landscapeOnly?{...process.env,JULIA_DEPOT_PATH:path.join
 if(landscapeOnly)for(const key of ['DISPLAY','WAYLAND_DISPLAY','XAUTHORITY','DBUS_SESSION_BUS_ADDRESS',
   'ETENDUE_SDL3_LIBRARY','ETENDUE_SDL3_DLSS_LIBRARY','ETENDUE_JOLTC_LIBRARY'])delete runnerEnvironment[key];
 let landscapeFixture,landscapeObserver,landscapePrimaryError;
+const landscapeMilestone=(stage,detail={})=>{
+  if(landscapeOnly)console.log('NATIVE_LANDSCAPE_TEARDOWN '+JSON.stringify({stage,at:new Date().toISOString(),...detail}));
+};
 let sessionSafeToRemove=true;
 const inspectCommand=promisify(execFile);
 const landscapeProcesses=new Map(),landscapeObserverErrors=[];
@@ -618,6 +621,7 @@ try {
     const video=path.join(output,`native-${process.platform}-vscode-${version}-${expectedVersion}-${phase}.mp4`);
     const display=phase==='landscape'?landscapeFixture.environment.DISPLAY:process.env.DISPLAY;
     const retainHostLogs=async()=>{
+      if(phase==='landscape')landscapeMilestone('host-logs',{status:'started'});
       const origin=path.join(phaseProfile,'logs'),destination=path.join(output,'host-startup-logs',phase);
       for(const relative of await fs.readdir(origin,{recursive:true}).catch(()=>[])){
         const source=path.join(origin,relative),stat=await fs.stat(source).catch(()=>undefined);
@@ -627,6 +631,7 @@ try {
           .replace(/(secret%3D)[^%\s"'<>]*/gi,'$1[session secret]');
         await fs.writeFile(target,text);
       }
+      if(phase==='landscape')landscapeMilestone('host-logs',{status:'finished'});
     };
     try {
       if(process.platform==='linux'&&version==='stable'&&(phase==='prepared'&&stage==='full'||phase==='mcp-pluto')){
@@ -713,8 +718,9 @@ try {
         const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
         const clean=()=>{clearTimeout(timer);clearTimeout(activationTimer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
         child.once('error',error=>{clean();if(!globalDeadlineExpired)reject(error);});
-        child.once('close',async code=>{clean();if(globalDeadlineExpired)return;try{
+        child.once('close',async(code,signal)=>{clean();if(phase==='landscape')landscapeMilestone('host-close',{code,signal});if(globalDeadlineExpired)return;try{
           const result=JSON.parse(await fs.readFile(path.join(output,`${phase}-finished.json`),'utf8'));
+          if(phase==='landscape')landscapeMilestone('host-result',{status:result.status});
           if(globalDeadlineExpired)return;
           result.status==='passed'?resolve():reject(new Error(result.error||`${phase} failed`));
         }catch(error){if(!globalDeadlineExpired)reject(new Error(`Native host exited ${code} before writing its final qualification: ${error}`));}});
@@ -967,12 +973,16 @@ finally {
     if(!qualified)sessionSafeToRemove=false;
   }
   if(landscapeOnly){
+    landscapeMilestone('runner-teardown',{status:'started'});
     process.off('SIGINT',abortLandscape);process.off('SIGTERM',abortLandscape);
+    landscapeMilestone('observer-sample',{status:'started'});
     await landscapeObserver?.sample();
+    landscapeMilestone('observer-sample',{status:'finished'});
     const errors=[],display=landscapeFixture?.displayChild;
     // Observe ownership continuously, including detached descendants after a parent exits.
     // A forced harness cleanup is a failure, never the native command's success oracle.
     const remaining=(await livingLandscapeProcesses()).filter(record=>record.pid!==display?.pid);
+    landscapeMilestone('owned-process-stop',{status:'started',remaining:remaining.length});
     if(remaining.length){
       errors.push(new Error(`Landscape native session still owns processes before teardown: ${remaining.map(record=>record.pid).join(',')}`));
       for(const signal of ['SIGTERM','SIGKILL']){
@@ -991,15 +1001,25 @@ finally {
         }while(Date.now()<until);
       }
     }
+    landscapeMilestone('owned-process-stop',{status:'finished'});
+    landscapeMilestone('display-stop',{status:'started',pid:display?.pid||null});
     if(display&&display.exitCode===null&&display.signalCode===null){
       display.kill('SIGTERM');await Promise.race([landscapeFixture.displayExit,new Promise(resolve=>setTimeout(resolve,2000))]);
       if(display.exitCode===null&&display.signalCode===null){display.kill('SIGKILL');await landscapeFixture.displayExit;}
     }
+    landscapeMilestone('display-stop',{status:'finished',code:display?.exitCode??null,signal:display?.signalCode??null});
+    landscapeMilestone('observer-drain',{status:'started'});
     clearInterval(landscapeObserver);await landscapeObserver?.sample();await landscapeObserver?.drain();
+    landscapeMilestone('observer-drain',{status:'finished'});
     errors.push(...landscapeObserverErrors);
     const survivors=await livingLandscapeProcesses();
     if(survivors.length||landscapeObserverErrors.length)errors.push(new Error(`Session preserved because the drained observer cannot confirm an empty owned tree: ${session}; PIDs=${survivors.map(record=>record.pid).join(',')}`));
-    else await fs.rm(session,{recursive:true,force:true,maxRetries:12,retryDelay:500});
+    else{
+      landscapeMilestone('private-session-removal',{status:'started'});
+      await fs.rm(session,{recursive:true,force:true,maxRetries:12,retryDelay:500});
+      landscapeMilestone('private-session-removal',{status:'finished'});
+    }
+    landscapeMilestone('runner-teardown',{status:errors.length?'failed':'finished',survivors:survivors.length,errors:errors.length});
     if(errors.length)throw new AggregateError(landscapePrimaryError?[landscapePrimaryError,...errors]:errors,'Native Landscape or its owned failure cleanup failed');
   }else if(sessionSafeToRemove)await fs.rm(session, {recursive: true, force: true, maxRetries: 12, retryDelay: 500});
   else console.error(`Private session preserved: owned process cleanup is unqualified: ${session}`);

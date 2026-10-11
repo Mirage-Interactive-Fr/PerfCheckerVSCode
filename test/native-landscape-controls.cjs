@@ -3,6 +3,7 @@
 // a private Xvfb display. This module never replaces VS Code or provider APIs.
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
+const {constants:fsFlags}=require('node:fs');
 const path=require('node:path');
 const {execFile,spawn}=require('node:child_process');
 const {promisify}=require('node:util');
@@ -93,8 +94,88 @@ async function processIdentity(pid){
   const text=await fs.readFile(`/proc/${pid}/stat`,'utf8').catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return null;throw error;});
   if(!text)return null;
   const fields=text.slice(text.lastIndexOf(') ')+2).trim().split(/\s+/);
-  return {pid,state:fields[0],parent:Number(fields[1]),group:Number(fields[2]),started:fields[19]};
+  return {pid,state:fields[0],parent:Number(fields[1]),group:Number(fields[2]),started:fields[19],
+    cpuTicks:{user:fields[11],system:fields[12]}};
 }
+function sameOwnedIdentity(expected,current){
+  assert(/^\d+$/.test(expected.started)&&Number.isInteger(expected.group)&&expected.group>0,'An established incarnation is required');
+  if(!current)return null;
+  assert.equal(current.pid,expected.pid);
+  assert.equal(current.started,expected.started,'Diagnostics never adopt a reused PID');
+  assert.equal(current.group,expected.group,'Diagnostics retain the established process group');
+  return ['Z','X'].includes(current.state)?null:current;
+}
+const inside=(root,file)=>{const relative=path.relative(root,file);return !!relative&&!path.isAbsolute(relative)&&relative.split(path.sep)[0]!=='..';};
+function diagnosticArguments(argv,privateRoot,executable){
+  return argv.slice(0,32).map((value,index)=>{
+    if(argv[index-1]==='-e')return `[Julia code sha256:${digest(value)}]`;
+    if(index===0)return value===executable?value:'[executable alias]';
+    if(['--startup-file=no','--history-file=no','--compiled-modules=strict','-e','--'].includes(value))return value;
+    if(/^--quality=[a-z][a-z0-9-]*$/.test(value))return value;
+    if(value.startsWith('--project=')&&inside(privateRoot,value.slice(10)))return value.slice(0,2048);
+    return path.isAbsolute(value)&&inside(privateRoot,value)?value.slice(0,2048):'[redacted argument]';
+  });
+}
+async function readOwnedTransport(root,file){
+  assert(path.isAbsolute(root)&&path.isAbsolute(file)&&inside(root,file),'The diagnostic transport stays inside its private temporary root');
+  assert.equal(await fs.realpath(root),root,'The transport root is canonical');
+  for(const component of path.relative(root,file).split(path.sep)){
+    root=path.join(root,component);
+    const info=await fs.lstat(root).catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+    if(!info)return {status:'absent'};
+    assert(!info.isSymbolicLink(),'Unexpected transport symlinks are refused');
+  }
+  const info=await fs.lstat(file);assert(info.isFile()&&info.nlink===1,'Only a regular singly linked owned transport is readable');
+  const handle=await fs.open(file,fsFlags.O_RDONLY|fsFlags.O_NOFOLLOW);
+  try{
+    assert.equal(await fs.realpath(`/proc/self/fd/${handle.fd}`),file,'The opened transport has not escaped through a replaced parent');
+    const opened=await handle.stat();assert.equal(opened.ino,info.ino);assert.equal(opened.dev,info.dev);assert.equal(opened.nlink,1);
+    if(opened.size>32768)return {status:'present',bytes:opened.size,contentOmitted:'32768-byte limit'};
+    const bytes=Buffer.alloc(32768),read=await handle.read(bytes,0,bytes.length,0),content=bytes.subarray(0,read.bytesRead);
+    const result={status:'present',bytes:opened.size,sha256:digest(content)};
+    try{const payload=JSON.parse(content);result.summary={schema_version:payload.schema_version==='perfchecker-provider-result/1'?payload.schema_version:'unrecognized',
+      state:['complete','failed','cancelled','partial'].includes(payload.state)?payload.state:'unrecognized',
+      observations:Array.isArray(payload.observations)?payload.observations.length:undefined,
+      diagnostics:Array.isArray(payload.diagnostics)?payload.diagnostics.length:undefined};}
+    catch{result.summary={json:'incomplete-or-invalid'};}
+    const after=await fs.lstat(file);assert(!after.isSymbolicLink()&&after.nlink===1&&after.ino===opened.ino&&after.dev===opened.dev,'The transport keeps its observed file identity');
+    return result;
+  }finally{await handle.close();}
+}
+async function processDiagnostic(record,privateRoot,transportRoot){
+  const before=sameOwnedIdentity(record,await processIdentity(record.pid));
+  if(!before)return {pid:record.pid,started:record.started,status:'physically-absent-or-terminal'};
+  const location=`/proc/${record.pid}`;
+  try{
+    const executable=await fs.realpath(`${location}/exe`);
+    const argv=(await fs.readFile(`${location}/cmdline`,'utf8')).split('\0').filter(Boolean);
+    const wchan=(await fs.readFile(`${location}/wchan`,'utf8')).slice(0,128);
+    const tids=(await fs.readdir(`${location}/task`)).sort().slice(0,48),threads=[];
+    for(const tid of tids){const name=await fs.readFile(`${location}/task/${tid}/comm`,'utf8').catch(error=>{if(['ENOENT','ESRCH'].includes(error.code))return null;throw error;});if(name)threads.push(name.trim().slice(0,80));}
+    // Inspect only the provider's result-file locator, never persist its environment.
+    const output=(await fs.readFile(`${location}/environ`,'utf8')).split('\0').find(value=>value.startsWith('PERFCHECKER_OUTPUT='))?.slice('PERFCHECKER_OUTPUT='.length);
+    const transport=output?await readOwnedTransport(transportRoot,output):undefined;
+    const after=sameOwnedIdentity(record,await processIdentity(record.pid));
+    if(!after)return {pid:record.pid,started:record.started,status:'physically-absent-or-terminal'};
+    assert.equal(await fs.realpath(`${location}/exe`),executable,'The diagnostic executable keeps its incarnation');
+    if(record.diagnosticExecutable)assert.equal(executable,record.diagnosticExecutable,'An observed image is never replaced silently');
+    else record.diagnosticExecutable=executable;
+    return {...after,role:record.role,executable,arguments:diagnosticArguments(argv,privateRoot,executable),
+      omittedArguments:Math.max(0,argv.length-32),wchan,threads,transport};
+  }catch(error){
+    if(['ENOENT','ESRCH'].includes(error.code)&&!sameOwnedIdentity(record,await processIdentity(record.pid)))
+      return {pid:record.pid,started:record.started,status:'physically-absent-or-terminal'};
+    throw error;
+  }
+}
+exports.sameOwnedIdentity=sameOwnedIdentity;
+exports.diagnosticArguments=diagnosticArguments;
+exports.readOwnedTransport=readOwnedTransport;
+async function diagnosticObservation(read){
+  try{return {status:'available',value:await read()};}
+  catch(error){return {status:'unavailable',error:nativeFailureDetail(error)};}
+}
+exports.diagnosticObservation=diagnosticObservation;
 async function living(records){
   const result=[];
   for(const record of records.values()){
@@ -121,7 +202,8 @@ async function trackTree(pid,records,role,provider,parent,started){
   assert(!old||old.started===current.started,'A PID cannot change identity inside the observed owned tree');
   const argv=(await fs.readFile(`/proc/${pid}/cmdline`).catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return Buffer.alloc(0);throw error;})).toString().split('\0');
   if(argv.includes(provider)&&!argv.includes('-e'))role='renderer';
-  records.set(pid,{...current,role:role==='renderer'?role:old?.role||role});
+  records.set(pid,{...current,role:role==='renderer'?role:old?.role||role,
+    ...(old?.diagnosticExecutable?{diagnosticExecutable:old.diagnosticExecutable}:{})});
   for(const child of await children(pid,current.started))await trackTree(child,records,'provider-descendant',provider,pid);
 }
 function observe(root,reports,records){
@@ -220,6 +302,31 @@ exports.run=async context=>{
   const qualityDigest=digest(await fs.readFile(path.join(root,'config','quality.toml'))),sceneDigest=digest(await fs.readFile(path.join(root,'content','scenes','beautiful_landscape.toml')));
   const sentinel=path.join(root,`native-landscape-unrelated-${randomUUID()}.mem`),sentinelBytes=Buffer.from('Unrelated allocation trace must survive native cancellation.\n');
   const records=new Map();let observer,foreign,foreignIdentity,primaryError,invocation,resolved,settled=true;
+  const transportRoot=await fs.realpath(process.env.TMPDIR);assert(inside(transportRoot,session),'Only this runner temporary transport root is inspected');
+  let diagnosticTimer,diagnosticTail=Promise.resolve(),diagnosticCount=0,periodicCount=0,unavailableDiagnostics=0,lastWindowAt=0;
+  const diagnose=label=>{
+    // Reserve two samples for the explicit observations before native/recovery Cancel.
+    if(diagnosticCount>=24||label==='periodic'&&periodicCount>=22)return diagnosticTail;
+    if(label==='periodic')periodicCount++;
+    const sample=++diagnosticCount;
+    diagnosticTail=diagnosticTail.then(async()=>{
+      await observer.sample();const owned=[...records.values()].filter(row=>row.role!=='sdk-probe');
+      const processes=[];for(const row of owned.slice(0,12)){
+        const observed=await diagnosticObservation(()=>processDiagnostic(row,session,transportRoot));
+        if(observed.status==='unavailable')unavailableDiagnostics++;
+        processes.push({pid:row.pid,started:row.started,...observed});
+      }
+      let rendered;
+      if(label!=='periodic'||Date.now()-lastWindowAt>=60000){
+        lastWindowAt=Date.now();rendered=await diagnosticObservation(()=>renderedFrame(display));
+        if(rendered.status==='available'&&rendered.value===null)rendered={status:'unavailable',reason:'No completed Landscape window sample exists yet'};
+        if(rendered.status==='unavailable')unavailableDiagnostics++;
+      }
+      context.log('native-landscape-command-observation',{label,sample,observedAt:new Date().toISOString(),
+        processes,omittedProcesses:Math.max(0,owned.length-12),rendered});
+    }).catch(error=>{unavailableDiagnostics++;context.log('native-landscape-observation-unavailable',{label,error:nativeFailureDetail(error)});});
+    return diagnosticTail;
+  };
   const notification=()=>windowPage.locator('.notification-list-item').filter({hasText:title});
   const cancel=async()=>{
     await vscode.commands.executeCommand('notifications.showList');
@@ -245,6 +352,7 @@ exports.run=async context=>{
     assert.equal(resolved?.length,5);
     for(const dependency of resolved){assert(sdk[dependency.name]);assert.equal(dependency.version,'0.1.1');assert.equal(digest((await sourceDigest(dependency.root)).join('')),sdk[dependency.name][1]);}
     await observer.sample();assert.deepEqual(await living(records),[],'SDK preparation leaves no child alive');records.clear();
+    diagnosticTimer=setInterval(()=>{void diagnose('periodic');},15000);
     const completed=await bounded(start(),'The real native Landscape command completes its measurement',180000,deadline);
     assert.equal(completed.ok,true,String(completed.error));
     const directory=await fs.realpath(completed.directory);
@@ -293,6 +401,7 @@ exports.run=async context=>{
       'The actual controller and rendering provider are both alive before Cancel');
     const ownedBefore=[...records.values()].map(({pid,parent,group,started,role})=>({pid,parent,group,started,role}));
     context.log('native-landscape-before-cancel',{owned:ownedBefore,foreign:foreignIdentity.pid,renderedBuffers:[first,changed]});
+    await diagnose('before-native-cancel');
     await cancel();
     const cancelled=await bounded(invocation,'Native progress Cancel waits for real controller cleanup',75000,deadline);
     assert.equal(cancelled.ok,false);assert.match(String(cancelled.error),/Live measurement cancelled/i);
@@ -308,10 +417,16 @@ exports.run=async context=>{
       core:context.core,vsixSha256:process.env.PERFCHECKER_NATIVE_SHA,gameCommit,ownedBefore,pidsDeadBeforeHarnessCleanup:true,
       changedSceneBuffers:true,sampledColors:changed.sampledColors,unrelatedProcessPreserved:true,preExistingMemPreserved:true,noNewMem:true,
       cancelledReportsUnchanged:true,scope:'Owned native controller/provider and fixture .mem inventory; no physical GPU or arbitrary user callback guarantee'});
-  }catch(error){primaryError=error;context.log('native-landscape-primary-failure',{error:nativeFailureDetail(error)});throw error;}
+  }catch(error){primaryError=error;context.log('native-landscape-primary-failure',{error:nativeFailureDetail(error)});
+    if(observer)await diagnose('before-recovery-cancel');throw error;}
   finally{
     const errors=[];let observerFailed=false;
+    clearInterval(diagnosticTimer);await diagnosticTail;
+    context.log('native-landscape-observation-summary',{status:!diagnosticCount?'not-observed':unavailableDiagnostics?'incomplete':'available',
+      samples:diagnosticCount,unavailable:unavailableDiagnostics,scope:'Diagnostics only; native functional and ownership assertions remain independent'});
+    context.log('native-landscape-teardown',{stage:'recovery-cancel',status:'started',at:new Date().toISOString()});
     if(!settled&&invocation)try{await cancel();await bounded(invocation,'Failure cancellation finishes',75000,Date.now()+75000);}catch(error){errors.push(error);}
+    context.log('native-landscape-teardown',{stage:'recovery-cancel',status:'finished',at:new Date().toISOString(),settled});
     if(observer){
       try{await observer.sample();}catch(error){observerFailed=true;errors.push(error);}
     }
