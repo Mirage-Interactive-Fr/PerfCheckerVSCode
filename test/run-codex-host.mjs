@@ -12,13 +12,16 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 const client=path.dirname(path.dirname(fileURLToPath(import.meta.url))),rawExecute=promisify(execFile);
 const preparationAbort=new AbortController();
 const execute=(command,args,options={})=>rawExecute(command,args,{timeout:60000,...options,signal:preparationAbort.signal});
-const vsixSha='e68a9264c301292568edbae21b7165f893bbeec59097233676d9de3983ba21b3';
-const coreTree='00c133336911b8600d63a8d6c59ce1befc5ce690';
+const vsixSha='771ff166e24e96ac1c7121bce8181cb4456089ea83b0356fc6d86593440dfa88';
+const coreTree='2563a09e7904f19592e8f658289566e76bf93c6c';
+const coreCommit='00e94c62a2080dba02782e451422ed98ea0b358a';
 const bibliography=process.env.PERFCHECKER_TEST_BIBLIOGRAPHY;
 const capturePreflightOnly=process.env.PERFCHECKER_TEST_CAPTURE_PREFLIGHT_ONLY==='1';
 const dialogueCancelOnly=process.env.PERFCHECKER_TEST_DIALOGUE_CANCEL_ONLY==='1';
+const liveCancelOnly=process.env.PERFCHECKER_TEST_LIVE_CANCEL_ONLY==='1';
 if(capturePreflightOnly)assert(bibliography,'The capture-only preflight uses the explicit private Bibliography fixture');
 if(dialogueCancelOnly)assert(bibliography&&!capturePreflightOnly,'Dialogue/Cancel is a distinct explicit Bibliography qualification');
+if(liveCancelOnly)assert(dialogueCancelOnly,'Live Cancel alone requires the explicit complementary mode');
 // This explicit real-package demo includes a cold isolated Julia environment.
 // Forced timeout/cancellation fixtures retain their separate 180 second budget.
 const advisorTimeout=bibliography?600:180;
@@ -28,7 +31,7 @@ for(const name of ['PERFCHECKER_TEST_CONTROLLER','PERFCHECKER_TEST_CODEX','PERFC
   if(!process.env[name]||!path.isAbsolute(process.env[name]))throw new Error(`Provide an absolute ${name} path.`);
 const archive=await fs.realpath(process.env.PERFCHECKER_TEST_VSIX);
 assert.equal(createHash('sha256').update(await fs.readFile(archive)).digest('hex'),vsixSha,'Use the approved VSIX bytes, not a development build');
-assert.equal((await fs.stat(archive)).size,1077160);
+assert.equal((await fs.stat(archive)).size,1077954);
 if(bibliography){
   assert(path.isAbsolute(bibliography),'Provide an absolute private Bibliography pilot path');
   assert(!process.env.WAYLAND_DISPLAY,'Remove WAYLAND_DISPLAY before launching this private X11 test');
@@ -37,7 +40,7 @@ if(bibliography){
   assert(process.env.PERFCHECKER_TEST_RESULTS&&path.isAbsolute(process.env.PERFCHECKER_TEST_RESULTS),'Provide an explicit absolute proof destination for the Bibliography qualification');
 }
 process.env.PERFCHECKER_CODEX_HOST_ONLY='1';
-const {prepareJuliaCodexFixture,prepareBibliographyCodexFixture,stopObservedCodexProcesses,ownedProcessState}=await import('./codex-real.test.mjs');
+const {prepareJuliaCodexFixture,prepareBibliographyCodexFixture,stopObservedCodexProcesses,ownedProcessState,observePrivateProcess}=await import('./codex-real.test.mjs');
 const sdk=await import(process.env.PERFCHECKER_TEST_ELECTRON?pathToFileURL(process.env.PERFCHECKER_TEST_ELECTRON).href:'@vscode/test-electron');
 const session=await fs.mkdtemp(path.join(os.tmpdir(),'perfchecker-codex-host-'));
 let displayChild,displayExit,sessionMayRemove=true,expired=false,forceDeadline,sdkRunning=false;
@@ -45,21 +48,23 @@ let affinityTimer,affinityPending,affinityError;
 const affinityProcesses=new Map(),affinityReceipt={cpus:'16-17',source:'read-only /proc PID/start, all observed TID children and per-TID status',
   observations:0,processes:[],errors:[],neverObservedDescendants:'Not established by a sampling observer'};
 const gone=error=>['ENOENT','ESRCH'].includes(error.code);
-const processBirth=async pid=>{
-  try{const text=await fs.readFile(`/proc/${pid}/stat`,'utf8'),fields=text.slice(text.lastIndexOf(') ')+2).trim().split(/\s+/);
-    assert(/^\d+$/.test(fields[19]));return fields[0]==='Z'?undefined:{pid,parent:Number(fields[1]),start:fields[19]};}
-  catch(error){if(gone(error))return undefined;throw error;}
-};
+const processBirth=ownedProcessState;
 const inspectAffinity=async()=>{
   if(affinityPending)return affinityPending;
   affinityPending=(async()=>{
-    const queue=[process.pid,...affinityProcesses.values()].map(value=>typeof value==='number'?{pid:value}:value),seen=new Set();
+    const queue=affinityProcesses.size?[...affinityProcesses.values()]:[{pid:process.pid}],seen=new Set();
     while(queue.length){
-      const prior=queue.shift(),identity=await processBirth(prior.pid);if(!identity||prior.start&&identity.start!==prior.start)continue;
+      const prior=queue.shift(),identity=await observePrivateProcess(prior.pid,{
+        known:affinityProcesses.get(`${prior.pid}:${prior.start}`),parent:prior.observedParent});
+      if(!identity||prior.start&&identity.start!==prior.start)continue;
       const key=`${identity.pid}:${identity.start}`;if(seen.has(key))continue;seen.add(key);
       assert(affinityProcesses.size<10000||affinityProcesses.has(key),'Affinity observation identity budget exceeded');
-      let executable;try{executable=await fs.readlink(`/proc/${identity.pid}/exe`);}catch(error){if(gone(error))continue;throw error;}
-      const known=affinityProcesses.get(key),record={...(known||{...identity,firstObservedAt:new Date().toISOString()}),executable,threads:{...known?.threads}},next=[];
+      const known=affinityProcesses.get(key),record={...known,...identity,firstObservedAt:known?.firstObservedAt??new Date().toISOString(),
+        threads:{...known?.threads}},next=[];
+      if(!identity.executable)delete record.executable;
+      // Persist even an unknown image before inspecting its TIDs. This map
+      // records observations only and never grants permission to send signals.
+      affinityProcesses.set(key,record);
       let tids;try{tids=await fs.readdir(`/proc/${identity.pid}/task`);}catch(error){if(gone(error))continue;throw error;}
       for(const tid of tids){
         assert(/^\d+$/.test(tid));const directory=`/proc/${identity.pid}/task/${tid}`;
@@ -74,7 +79,7 @@ const inspectAffinity=async()=>{
             // Preserve the offending observation before the assertion aborts this
             // scan. This metadata never grants permission to signal a process.
             const violation={at:new Date().toISOString(),pid:identity.pid,start:identity.start,parent:identity.parent,
-              executable,tid:Number(tid),tidStart:start,cpus};
+              executableObservation:identity.executableObservation,group:identity.group,session:identity.session,tid:Number(tid),tidStart:start,cpus};
             try{violation.cgroup=await fs.readFile(path.join(directory,'cgroup'),'utf8');}
             catch(error){violation.cgroupUnavailable=String(error.code??error.name);}
             affinityReceipt.violation=violation;
@@ -86,11 +91,13 @@ const inspectAffinity=async()=>{
           record.threads[`${tid}:${start}`]={tid:Number(tid),start,cpus};
           for(const child of children.trim().split(/\s+/).filter(Boolean)){
             assert(/^\d+$/.test(child));const current=await processBirth(Number(child));
-            if(current?.parent===identity.pid)next.push(current);
+            if(current?.parent===identity.pid)next.push({...current,observedParent:identity});
           }
         }catch(error){if(!gone(error))throw error;}
       }
-      if((await processBirth(identity.pid))?.start!==identity.start||await fs.readlink(`/proc/${identity.pid}/exe`).catch(error=>{if(!gone(error))throw error;})!==executable)continue;
+      const after=await observePrivateProcess(identity.pid,{known:record});
+      if(!after||after.start!==identity.start)continue;
+      Object.assign(record,after);if(!after.executable)delete record.executable;
       record.lastObservedAt=new Date().toISOString();affinityProcesses.set(key,record);queue.push(...next);
     }
     affinityReceipt.observations++;
@@ -159,11 +166,11 @@ try{
   checkPreparation();
   const fixture=capturePreflightOnly?{probe:{mode:'capture-only',oracleExecuted:false}}:
     await (bibliography?prepareBibliographyCodexFixture:prepareJuliaCodexFixture)(root,
-      {julia:process.env.PERFCHECKER_TEST_JULIA,project:process.env.PERFCHECKER_TEST_CONTROLLER,coreVersion:'1.0.1',coreTree,signal:preparationAbort.signal,dialogueCancelOnly});
+      {julia:process.env.PERFCHECKER_TEST_JULIA,project:process.env.PERFCHECKER_TEST_CONTROLLER,coreVersion:'1.1.0',coreTree,coreCommit,signal:preparationAbort.signal,dialogueCancelOnly});
   if(affinityError)throw affinityError;checkPreparation();
   await execute('unzip',['-q',archive,'-d',path.join(session,'archive')]);
   const archiveExtension=path.join(session,'archive','extension');
-  assert.equal(JSON.parse(await fs.readFile(path.join(archiveExtension,'package.json'),'utf8')).version,'1.0.1');
+  assert.equal(JSON.parse(await fs.readFile(path.join(archiveExtension,'package.json'),'utf8')).version,'1.0.2');
   // -displayfd asks Xvfb to reserve its own free display. Never attach to the user's DISPLAY.
   checkPreparation();displayChild=spawn(process.env.PERFCHECKER_TEST_XVFB||'Xvfb',
     ['-displayfd','3','-screen','0','1920x1080x24','-nolisten','tcp','-ac'],{stdio:['ignore','ignore','pipe','pipe']});
@@ -211,6 +218,7 @@ try{
       PERFCHECKER_HOST_PRIVATE_DIRECTORIES:JSON.stringify(directories),PERFCHECKER_HOST_ADVISOR_TIMEOUT:String(advisorTimeout),
       ...(capturePreflightOnly?{PERFCHECKER_HOST_CAPTURE_PREFLIGHT_ONLY:'1'}:{}),
       ...(dialogueCancelOnly?{PERFCHECKER_HOST_DIALOGUE_CANCEL_ONLY:'1'}:{}),
+      ...(liveCancelOnly?{PERFCHECKER_HOST_LIVE_CANCEL_ONLY:'1'}:{}),
       ...(bibliography?{PERFCHECKER_HOST_BIBLIOGRAPHY:JSON.stringify(fixture.probe)}:{}),
       ...(process.env.PERFCHECKER_TEST_RESULTS?{PERFCHECKER_HOST_PROOFS:process.env.PERFCHECKER_TEST_RESULTS}:{}),
       JULIA_NUM_THREADS:bibliography?'2':'1',JULIA_NUM_PRECOMPILE_TASKS:'1',JULIA_NUM_GC_THREADS:'1',OPENBLAS_NUM_THREADS:'1',OMP_NUM_THREADS:'1'}});}
@@ -252,20 +260,25 @@ try{
       displayChild.kill('SIGTERM');await Promise.race([displayExit,delay(2000)]);
       if(displayChild.exitCode===null&&displayChild.signalCode===null){displayChild.kill('SIGKILL');await displayExit;}
     }
-    if(capturePreflightOnly){
-      const living=[];
-      for(const record of affinityProcesses.values())if(record.pid!==process.pid&&(await processBirth(record.pid))?.start===record.start)
-        living.push({pid:record.pid,start:record.start});
+    if(bibliography){
+      let living=[];const cleanupEnd=Date.now()+60000;
+      do{
+        living=[];
+        for(const record of affinityProcesses.values())if(record.pid!==process.pid&&(await processBirth(record.pid))?.start===record.start)
+          living.push({pid:record.pid,start:record.start,executableObservation:record.executableObservation});
+        if(!living.length||Date.now()>=cleanupEnd)break;
+        await delay(100);
+      }while(true);
       affinityReceipt.afterSdkAndDisplayCleanup={at:new Date().toISOString(),observedLiving:living,
         neverObservedDescendants:'Not established by a sampling observer'};
       if(process.env.PERFCHECKER_TEST_RESULTS)await fs.writeFile(path.join(process.env.PERFCHECKER_TEST_RESULTS,'cpu-affinity.json'),JSON.stringify(affinityReceipt,null,2));
       const outcome=await fs.readFile(path.join(session,'result.json'),'utf8').catch(error=>{if(error.code!=='ENOENT')throw error;});
       if(outcome){const result=JSON.parse(outcome);result.driverCleanup=affinityReceipt.afterSdkAndDisplayCleanup;
-        if(living.length)Object.assign(result,{status:'failed',cleanupSafeToRemove:false,cleanupError:'Observed private preflight descendants remain alive'});
+        if(living.length)Object.assign(result,{status:'failed',cleanupSafeToRemove:false,cleanupError:'Observed private descendants remain alive after SDK/display cleanup'});
         await fs.writeFile(path.join(session,'result.json'),JSON.stringify(result,null,2));
         if(process.env.PERFCHECKER_TEST_RESULTS)await fs.copyFile(path.join(session,'result.json'),path.join(process.env.PERFCHECKER_TEST_RESULTS,'result.json'));}
-      if(living.length){sessionMayRemove=false;console.error(`Private preflight session retained: ${session}`);
-        throw new Error('Observed private preflight descendants remain alive; preserve the session instead of claiming extinction');}
+      if(living.length){sessionMayRemove=false;console.error(`Private session retained: ${session}`);
+        throw new Error('Observed private descendants remain alive; preserve the session instead of claiming extinction');}
     }
     if(sessionMayRemove)await fs.rm(session,{recursive:true,force:true});
     else console.error(`Failed session preserved while process cleanup is unresolved: ${session}`);

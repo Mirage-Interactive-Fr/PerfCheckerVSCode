@@ -88,7 +88,12 @@ export class PosixProcessCohort {
   private async identity(row: Omit<Identity, 'exe'>, initial = false, deadline = Infinity): Promise<Identity | undefined> {
       remaining(deadline);
       const {pid} = row;
+      const refusal = (message: string, observed?: Omit<Identity, 'exe'> & {state: string}, executable?: string, errno?: string) =>
+        new Error(message, {cause: {kind: 'process-identity', platform: process.platform, initial,
+          expected: {pid, parent: row.parent, group: row.group, session: row.session, start: row.start}, observed, executable, errno}});
       if (process.platform === 'linux') {
+        const snapshot = (fields: string[]) => ({pid, parent: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), start: fields[19], state: fields[0]});
+        const sameBirth = (fields: string[]) => [fields[1], fields[2], fields[3], fields[19]].every(value => /^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value))) && fields[19] === row.start;
         try {
           let exe: string;
           try {exe = await realpath(`/proc/${pid}/exe`);}
@@ -96,42 +101,51 @@ export class PosixProcessCohort {
             const current = await readFile(`/proc/${pid}/stat`, 'utf8').catch(error => {
               if (['ENOENT', 'ESRCH'].includes(error.code)) return ''; throw error;
             });
-            if (!current || ['Z', 'X'].includes(current.slice(current.lastIndexOf(')') + 2).trim().split(/\s+/)[0])) return undefined;
-            throw new Error('A live private MCP process has no observable executable.');
+            if (!current) return undefined;
+            const fields = current.slice(current.lastIndexOf(')') + 2).trim().split(/\s+/);
+            if (!sameBirth(fields)) throw refusal('Process identity changed while inspecting.', snapshot(fields), undefined, (error as NodeJS.ErrnoException).code);
+            if (['Z', 'X'].includes(fields[0])) return undefined;
+            throw refusal('A live private MCP process has no observable executable.', snapshot(fields), undefined, (error as NodeJS.ErrnoException).code);
           }
           const after = await readFile(`/proc/${pid}/stat`, 'utf8'), fields = after.slice(after.lastIndexOf(')') + 2).trim().split(/\s+/);
-          if (![fields[1], fields[2], fields[3], fields[19]].every(value => /^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value))) ||
-            fields[19] !== row.start ||
-            ((!this.followSessionChanges && (Number(fields[2]) !== row.group || Number(fields[3]) !== row.session)) ||
+          if (!sameBirth(fields)) throw refusal('Process identity changed while inspecting.', snapshot(fields), exe);
+          // A dead incarnation needs no ownership transition or signal. Its
+          // birth must still match before ignoring changed parent/group/session.
+          if (['Z', 'X'].includes(fields[0])) return undefined;
+          if ((!this.followSessionChanges && (Number(fields[2]) !== row.group || Number(fields[3]) !== row.session)) ||
               ((Number(fields[2]) !== row.group || Number(fields[3]) !== row.session || Number(fields[1]) !== row.parent) &&
-                !this.knownReparent(row, exe, fields[1], initial)))) throw new Error('Process identity changed while inspecting.');
-          if (this.followSessionChanges && await realpath(`/proc/${pid}/exe`) !== exe) throw new Error('Owned executable changed during its identity read.');
-          if (!['Z','X'].includes(fields[0])) return {...row, parent: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), exe};
+                !this.knownReparent(row, exe, fields[1], initial))) throw refusal('Process identity changed while inspecting.', snapshot(fields), exe);
+          if (this.followSessionChanges && await realpath(`/proc/${pid}/exe`) !== exe) throw refusal('Owned executable changed during its identity read.', snapshot(fields), exe);
+          return {...row, parent: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), exe};
         } catch (error) {if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;}
         return undefined;
       }
       try {
         const txt = await execute('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'txt', '-Fn'], {timeout: remaining(deadline), maxBuffer: 1_000_000});
         const filename = txt.stdout.split('\n').find(line => line.startsWith('n/'))?.slice(1);
-        if (!filename) throw new Error('The MCP executable mapping is unavailable.');
+        if (!filename) throw refusal('The MCP executable mapping is unavailable.');
         const exe = await realpath(filename);
         const after = await execute('/bin/ps', ['-p', String(pid), '-o', 'pid=,ppid=,pgid=,sess=,stat=,lstart='], {timeout: remaining(deadline)});
         const again = after.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.+)$/);
-        if (!again || Number(again[1]) !== row.pid || again[6] !== row.start ||
-          ((!this.followSessionChanges && (Number(again[3]) !== row.group || again[4] !== row.session)) ||
+        const observed = again ? {pid: Number(again[1]), parent: Number(again[2]), group: Number(again[3]), session: again[4], state: again[5], start: again[6]} : undefined;
+        if (!again || ![again[1], again[2], again[3]].every(value => Number.isSafeInteger(Number(value))) || Number(again[1]) !== row.pid || again[6] !== row.start)
+          throw refusal('MCP process identity changed while inspecting its executable.', observed, exe);
+        if (/^[ZX]/.test(again[5])) return undefined;
+        if ((!this.followSessionChanges && (Number(again[3]) !== row.group || again[4] !== row.session)) ||
             ((Number(again[3]) !== row.group || again[4] !== row.session || Number(again[2]) !== row.parent) &&
-              !this.knownReparent(row, exe, again[2], initial)))) throw new Error('MCP process identity changed while inspecting its executable.');
+              !this.knownReparent(row, exe, again[2], initial))) throw refusal('MCP process identity changed while inspecting its executable.', observed, exe);
         if (this.followSessionChanges) {
           const second = await execute('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'txt', '-Fn'], {timeout: remaining(deadline), maxBuffer: 1_000_000});
           const image = second.stdout.split('\n').find(line => line.startsWith('n/'))?.slice(1);
-          if (!image || await realpath(image) !== exe) throw new Error('Owned executable changed during its identity read.');
+          if (!image || await realpath(image) !== exe) throw refusal('Owned executable changed during its identity read.', observed, exe);
         }
-        if (!/^[ZX]/.test(again[5])) return {...row, parent: Number(again[2]), group: Number(again[3]), session: again[4], exe};
+        return {...row, parent: Number(again[2]), group: Number(again[3]), session: again[4], exe};
       } catch (error) {
         const current = await execute('/bin/ps', ['-p', String(pid), '-o', 'pid=,stat=,lstart='], {timeout: remaining(deadline)}).catch(error => {
           if (error.code === 1 && !String(error.stdout ?? '').trim() && !String(error.stderr ?? '').trim()) return {stdout: ''}; throw error;
         });
-        if (current.stdout.trim() && !/^\s*\d+\s+[ZX]/.test(current.stdout)) throw error;
+        const final = current.stdout.trim().match(/^(\d+)\s+(\S+)\s+(.+)$/);
+        if (current.stdout.trim() && (!final || Number(final[1]) !== pid || final[3] !== row.start || !/^[ZX]/.test(final[2]))) throw error;
       }
   }
   async observe(initial = false, command?: string, deadline = Infinity) {

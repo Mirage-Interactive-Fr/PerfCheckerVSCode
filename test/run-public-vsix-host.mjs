@@ -9,9 +9,9 @@ import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
-import {nativeCoreContract,GENERAL101_TREE} from './native-core-contract.mjs';
+import {nativeCoreContract,CORE110_CANDIDATE} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -29,6 +29,7 @@ const coreTree=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_TREE 
 const coreProvenance=nativeCoreContract({core:coreMode,artifact:mode,stage:process.env.PERFCHECKER_NATIVE_STAGE||'smoke',
   group:process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative',commit:process.env.PERFCHECKER_NATIVE_CORE_COMMIT||'',tree:process.env.PERFCHECKER_NATIVE_CORE_TREE||''});
 const expectedCoreVersion=coreProvenance.version;
+const minimumVersion=mode==='public'?'1.0.0':'1.1.0';
 const installCore=coreMode==='candidate'?`${candidateGitSetupScript};Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]));${candidateCheckoutPermissionsScript}`:`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))${coreMode==='general100'?'; Pkg.pin(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))':''}`;
 // Read the actual dependency and Manifest route, not the declared fixture pin.
 const companionProvenance=String.raw`function native_provider_provenance(m)
@@ -103,7 +104,8 @@ async function execute(executable, args, options = {}) {
 
 // This preparation owns its compilation children independently of the import
 // timeout. No uncertain observation is accepted as proof of an empty tree.
-async function executeControllerPreflight(executable,args,receipt){
+async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180000}={}){
+  assert(Number.isSafeInteger(timeoutMs)&&timeoutMs>0);
   const windows=process.platform==='win32',expected=await fs.realpath(executable);
   const launcher=path.join(repository,'resources','windows-owned-process.ps1');
   const ownerExecutable=windows?path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'):expected;
@@ -111,7 +113,7 @@ async function executeControllerPreflight(executable,args,receipt){
   const ownerArgs=windows?['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',launcher,
     '-Executable',expected,'-WorkingDirectory',receipt.project,'-ArgumentsBase64',Buffer.from(JSON.stringify(args)).toString('base64'),'-ParentPid',String(process.pid)]:args;
   const child=spawn(ownerExecutable,ownerArgs,{cwd:receipt.project,env:runnerEnvironment,windowsHide:true,detached:!windows,stdio:['pipe','pipe','pipe']});
-  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Date.now()+180000;
+  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Date.now()+timeoutMs;
   receipt.deadlineAt=new Date(cleanupUntil).toISOString();
   const limit=maximum=>{const remaining=cleanupUntil-Date.now();if(remaining<=0)throw new Error('Owned preflight inspection exceeded its current preparation or cleanup deadline');return Math.min(maximum,remaining);};
   receipt.ownership={ownerPid:child.pid,identities:[],observations:[],errors,cleanupQualified:false};
@@ -171,7 +173,10 @@ async function executeControllerPreflight(executable,args,receipt){
       const same=after=>{assert.equal(after.started,before.started);assert.equal(after.group,before.group);};
       let executable;
       try{executable=await fs.realpath(`/proc/${row.pid}/exe`);}
-      catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;const current=await linuxCurrent(row.pid);
+      catch(error){if(!['ENOENT','ESRCH'].includes(error.code))throw error;
+        if(qualified)return revalidateQualifiedLinuxExecutable({identity:qualified,error,deadlineAt:cleanupUntil,readCurrent:linuxCurrent,
+          readExecutable:pid=>fs.realpath(`/proc/${pid}/exe`),record:observation=>(receipt.ownership.revalidations??=[]).push(observation)});
+        const current=await linuxCurrent(row.pid);
         if(!current)return undefined;same(current);if(['Z','X'].includes(current.state))return undefined;throw error;}
       const after=await linuxCurrent(row.pid);if(!after)return undefined;same(after);if(['Z','X'].includes(after.state))return undefined;
       if(after.parent!==before.parent||after.state!==before.state)(receipt.ownership.revalidations??=[]).push({stage:'mutable-process-fields',pid:row.pid,
@@ -306,7 +311,7 @@ async function executeControllerPreflight(executable,args,receipt){
     if(!receipt.ownership.cleanupQualified){sessionSafeToRemove=false;child.unref();child.stdout.destroy();child.stderr.destroy();}
   }
   if(expired||spawnError||outcome?.code!==0||!started||!receipt.ownership.cleanupQualified||receipt.ownership.aliveBeforeCleanup?.length)
-    throw Object.assign(new Error(`Controller preflight failed: ${expired?'180 second timeout':spawnError||JSON.stringify(outcome)}; owned cleanup=${receipt.ownership.cleanupQualified}`),{commandOutput:text});
+    throw Object.assign(new Error(`Controller ${receipt.phase??'preflight'} failed: ${expired?`${timeoutMs/1000} second timeout`:spawnError||JSON.stringify(outcome)}; owned cleanup=${receipt.ownership.cleanupQualified}`),{commandOutput:text});
   return text;
 }
 
@@ -544,14 +549,14 @@ try {
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
-  const versionsText=await minimumResponse.text(),minimumSection=versionsText.split(/^\["1\.0\.1"\]\s*$/m)[1]?.split(/^\[/m)[0];
+  const versionsText=await minimumResponse.text(),minimumSection=versionsText.split('["'+minimumVersion+'"]')[1]?.split(/^\[/m)[0];
   const minimumTree=/^git-tree-sha1\s*=\s*"([a-f0-9]{40})"/m.exec(minimumSection||'')?.[1];
   const minimumAvailable=Boolean(minimumTree);
-  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,GENERAL101_TREE,'The published General 1.0.1 tree is the immutable release contract');
+  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,CORE110_CANDIDATE.tree,'Published General 1.1.0 must match the independently pinned Core source tree');
   const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml');
   if(!plutoTagResponse.ok&&plutoTagResponse.status!==404)throw new Error(`Cannot verify published Pluto companion tag: ${plutoTagResponse.status}`);
   const plutoTagAvailable=plutoTagResponse.ok&&/^version\s*=\s*"1\.0\.1"\s*$/m.test(await plutoTagResponse.text());
-  await fs.writeFile(path.join(output,'production-bootstrap-gate.json'),JSON.stringify({minimum:'1.0.1',registry:'General',available:minimumAvailable,
+  await fs.writeFile(path.join(output,'production-bootstrap-gate.json'),JSON.stringify({minimum:minimumVersion,registry:'General',available:minimumAvailable,
     tree:minimumTree,plutoTag:'v1.0.1',plutoTagAvailable,
     status:minimumAvailable&&plutoTagAvailable?'native-positive-test-required':'awaiting-registration-or-tag',candidateFunctions:coreProvenance},null,2));
 
@@ -616,6 +621,7 @@ try {
         PERFCHECKER_NATIVE_STAGE: process.env.PERFCHECKER_NATIVE_STAGE || 'smoke',
         PERFCHECKER_NATIVE_EXPECTED_VERSION: expectedVersion, PERFCHECKER_NATIVE_JULIA_VERSION: runtime.version,
         PERFCHECKER_NATIVE_CORE_VERSION: expectedCoreVersion, PERFCHECKER_NATIVE_CORE_PROVENANCE:JSON.stringify(coreProvenance),
+        PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION:minimumVersion,
         PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE:String(minimumAvailable),
         PERFCHECKER_NATIVE_GENERAL_MINIMUM_TREE:minimumTree||'',
         PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE:String(plutoTagAvailable),
@@ -712,7 +718,7 @@ try {
     artifactRecord.documentedMcpInstallation={status:'passed',startedAt:installationStartedAt,finishedAt:new Date().toISOString(),
       elapsedSeconds:(Date.now()-Date.parse(installationStartedAt))/1000,autoPrecompile:runnerEnvironment.JULIA_PKG_PRECOMPILE_AUTO,
       privateDepot:runnerEnvironment.JULIA_DEPOT_PATH,project:controller,core:{...coreProvenance},http,
-      packagesAdded:['PerfChecker@1.0.1','HTTP'],manualHttpImport:false,controllerPreflight:false,
+      packagesAdded:[`PerfChecker@${expectedCoreVersion}`,'HTTP'],manualHttpImport:false,controllerPreflight:false,
       scope:'Documented package installation with normal automatic precompilation, not a cold-cache advice qualification'};
     assert.equal(artifactRecord.documentedMcpInstallation.autoPrecompile,'1');
     await fs.writeFile(path.join(output,'documented-mcp-installation.log'),installation);
@@ -727,6 +733,31 @@ try {
   }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
   if(stage==='targeted'||stage==='full'||stage==='focused'&&(['general100','mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
+    // This is installation/cache preparation, not first-Send or a cold-start
+    // measurement. Keep its explicit compilation cost and physical ownership
+    // separate from the unchanged 180-second prepared-import qualification.
+    const preparationBefore=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
+    const preparation={status:'running',phase:'cache preparation',startedAt:new Date().toISOString(),project:controller,
+      packages:['PerfChecker','HTTP'],strict:true,timeoutMilliseconds:900000,hashesBefore:preparationBefore,
+      automaticPrecompile:runnerEnvironment.JULIA_PKG_PRECOMPILE_AUTO,
+      scope:'Explicit selected-package cache preparation with owned compilation children; no cold-start or native first-Send claim'};
+    artifactRecord.controllerCachePreparation=preparation;await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+    try{
+      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',controllerCachePreparationScript,controller],preparation,{timeoutMs:preparation.timeoutMilliseconds});
+      await fs.writeFile(path.join(output,'controller-cache-preparation.log'),text);
+      const complete=text.split(/\r?\n/).filter(line=>line.startsWith('CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 '));
+      assert.equal(complete.length,1,'Exactly one completed explicit cache-preparation receipt is required');
+      preparation.precompileSeconds=Number(complete[0].slice('CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 '.length));
+      assert(Number.isFinite(preparation.precompileSeconds)&&preparation.precompileSeconds>=0);
+      preparation.status='passed';
+    }catch(error){preparation.status='failed';preparation.error=String(error);if(error.commandOutput)await fs.writeFile(path.join(output,'controller-cache-preparation.log'),error.commandOutput);throw error;}
+    finally{
+      preparation.finishedAt=new Date().toISOString();preparation.elapsedSeconds=(Date.now()-Date.parse(preparation.startedAt))/1000;
+      preparation.hashesAfter=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
+      if(Object.keys(preparationBefore).some(name=>preparation.hashesAfter[name]!==preparationBefore[name])){preparation.status='failed';preparation.hashMismatch=true;}
+      await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+      assert.deepEqual(preparation.hashesAfter,preparationBefore,'Explicit cache preparation preserves the exact installed Project and Manifest');
+    }
     const before=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
     const receipt={status:'running',startedAt:new Date().toISOString(),project:controller,hashesBefore:before,
       scope:'Explicit controller preparation before the native first Send; cache preparation, not a cold-start qualification'};

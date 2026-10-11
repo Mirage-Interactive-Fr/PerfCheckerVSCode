@@ -12,12 +12,12 @@ async function eventually(callback,label,timeout=180000){
   throw new Error(label);
 }
 
-// Candidate native hosts already require real Core1.0.1. General1.0.0 has its
-// separately executable CLI integration test, not an unreachable native branch.
+// The driver verifies the exact Core version and source tree before this host.
+// General1.0.0 has its separately executable CLI integration test.
 exports.run=async(context,{calls,receipts,providerErrors,state,setAttached})=>{
   const {vscode,workspace,findFrame,proof}=context,uri=vscode.Uri.file(workspace);
-  assert.equal(context.core.version,'1.0.1','The existing native candidate Core contract remains unchanged');
-  assert.equal(process.env.PERFCHECKER_NATIVE_CORE_VERSION,context.core.version);
+  assert.equal(context.core.version,process.env.PERFCHECKER_NATIVE_CORE_VERSION,
+    'The native Suite evidence uses the exact Core version already verified by the driver');
   const settings=vscode.workspace.getConfiguration('perfchecker',uri);
   const reports=path.resolve(workspace,settings.get('reports','perf/results/vscode'));
   assert(!path.relative(workspace,reports).startsWith('..')&&!path.isAbsolute(path.relative(workspace,reports)));

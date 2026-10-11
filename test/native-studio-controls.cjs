@@ -179,9 +179,47 @@ async function nativeSuiteWorker(context) {
   return matches[0];
 }
 
+async function resultDocuments(context) {
+  const documents=[];
+  for(const browserContext of context.browser.contexts())for(const page of browserContext.pages())for(const current of page.frames()){
+    try{
+    const button=current.locator('button[data-report="suite-result.json"]');
+    if(!await button.count())continue;
+    const nonce=await current.locator('script[nonce]').evaluate(script=>script.nonce);
+    assert(typeof nonce==='string'&&nonce.length>0,'A results document has its actual CSP nonce');
+    let visible=await button.first().isVisible();
+    for(let parent=current;visible&&parent.parentFrame();parent=parent.parentFrame()){
+      const owner=await parent.frameElement();
+      try{visible=await owner.isVisible();}finally{await owner.dispose();}
+    }
+    documents.push({frame:current,nonce,visible});
+    }catch(error){
+      if(!current.isDetached())throw error;
+      // A detached read is not a completed user action. Record the invalidated
+      // observation and require a fresh visible document without replaying a click.
+      context.log('native-results-document-observation-invalidated',{message:String(error),detached:true});
+    }
+  }
+  return documents;
+}
+
 async function output(context) {
+  // Results retains its hidden document. The Studio click requests an asynchronous
+  // report read and HTML replacement, so visibility alone can still select its old frame.
+  const previous=new Set((await resultDocuments(context)).map(document=>document.nonce));
   await clickStudioAction(context, 'results');
-  return frame(context, 'button[data-report="suite-result.json"]');
+  const deadline=Date.now()+60000;
+  while(Date.now()<deadline){
+    const current=(await resultDocuments(context)).filter(document=>document.visible&&!previous.has(document.nonce));
+    assert(current.length<=1,'Only one new results document belongs to this request');
+    if(current.length){
+      context.log('native-results-document-ready',{previousNonces:[...previous],nonce:current[0].nonce,
+        newDocumentObserved:true,studioClicks:1});
+      return current[0].frame;
+    }
+    await new Promise(resolve=>setTimeout(resolve,100));
+  }
+  throw new Error('Timed out: The single Results click renders its new visible document');
 }
 
 async function resetDesigner(view) {

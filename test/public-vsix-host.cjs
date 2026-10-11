@@ -454,6 +454,8 @@ async function measureNativeTestItem(context,expectedPassed,options={}){
 exports.run = async () => {
   assert.equal(process.env.CI, 'true', 'Never run this host against a human VS Code installation');
   const phase = process.env.PERFCHECKER_NATIVE_PHASE;
+  const minimumVersion=process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION;
+  assert(/^\d+\.\d+\.\d+$/.test(minimumVersion),'The runner declares the production registry minimum explicitly');
   const workspace = process.env.PERFCHECKER_NATIVE_WORKSPACE;
   const output = process.env.PERFCHECKER_NATIVE_OUTPUT;
   assert(path.isAbsolute(workspace));
@@ -470,7 +472,7 @@ exports.run = async () => {
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,platform:process.platform,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
       coverage:process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
-      core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1',available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
+      core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:minimumVersion,available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
       commands:commandCoverage(commands,checks),configuration:configurationCoverage(configurationProperties,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);
     pendingReport=pendingReport.then(()=>fs.writeFile(path.join(output,`${phase}.json`),report));
     return pendingReport;
@@ -605,7 +607,7 @@ exports.run = async () => {
     if(['testitems-ready','suite','diagnosis','pluto'].includes(phase))context.observeWork=stage=>observeNativeWork(context,stage);
     if(phase==='diagnosis'&&process.platform==='darwin'&&process.env.PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP)context.observeDiagnosisRequest=(stage,deadline)=>macProcessInventory(context,stage,undefined,[],deadline);
     context.measureTestItem=options=>measureNativeTestItem(context,true,options);
-    log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
+    log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${minimumVersion}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 
     if(phase!=='fresh'&&(phase==='narrative'||process.env.PERFCHECKER_NATIVE_STAGE==='focused')){
       const settings=vscode.workspace.getConfiguration('perfchecker',uri);
@@ -718,11 +720,11 @@ exports.run = async () => {
         if(process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE!=='true'){
           await eventually(async()=>{
             const text=(await studio.locator('body').innerText())+'\n'+(await windowPage.locator('body').innerText());
-            return /requires registered PerfChecker 1\.0\.1/.test(text)&&/Install or upgrade it explicitly/.test(text);
+            return text.includes(`requires registered PerfChecker ${minimumVersion}`)&&/Install or upgrade it explicitly/.test(text);
           },'Production bootstrap explains the registered minimum and upgrade action',180000);
           assert.equal(vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject','perf'),'perf','Failed production setup preserves the selected controller');
           assert(!await fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false));
-          proof('bootstrap-awaiting-registration',{status:'prerequisite',minimum:'1.0.1',registry:'General',positiveBootstrapQualified:false,explicitConfirmation:true,nativeStudioClick:true});
+          proof('bootstrap-awaiting-registration',{status:'prerequisite',minimum:minimumVersion,registry:'General',positiveBootstrapQualified:false,explicitConfirmation:true,nativeStudioClick:true});
           return;
         }
         await eventually(()=>fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false),'Explicit first-use setup creates a real suite',initializationRemaining());
@@ -737,13 +739,13 @@ exports.run = async () => {
         },'The real initialization plan finishes before opening Feature suite',initializationRemaining());
         log('native-bootstrap-plan-ready',{...bootstrapPlan,elapsedMs:Date.now()-initializationStartedAt,maximumMs:600000,noAdditionalPlanRequested:true});
         await controls.runSelection(context);
-        proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:'General 1.0.1',nativeStudioClick:true});
+        proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:`General ${minimumVersion}`,nativeStudioClick:true});
       });
       if(process.env.PERFCHECKER_NATIVE_MODE==='candidate')await runCase('fresh-pluto-published-install',async()=>{
         if(!bootstrapped)throw Object.assign(new Error('Blocked by failed production controller bootstrap'),{blockedBy:'missing-controller-initialize'});
         if(process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE!=='true'||process.env.PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE!=='true'){
-          proof('bootstrap-pluto-awaiting-publication',{status:'prerequisite',core:'General 1.0.1',companion:'PerfCheckerPluto subdir at v1.0.1',positiveBootstrapQualified:false});
-          if(process.env.PERFCHECKER_NATIVE_CASE_GROUP==='bootstrap')throw new Error('Published General 1.0.1 and companion tag v1.0.1 are required for this positive bootstrap qualification');
+          proof('bootstrap-pluto-awaiting-publication',{status:'prerequisite',core:`General ${minimumVersion}`,companion:'PerfCheckerPluto subdir at v1.0.1',positiveBootstrapQualified:false});
+          if(process.env.PERFCHECKER_NATIVE_CASE_GROUP==='bootstrap')throw new Error(`Published General ${minimumVersion} and companion tag v1.0.1 are required for this positive bootstrap qualification`);
           return;
         }
         await pluto.runFreshInstall(context);

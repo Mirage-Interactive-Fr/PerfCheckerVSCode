@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.2 — Narrow chat and process lifecycle fixes
+
+- Keep MCP chat controls usable in narrow VS Code editor panels with the host's
+  styles and native zoom.
+- Guided controller setup and Pluto notebooks require PerfChecker.jl 1.1.0.
+  Existing CLI controllers remain compatible with 1.0.1; 1.1.0 is recommended
+  for its fixes when copying read-only worker environments.
+- Handle terminated Linux and macOS CLI processes without confusing reparenting
+  with a live identity change. PID reuse and unverified live ownership still
+  fail closed, with safe diagnostic metadata retained for identity errors.
+
 ## 1.0.1 — Pluto notebooks and first-use fixes
 
 - MCP connection settings now lead with generic HTTP and local stdio servers.
