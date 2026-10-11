@@ -7,6 +7,97 @@ import nativeLandscape from './native-landscape-controls.cjs';
 
 // Exercise the error serializer used by the actual native Landscape harness.
 const detail=nativeLandscape.nativeFailureDetail;
+const wait=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done;});return {promise,resolve};};
+
+test('Landscape scene waits propagate terminal command and observer failures immediately without retrying',async()=>{
+  for(const failure of [new assert.AssertionError({message:'The renderer already settled'}),new Error('Owned identity inspection failed')]){
+    let reads=0;const started=Date.now();
+    await assert.rejects(nativeLandscape.eventually(async()=>{reads++;throw failure;},'Scene readiness',900000,started+900000),error=>error===failure);
+    assert.equal(reads,1);assert(Date.now()-started<500,'A permanent failure must not consume the 900-second startup allowance');
+  }
+});
+
+test('Landscape scene waits retry only explicit unavailable results and bound a stalled observation',async()=>{
+  let reads=0;
+  assert.equal(await nativeLandscape.eventually(async()=>++reads===1?false:'rich-scene','Scene readiness',1000,Date.now()+1000),'rich-scene');
+  assert.equal(reads,2);
+  const never=deferred(),started=Date.now();
+  await assert.rejects(nativeLandscape.eventually(()=>never.promise,'Scene readiness',30,started+1000),/Scene readiness/);
+  assert(Date.now()-started<500);never.resolve(false);
+});
+
+test('Landscape observer coalesces bursts while a slow inspection is active without a deferred backlog',async()=>{
+  const gate=deferred();let calls=0,active=0,maximum=0;
+  const observer=nativeLandscape.createCoalescingObserver(async check=>{
+    calls++;maximum=Math.max(maximum,++active);await gate.promise;check();active--;
+  },{interval:1});
+  const samples=Array.from({length:100},()=>observer.sample());
+  try{
+    await wait(20);assert.equal(calls,1);assert.equal(maximum,1);
+    gate.resolve();await Promise.all(samples);await observer.stop(Date.now()+1000);
+    await wait(10);assert.equal(calls,1,'Timer ticks and sample bursts do not enqueue future inspections');
+    assert.equal(observer.idle,true);
+  }finally{gate.resolve();await observer.stop(Date.now()+1000);}
+});
+
+test('Landscape observer stop prevents new work immediately and drains exactly the active inspection',async()=>{
+  const gate=deferred();let calls=0,finished=false;
+  const observer=nativeLandscape.createCoalescingObserver(async()=>{calls++;await gate.promise;finished=true;},{interval:1});
+  const sample=observer.sample();await wait(5);
+  const stopping=observer.stop(Date.now()+1000);
+  await assert.rejects(observer.sample(),/has stopped/);
+  await wait(10);assert.equal(calls,1);assert.equal(finished,false);
+  gate.resolve();await Promise.all([sample,stopping]);
+  await wait(5);assert.equal(calls,1);assert.equal(finished,true);assert.equal(observer.idle,true);
+});
+
+test('Landscape observer retains the actual inspection error through sample and stop without retrying it',async()=>{
+  const failure=new Error('owned incarnation is ambiguous'),errors=[];let calls=0;
+  const observer=nativeLandscape.createCoalescingObserver(async()=>{calls++;throw failure;},{interval:1,onError:error=>errors.push(error)});
+  await assert.rejects(observer.sample(),error=>error===failure);
+  await wait(5);await assert.rejects(observer.sample(),error=>error===failure);
+  await assert.rejects(observer.stop(Date.now()+1000),error=>error===failure);
+  assert.equal(calls,1);assert.deepEqual(errors,[failure]);assert.equal(observer.idle,true);
+});
+
+test('Landscape cleanup deadline includes an inspection already active before stop and forbids later reads',async()=>{
+  const gate=deferred(),errors=[];let laterReads=0;
+  const observer=nativeLandscape.createCoalescingObserver(async check=>{
+    await gate.promise;check();laterReads++;
+  },{interval:1,onError:error=>errors.push(error)});
+  const sample=observer.sample();void sample.catch(()=>{});await wait(5);
+  const started=Date.now();
+  await assert.rejects(observer.stop(started+30),/deadline expired/);
+  assert(Date.now()-started<500,'The pre-existing inspection cannot drain outside the cleanup deadline');
+  assert.equal(observer.idle,false,'An expired observer is not an empty-tree certificate');
+  gate.resolve();await assert.rejects(sample,/deadline expired/);
+  assert.equal(laterReads,0);assert.equal(observer.idle,true);assert.equal(errors.length,1);
+  await assert.rejects(observer.sample(),/has stopped/);
+});
+
+test('Landscape shared deadline refuses to start expired cleanup work and retains primary errors',async()=>{
+  let touched=false;
+  await assert.rejects(nativeLandscape.beforeDeadline(()=>{touched=true;},Date.now()-1),/deadline expired/);
+  assert.equal(touched,false);
+  const primary=new Error('original renderer failure');
+  await assert.rejects(nativeLandscape.beforeDeadline(()=>Promise.reject(primary),Date.now()+1000),error=>error===primary);
+});
+
+test('Landscape scene oracle rejects missing richness and accepts actual varied buffers in both byte orders',()=>{
+  const pixels=(colors,bigEndian=false)=>{
+    const bytes=Buffer.alloc(colors*13*4);
+    for(let i=0;i<colors;i++)bigEndian?bytes.writeUInt32BE(i,i*13*4):bytes.writeUInt32LE(i,i*13*4);
+    return bytes;
+  };
+  assert.equal(nativeLandscape.renderedScene(pixels(195)).state,'initializing','Observed initialization window is never a scene');
+  assert.equal(nativeLandscape.renderedScene(pixels(1000)).state,'initializing','Exactly 1,000 colors is not rich enough');
+  const actual=nativeLandscape.renderedScene(pixels(14543));
+  assert.equal(actual.state,'rich-scene');assert.equal(actual.sampledColors,14543);
+  assert.equal(nativeLandscape.renderedScene(pixels(14543,true),{byteOrder:1}).sampledColors,14543);
+  const changed=pixels(14543);changed.writeUInt32LE(0xffffff,52);
+  assert.notEqual(nativeLandscape.renderedScene(changed).sha256,actual.sha256);
+});
 
 test('native Landscape diagnostics retain the primary subprocess and nested cleanup errors',()=>{
   const primary=Object.assign(new Error('SDK import interrupted'),{code:null,signal:'SIGTERM',killed:true,

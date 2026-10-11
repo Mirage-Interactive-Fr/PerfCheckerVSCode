@@ -11,6 +11,7 @@ import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 import {nativeCoreContract,CORE110_CANDIDATE} from './native-core-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
+import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
 import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -318,25 +319,30 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
   return text;
 }
 
-async function landscapeIdentity(pid){
+async function landscapeIdentity(pid,check=()=>{}){
+  check();
   const text=await fs.readFile(`/proc/${pid}/stat`,'utf8').catch(error=>{if(['ENOENT','ESRCH'].includes(error.code))return null;throw error;});
+  check();
   if(!text)return null;const fields=text.slice(text.lastIndexOf(') ')+2).trim().split(/\s+/);
   return {pid,parent:Number(fields[1]),started:fields[19],state:fields[0]};
 }
-async function landscapeChildren(pid,started){
+async function landscapeChildren(pid,started,check=()=>{}){
+  check();
   const tasks=await fs.readdir(`/proc/${pid}/task`).catch(error=>{if(['ENOENT','ESRCH'].includes(error.code))return [];throw error;});
+  check();
   const found=new Set();
   for(const tid of tasks.filter(name=>/^\d+$/.test(name))){
     const text=await fs.readFile(`/proc/${pid}/task/${tid}/children`,'utf8').catch(error=>{if(['ENOENT','ESRCH'].includes(error.code))return '';throw error;});
+    check();
     for(const child of text.trim().split(/\s+/).filter(Boolean).map(Number))found.add(child);
   }
-  const after=await landscapeIdentity(pid);return after?.started===started&&after.state!=='Z'?[...found]:[];
+  const after=await landscapeIdentity(pid,check);return after?.started===started&&after.state!=='Z'?[...found]:[];
 }
-async function observeLandscapeChildren(pid=process.pid,parent){
-  const current=await landscapeIdentity(pid);if(!current||current.state==='Z')return;
+async function observeLandscapeChildren(pid=process.pid,parent,check=()=>{}){
+  const current=await landscapeIdentity(pid,check);if(!current||current.state==='Z')return;
   if(parent!==undefined&&current.parent!==parent)return;
   if(pid!==process.pid){const old=landscapeProcesses.get(pid);assert(!old||old.started===current.started,'An owned PID retains its start identity');landscapeProcesses.set(pid,current);}
-  for(const child of await landscapeChildren(pid,current.started))await observeLandscapeChildren(child,pid);
+  for(const child of await landscapeChildren(pid,current.started,check))await observeLandscapeChildren(child,pid,check);
 }
 async function livingLandscapeProcesses(){
   const alive=[];
@@ -495,15 +501,12 @@ try {
   await fs.mkdir(output, {recursive: true});
   assertCI();
   if(landscapeOnly){
-    assert.equal(process.platform,'linux');await fs.mkdir(runnerEnvironment.XDG_RUNTIME_DIR,{mode:0o700});let pending=Promise.resolve();
+    assert.equal(process.platform,'linux');await fs.mkdir(runnerEnvironment.XDG_RUNTIME_DIR,{mode:0o700});
     process.on('SIGINT',abortLandscape);process.on('SIGTERM',abortLandscape);
-    const inspect=async()=>{await observeLandscapeChildren();for(const record of [...landscapeProcesses.values()]){
-      const current=await landscapeIdentity(record.pid);if(current?.started===record.started&&current.state!=='Z')await observeLandscapeChildren(record.pid);
+    const inspect=async check=>{await observeLandscapeChildren(process.pid,undefined,check);for(const record of [...landscapeProcesses.values()]){
+      const current=await landscapeIdentity(record.pid,check);if(current?.started===record.started&&current.state!=='Z')await observeLandscapeChildren(record.pid,undefined,check);
     }};
-    const sample=()=>pending=pending.then(inspect).catch(error=>{landscapeObserverErrors.push(error);});
-    landscapeObserver=setInterval(sample,100);
-    landscapeObserver.sample=sample;
-    landscapeObserver.drain=()=>pending;
+    landscapeObserver=createCoalescingObserver(inspect,{interval:100,onError:error=>landscapeObserverErrors.push(error)});
   }
   if(stage==='core-external'){
     if(coreMode!=='candidate')throw new Error('The focused Core regression requires an immutable candidate commit/tree.');
@@ -703,7 +706,7 @@ try {
           await retainHostLogs().catch(error=>console.error(`NATIVE_STARTUP_LOGS ${error.message}`));stop();
           reject(new Error(`The ${phase} helper did not activate within 3 minutes. Retained Electron/extension-host logs distinguish startup failure from campaign duration.`));
         })();},180000);
-        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?130:40;
+        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?130:phase==='landscape'?45:40;
         const deadlineStartedAt=new Date().toISOString();
         let globalDeadlineExpired=false;
         const timer=setTimeout(()=>{globalDeadlineExpired=true;void(async()=>{
@@ -973,53 +976,62 @@ finally {
     if(!qualified)sessionSafeToRemove=false;
   }
   if(landscapeOnly){
-    landscapeMilestone('runner-teardown',{status:'started'});
-    process.off('SIGINT',abortLandscape);process.off('SIGTERM',abortLandscape);
-    landscapeMilestone('observer-sample',{status:'started'});
-    await landscapeObserver?.sample();
-    landscapeMilestone('observer-sample',{status:'finished'});
+    // This deadline starts BEFORE sampling/draining any observer, and covers
+    // all ownership checks, failure signals and private-session removal.
+    const cleanupDeadline=Date.now()+120000;
+    const cleanup=operation=>beforeDeadline(operation,cleanupDeadline,'Landscape runner cleanup deadline expired');
     const errors=[],display=landscapeFixture?.displayChild;
+    landscapeMilestone('runner-teardown',{status:'started',deadlineAt:new Date(cleanupDeadline).toISOString(),budgetMilliseconds:120000});
+    process.off('SIGINT',abortLandscape);process.off('SIGTERM',abortLandscape);
+    try{
+    landscapeMilestone('observer-sample',{status:'started'});
+    await landscapeObserver?.sample(cleanupDeadline);
+    landscapeMilestone('observer-sample',{status:'finished'});
     // Observe ownership continuously, including detached descendants after a parent exits.
     // A forced harness cleanup is a failure, never the native command's success oracle.
-    const remaining=(await livingLandscapeProcesses()).filter(record=>record.pid!==display?.pid);
+    const remaining=(await cleanup(livingLandscapeProcesses)).filter(record=>record.pid!==display?.pid);
     landscapeMilestone('owned-process-stop',{status:'started',remaining:remaining.length});
     if(remaining.length){
       errors.push(new Error(`Landscape native session still owns processes before teardown: ${remaining.map(record=>record.pid).join(',')}`));
       for(const signal of ['SIGTERM','SIGKILL']){
         const signalled=new Set();
-        const until=Date.now()+(signal==='SIGTERM'?5000:2000);
+        const until=Math.min(cleanupDeadline,Date.now()+(signal==='SIGTERM'?5000:2000));
         do{
-          await landscapeObserver?.sample();
-          for(const record of (await livingLandscapeProcesses()).reverse()){
+          await landscapeObserver?.sample(cleanupDeadline);
+          for(const record of (await cleanup(livingLandscapeProcesses)).reverse()){
             if(record.pid===display?.pid)continue;
-            const identity=record.pid+'/'+record.started,current=await landscapeIdentity(record.pid);
+            const identity=record.pid+'/'+record.started,current=await cleanup(()=>landscapeIdentity(record.pid));
             if(signalled.has(identity)||current?.started!==record.started||current.state==='Z')continue;
             try{process.kill(record.pid,signal);signalled.add(identity);}catch(error){if(error.code!=='ESRCH')errors.push(error);}
           }
-          if(!(await livingLandscapeProcesses()).some(record=>record.pid!==display?.pid))break;
-          await new Promise(resolve=>setTimeout(resolve,100));
+          if(!(await cleanup(livingLandscapeProcesses)).some(record=>record.pid!==display?.pid))break;
+          await cleanup(()=>new Promise(resolve=>setTimeout(resolve,100)));
         }while(Date.now()<until);
       }
     }
     landscapeMilestone('owned-process-stop',{status:'finished'});
     landscapeMilestone('display-stop',{status:'started',pid:display?.pid||null});
     if(display&&display.exitCode===null&&display.signalCode===null){
-      display.kill('SIGTERM');await Promise.race([landscapeFixture.displayExit,new Promise(resolve=>setTimeout(resolve,2000))]);
-      if(display.exitCode===null&&display.signalCode===null){display.kill('SIGKILL');await landscapeFixture.displayExit;}
+      await cleanup(()=>display.kill('SIGTERM'));
+      await cleanup(()=>Promise.race([landscapeFixture.displayExit,new Promise(resolve=>setTimeout(resolve,2000))]));
+      if(display.exitCode===null&&display.signalCode===null){await cleanup(()=>display.kill('SIGKILL'));await cleanup(()=>landscapeFixture.displayExit);}
     }
     landscapeMilestone('display-stop',{status:'finished',code:display?.exitCode??null,signal:display?.signalCode??null});
+    }catch(error){errors.push(error);}
     landscapeMilestone('observer-drain',{status:'started'});
-    clearInterval(landscapeObserver);await landscapeObserver?.sample();await landscapeObserver?.drain();
-    landscapeMilestone('observer-drain',{status:'finished'});
+    try{await landscapeObserver?.stop(cleanupDeadline);landscapeMilestone('observer-drain',{status:'finished'});}
+    catch(error){errors.push(error);landscapeMilestone('observer-drain',{status:'failed'});}
     errors.push(...landscapeObserverErrors);
-    const survivors=await livingLandscapeProcesses();
-    if(survivors.length||landscapeObserverErrors.length)errors.push(new Error(`Session preserved because the drained observer cannot confirm an empty owned tree: ${session}; PIDs=${survivors.map(record=>record.pid).join(',')}`));
-    else{
+    let survivors;
+    try{survivors=await cleanup(livingLandscapeProcesses);}catch(error){errors.push(error);}
+    if(!survivors||survivors.length||!landscapeObserver?.idle||landscapeObserverErrors.length)
+      errors.push(new Error(`Session preserved because the drained observer cannot confirm an empty owned tree: ${session}; PIDs=${survivors?.map(record=>record.pid).join(',')??'unknown'}`));
+    else if(!errors.length){
       landscapeMilestone('private-session-removal',{status:'started'});
-      await fs.rm(session,{recursive:true,force:true,maxRetries:12,retryDelay:500});
-      landscapeMilestone('private-session-removal',{status:'finished'});
+      try{await cleanup(()=>fs.rm(session,{recursive:true,force:true,maxRetries:12,retryDelay:500}));landscapeMilestone('private-session-removal',{status:'finished'});}
+      catch(error){errors.push(error);}
     }
-    landscapeMilestone('runner-teardown',{status:errors.length?'failed':'finished',survivors:survivors.length,errors:errors.length});
+    landscapeMilestone('runner-teardown',{status:errors.length?'failed':'finished',survivors:survivors?.length??null,errors:errors.length});
     if(errors.length)throw new AggregateError(landscapePrimaryError?[landscapePrimaryError,...errors]:errors,'Native Landscape or its owned failure cleanup failed');
   }else if(sessionSafeToRemove)await fs.rm(session, {recursive: true, force: true, maxRetries: 12, retryDelay: 500});
   else console.error(`Private session preserved: owned process cleanup is unqualified: ${session}`);
