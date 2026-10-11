@@ -264,7 +264,16 @@ exports.run=async context=>{
   assert.equal(process.platform,'linux','This software renderer qualification uses Linux/X11 process identities');
   assert.equal(process.env.CI,'true','Only the disposable native host is supported');
   assert.equal(process.env.PERFCHECKER_NATIVE_PHASE,'landscape');
-  const {vscode,windowPage}=context,deadline=Date.now()+420000;
+  // The installed provider contract allows 900s. Controller startup, bundle
+  // validation and the editor handoff have a separate bounded 120s allowance;
+  // SDK import and the second, real rendering/Cancel phase keep their limits.
+  const budgets={sdkImport:120000,provider:900000,controllerHandoff:120000,
+    unrelatedReadiness:10000,renderBeforeCancel:75000,cancelSettlement:75000,fixtureAndAssertions:180000};
+  const caseBudget=Object.values(budgets).reduce((total,value)=>total+value,0);
+  const {vscode,windowPage}=context,deadline=Date.now()+caseBudget;
+  context.log('native-landscape-observation-budgets',{...budgets,caseMilliseconds:caseBudget,
+    commandMilliseconds:budgets.provider+budgets.controllerHandoff,productProviderMilliseconds:900000,
+    scope:'Observation only; unchanged provider, measurement assertions and native Cancel'});
   const session=await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION);
   assert.match(path.basename(session),/^pc-vsix-/,'Use the existing runner-owned native session');
   const insideSession=location=>{const relative=path.relative(session,location);return !!relative&&!path.isAbsolute(relative)&&relative.split(path.sep)[0]!=='..';};
@@ -340,12 +349,12 @@ exports.run=async context=>{
     observer=observe(root,reports,records);
     const workerCode='using EtenduBeautifulLandscape,EtenduContracts,EtenduNativeArtifacts,EtenduRender,EtenduRuntime,EtenduSDLGPU,JSON3; println("NATIVE_LANDSCAPE_SDK "*JSON3.write([Dict("name"=>string(nameof(m)),"version"=>string(Base.pkgversion(m)),"root"=>pkgdir(m)) for m in (EtenduContracts,EtenduNativeArtifacts,EtenduRender,EtenduRuntime,EtenduSDLGPU)]))';
     const sdkStartedAt=new Date().toISOString(),sdkStarted=Date.now();let worker;
-    context.log('native-landscape-sdk-import',{status:'started',startedAt:sdkStartedAt,timeoutMilliseconds:120000});
+    context.log('native-landscape-sdk-import',{status:'started',startedAt:sdkStartedAt,timeoutMilliseconds:budgets.sdkImport});
     try{
-      worker=await command(julia,['--startup-file=no','--history-file=no',`--project=${root}`,'-e',workerCode,'--',root,reports],{env:{...process.env,JULIA_LOAD_PATH:'@:@stdlib'}});
-      context.log('native-landscape-sdk-import',{status:'passed',startedAt:sdkStartedAt,elapsedMilliseconds:Date.now()-sdkStarted,timeoutMilliseconds:120000});
+      worker=await command(julia,['--startup-file=no','--history-file=no',`--project=${root}`,'-e',workerCode,'--',root,reports],{env:{...process.env,JULIA_LOAD_PATH:'@:@stdlib'},timeout:budgets.sdkImport});
+      context.log('native-landscape-sdk-import',{status:'passed',startedAt:sdkStartedAt,elapsedMilliseconds:Date.now()-sdkStarted,timeoutMilliseconds:budgets.sdkImport});
     }catch(error){
-      context.log('native-landscape-sdk-import',{status:'failed',startedAt:sdkStartedAt,elapsedMilliseconds:Date.now()-sdkStarted,timeoutMilliseconds:120000,error:nativeFailureDetail(error)});
+      context.log('native-landscape-sdk-import',{status:'failed',startedAt:sdkStartedAt,elapsedMilliseconds:Date.now()-sdkStarted,timeoutMilliseconds:budgets.sdkImport,error:nativeFailureDetail(error)});
       throw error;
     }
     resolved=JSON.parse(worker.match(/^NATIVE_LANDSCAPE_SDK (.+)$/m)?.[1]||'null');
@@ -353,7 +362,7 @@ exports.run=async context=>{
     for(const dependency of resolved){assert(sdk[dependency.name]);assert.equal(dependency.version,'0.1.1');assert.equal(digest((await sourceDigest(dependency.root)).join('')),sdk[dependency.name][1]);}
     await observer.sample();assert.deepEqual(await living(records),[],'SDK preparation leaves no child alive');records.clear();
     diagnosticTimer=setInterval(()=>{void diagnose('periodic');},15000);
-    const completed=await bounded(start(),'The real native Landscape command completes its measurement',180000,deadline);
+    const completed=await bounded(start(),'The real native Landscape command completes its measurement',budgets.provider+budgets.controllerHandoff,deadline);
     assert.equal(completed.ok,true,String(completed.error));
     const directory=await fs.realpath(completed.directory);
     assert.equal(path.dirname(directory),await fs.realpath(reports));
@@ -389,13 +398,13 @@ exports.run=async context=>{
     void foreignReady.catch(()=>{});
     foreignIdentity=await processIdentity(foreign.pid);assert.equal(foreignIdentity?.parent,process.pid);
     await bounded(foreignReady,
-      'The unrelated fixture reaches readiness',10000,deadline);
+      'The unrelated fixture reaches readiness',budgets.unrelatedReadiness,deadline);
     records.clear();start();let first;
     const changed=await eventually(async()=>{
       await observer.sample();assert.equal(settled,false,'The active renderer must still be measuring before its native Cancel');
       const current=await renderedFrame(display);if(!current)return false;
       if(!first){first=current;return false;}return current.sha256!==first.sha256?current:false;
-    },'Observe two different actual rendered scene buffers before cancellation',75000,deadline);
+    },'Observe two different actual rendered scene buffers before cancellation',budgets.renderBeforeCancel,deadline);
     const activeBefore=await living(records),activeIds=new Set(activeBefore.map(x=>x.pid));
     assert([...records.values()].some(x=>x.role==='controller'&&activeIds.has(x.pid))&&[...records.values()].some(x=>x.role==='renderer'&&activeIds.has(x.pid)),
       'The actual controller and rendering provider are both alive before Cancel');
@@ -403,7 +412,7 @@ exports.run=async context=>{
     context.log('native-landscape-before-cancel',{owned:ownedBefore,foreign:foreignIdentity.pid,renderedBuffers:[first,changed]});
     await diagnose('before-native-cancel');
     await cancel();
-    const cancelled=await bounded(invocation,'Native progress Cancel waits for real controller cleanup',75000,deadline);
+    const cancelled=await bounded(invocation,'Native progress Cancel waits for real controller cleanup',budgets.cancelSettlement,deadline);
     assert.equal(cancelled.ok,false);assert.match(String(cancelled.error),/Live measurement cancelled/i);
     await observer.sample();assert.deepEqual(await living(records),[],'All observed owned processes exit before harness teardown');
     const foreignAfter=await processIdentity(foreignIdentity.pid);

@@ -36,8 +36,13 @@ export class PosixProcessCohort {
         if (!/^\d+$/.test(name)) continue;
         try {
           const raw = await readFile(`/proc/${name}/stat`, 'utf8'), fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/);
-          if (![fields[1], fields[2], fields[3], fields[19]].every(value => /^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value)))) throw new Error('Invalid process identity.');
-          if (['Z', 'X'].includes(fields[0])) continue;
+          const unsigned = (value: string) => /^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value));
+          // Linux do_task_stat can retain this exact tuple when a task loses
+          // its sighand during the read. It is enumerable, never proof of
+          // ownership: a selected leader/known birth still passes identity().
+          const kernelExitSentinel = fields[1] === '0' && fields[2] === '-1' && fields[3] === '-1' && unsigned(fields[19]);
+          if (!kernelExitSentinel && ![fields[1], fields[2], fields[3], fields[19]].every(unsigned)) throw new Error('Invalid process identity.');
+          if (['Z', 'X'].includes(fields[0]) && !kernelExitSentinel) continue;
           metadata.push({pid: Number(name), parent: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), start: fields[19]});
         } catch (error) {if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;}
       }

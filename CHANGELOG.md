@@ -10,6 +10,8 @@
 - Handle terminated Linux and macOS CLI processes without confusing reparenting
   with a live identity change. PID reuse and unverified live ownership still
   fail closed, with safe diagnostic metadata retained for identity errors.
+- Prevent an unrelated exiting Linux process from blocking MCP shutdown when
+  `/proc` reports its kernel exit sentinel; owned identities remain strictly checked.
 
 ## 1.0.1 — Pluto notebooks and first-use fixes
 

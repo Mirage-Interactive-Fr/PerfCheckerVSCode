@@ -103,6 +103,78 @@ for (const platform of ['linux', 'darwin']) {
   }
 }
 
+// Exercise enumeration and signal authority through the actual compiled class,
+// including the kernel's exiting-task tuple among unrelated /proc entries.
+function linuxEnumerationFixture({target='foreign',state='R',override={},reused=false}={}) {
+  const leader={pid:41000,parent:40000,group:41000,session:41000,start:'123456',state:'R'};
+  const second={pid:42000,parent:target==='descendant'?leader.pid:0,group:42000,session:42000,start:'123457',state:'R'};
+  let changed=false;const signals=[];
+  const rows=()=>[leader,second].map(original=>{
+    if(!changed||original.pid!==(target==='leader'?leader.pid:second.pid))return original;
+    return {...original,parent:0,group:-1,session:-1,state,...(reused?{start:String(Number(original.start)+10)}:{}),...override};
+  });
+  const filesystem={
+    readdir:async value=>{assert.equal(value,'/proc');return rows().map(row=>String(row.pid));},
+    readFile:async value=>{
+      const pid=Number(/^\/proc\/(\d+)\/stat$/.exec(value)?.[1]),row=rows().find(row=>row.pid===pid);
+      assert(row,'Only a controlled numeric stat path is read');
+      const fields=Array(20).fill('0');
+      [fields[0],fields[1],fields[2],fields[3],fields[19]]=[row.state,row.parent,row.group,row.session,row.start];
+      return `${pid} (controlled fixture) ${fields.join(' ')}\n`;
+    },
+    realpath:async value=>{assert.match(value,/^\/proc\/(41000|42000)\/exe$/);return '/private/controlled-executable';},
+  };
+  const sandbox={exports:{},process:{pid:leader.parent,platform:'linux',kill:(...args)=>signals.push(args)},
+    require:name=>name==='node:fs/promises'?filesystem:require(name)};
+  runInNewContext(source,sandbox,{filename:filename.pathname});
+  const cohort=new sandbox.exports.PosixProcessCohort({pid:leader.pid});
+  return {cohort,leader,second,signals,useSentinel:()=>{changed=true;}};
+}
+
+for(const state of ['R','Z','X']) {
+  test(`linux enumerates an unrelated ${state} exit sentinel without adopting or signalling it`,async()=>{
+    const f=linuxEnumerationFixture({state});f.useSentinel();
+    assert.deepEqual(Array.from(await f.cohort.observe(true),row=>row.pid),[f.leader.pid]);
+    assert.equal(f.cohort.known.has(f.second.pid),false);
+    await f.cohort.signal('SIGTERM');
+    assert.deepEqual(f.signals,[[f.leader.pid,'SIGTERM']]);
+    assert.equal(f.cohort.known.has(f.second.pid),false);
+  });
+  test(`linux refuses an unqualified initial ${state} sentinel leader without signal authority`,async()=>{
+    const f=linuxEnumerationFixture({target:'leader',state});f.useSentinel();
+    await assert.rejects(f.cohort.observe(true),/identity/);
+    assert.equal(f.cohort.known.size,0);assert.equal(f.cohort.groups.size,0);assert.deepEqual(f.signals,[]);
+  });
+  for(const target of ['leader','descendant'])test(`linux refuses a known ${state} sentinel ${target} at its original birth before signalling`,async()=>{
+    const f=linuxEnumerationFixture({target,state});await f.cohort.observe(true);
+    const expected=f.cohort.known.get(target==='leader'?f.leader.pid:f.second.pid);assert(expected);
+    f.useSentinel();
+    await assert.rejects(f.cohort.signal('SIGTERM'),error=>{
+      assert.equal(error.cause?.kind,'process-identity');assert.equal(error.cause.expected.start,expected.start);
+      assert.equal(error.cause.observed.group,-1);assert.equal(error.cause.observed.session,-1);return true;
+    });
+    assert.deepEqual(f.signals,[]);assert.equal(f.cohort.known.get(expected.pid).start,expected.start);
+  });
+}
+
+test('linux never readopts a reused descendant PID from an exit sentinel',async()=>{
+  const f=linuxEnumerationFixture({target:'descendant',reused:true});await f.cohort.observe(true);
+  const original=f.cohort.known.get(f.second.pid);f.useSentinel();
+  const rows=await f.cohort.observe();assert.deepEqual(Array.from(rows,row=>row.pid),[f.leader.pid]);
+  assert.equal(f.cohort.known.get(f.second.pid).start,original.start);
+  await f.cohort.signal('SIGTERM');assert.deepEqual(f.signals,[[f.leader.pid,'SIGTERM']]);
+});
+
+for(const [name,override] of [['partial group',{session:42000}],['partial session',{group:42000}],
+  ['other negative',{group:-2}],['nonzero parent',{parent:1}],['missing birth',{start:''}],
+  ['unsafe birth',{start:'9007199254740992'}]]) {
+  test(`linux refuses metadata with ${name} instead of treating it as a kernel sentinel`,async()=>{
+    const f=linuxEnumerationFixture({override});f.useSentinel();
+    await assert.rejects(f.cohort.observe(true),/Invalid process identity/);
+    assert.equal(f.cohort.known.size,0);assert.deepEqual(f.signals,[]);
+  });
+}
+
 test('passive native refusal observation keeps the original outcome and only safe cause fields', async () => {
   const {observeIdentityRefusals} = require('./codex-vscode-host.cjs');
   const records = [], value = {pid: 42};
