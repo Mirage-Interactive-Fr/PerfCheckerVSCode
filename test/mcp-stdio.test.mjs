@@ -481,13 +481,63 @@ test('one bounded discovery deadline includes all actual tool pages',()=>fixture
   assert.equal(await alive(pid),false,'Discovery deadline stops the owned server before teardown');
 },'slow-pages'));
 
-test('legacy initialize timeout never emits a forbidden initialize cancellation notification',()=>fixture(async({root,create})=>{
-  const connector=create({version:'2025-11-25',timeoutMs:250});
-  await assert.rejects(connector.start(),/timed out/);
-  const requests=(await readFile(path.join(root,'requests.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
-  assert.equal(requests[0].method,'initialize');assert.equal(requests.some(row=>row.method==='notifications/cancelled'),false);
-  assert.equal(await alive(Number(await readFile(path.join(root,'server.pid'),'utf8'))),false);
-},'hold-init'));
+test('legacy initialize timeout never emits a forbidden initialize cancellation notification',async context=>{
+  const filesystem=require('node:fs/promises'),nativeRead=filesystem.readFile,invalidStats=[],shutdown=[];
+  let primaryRpc,testFailure,observerFailures=0;
+  const safeError=error=>error?({name:/^[A-Za-z]+$/.test(error?.name??'')?error.name:null,
+    code:/^[A-Z0-9_]+$/.test(error?.code??'')?error.code:null,
+    message:['Invalid process identity.','MCP request timed out. Reconnect the local server to continue.',
+      'The private MCP process group could not be inspected.'].includes(error?.message)?error.message:'[unlisted message omitted]'}):null;
+  const stat=(bytes,pid)=>{
+    const raw=typeof bytes==='string'?bytes:Buffer.isBuffer(bytes)?bytes.toString('utf8'):'',end=raw.lastIndexOf(')'),fields=raw.slice(end+2).trim().split(/\s+/);
+    const numeric=value=>/^[0-9]+$/.test(value??'')&&Number.isSafeInteger(Number(value))?value:null;
+    return {pid,at:new Date().toISOString(),bytes:Buffer.byteLength(raw),closingDelimiterPresent:end>=0,
+      state:/^[A-ZIt]$/.test(fields[0]??'')?fields[0]:null,parent:numeric(fields[1]),
+      group:fields[2]==='-1'?-1:numeric(fields[2]),session:fields[3]==='-1'?-1:numeric(fields[3]),birth:numeric(fields[19]),
+      unsignedFieldsValid:[fields[1],fields[2],fields[3],fields[19]].every(value=>numeric(value)!==null),
+      kernelExitSentinel:fields[1]==='0'&&fields[2]==='-1'&&fields[3]==='-1'};
+  };
+  // Observe the actual compiled module's reads, returning its exact bytes/errors.
+  // No process name, argv, environment or server content enters the receipt.
+  filesystem.readFile=async function(...args){
+    const bytes=await Reflect.apply(nativeRead,this,args);
+    try{
+      const match=typeof args[0]==='string'&&/^\/proc\/([0-9]+)\/stat$/.exec(args[0]);
+      if(match&&invalidStats.length<8){const row=stat(bytes,Number(match[1]));if(!row.unsignedFieldsValid)invalidStats.push(row);}
+    }catch{observerFailures++;}
+    return bytes;
+  };
+  try{
+    await fixture(async({root,create})=>{
+      const connector=create({version:'2025-11-25',timeoutMs:250}),rpc=connector.rpc,stop=connector.stop;
+      connector.rpc=async function(...args){
+        try{return await Reflect.apply(rpc,this,args);}
+        catch(error){if(args[0]==='initialize')primaryRpc={at:new Date().toISOString(),error:safeError(error),storedPrimary:safeError(this.failure)};throw error;}
+      };
+      connector.stop=async function(...args){
+        const row={at:new Date().toISOString(),storedPrimary:safeError(this.failure)};if(shutdown.length<8)shutdown.push(row);
+        try{const value=await Reflect.apply(stop,this,args);row.completedAt=new Date().toISOString();row.resolved=true;return value;}
+        catch(error){row.completedAt=new Date().toISOString();row.resolved=false;row.error=safeError(error);throw error;}
+      };
+      await assert.rejects(connector.start(),/timed out/);
+      const requests=(await readFile(path.join(root,'requests.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+      assert.equal(requests[0].method,'initialize');assert.equal(requests.some(row=>row.method==='notifications/cancelled'),false);
+      assert.equal(await alive(Number(await readFile(path.join(root,'server.pid'),'utf8'))),false);
+    },'hold-init');
+  }catch(error){
+    testFailure=safeError(error);
+    // Reread only the numeric PID that produced invalid metadata, after failure.
+    // This is diagnostic evidence, never a replacement ownership decision.
+    await Promise.all(invalidStats.map(async row=>{
+      try{row.afterFailure=stat(await nativeRead(`/proc/${row.pid}/stat`,{encoding:'utf8',signal:AbortSignal.timeout(250)}),row.pid);}
+      catch(observationError){row.afterFailure={at:new Date().toISOString(),...safeError(observationError),absent:['ENOENT','ESRCH'].includes(observationError.code)};}
+    }));
+    throw error;
+  }finally{
+    filesystem.readFile=nativeRead;
+    context.diagnostic(JSON.stringify({legacyInitializeObservation:{primaryRpc,testFailure,invalidStats,shutdown,observerFailures}}));
+  }
+});
 
 test('no shell, no relative executable/directory, no automatic revision fallback',async()=>{
   for(const options of [{command:'node',args:[],cwd:tmpdir(),version:'2026-07-28'},

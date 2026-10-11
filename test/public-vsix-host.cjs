@@ -35,7 +35,7 @@ function commandCoverage(commands,checks){
     openStudio:['native-open-studio-command'],openStudioForWorkspace:['controller-visible-in-studio','studio-inventory','bootstrap-existing-controller'],openChat:['native-mcp-advice-implementation-restore','native-mcp-configuration-only-conversation'],
     openTerminal:['native-julia-terminal'],newNotebook:['pluto-suite-select-launch-save','pluto-studio-file-dialog-buttons','bootstrap-pluto-published-install'],openNotebook:['pluto-reactive-save-reload-close','pluto-studio-file-dialog-buttons'],
     debugFile:['official-julia-debug'],prepareImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],applyImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],
-    restoreImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],connectCodex:['codex-missing-native-prerequisite'],disconnectCodex:['codex-disconnected-command'],
+    restoreImplementation:['native-mcp-advice-implementation-restore','native-mcp-reviewed-apply-exact-restore'],connectCodex:['codex-missing-native-prerequisite','native-codex-authenticated-connect'],disconnectCodex:['codex-disconnected-command','native-codex-active-disconnect'],
     connectMcpStdio:['native-mcp-stdio-connected-session'],disconnectMcpStdio:['native-mcp-stdio-modern-disconnect'],
     stopNotebookSession:['native-pluto-without-jupyter','pluto-stop-active-owned-worker'],
   };
@@ -43,11 +43,12 @@ function commandCoverage(commands,checks){
     const name=command.replace(/^perfchecker\./,''),proof=checks.filter(check=>check.assertionsCompleted===true&&(effects[name]||[]).includes(check.name));
     const narrativeEnabled=proof.some(check=>check.name==='native-narrative-controlled-response');
     const landscapeExecuted=proof.some(check=>check.name==='native-landscape-command-completed');
-    const externalPrerequisite=name==='connectCodex'||name==='runLandscapeLiveForWorkspace'&&!landscapeExecuted||name==='narrateAdvice'&&!narrativeEnabled;
+    const codexConnected=proof.some(check=>check.name==='native-codex-authenticated-connect');
+    const externalPrerequisite=name==='connectCodex'&&!codexConnected||name==='runLandscapeLiveForWorkspace'&&!landscapeExecuted||name==='narrateAdvice'&&!narrativeEnabled;
     const prerequisite=externalPrerequisite||(proof.length>0&&proof.every(check=>['prerequisite','unavailable'].includes(check.status)));
     return {command,registered:true,status:proof.length?(prerequisite?'prerequisite-verified':'effect-verified'):'unverified',evidence:proof.map(check=>({name:check.name,outcome:check.status||'validated-effect',case:check.case,prerequisite:check.prerequisite})),
       ...(prerequisite?{limit:name==='narrateAdvice'?'No configured narrative model; enabled model execution is not qualified.':name==='connectCodex'?'No human Codex authentication in CI; authenticated CLI/General integration is covered by the separate local opt-in test.':name==='runLandscapeLiveForWorkspace'?'No physical Étendue/GPU renderer in this disposable package; only its explicit prerequisites are verified.':'Only explicit prerequisites were validated; this execution was unavailable.'}:{}),
-      ...(name==='disconnectCodex'?{limit:'The native test verifies the explicit disconnected return state and preserved saved configuration after a failed temporary connection. An active authenticated CLI disconnect is covered separately by the local opt-in test.'}:{}),
+      ...(name==='disconnectCodex'&&!proof.some(check=>check.name==='native-codex-active-disconnect')?{limit:'The native test verifies the explicit disconnected return state and preserved saved configuration after a failed temporary connection. An active authenticated CLI disconnect is covered separately by the local opt-in test.'}:{}),
       ...(name==='narrateAdvice'&&narrativeEnabled?{limit:'The actual native button, Core worker and request/response contract use a clearly identified local protocol fixture. This is not evidence of authenticated model inference.'}:{}),
       ...(name==='runLandscapeLiveForWorkspace'&&landscapeExecuted?{limit:'Real immutable Landscape tag and SDKs through the installed command, SDL/Vulkan llvmpipe software rendering. GPU timing and physical presentation remain unavailable. Cancellation is separate evidence.'}:{}),
       route:'Evidence records actual palette/API or webview backend effects; registration alone is never execution proof.'};
@@ -152,7 +153,7 @@ function configurationCoverage(properties,checks){
     suite:['suite-selection-and-save'],factory:['suite-selection-and-save'],profile:['all-supported-collectors-measured'],reports:['result-controls','computed-reference-aggregation'],
     uiConfiguration:['save-palette-command','native-suite-save-palette'],gitTargets:['git-reference-controls'],comparisonPolicies:['computed-reference-aggregation'],
     advisorImplementationMcpTool:['native-mcp-advice-implementation-restore'],advisorImplementationMcpPromptArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],
-    advisorImplementationMcpWorkspaceArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],codexExecutable:['codex-missing-native-prerequisite'],
+    advisorImplementationMcpWorkspaceArgument:['native-mcp-advice-implementation-restore','native-mcp-custom-arguments'],codexExecutable:['codex-missing-native-prerequisite','native-codex-authenticated-connect'],
     ...Object.fromEntries(['advisorImplementationMcpArguments','advisorMcpStdioCommand','advisorMcpStdioArguments','advisorMcpStdioDirectory'].map(key=>[key,['native-mcp-persisted-stdio-settings-after-reload']])),
     plutoProject:['native-pluto-without-jupyter','pluto-investigation-real-run','pluto-stop-active-owned-worker'],
   };
@@ -175,14 +176,15 @@ function configurationCoverage(properties,checks){
     const key=option.replace(/^perfchecker\./,''),evidence=checks.filter(check=>check.assertionsCompleted===true&&(paths[key]||[]).includes(check.name));
     const deadlineVerified=evidence.some(check=>({advisorTimeout:'native-narrative-configured-deadline',analysisTimeout:'native-analysis-configured-deadline',
       investigationBudgetSeconds:'native-investigation-elapsed-budget',advisorInvestigates:'native-investigation-enabled-model-decision'})[key]===check.name);
-    const status=!evidence.length?'unverified':key==='codexExecutable'?'prerequisite-verified':pathOnly.has(key)&&!deadlineVerified?'path-exercised':'effect-verified';
+    const authenticatedCodex=evidence.some(check=>check.name==='native-codex-authenticated-connect');
+    const status=!evidence.length?'unverified':key==='codexExecutable'&&!authenticatedCodex?'prerequisite-verified':pathOnly.has(key)&&!deadlineVerified?'path-exercised':'effect-verified';
     const qualifiedLimit=deadlineVerified?({advisorTimeout:'One actual 45-second request expiry is asserted; other configured limits are not implied.',
       analysisTimeout:'One actual 45-second sleeping scenario expires; every analyzer and deadline value is not implied.',
       investigationBudgetSeconds:'One real 45-second elapsed budget interrupts a running scenario and leaves experiments unexecuted.',
       advisorInvestigates:'One controlled structured MCP stop decision is asserted with preserved custom fields; external inference is not qualified.'})[key]:undefined;
     return {option,status,evidence:evidence.map(check=>({name:check.name,case:check.case,status:check.status||'validated-effect'})),
       scope:'Actual values asserted by the cited case only; API-written test settings and native UI changes are not interchangeable.',
-      ...(qualifiedLimit||limits[key]?{limit:qualifiedLimit||limits[key]}:{})};
+      ...(key==='codexExecutable'&&authenticatedCodex?{limit:'Selected native CLI, real authenticated Connect and active Disconnect only; no model inference or implementation was requested.'}:qualifiedLimit||limits[key]?{limit:qualifiedLimit||limits[key]}:{})};
   });
 }
 
@@ -454,6 +456,8 @@ async function measureNativeTestItem(context,expectedPassed,options={}){
 exports.run = async () => {
   assert.equal(process.env.CI, 'true', 'Never run this host against a human VS Code installation');
   const phase = process.env.PERFCHECKER_NATIVE_PHASE;
+  const minimumVersion=process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION;
+  assert(/^\d+\.\d+\.\d+$/.test(minimumVersion),'The runner declares the production registry minimum explicitly');
   const workspace = process.env.PERFCHECKER_NATIVE_WORKSPACE;
   const output = process.env.PERFCHECKER_NATIVE_OUTPUT;
   assert(path.isAbsolute(workspace));
@@ -470,7 +474,7 @@ exports.run = async () => {
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,platform:process.platform,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
       coverage:process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
-      core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1',available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
+      core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:minimumVersion,available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
       commands:commandCoverage(commands,checks),configuration:configurationCoverage(configurationProperties,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);
     pendingReport=pendingReport.then(()=>fs.writeFile(path.join(output,`${phase}.json`),report));
     return pendingReport;
@@ -595,6 +599,10 @@ exports.run = async () => {
     for (const command of commands) assert(registered.has(command), `Contributed command is registered: ${command}`);
     log('installed-extension', {version: extension.packageJSON.version, vscode: vscode.version, commands: commands.length,
       settings: Object.keys(extension.packageJSON.contributes.configuration.properties).length, vsixSha256: process.env.PERFCHECKER_NATIVE_SHA});
+    if(phase==='codex-connect'){
+      await runCase('native-codex-connect-disconnect',()=>require('./native-codex-controls.cjs').run({
+        vscode,windowPage,workspace,session,output,extension,log,proof,findFrame}));
+    }else{
     const uri = vscode.Uri.file(workspace);
     const context = {vscode, browser, windowPage, workspace,
       controller: process.env.PERFCHECKER_NATIVE_CONTROLLER, target: process.env.PERFCHECKER_NATIVE_TARGET,
@@ -605,7 +613,7 @@ exports.run = async () => {
     if(['testitems-ready','suite','diagnosis','pluto'].includes(phase))context.observeWork=stage=>observeNativeWork(context,stage);
     if(phase==='diagnosis'&&process.platform==='darwin'&&process.env.PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP)context.observeDiagnosisRequest=(stage,deadline)=>macProcessInventory(context,stage,undefined,[],deadline);
     context.measureTestItem=options=>measureNativeTestItem(context,true,options);
-    log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${process.env.PERFCHECKER_NATIVE_MODE==='public'?'1.0.0':'1.0.1'}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
+    log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${minimumVersion}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
 
     if(phase!=='fresh'&&(phase==='narrative'||process.env.PERFCHECKER_NATIVE_STAGE==='focused')){
       const settings=vscode.workspace.getConfiguration('perfchecker',uri);
@@ -718,11 +726,11 @@ exports.run = async () => {
         if(process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE!=='true'){
           await eventually(async()=>{
             const text=(await studio.locator('body').innerText())+'\n'+(await windowPage.locator('body').innerText());
-            return /requires registered PerfChecker 1\.0\.1/.test(text)&&/Install or upgrade it explicitly/.test(text);
+            return text.includes(`requires registered PerfChecker ${minimumVersion}`)&&/Install or upgrade it explicitly/.test(text);
           },'Production bootstrap explains the registered minimum and upgrade action',180000);
           assert.equal(vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject','perf'),'perf','Failed production setup preserves the selected controller');
           assert(!await fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false));
-          proof('bootstrap-awaiting-registration',{status:'prerequisite',minimum:'1.0.1',registry:'General',positiveBootstrapQualified:false,explicitConfirmation:true,nativeStudioClick:true});
+          proof('bootstrap-awaiting-registration',{status:'prerequisite',minimum:minimumVersion,registry:'General',positiveBootstrapQualified:false,explicitConfirmation:true,nativeStudioClick:true});
           return;
         }
         await eventually(()=>fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false),'Explicit first-use setup creates a real suite',initializationRemaining());
@@ -737,13 +745,13 @@ exports.run = async () => {
         },'The real initialization plan finishes before opening Feature suite',initializationRemaining());
         log('native-bootstrap-plan-ready',{...bootstrapPlan,elapsedMs:Date.now()-initializationStartedAt,maximumMs:600000,noAdditionalPlanRequested:true});
         await controls.runSelection(context);
-        proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:'General 1.0.1',nativeStudioClick:true});
+        proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:`General ${minimumVersion}`,nativeStudioClick:true});
       });
       if(process.env.PERFCHECKER_NATIVE_MODE==='candidate')await runCase('fresh-pluto-published-install',async()=>{
         if(!bootstrapped)throw Object.assign(new Error('Blocked by failed production controller bootstrap'),{blockedBy:'missing-controller-initialize'});
         if(process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE!=='true'||process.env.PERFCHECKER_NATIVE_PLUTO_TAG_AVAILABLE!=='true'){
-          proof('bootstrap-pluto-awaiting-publication',{status:'prerequisite',core:'General 1.0.1',companion:'PerfCheckerPluto subdir at v1.0.1',positiveBootstrapQualified:false});
-          if(process.env.PERFCHECKER_NATIVE_CASE_GROUP==='bootstrap')throw new Error('Published General 1.0.1 and companion tag v1.0.1 are required for this positive bootstrap qualification');
+          proof('bootstrap-pluto-awaiting-publication',{status:'prerequisite',core:`General ${minimumVersion}`,companion:'PerfCheckerPluto subdir at v1.0.1',positiveBootstrapQualified:false});
+          if(process.env.PERFCHECKER_NATIVE_CASE_GROUP==='bootstrap')throw new Error(`Published General ${minimumVersion} and companion tag v1.0.1 are required for this positive bootstrap qualification`);
           return;
         }
         await pluto.runFreshInstall(context);
@@ -830,6 +838,7 @@ exports.run = async () => {
           });
         }
       }
+    }
     }
     }
   } catch (error) {failures.push({name: 'host-bootstrap', message: String(error), stack: error.stack});}

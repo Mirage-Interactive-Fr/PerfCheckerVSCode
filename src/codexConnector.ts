@@ -9,7 +9,7 @@ import {PosixProcessCohort} from './posixProcessCohort';
 import {CANCELLATION_GRACE_MS} from './controllerCancellation';
 
 const revisions = ['2026-07-28', '2025-11-25'];
-const serverInfo = {name: 'PerfChecker local Codex connector', version: '1.0.1'};
+const serverInfo = {name: 'PerfChecker local Codex connector', version: '1.0.2'};
 const object = (value: unknown): value is Record<string, any> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const tools = [

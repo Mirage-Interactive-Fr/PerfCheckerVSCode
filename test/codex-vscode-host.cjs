@@ -4,6 +4,29 @@ const path=require('node:path'),{execFile}=require('node:child_process'),{promis
 const {createHash}=require('node:crypto'),{pathToFileURL}=require('node:url');
 const execute=promisify(execFile),delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+// Capture only the installed product's safe refusal cause before the UI turns
+// it into text. The original method, return value and error object stay intact.
+function observeIdentityRefusals(Cohort,record){
+  const original=Cohort.prototype.identity,failures=[];
+  const row=value=>value&&Object.fromEntries(['pid','parent','group','session','start','state'].filter(key=>value[key]!==undefined).map(key=>[key,value[key]]));
+  const wrapped=async function(...args){
+    try{return await original.apply(this,args);}
+    catch(error){
+      if(error?.cause?.kind==='process-identity'){
+        const cause=error.cause,key=JSON.stringify(this.child?.spawnargs?.slice(1));
+        const stage=new Map([['["--version"]','version'],['["--help"]','global-help'],['["exec","--help"]','exec-help'],['["login","status"]','login-status']]).get(key)??'other';
+        try{record({at:new Date().toISOString(),stage,message:error.message,cause:{kind:cause.kind,platform:cause.platform,initial:cause.initial,
+          expected:row(cause.expected),observed:row(cause.observed),executable:cause.executable,errno:cause.errno}});}
+        catch(observationError){failures.push(String(observationError));}
+      }
+      throw error;
+    }
+  };
+  Cohort.prototype.identity=wrapped;
+  const stop=()=>{assert.equal(Cohort.prototype.identity,wrapped);Cohort.prototype.identity=original;};
+  stop.failures=failures;return stop;
+}
+exports.observeIdentityRefusals=observeIdentityRefusals;
 let suiteDeadline=Infinity;
 async function eventually(read,label,timeout=210000){
   const until=Math.min(Date.now()+timeout,suiteDeadline);
@@ -82,6 +105,11 @@ function requestProgressed(before,current){
     JSON.stringify(current.messages)!==JSON.stringify(before.messages);
 }
 exports.requestProgressed=requestProgressed;
+function observedModelActivity(events,identity){
+  return events?.find(event=>identity&&event.pid===identity.pid&&event.start===identity.start&&
+    ['item.started','item.updated','item.completed'].includes(event.event)&&['reasoning','agent_message'].includes(event.itemType));
+}
+exports.observedModelActivity=observedModelActivity;
 // The native Chat attaches one real timing report. This separate, explicitly
 // partial allocation context is pasted by the user gesture, not a forged bundle.
 function bibliographyAllocationProjection(runBytes,adviceBytes,sources){
@@ -202,10 +230,12 @@ exports.run=async()=>{
   const bibliography=process.env.PERFCHECKER_HOST_BIBLIOGRAPHY?JSON.parse(process.env.PERFCHECKER_HOST_BIBLIOGRAPHY):undefined;
   const capturePreflightOnly=process.env.PERFCHECKER_HOST_CAPTURE_PREFLIGHT_ONLY==='1';
   const dialogueCancelOnly=process.env.PERFCHECKER_HOST_DIALOGUE_CANCEL_ONLY==='1';
+  const liveCancelOnly=process.env.PERFCHECKER_HOST_LIVE_CANCEL_ONLY==='1';
   assert(!dialogueCancelOnly||bibliography&&!capturePreflightOnly,'The complementary mode is explicit and separate from capture-only');
+  assert(!liveCancelOnly||dialogueCancelOnly,'A single live Cancel is an explicit complementary submode');
   result.maximumHostMinutes=capturePreflightOnly?5:dialogueCancelOnly?12:bibliography?21:14;
   suiteDeadline=Date.now()+result.maximumHostMinutes*60*1000;
-  result.maximumBridgeInvocations=dialogueCancelOnly?2:4;result.requestedInvocations=[];
+  result.maximumBridgeInvocations=liveCancelOnly?1:dialogueCancelOnly?2:4;result.requestedInvocations=[];
   // This sentinel must be written by the actual extension host, never by the outer SDK.
   await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result));
   const configFile=path.join(root,'perf','advisor.json'),settingsFile=path.join(root,'.vscode','settings.json');
@@ -236,7 +266,7 @@ exports.run=async()=>{
   const captureWorkingStateBefore=capturePreflightOnly?await captureWorkingState():undefined;
   if(capturePreflightOnly)result.captureWorkingStateBefore=captureWorkingStateBefore;
   let browser,view,windowPage,endpoint,server,owned,primaryError,observer,observation,portrait=false;
-  const observed=new Map(),cliObservers=new Map(),processStates=new Map();let passiveCli;
+  const observed=new Map(),cliObservers=new Map(),processStates=new Map();let passiveCli,stopIdentityObservation;
   const observe=async()=>{
     if(observation)return observation;
     observation=(async()=>{
@@ -438,20 +468,24 @@ exports.run=async()=>{
     for(const file of ['Project.toml','Manifest.toml'])await fs.copyFile(path.join(directory,'perf','episode-05a','worker',file),path.join(target,file));}};
   try{
     result.vsixSha256=hash(await fs.readFile(process.env.PERFCHECKER_HOST_ARCHIVE));
-    assert.equal(result.vsixSha256,'e68a9264c301292568edbae21b7165f893bbeec59097233676d9de3983ba21b3');
+    assert.equal(result.vsixSha256,'771ff166e24e96ac1c7121bce8181cb4456089ea83b0356fc6d86593440dfa88');
     const extension=vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode');assert(extension,'Load the installed product');
     const installed=await fs.realpath(extension.extensionPath);
     assert(installed.startsWith(path.join(session,'extensions')+path.sep),'The product must not come from the source checkout or human extension directory');
-    assert.equal(extension.packageJSON.version,'1.0.1');assert.equal(vscode.version,'1.141.0');
+    assert.equal(extension.packageJSON.version,'1.0.2');assert.equal(vscode.version,'1.141.0');
     const expected=await packagedFiles(process.env.PERFCHECKER_HOST_ARCHIVE_EXTENSION),actual=await packagedFiles(installed);
     assert.deepEqual(actual,expected,'Every installed compiled module, media file and resource matches the SHA-verified archive');
     result.installedExtension={path:installed,version:extension.packageJSON.version,mainSha256:hash(await fs.readFile(path.resolve(installed,extension.packageJSON.main))),runtimeFiles:actual};
+    result.identityRefusals=[];
+    stopIdentityObservation=observeIdentityRefusals(require(path.join(installed,'dist','posixProcessCohort.js')).PosixProcessCohort,value=>result.identityRefusals.push(value));
     await extension.activate();assert(extension.isActive);
     assert.equal(settings().get('runnerProject'),process.env.PERFCHECKER_TEST_CONTROLLER);
     assert.equal(settings().get('juliaExecutable'),process.env.PERFCHECKER_TEST_JULIA);
     if(capturePreflightOnly)result.core={loaded:false,probed:false,configuredProject:settings().get('runnerProject')};
-    else{result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'00c133336911b8600d63a8d6c59ce1befc5ce690');assert.equal(result.core.version,'1.0.1');
-      if(bibliography)assert.equal(result.core.registered,true);}
+    else{result.core=JSON.parse(process.env.PERFCHECKER_HOST_CORE);assert.equal(result.core.tree,'2563a09e7904f19592e8f658289566e76bf93c6c');assert.equal(result.core.version,'1.1.0');
+      if(bibliography){assert.equal(result.core.registered,false);assert.equal(result.core.trackingRepo,true);
+        assert.equal(result.core.gitSource,'https://github.com/Mirage-Interactive-Fr/PerfChecker.jl');
+        assert.equal(result.core.gitRevision,'00e94c62a2080dba02782e451422ed98ea0b358a');assert.equal(result.core.qualificationSource,'pinned-candidate');}}
     const directories=JSON.parse(process.env.PERFCHECKER_HOST_PRIVATE_DIRECTORIES);
     assert.deepEqual(directories.map(([flag])=>flag),['user-data-dir','extensions-dir','shared-data-dir','agent-plugins-dir','agents-user-data-dir','agents-extensions-dir']);
     for(const [,directory]of directories){assert.equal(await fs.realpath(directory),directory);assert(directory.startsWith(session+path.sep));}
@@ -505,10 +539,17 @@ exports.run=async()=>{
           await view.locator('#chat-question').fill('How can I review this package while preserving its exact behavior?');
           await view.locator('#chat-question').scrollIntoViewIfNeeded();
           const metrics=await view.locator('#chat-question').evaluate(node=>({fontSize:getComputedStyle(node).fontSize,
-            width:innerWidth,documentWidth:document.documentElement.scrollWidth,transcriptMaxHeight:getComputedStyle(document.querySelector('.transcript')).maxHeight}));
+            width:innerWidth,documentWidth:document.documentElement.scrollWidth,bodyPadding:getComputedStyle(document.body).padding,
+            overflow:getComputedStyle(document.documentElement).overflowX,transcriptMaxHeight:getComputedStyle(document.querySelector('.transcript')).maxHeight,
+            clippedControls:[...document.querySelectorAll('#chat-root *')].filter(control=>{
+              const bounds=control.getBoundingClientRect();return bounds.width>0&&(bounds.left<0||bounds.right>innerWidth);
+            }).map(control=>({tag:control.tagName,className:control.className,width:control.getBoundingClientRect().width}))}));
           const framebuffer=await capture('portrait-layout-preflight',5000);
           metrics.nativePixels=parseFloat(metrics.fontSize)*framebuffer.pixelsPerCssY;result.portraitPreflight={...metrics,framebuffer};
-          assert(metrics.width<=650&&metrics.documentWidth<=metrics.width,'The unchanged product reflows without horizontal clipping');
+          assert.equal(metrics.width,234,'The native Code window reaches the actual previously failing 234 CSS pixel webview');
+          assert(metrics.documentWidth<=metrics.width,'The unchanged product reflows without horizontal clipping');
+          assert.deepEqual(metrics.clippedControls,[],'Every visible Chat control stays inside the real webview');
+          assert.equal(metrics.bodyPadding,'0px');assert.notEqual(metrics.overflow,'hidden','Layout must solve clipping rather than hide it');
           assert.equal(metrics.transcriptMaxHeight,'none','Narrow conversation uses the natural document scroll');
           assert(metrics.nativePixels>=22&&metrics.nativePixels<=24,'Native portrait text measures 22–24 pixels from actual IHDR mapping');
           await view.locator('#chat-question').fill('');
@@ -624,7 +665,7 @@ exports.run=async()=>{
     assert.equal(unauthorized.status,401);await unauthorized.arrayBuffer();await preserved();
     checks.push('installed immutable candidate path/version/runtime hashes; genuine Connect control; saved disabled provider unchanged; unauthenticated HTTP refused');
 
-    const questions=dialogueCancelOnly?[
+    const questions=liveCancelOnly?[]:dialogueCancelOnly?[
       `Advice only: no tools, commands, edits or implementation. Review this original name_to_string function from Bibliography and explain a bounded way to reduce repeated string construction while preserving partial names, exact separators, Unicode and non-mutation. No measurements are attached in this complementary dialogue; do not claim measured attribution or a gain. Give concrete independent checks and remaining limits in at most six short paragraphs. Original source: ${source}`
     ]:bibliography?[
       allocationQuestion,
@@ -650,7 +691,7 @@ exports.run=async()=>{
       });
     }
     if(bibliography)result.conversation=(await state()).messages;
-    checks.push(`${questions.length} authenticated contextual advice replies through Julia MCP are visible and preserve exact source/index/HEAD/config`);
+    if(questions.length)checks.push(`${questions.length} authenticated contextual advice replies through Julia MCP are visible and preserve exact source/index/HEAD/config`);
     const agentBudgetMs=Number(settings().get('advisorTimeout'))*1000;
     const cleanupGraceMs=require(path.join(installed,'dist','controllerCancellation.js')).CANCELLATION_GRACE_MS;
     assert.equal(agentBudgetMs,bibliography?600000:180000);assert.equal(cleanupGraceMs,60000);
@@ -767,7 +808,9 @@ exports.run=async()=>{
         }
       }
       const liveRoles=[current.cli,current.worker,current.agent];
-      if(value.busy&&liveRoles.every(pid=>pid&&current.identities.some(identity=>identity.pid===pid))){owned=current;break;}
+      const activity=observedModelActivity(result.cliEvents,current.identities.find(identity=>identity.pid===current.agent));
+      if(activity)result.cancelObservation.modelActivity??=activity;
+      if(value.busy&&liveRoles.every(pid=>pid&&current.identities.some(identity=>identity.pid===pid))&&(!liveCancelOnly||activity)){owned=current;break;}
       if(cancelAccepted&&!value.busy){
         result.cancelObservation.terminalBeforeLiveAgent={...outcome,messageCount:value.messages.length,elapsedMs:now-cancelStarted};
         assert.fail(`The real request ended before a live agent could qualify Cancel: ${outcome.status}`);
@@ -804,11 +847,12 @@ exports.run=async()=>{
     checks.push('Cancel automatically disconnects after owned cleanup; genuine Reconnect preflight (no model call) and Disconnect close the new listener and preserve saved settings');
     if(dialogueCancelOnly){
       const after=await indexProof('dialogue-after');assert.deepEqual(after.bytes,dialogueIndex.bytes);assert.deepEqual(after.entries,dialogueIndex.entries);
-      assert.equal(result.requestedInvocations.length,2,'Exactly one advice request and one live Cancel request were made');
+      assert.equal(result.requestedInvocations.length,liveCancelOnly?1:2,'Only the explicitly permitted live model requests were made');
+      if(liveCancelOnly)assert(result.cancelObservation.modelActivity,'Live Cancel requires real streamed model activity from the same observed agent incarnation');
     }
     assert.equal(result.captureFailures?.length??0,0,'Every requested native presentation capture must pass before global PASS');
-    Object.assign(result,{status:'passed',mode:dialogueCancelOnly?'dialogue-cancel-only':'complete-implementation',adviceTurns:questions.length,adviceCharacters,
-      ...(dialogueCancelOnly?{notExecuted:['measurements','implementation Prepare','candidate oracle','Apply','Restore']}:
+    Object.assign(result,{status:'passed',mode:liveCancelOnly?'live-agent-cancel-only':dialogueCancelOnly?'dialogue-cancel-only':'complete-implementation',adviceTurns:questions.length,adviceCharacters,
+      ...(dialogueCancelOnly?{notExecuted:[...(liveCancelOnly?['completed advice reply','assistant transcript captures']:[]),'measurements','implementation Prepare','candidate oracle','Apply','Restore']}:
         {oracle:bibliography?{independentNameCases:10,Unicode:true,multiEntryExport:true,nonMutation:true,historicalOracleUnchanged:true}:{empty:0,signed:14,range1000:333833500},
           allocationBaselineBytes:baselineBytes,allocationCandidateBytes:candidateBytes,changedFiles:proposal.files}),
       ownedRequestPids:{cli:owned.cli,worker:owned.worker,codex:owned.agent},ownedDeadBeforeCleanup:true,socketClosedBeforeCleanup:true,
@@ -864,6 +908,8 @@ exports.run=async()=>{
       result.cleanupSafeToRemove=true;
     }catch(error){result.processCleanupError=String(error);primaryError??=error;result.status='failed';result.cleanupSafeToRemove=false;}
     try{await browser?.close();}catch(error){result.browserCleanupError=String(error);primaryError??=error;result.status='failed';}
+    stopIdentityObservation?.();
+    if(stopIdentityObservation?.failures.length){result.identityObservationErrors=stopIdentityObservation.failures;primaryError??=new Error('Passive identity refusal capture failed.');result.status='failed';}
     await fs.writeFile(process.env.PERFCHECKER_HOST_RESULT,JSON.stringify(result,null,2));
   }
   if(primaryError)throw primaryError;

@@ -79,7 +79,7 @@ async function existingController(context){
     if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(3000);
     context.proof('bootstrap-existing-controller',{nativeStudioClick:true,realChooser:true,selectionVerified:true,core:context.core,
       invalidSettingVerified:true,folderDialogClosed:true,workspaceFolderSettingPersisted:true,
-      installerNotInvoked:true,registeredBootstrapQualified:false,minimum:'1.0.1',controller});
+      installerNotInvoked:true,registeredBootstrapQualified:false,minimum:'1.1.0',controller});
   }catch(error){
     primaryError=error;
     // Retain the primitive failure while its owning dialog is still visible.

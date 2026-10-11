@@ -3,6 +3,7 @@
 // a private Xvfb display. This module never replaces VS Code or provider APIs.
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
+const {constants:fsFlags}=require('node:fs');
 const path=require('node:path');
 const {execFile,spawn}=require('node:child_process');
 const {promisify}=require('node:util');
@@ -23,19 +24,78 @@ const sdk={
 };
 
 async function eventually(read,label,timeout,deadline){
-  const until=Math.min(Date.now()+timeout,deadline);let last;
+  const until=Math.min(Date.now()+timeout,deadline);
   while(Date.now()<until){
-    try{const value=await read();if(value)return value;}catch(error){last=error;}
-    await delay(100);
+    const value=await beforeDeadline(read,until,label);if(value)return value;
+    await beforeDeadline(()=>delay(Math.min(100,until-Date.now())),until,label);
   }
-  throw new Error(`${label}${last?`: ${last.message}`:''}`);
+  throw new Error(label);
 }
+exports.eventually=eventually;
 async function bounded(promise,label,timeout,deadline){
   let timer;
   try{return await Promise.race([promise,new Promise((_,reject)=>{
     timer=setTimeout(()=>reject(new Error(label)),Math.max(1,Math.min(timeout,deadline-Date.now())));
   })]);}finally{clearTimeout(timer);}
 }
+async function beforeDeadline(operation,deadline,label='Landscape observation deadline expired'){
+  const remaining=deadline-Date.now();
+  if(remaining<=0){if(typeof operation!=='function')void Promise.resolve(operation).catch(()=>{});throw new Error(label);}
+  const promise=typeof operation==='function'?Promise.resolve().then(operation):Promise.resolve(operation);
+  if(deadline===Infinity)return promise;
+  let timer;
+  try{return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(label)),remaining);})]);}
+  finally{clearTimeout(timer);}
+}
+function createCoalescingObserver(inspect,{interval=50,onError=()=>{}}={}){
+  let active,stopped=false,failure,deadline=Infinity;
+  const check=()=>{if(Date.now()>=deadline)throw new Error('Landscape observation deadline expired');};
+  const sample=(until=Infinity)=>{
+    if(stopped)return Promise.reject(new Error('Landscape observer has stopped'));
+    deadline=Math.min(deadline,until);
+    if(failure)return Promise.reject(failure);
+    if(!active){
+      active=Promise.resolve().then(async()=>{check();const value=await inspect(check);check();return value;})
+        .catch(error=>{failure??=error;onError(error);}).finally(()=>{active=undefined;});
+    }
+    return beforeDeadline(active,deadline).then(value=>{if(failure)throw failure;return value;});
+  };
+  const timer=setInterval(()=>{void sample().catch(()=>{});},interval);
+  return {sample,get idle(){return !active;},async stop(until=Infinity){
+    stopped=true;clearInterval(timer);deadline=Math.min(deadline,until);
+    await beforeDeadline(active||Promise.resolve(),deadline);
+    if(failure)throw failure;
+  }};
+}
+exports.createCoalescingObserver=createCoalescingObserver;
+exports.beforeDeadline=beforeDeadline;
+function nativeFailureDetail(error,{maxNodes=16,maxDepth=4,maxFieldChars=6000}={}){
+  const seen=new Set();let nodes=0;
+  const text=value=>{
+    const content=String(value);if(content.length<=maxFieldChars)return content;
+    const half=Math.floor(maxFieldChars/2);
+    return content.slice(0,half)+`\n[truncated ${content.length-maxFieldChars} characters]\n`+content.slice(-half);
+  };
+  const visit=(value,depth)=>{
+    if(depth>maxDepth)return {truncated:'depth-limit'};
+    if(nodes++>=maxNodes)return {truncated:'node-limit'};
+    if(!value||typeof value!=='object')return {message:text(value)};
+    if(seen.has(value))return {truncated:'repeated-error'};seen.add(value);
+    const result={};
+    for(const key of ['name','message','stack','code','signal','killed','cmd','stdout','stderr']){
+      const item=value[key];if(item===undefined)continue;
+      result[key]=item===null||['boolean','number'].includes(typeof item)?item:text(item);
+    }
+    if(value.cause!==undefined)result.cause=visit(value.cause,depth+1);
+    if(Array.isArray(value.errors)){
+      result.errors=value.errors.slice(0,8).map(item=>visit(item,depth+1));
+      if(value.errors.length>8)result.omittedErrors=value.errors.length-8;
+    }
+    return result;
+  };
+  return visit(error,0);
+}
+exports.nativeFailureDetail=nativeFailureDetail;
 async function command(executable,args,options={}){
   const result=await execute(executable,args,{encoding:'utf8',timeout:120000,maxBuffer:4000000,...options});
   return result.stdout.trim();
@@ -62,12 +122,94 @@ async function memSnapshot(roots){
   for(const [label,root]of Object.entries(roots))await walk(root,label);
   return Object.fromEntries(Object.entries(records).sort(([a],[b])=>a.localeCompare(b)));
 }
-async function processIdentity(pid){
+async function processIdentity(pid,check=()=>{}){
+  check();
   const text=await fs.readFile(`/proc/${pid}/stat`,'utf8').catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return null;throw error;});
+  check();
   if(!text)return null;
   const fields=text.slice(text.lastIndexOf(') ')+2).trim().split(/\s+/);
-  return {pid,state:fields[0],parent:Number(fields[1]),group:Number(fields[2]),started:fields[19]};
+  return {pid,state:fields[0],parent:Number(fields[1]),group:Number(fields[2]),started:fields[19],
+    cpuTicks:{user:fields[11],system:fields[12]}};
 }
+function sameOwnedIdentity(expected,current){
+  assert(/^\d+$/.test(expected.started)&&Number.isInteger(expected.group)&&expected.group>0,'An established incarnation is required');
+  if(!current)return null;
+  assert.equal(current.pid,expected.pid);
+  assert.equal(current.started,expected.started,'Diagnostics never adopt a reused PID');
+  assert.equal(current.group,expected.group,'Diagnostics retain the established process group');
+  return ['Z','X'].includes(current.state)?null:current;
+}
+const inside=(root,file)=>{const relative=path.relative(root,file);return !!relative&&!path.isAbsolute(relative)&&relative.split(path.sep)[0]!=='..';};
+function diagnosticArguments(argv,privateRoot,executable){
+  return argv.slice(0,32).map((value,index)=>{
+    if(argv[index-1]==='-e')return `[Julia code sha256:${digest(value)}]`;
+    if(index===0)return value===executable?value:'[executable alias]';
+    if(['--startup-file=no','--history-file=no','--compiled-modules=strict','-e','--'].includes(value))return value;
+    if(/^--quality=[a-z][a-z0-9-]*$/.test(value))return value;
+    if(value.startsWith('--project=')&&inside(privateRoot,value.slice(10)))return value.slice(0,2048);
+    return path.isAbsolute(value)&&inside(privateRoot,value)?value.slice(0,2048):'[redacted argument]';
+  });
+}
+async function readOwnedTransport(root,file){
+  assert(path.isAbsolute(root)&&path.isAbsolute(file)&&inside(root,file),'The diagnostic transport stays inside its private temporary root');
+  assert.equal(await fs.realpath(root),root,'The transport root is canonical');
+  for(const component of path.relative(root,file).split(path.sep)){
+    root=path.join(root,component);
+    const info=await fs.lstat(root).catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+    if(!info)return {status:'absent'};
+    assert(!info.isSymbolicLink(),'Unexpected transport symlinks are refused');
+  }
+  const info=await fs.lstat(file);assert(info.isFile()&&info.nlink===1,'Only a regular singly linked owned transport is readable');
+  const handle=await fs.open(file,fsFlags.O_RDONLY|fsFlags.O_NOFOLLOW);
+  try{
+    assert.equal(await fs.realpath(`/proc/self/fd/${handle.fd}`),file,'The opened transport has not escaped through a replaced parent');
+    const opened=await handle.stat();assert.equal(opened.ino,info.ino);assert.equal(opened.dev,info.dev);assert.equal(opened.nlink,1);
+    if(opened.size>32768)return {status:'present',bytes:opened.size,contentOmitted:'32768-byte limit'};
+    const bytes=Buffer.alloc(32768),read=await handle.read(bytes,0,bytes.length,0),content=bytes.subarray(0,read.bytesRead);
+    const result={status:'present',bytes:opened.size,sha256:digest(content)};
+    try{const payload=JSON.parse(content);result.summary={schema_version:payload.schema_version==='perfchecker-provider-result/1'?payload.schema_version:'unrecognized',
+      state:['complete','failed','cancelled','partial'].includes(payload.state)?payload.state:'unrecognized',
+      observations:Array.isArray(payload.observations)?payload.observations.length:undefined,
+      diagnostics:Array.isArray(payload.diagnostics)?payload.diagnostics.length:undefined};}
+    catch{result.summary={json:'incomplete-or-invalid'};}
+    const after=await fs.lstat(file);assert(!after.isSymbolicLink()&&after.nlink===1&&after.ino===opened.ino&&after.dev===opened.dev,'The transport keeps its observed file identity');
+    return result;
+  }finally{await handle.close();}
+}
+async function processDiagnostic(record,privateRoot,transportRoot){
+  const before=sameOwnedIdentity(record,await processIdentity(record.pid));
+  if(!before)return {pid:record.pid,started:record.started,status:'physically-absent-or-terminal'};
+  const location=`/proc/${record.pid}`;
+  try{
+    const executable=await fs.realpath(`${location}/exe`);
+    const argv=(await fs.readFile(`${location}/cmdline`,'utf8')).split('\0').filter(Boolean);
+    const wchan=(await fs.readFile(`${location}/wchan`,'utf8')).slice(0,128);
+    const tids=(await fs.readdir(`${location}/task`)).sort().slice(0,48),threads=[];
+    for(const tid of tids){const name=await fs.readFile(`${location}/task/${tid}/comm`,'utf8').catch(error=>{if(['ENOENT','ESRCH'].includes(error.code))return null;throw error;});if(name)threads.push(name.trim().slice(0,80));}
+    // Inspect only the provider's result-file locator, never persist its environment.
+    const output=(await fs.readFile(`${location}/environ`,'utf8')).split('\0').find(value=>value.startsWith('PERFCHECKER_OUTPUT='))?.slice('PERFCHECKER_OUTPUT='.length);
+    const transport=output?await readOwnedTransport(transportRoot,output):undefined;
+    const after=sameOwnedIdentity(record,await processIdentity(record.pid));
+    if(!after)return {pid:record.pid,started:record.started,status:'physically-absent-or-terminal'};
+    assert.equal(await fs.realpath(`${location}/exe`),executable,'The diagnostic executable keeps its incarnation');
+    if(record.diagnosticExecutable)assert.equal(executable,record.diagnosticExecutable,'An observed image is never replaced silently');
+    else record.diagnosticExecutable=executable;
+    return {...after,role:record.role,executable,arguments:diagnosticArguments(argv,privateRoot,executable),
+      omittedArguments:Math.max(0,argv.length-32),wchan,threads,transport};
+  }catch(error){
+    if(['ENOENT','ESRCH'].includes(error.code)&&!sameOwnedIdentity(record,await processIdentity(record.pid)))
+      return {pid:record.pid,started:record.started,status:'physically-absent-or-terminal'};
+    throw error;
+  }
+}
+exports.sameOwnedIdentity=sameOwnedIdentity;
+exports.diagnosticArguments=diagnosticArguments;
+exports.readOwnedTransport=readOwnedTransport;
+async function diagnosticObservation(read){
+  try{return {status:'available',value:await read()};}
+  catch(error){return {status:'unavailable',error:nativeFailureDetail(error)};}
+}
+exports.diagnosticObservation=diagnosticObservation;
 async function living(records){
   const result=[];
   for(const record of records.values()){
@@ -76,76 +218,85 @@ async function living(records){
   }
   return result;
 }
-async function children(pid,started){
-  const before=await processIdentity(pid);if(!before||before.state==='Z'||started!==undefined&&before.started!==started)return [];
+async function children(pid,started,check=()=>{}){
+  const before=await processIdentity(pid,check);if(!before||before.state==='Z'||started!==undefined&&before.started!==started)return [];
   const tasks=await fs.readdir(`/proc/${pid}/task`).catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return [];throw error;});
+  check();
   const found=new Set();
   for(const tid of tasks.filter(name=>/^\d+$/.test(name))){
     const text=await fs.readFile(`/proc/${pid}/task/${tid}/children`,'utf8').catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return '';throw error;});
+    check();
     for(const child of text.trim().split(/\s+/).filter(Boolean).map(Number))found.add(child);
   }
-  const after=await processIdentity(pid);
+  const after=await processIdentity(pid,check);
   return after?.started===before.started&&after.state!=='Z'?[...found]:[];
 }
-async function trackTree(pid,records,role,provider,parent,started){
-  const current=await processIdentity(pid);if(!current||current.state==='Z')return;
+async function trackTree(pid,records,role,provider,parent,started,check=()=>{}){
+  const current=await processIdentity(pid,check);if(!current||current.state==='Z')return;
   if(parent!==undefined&&current.parent!==parent||started!==undefined&&current.started!==started)return;
   const old=records.get(pid);
   assert(!old||old.started===current.started,'A PID cannot change identity inside the observed owned tree');
   const argv=(await fs.readFile(`/proc/${pid}/cmdline`).catch(error=>{if(error.code==='ENOENT'||error.code==='ESRCH')return Buffer.alloc(0);throw error;})).toString().split('\0');
+  check();
   if(argv.includes(provider)&&!argv.includes('-e'))role='renderer';
-  records.set(pid,{...current,role:role==='renderer'?role:old?.role||role});
-  for(const child of await children(pid,current.started))await trackTree(child,records,'provider-descendant',provider,pid);
+  records.set(pid,{...current,role:role==='renderer'?role:old?.role||role,
+    ...(old?.diagnosticExecutable?{diagnosticExecutable:old.diagnosticExecutable}:{})});
+  for(const child of await children(pid,current.started,check))await trackTree(child,records,'provider-descendant',provider,pid,undefined,check);
 }
 function observe(root,reports,records){
   const provider=path.join(root,'perf','live_provider.jl');
-  let pending=Promise.resolve(),error;
-  const inspect=async()=>{
-    for(const pid of await children(process.pid)){
-      const current=await processIdentity(pid);if(!current||current.parent!==process.pid)continue;
+  const inspect=async check=>{
+    for(const pid of await children(process.pid,undefined,check)){
+      const current=await processIdentity(pid,check);if(!current||current.parent!==process.pid)continue;
       const argv=(await fs.readFile(`/proc/${pid}/cmdline`).catch(e=>{if(e.code==='ENOENT'||e.code==='ESRCH')return Buffer.alloc(0);throw e;})).toString().split('\0');
+      check();
       if(argv.includes(root)&&argv.includes(reports)&&argv.some(arg=>arg.includes('PERFCHECKER_LIVE_BUNDLE')||arg.includes('NATIVE_LANDSCAPE_SDK')))
-        await trackTree(pid,records,argv.some(arg=>arg.includes('NATIVE_LANDSCAPE_SDK'))?'sdk-probe':'controller',provider,process.pid,current.started);
+        await trackTree(pid,records,argv.some(arg=>arg.includes('NATIVE_LANDSCAPE_SDK'))?'sdk-probe':'controller',provider,process.pid,current.started,check);
     }
     for(const record of [...records.values()]){
-      const current=await processIdentity(record.pid);
-      if(current?.started===record.started&&current.state!=='Z')await trackTree(record.pid,records,record.role,provider,undefined,record.started);
+      const current=await processIdentity(record.pid,check);
+      if(current?.started===record.started&&current.state!=='Z')await trackTree(record.pid,records,record.role,provider,undefined,record.started,check);
     }
   };
-  const schedule=()=>pending=pending.then(inspect).catch(e=>{error??=e;});
-  const timer=setInterval(schedule,50);
-  return {async sample(){await schedule();if(error)throw error;},async stop(){clearInterval(timer);await schedule();if(error)throw error;}};
+  return createCoalescingObserver(inspect);
 }
+function renderedScene(pixels,{byteOrder=0}={}){
+  const colors=new Set();
+  for(let i=0;i+4<=pixels.length;i+=4*13)colors.add((byteOrder===0?pixels.readUInt32LE(i):pixels.readUInt32BE(i))&0xffffff);
+  // The observed initialization window had 195 colors; the real scene had
+  // 14,543+. Require >1,000 sampled colors before treating a buffer as a scene.
+  return {state:colors.size>1000?'rich-scene':'initializing',sampledColors:colors.size,sha256:digest(pixels)};
+}
+exports.renderedScene=renderedScene;
 async function renderedFrame(display){
   const tree=await command('xwininfo',['-display',display,'-root','-tree'],{timeout:5000});
-  const window=tree.match(/(0x[0-9a-f]+) "Beautiful Landscape/);if(!window)return null;
+  const window=tree.match(/(0x[0-9a-f]+) "Beautiful Landscape/);if(!window)return {state:'no-window'};
   const {stdout}=await execute('xwd',['-display',display,'-id',window[1],'-silent'],{encoding:'buffer',timeout:5000,maxBuffer:5000000});
   const header=Array.from({length:25},(_,i)=>stdout.readUInt32BE(4*i));
   assert.equal(header[1],7);assert.equal(header[4],960);assert.equal(header[5],540);assert.equal(header[11],32);
-  const pixels=stdout.subarray(header[0]+12*header[19]),colors=new Set();
-  for(let i=0;i+4<=pixels.length;i+=4*13)colors.add((header[7]===0?pixels.readUInt32LE(i):pixels.readUInt32BE(i))&0xffffff);
-  return colors.size<100?null:{sha256:digest(pixels),sampledColors:colors.size};
+  return renderedScene(stdout.subarray(header[0]+12*header[19]),{byteOrder:header[7]});
 }
-async function stopObserved(records,log,observer){
+async function stopObserved(records,log,observer,deadline){
   // Failure cleanup only. The positive oracle has already required an empty tree.
   const terminatedOwnedPids=new Set();
   let observationError;
   for(const signal of ['SIGTERM','SIGKILL']){
     const signalled=new Set();
-    const until=Date.now()+(signal==='SIGTERM'?5000:2000);
+    const until=Math.min(deadline,Date.now()+(signal==='SIGTERM'?5000:2000));
     do{
-      try{await observer?.sample();}catch(error){observationError??=error;}
-      for(const record of (await living(records)).reverse()){
-        const identity=record.pid+'/'+record.started,current=await processIdentity(record.pid);
+      if(Date.now()>=deadline)throw new Error('Landscape cleanup deadline expired');
+      try{await observer?.sample(deadline);}catch(error){observationError??=error;}
+      for(const record of (await beforeDeadline(()=>living(records),deadline)).reverse()){
+        const identity=record.pid+'/'+record.started,current=await beforeDeadline(()=>processIdentity(record.pid),deadline);
         if(signalled.has(identity)||current?.started!==record.started||current.state==='Z')continue;
         try{process.kill(record.pid,signal);signalled.add(identity);terminatedOwnedPids.add(record.pid);}catch(error){if(error.code!=='ESRCH')throw error;}
       }
-      if(!(await living(records)).length)break;
-      await delay(100);
+      if(!(await beforeDeadline(()=>living(records),deadline)).length)break;
+      await beforeDeadline(()=>delay(100),deadline);
     }while(Date.now()<until);
-    if(!(await living(records)).length)break;
+    if(!(await beforeDeadline(()=>living(records),deadline)).length)break;
   }
-  const remaining=await living(records);
+  const remaining=await beforeDeadline(()=>living(records),deadline);
   log('native-landscape-failure-teardown',{terminatedOwnedPids:[...terminatedOwnedPids],survivingOwnedPids:remaining.map(x=>x.pid)});
   assert.deepEqual(remaining,[],'Only identity-checked owned workers may be stopped, and must die before deleting fixture files');
   if(observationError)throw observationError;
@@ -155,7 +306,17 @@ exports.run=async context=>{
   assert.equal(process.platform,'linux','This software renderer qualification uses Linux/X11 process identities');
   assert.equal(process.env.CI,'true','Only the disposable native host is supported');
   assert.equal(process.env.PERFCHECKER_NATIVE_PHASE,'landscape');
-  const {vscode,windowPage}=context,deadline=Date.now()+420000;
+  // The installed provider contract allows 900s. Controller startup, bundle
+  // validation and the editor handoff have a separate bounded 120s allowance;
+  // First scene readiness shares the provider's 900s startup contract. Once
+  // ready, the second distinct rich buffer still has a separate 75s bound.
+  const budgets={sdkImport:120000,provider:900000,controllerHandoff:120000,
+    unrelatedReadiness:10000,sceneReadiness:900000,renderBeforeCancel:75000,cancelSettlement:75000,fixtureAndAssertions:180000};
+  const caseBudget=Object.values(budgets).reduce((total,value)=>total+value,0);
+  const {vscode,windowPage}=context,deadline=Date.now()+caseBudget;
+  context.log('native-landscape-observation-budgets',{...budgets,caseMilliseconds:caseBudget,
+    commandMilliseconds:budgets.provider+budgets.controllerHandoff,productProviderMilliseconds:900000,
+    scope:'Observation only; unchanged provider, measurement assertions and native Cancel'});
   const session=await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION);
   assert.match(path.basename(session),/^pc-vsix-/,'Use the existing runner-owned native session');
   const insideSession=location=>{const relative=path.relative(session,location);return !!relative&&!path.isAbsolute(relative)&&relative.split(path.sep)[0]!=='..';};
@@ -193,6 +354,31 @@ exports.run=async context=>{
   const qualityDigest=digest(await fs.readFile(path.join(root,'config','quality.toml'))),sceneDigest=digest(await fs.readFile(path.join(root,'content','scenes','beautiful_landscape.toml')));
   const sentinel=path.join(root,`native-landscape-unrelated-${randomUUID()}.mem`),sentinelBytes=Buffer.from('Unrelated allocation trace must survive native cancellation.\n');
   const records=new Map();let observer,foreign,foreignIdentity,primaryError,invocation,resolved,settled=true;
+  const transportRoot=await fs.realpath(process.env.TMPDIR);assert(inside(transportRoot,session),'Only this runner temporary transport root is inspected');
+  let diagnosticTimer,diagnosticTail=Promise.resolve(),diagnosticCount=0,periodicCount=0,unavailableDiagnostics=0,lastWindowAt=0;
+  const diagnose=label=>{
+    // Reserve two samples for the explicit observations before native/recovery Cancel.
+    if(diagnosticCount>=24||label==='periodic'&&periodicCount>=22)return diagnosticTail;
+    if(label==='periodic')periodicCount++;
+    const sample=++diagnosticCount;
+    diagnosticTail=diagnosticTail.then(async()=>{
+      await observer.sample();const owned=[...records.values()].filter(row=>row.role!=='sdk-probe');
+      const processes=[];for(const row of owned.slice(0,12)){
+        const observed=await diagnosticObservation(()=>processDiagnostic(row,session,transportRoot));
+        if(observed.status==='unavailable')unavailableDiagnostics++;
+        processes.push({pid:row.pid,started:row.started,...observed});
+      }
+      let rendered;
+      if(label!=='periodic'||Date.now()-lastWindowAt>=60000){
+        lastWindowAt=Date.now();rendered=await diagnosticObservation(()=>renderedFrame(display));
+        if(rendered.status==='available'&&rendered.value===null)rendered={status:'unavailable',reason:'No completed Landscape window sample exists yet'};
+        if(rendered.status==='unavailable')unavailableDiagnostics++;
+      }
+      context.log('native-landscape-command-observation',{label,sample,observedAt:new Date().toISOString(),
+        processes,omittedProcesses:Math.max(0,owned.length-12),rendered});
+    }).catch(error=>{unavailableDiagnostics++;context.log('native-landscape-observation-unavailable',{label,error:nativeFailureDetail(error)});});
+    return diagnosticTail;
+  };
   const notification=()=>windowPage.locator('.notification-list-item').filter({hasText:title});
   const cancel=async()=>{
     await vscode.commands.executeCommand('notifications.showList');
@@ -205,12 +391,21 @@ exports.run=async context=>{
     for(const [key,value]of Object.entries({juliaExecutable:julia,runnerProject:controller}))await settings().update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
     observer=observe(root,reports,records);
     const workerCode='using EtenduBeautifulLandscape,EtenduContracts,EtenduNativeArtifacts,EtenduRender,EtenduRuntime,EtenduSDLGPU,JSON3; println("NATIVE_LANDSCAPE_SDK "*JSON3.write([Dict("name"=>string(nameof(m)),"version"=>string(Base.pkgversion(m)),"root"=>pkgdir(m)) for m in (EtenduContracts,EtenduNativeArtifacts,EtenduRender,EtenduRuntime,EtenduSDLGPU)]))';
-    const worker=await command(julia,['--startup-file=no','--history-file=no',`--project=${root}`,'-e',workerCode,'--',root,reports],{env:{...process.env,JULIA_LOAD_PATH:'@:@stdlib'}});
+    const sdkStartedAt=new Date().toISOString(),sdkStarted=Date.now();let worker;
+    context.log('native-landscape-sdk-import',{status:'started',startedAt:sdkStartedAt,timeoutMilliseconds:budgets.sdkImport});
+    try{
+      worker=await command(julia,['--startup-file=no','--history-file=no',`--project=${root}`,'-e',workerCode,'--',root,reports],{env:{...process.env,JULIA_LOAD_PATH:'@:@stdlib'},timeout:budgets.sdkImport});
+      context.log('native-landscape-sdk-import',{status:'passed',startedAt:sdkStartedAt,elapsedMilliseconds:Date.now()-sdkStarted,timeoutMilliseconds:budgets.sdkImport});
+    }catch(error){
+      context.log('native-landscape-sdk-import',{status:'failed',startedAt:sdkStartedAt,elapsedMilliseconds:Date.now()-sdkStarted,timeoutMilliseconds:budgets.sdkImport,error:nativeFailureDetail(error)});
+      throw error;
+    }
     resolved=JSON.parse(worker.match(/^NATIVE_LANDSCAPE_SDK (.+)$/m)?.[1]||'null');
     assert.equal(resolved?.length,5);
     for(const dependency of resolved){assert(sdk[dependency.name]);assert.equal(dependency.version,'0.1.1');assert.equal(digest((await sourceDigest(dependency.root)).join('')),sdk[dependency.name][1]);}
     await observer.sample();assert.deepEqual(await living(records),[],'SDK preparation leaves no child alive');records.clear();
-    const completed=await bounded(start(),'The real native Landscape command completes its measurement',180000,deadline);
+    diagnosticTimer=setInterval(()=>{void diagnose('periodic');},15000);
+    const completed=await bounded(start(),'The real native Landscape command completes its measurement',budgets.provider+budgets.controllerHandoff,deadline);
     assert.equal(completed.ok,true,String(completed.error));
     const directory=await fs.realpath(completed.directory);
     assert.equal(path.dirname(directory),await fs.realpath(reports));
@@ -246,20 +441,30 @@ exports.run=async context=>{
     void foreignReady.catch(()=>{});
     foreignIdentity=await processIdentity(foreign.pid);assert.equal(foreignIdentity?.parent,process.pid);
     await bounded(foreignReady,
-      'The unrelated fixture reaches readiness',10000,deadline);
-    records.clear();start();let first;
-    const changed=await eventually(async()=>{
+      'The unrelated fixture reaches readiness',budgets.unrelatedReadiness,deadline);
+    records.clear();const renderingStarted=Date.now();start();let lastRenderState;
+    const scene=async()=>{
       await observer.sample();assert.equal(settled,false,'The active renderer must still be measuring before its native Cancel');
-      const current=await renderedFrame(display);if(!current)return false;
-      if(!first){first=current;return false;}return current.sha256!==first.sha256?current:false;
-    },'Observe two different actual rendered scene buffers before cancellation',75000,deadline);
+      const current=await renderedFrame(display);
+      if(current.state!==lastRenderState){lastRenderState=current.state;context.log('native-landscape-scene-readiness',
+        {...current,elapsedMilliseconds:Date.now()-renderingStarted,observedAt:new Date().toISOString()});}
+      return current.state==='rich-scene'?current:false;
+    };
+    const first=await eventually(scene,'Observe the first rich rendered scene before cancellation',budgets.sceneReadiness,deadline);
+    const firstSceneAt=Date.now();
+    const changed=await eventually(async()=>{
+      const current=await scene();return current&&current.sha256!==first.sha256?current:false;
+    },'Observe two different actual rendered scene buffers before cancellation',budgets.renderBeforeCancel,deadline);
+    context.log('native-landscape-distinct-scenes',{firstSceneMilliseconds:firstSceneAt-renderingStarted,
+      secondSceneMilliseconds:Date.now()-firstSceneAt,renderedBuffers:[first,changed]});
     const activeBefore=await living(records),activeIds=new Set(activeBefore.map(x=>x.pid));
     assert([...records.values()].some(x=>x.role==='controller'&&activeIds.has(x.pid))&&[...records.values()].some(x=>x.role==='renderer'&&activeIds.has(x.pid)),
       'The actual controller and rendering provider are both alive before Cancel');
     const ownedBefore=[...records.values()].map(({pid,parent,group,started,role})=>({pid,parent,group,started,role}));
     context.log('native-landscape-before-cancel',{owned:ownedBefore,foreign:foreignIdentity.pid,renderedBuffers:[first,changed]});
+    await diagnose('before-native-cancel');
     await cancel();
-    const cancelled=await bounded(invocation,'Native progress Cancel waits for real controller cleanup',75000,deadline);
+    const cancelled=await bounded(invocation,'Native progress Cancel waits for real controller cleanup',budgets.cancelSettlement,deadline);
     assert.equal(cancelled.ok,false);assert.match(String(cancelled.error),/Live measurement cancelled/i);
     await observer.sample();assert.deepEqual(await living(records),[],'All observed owned processes exit before harness teardown');
     const foreignAfter=await processIdentity(foreignIdentity.pid);
@@ -273,39 +478,54 @@ exports.run=async context=>{
       core:context.core,vsixSha256:process.env.PERFCHECKER_NATIVE_SHA,gameCommit,ownedBefore,pidsDeadBeforeHarnessCleanup:true,
       changedSceneBuffers:true,sampledColors:changed.sampledColors,unrelatedProcessPreserved:true,preExistingMemPreserved:true,noNewMem:true,
       cancelledReportsUnchanged:true,scope:'Owned native controller/provider and fixture .mem inventory; no physical GPU or arbitrary user callback guarantee'});
-  }catch(error){primaryError=error;throw error;}
+  }catch(error){primaryError=error;context.log('native-landscape-primary-failure',{error:nativeFailureDetail(error)});
+    if(observer)await diagnose('before-recovery-cancel');throw error;}
   finally{
     const errors=[];let observerFailed=false;
-    if(!settled&&invocation)try{await cancel();await bounded(invocation,'Failure cancellation finishes',75000,Date.now()+75000);}catch(error){errors.push(error);}
+    const cleanupDeadline=Date.now()+120000;
+    const cleanup=operation=>beforeDeadline(operation,cleanupDeadline,'Landscape cleanup deadline expired');
+    clearInterval(diagnosticTimer);
+    try{await beforeDeadline(diagnosticTail,cleanupDeadline);}catch(error){errors.push(error);observerFailed=true;}
+    context.log('native-landscape-observation-summary',{status:!diagnosticCount?'not-observed':unavailableDiagnostics?'incomplete':'available',
+      samples:diagnosticCount,unavailable:unavailableDiagnostics,scope:'Diagnostics only; native functional and ownership assertions remain independent'});
+    context.log('native-landscape-teardown',{stage:'recovery-cancel',status:'started',at:new Date().toISOString(),
+      cleanupDeadlineAt:new Date(cleanupDeadline).toISOString(),cleanupBudgetMilliseconds:120000});
+    if(!settled&&invocation)try{await cleanup(cancel);await bounded(invocation,'Failure cancellation finishes',75000,cleanupDeadline);}catch(error){errors.push(error);}
+    context.log('native-landscape-teardown',{stage:'recovery-cancel',status:'finished',at:new Date().toISOString(),settled});
     if(observer){
-      try{await observer.sample();}catch(error){observerFailed=true;errors.push(error);}
+      try{await observer.sample(cleanupDeadline);}catch(error){observerFailed=true;errors.push(error);}
     }
-    if((await living(records)).length){
+    try{if((await cleanup(()=>living(records))).length){
       errors.push(new Error('Native Landscape left owned processes alive; harness teardown cannot turn that failure into PASS'));
-      try{await stopObserved(records,context.log,observer);}catch(error){errors.push(error);}
-    }
+      await stopObserved(records,context.log,observer,cleanupDeadline);
+    }}catch(error){errors.push(error);observerFailed=true;}
     if(foreign){
       try{
-        const current=await processIdentity(foreign.pid);
+        const current=await cleanup(()=>processIdentity(foreign.pid));
         if(foreignIdentity?.parent===process.pid&&current?.started===foreignIdentity.started&&current.state!=='Z')foreign.kill('SIGTERM');
         const finished=new Promise(resolve=>{if(foreign.exitCode!==null||foreign.signalCode!==null)resolve();else foreign.once('close',resolve);});
-        try{await bounded(finished,'The unrelated fixture stops only during its own teardown',5000,Date.now()+5000);}
+        try{await bounded(finished,'The unrelated fixture stops only during its own teardown',5000,cleanupDeadline);}
         catch(error){
-          const remaining=await processIdentity(foreign.pid);
+          const remaining=await cleanup(()=>processIdentity(foreign.pid));
           if(foreignIdentity?.parent===process.pid&&remaining?.started===foreignIdentity.started&&remaining.state!=='Z')foreign.kill('SIGKILL');
-          await bounded(finished,'Identity-checked unrelated fixture teardown finishes',2000,Date.now()+2000);throw error;
+          await bounded(finished,'Identity-checked unrelated fixture teardown finishes',2000,cleanupDeadline);throw error;
         }
-        const remaining=await processIdentity(foreign.pid);
+        const remaining=await cleanup(()=>processIdentity(foreign.pid));
         assert(!remaining||remaining.started!==foreignIdentity?.started||remaining.state==='Z','The fixture process is dead before its session is removed');
       }catch(error){errors.push(error);}
     }
-    if(observer)try{await observer.stop();}catch(error){observerFailed=true;errors.push(error);}
-    const remaining=await living(records);
-    if(remaining.length||observerFailed)errors.push(new Error('The final drained Landscape inventory could not confirm an empty owned tree; fixture files are preserved'));
-    if(!remaining.length&&!observerFailed){
-      try{await fs.rm(sentinel,{force:true});assert.deepEqual(await memSnapshot(roots),baselineMem);}catch(error){errors.push(error);}
-      for(const key of keys)try{await settings().update(key,previous[key],vscode.ConfigurationTarget.WorkspaceFolder);}catch(error){errors.push(error);}
+    if(observer)try{await observer.stop(cleanupDeadline);}catch(error){observerFailed=true;errors.push(error);}
+    let remaining;
+    try{remaining=await cleanup(()=>living(records));}catch(error){observerFailed=true;errors.push(error);}
+    if(remaining?.length||observerFailed)errors.push(new Error('The final drained Landscape inventory could not confirm an empty owned tree; fixture files are preserved'));
+    if(remaining&&!remaining.length&&!observerFailed){
+      try{await cleanup(()=>fs.rm(sentinel,{force:true}));assert.deepEqual(await cleanup(()=>memSnapshot(roots)),baselineMem);}catch(error){errors.push(error);}
+      for(const key of keys)try{await cleanup(()=>settings().update(key,previous[key],vscode.ConfigurationTarget.WorkspaceFolder));}catch(error){errors.push(error);}
     }
-    if(errors.length)throw new AggregateError(primaryError?[primaryError,...errors]:errors,'Native Landscape failed or its owned cleanup remained incomplete');
+    if(errors.length){
+      const failure=new AggregateError(primaryError?[primaryError,...errors]:errors,'Native Landscape failed or its owned cleanup remained incomplete');
+      context.log('native-landscape-aggregate-failure',{error:nativeFailureDetail(failure)});
+      throw failure;
+    }
   }
 };

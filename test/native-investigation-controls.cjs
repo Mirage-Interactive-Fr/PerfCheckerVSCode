@@ -49,7 +49,12 @@ function reportRoot(context) {
 
 async function reportAfter(context, before, action, timeout = 360000) {
   const root = reportRoot(context);
-  const observationDeadline=Date.now()+timeout;let nextObservation=0;
+  const observationStarted=Date.now(),observationDeadline=observationStarted+timeout;let nextObservation=0;
+  if(action==='diagnose')context.log('investigation-diagnosis-observation-budget',{
+    timeoutMilliseconds:timeout,startedAt:new Date(observationStarted).toISOString(),deadlineAt:new Date(observationDeadline).toISOString(),
+    scope:'Native test observation only; analyzer and investigation execution budgets are unchanged'});
+  let reportObserved=false,cleanupConfirmed=false,reportObservedAt,cleanupConfirmedAt;
+  try{
   const found = await eventually(async () => {
     if(action==='diagnose'&&context.observeDiagnosisRequest&&Date.now()>=nextObservation){
       nextObservation=Date.now()+2000;
@@ -66,18 +71,27 @@ async function reportAfter(context, before, action, timeout = 360000) {
     }
     return false;
   }, `real Julia ${action} report`, timeout);
+  reportObserved=true;
+  reportObservedAt=new Date().toISOString();
   const current = await view(context);
-  await eventually(async () => !(await current.locator('#app .status').getAttribute('class')).includes('busy'), `${action} controller completes cleanup`, timeout);
+  await eventually(async () => !(await current.locator('#app .status').getAttribute('class')).includes('busy'), `${action} controller completes cleanup`, Math.min(timeout,360000));
   assert.equal(await current.getByRole('button', {name: 'Cancel', exact: true}).isDisabled(), true);
+  cleanupConfirmed=true;
+  cleanupConfirmedAt=new Date().toISOString();
   return found;
+  }finally{
+    if(action==='diagnose')context.log('investigation-diagnosis-observation-result',{
+      timeoutMilliseconds:timeout,finishedAt:new Date().toISOString(),elapsedMilliseconds:Date.now()-observationStarted,
+      reportObserved,reportObservedAt,cleanupConfirmed,cleanupConfirmedAt});
+  }
 }
 
-async function action(context, label, name) {
+async function action(context, label, name, timeout = 360000) {
   const before = await directories(reportRoot(context));
   const current = await view(context);
   await context.observeWork?.(`investigation-${name}-before-action`);
   await current.getByRole('button', {name: label, exact: true}).click();
-  const result=await reportAfter(context, before, name);
+  const result=await reportAfter(context, before, name, timeout);
   await context.observeWork?.(`investigation-${name}-completed-before-teardown`);
   return result;
 }
@@ -236,7 +250,9 @@ async function diagnose(context) {
   await selectScenario(context, 'ui_adopted', 'ui');
   const tools = ['jet', 'aqua', 'alloccheck', 'snoopcompile', 'latency', 'gc', 'memory', 'heap', 'locks'];
   await selectTools(context, tools);
-  const result = await action(context, 'Diagnose selected', 'diagnose');
+  // Nine real analyzers can outlive six minutes on a cold macOS CI host.
+  // This observation allowance leaves every execution limit and assertion intact.
+  const result = await action(context, 'Diagnose selected', 'diagnose', process.platform==='darwin'?900000:360000);
   assert.equal(result.report.schema_version, 'perfchecker-diagnosis/1');
   for (const tool of tools) {
     const records = result.report.records.filter(record => record.tool === tool);

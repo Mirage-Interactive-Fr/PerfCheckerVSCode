@@ -115,12 +115,83 @@ if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('passive CLI diagnostic ov
   assert.equal(events.length,1);assert.equal(events[0].observation,'unknown');assert.equal(events[0].reason,'unterminated-event-budget');
 });
 
+if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('live Cancel requires streamed model activity from the same PID incarnation',()=>{
+  const {observedModelActivity}=require('./codex-vscode-host.cjs'),identity={pid:123,start:'456'};
+  const metadata={...identity,event:'turn.started'},command={...identity,event:'item.started',itemType:'command_execution'};
+  const reused={pid:123,start:'789',event:'item.updated',itemType:'reasoning'};
+  assert.equal(observedModelActivity([metadata,command,reused],identity),undefined,'A spawn, turn start, tool command or reused PID does not prove observed model output');
+  assert.equal(observedModelActivity([reused],undefined),undefined);
+  for(const itemType of ['reasoning','agent_message']){
+    const activity={...identity,event:'item.updated',itemType};
+    assert.equal(observedModelActivity([metadata,activity],identity),activity);
+  }
+});
+
 export async function ownedProcessState(pid) {
   try{
     const stat=await readFile(`/proc/${pid}/stat`,'utf8'),fields=stat.slice(stat.lastIndexOf(') ')+2).trim().split(/\s+/);
-    return fields[0]==='Z'?undefined:{pid,parent:Number(fields[1]),group:Number(fields[2]),start:fields[19]};
+    assert([fields[1],fields[2],fields[3],fields[19]].every(value=>/^\d+$/.test(value)&&Number.isSafeInteger(Number(value))),'Valid kernel process birth metadata is required');
+    return ['Z','X'].includes(fields[0])?undefined:{pid,parent:Number(fields[1]),group:Number(fields[2]),session:Number(fields[3]),start:fields[19]};
   }catch(error){if(error.code==='ENOENT'||error.code==='ESRCH')return undefined;throw error;}
 }
+
+// Read-only Electron observation, not the connector's signalling authority.
+// An inaccessible image is retained explicitly; neither a CPU mask nor a
+// directory/name is evidence that a previously unseen process belongs to us.
+export async function observePrivateProcess(pid,{known,parent,rootPid=process.pid,readBirth=ownedProcessState,
+  readExecutable=value=>fsRealpath(`/proc/${value}/exe`)}={}) {
+  const before=await readBirth(pid);if(!before||known&&before.start!==known.start)return undefined;
+  const same=(left,right)=>left&&right&&['pid','start','parent','group','session'].every(key=>left[key]===right[key]);
+  let parentBefore;
+  if(!known&&pid!==rootPid){
+    if(!parent||before.parent!==parent.pid)return undefined;
+    parentBefore=await readBirth(parent.pid);if(parentBefore?.start!==parent.start)return undefined;
+  }
+  const image=async()=>{try{return {status:'observed',path:await readExecutable(pid)};}
+    catch(error){return {status:'unknown',errorCode:String(error.code??error.name)};}};
+  const first=await image(),second=await image(),after=await readBirth(pid);
+  if(!same(before,after))return undefined;
+  if(parentBefore&&!same(parentBefore,await readBirth(parent.pid)))return undefined;
+  const executableObservation=first.status==='observed'&&second.status==='observed'&&first.path===second.path?first:
+    {status:'unknown',reason:'executable-unavailable-or-changing',reads:[first,second]};
+  const executableHistory=[...(known?.executableHistory??[])];
+  if(JSON.stringify(executableHistory.at(-1)?.observation)!==JSON.stringify(executableObservation)){
+    assert(executableHistory.length<100,'Private executable observation budget exceeded');
+    executableHistory.push({at:new Date().toISOString(),observation:executableObservation});
+  }
+  return {...after,...(executableObservation.status==='observed'?{executable:executableObservation.path}:{}),executableObservation,
+    executableHistory,
+    birth:known?.birth??{parent:before.parent,...(parentBefore?{parentStart:parentBefore.start}:{}),observedAt:new Date().toISOString()}};
+}
+
+if(process.env.PERFCHECKER_CODEX_HOST_ONLY!=='1')test('private Electron observations retain unknown images and reparented births without adopting foreign incarnations',async()=>{
+  const parent={pid:10,start:'100',parent:1,group:10,session:10},child={pid:11,start:'101',parent:10,group:10,session:10};
+  const states=new Map([[10,parent],[11,child]]),readBirth=async pid=>states.get(pid);
+  const unavailable=Object.assign(new Error('not retained'),{code:'EACCES'});
+  const options={parent,rootPid:1,readBirth,readExecutable:async()=>{throw unavailable;}};
+  const unknown=await observePrivateProcess(11,options);
+  assert.equal(unknown.executable,undefined);assert.equal(unknown.executableObservation.status,'unknown');
+  assert.deepEqual(unknown.executableObservation.reads.map(value=>value.errorCode),['EACCES','EACCES']);
+  assert.equal(unknown.birth.parentStart,'100');assert(!JSON.stringify(unknown).includes('not retained'));
+  states.set(11,{...child,parent:1,group:11,session:11});states.delete(10);
+  const retained=await observePrivateProcess(11,{...options,known:unknown,readExecutable:async()=>'/private/code'});
+  assert.equal(retained.parent,1);assert.deepEqual(retained.birth,unknown.birth);assert.equal(retained.executable,'/private/code');
+  assert.equal(retained.executableHistory[0].observation.status,'unknown','A later readable executable does not erase the earlier uncertainty');
+  assert.equal(await observePrivateProcess(11,options),undefined,'A new reparented process is not adopted');
+  states.set(11,{...child,start:'102'});
+  assert.equal(await observePrivateProcess(11,{...options,known:unknown}),undefined,'A reused PID never inherits a recorded birth');
+  states.set(11,child);states.set(10,parent);
+  let reads=0;
+  assert.equal(await observePrivateProcess(11,{...options,readBirth:async pid=>pid===10&&++reads===2?undefined:states.get(pid)}),undefined,'The birth parent must remain alive through qualification');
+  reads=0;
+  assert.equal(await observePrivateProcess(11,{...options,readBirth:async pid=>pid===11&&++reads===2?{...child,parent:1}:states.get(pid)}),undefined,'A transient parent change is not a stable new birth');
+  reads=0;
+  const changing=await observePrivateProcess(11,{...options,readExecutable:async()=>++reads===1?'/private/shell':'/private/code'});
+  assert.equal(changing.executable,undefined);assert.equal(changing.executableObservation.status,'unknown');
+  const transient=await observePrivateProcess(11,{...options,readExecutable:async()=>{throw Object.assign(new Error(),{code:'ENOENT'});}});
+  assert.equal(transient.executableObservation.reads[0].errorCode,'ENOENT','A live process with an unavailable image is not mistaken for physical absence');
+  assert.equal(await observePrivateProcess(12,options),undefined,'Physical absence remains distinct from an unknown executable');
+});
 
 // Failure teardown only. Recorded start times and ancestry protect unrelated processes;
 // a private process group is signalled only while its recorded leader still owns it.
@@ -191,7 +262,7 @@ export async function probeBibliographyCodexFixture(directory,julia,{prepare=fal
     independentExportChecks:true,historicalOraclePassed:true};
 }
 
-export async function prepareBibliographyCodexFixture(root,{julia,project,coreTree,signal,dialogueCancelOnly=false}) {
+export async function prepareBibliographyCodexFixture(root,{julia,project,coreTree,coreVersion='1.0.1',coreCommit,signal,dialogueCancelOnly=false}) {
   // The complementary UI/Cancel qualification reuses no benchmark result and
   // performs no worker setup, measurements or implementation oracle.
   const probe=dialogueCancelOnly?{mode:'dialogue-cancel-only',oracleExecuted:false}:
@@ -204,11 +275,19 @@ export async function prepareBibliographyCodexFixture(root,{julia,project,coreTr
     info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]
     project=realpath(Base.active_project()); manifest=realpath(joinpath(dirname(project),"Manifest.toml"))
     PerfChecker.JSON.print(Dict("uuid"=>string(Base.PkgId(PerfChecker).uuid),"version"=>string(Base.pkgversion(PerfChecker)),
-      "tree"=>bytes2hex(Pkg.GitTools.tree_hash(pkgdir(PerfChecker))),"registered"=>info.is_tracking_registry,"http"=>string(Base.pkgversion(HTTP)),
+      "tree"=>bytes2hex(Pkg.GitTools.tree_hash(pkgdir(PerfChecker))),"registered"=>info.is_tracking_registry,"trackingRepo"=>info.is_tracking_repo,
+      "gitSource"=>info.git_source,"gitRevision"=>info.git_revision,"http"=>string(Base.pkgversion(HTTP)),
       "project"=>project,"root"=>realpath(pkgdir(PerfChecker)),"entrypoint"=>realpath(pathof(PerfChecker)),"manifest"=>manifest,
       "projectSha256"=>bytes2hex(sha256(read(project))),"manifestSha256"=>bytes2hex(sha256(read(manifest)))))`],{timeout:60000,signal})).stdout);
-  assert.equal(core.uuid,'6309bf6b-a531-4b08-891e-8ee981e5c424');assert.equal(core.version,'1.0.1');assert.equal(core.tree,coreTree);
-  assert.equal(core.registered,true,'The real-package demo loads published General Core, without a Git or path override');
+  assert.equal(core.uuid,'6309bf6b-a531-4b08-891e-8ee981e5c424');assert.equal(core.version,coreVersion);assert.equal(core.tree,coreTree);
+  if(coreCommit){
+    assert.equal(core.registered,false,'The explicitly pinned candidate is not attributed to General');assert.equal(core.trackingRepo,true);
+    assert.equal(core.gitSource,'https://github.com/Mirage-Interactive-Fr/PerfChecker.jl');assert.equal(core.gitRevision,coreCommit);
+    core.qualificationSource='pinned-candidate';
+  }else{
+    assert.equal(core.registered,true,'The real-package demo loads published General Core, without a Git or path override');
+    core.qualificationSource='General';
+  }
   assert.equal(core.project,await fsRealpath(path.join(project,'Project.toml')),'Probe the requested dedicated controller');
   assert.equal(core.manifest,await fsRealpath(path.join(project,'Manifest.toml')));
   assert.equal(core.entrypoint,await fsRealpath(path.join(core.root,'src','PerfChecker.jl')),'The loaded module belongs to the tree-hashed Core');

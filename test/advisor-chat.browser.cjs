@@ -3,6 +3,9 @@ const assert=require('node:assert/strict');
 const path=require('node:path');
 const fs=require('node:fs/promises'),os=require('node:os');
 const {captureConversationReply,requestProgressed}=require('./codex-vscode-host.cjs');
+// VS Code's webview pre/index.html injects these body defaults before the
+// extension stylesheet. A standalone browser's zero padding misses that host.
+const hostDefaults='@layer vscode-default { body { margin:0; padding:0 20px; } }';
 const beforeSend={busy:false,status:'Ready',connection:'local',messages:[{role:'assistant',content:'Previous reply'}]};
 assert.equal(requestProgressed(beforeSend,{...beforeSend}),false);
 assert.equal(requestProgressed(beforeSend,{...beforeSend,busy:true}),true);
@@ -19,6 +22,7 @@ assert.equal(requestProgressed(beforeSend,{...beforeSend,connection:undefined}),
     evidenceId:'',pending:'',busy:false,status:'Ready',implementation:{tool:'implement',promptArgument:'prompt',workspaceArgument:'workspace'}};
   try {
     await page.setContent('<!doctype html><html lang="en"><body><main id="chat-root"></main></body></html>');
+    await page.addStyleTag({content:hostDefaults});
     await page.addStyleTag({path:path.join(__dirname,'../media/advisor-chat.css')});
     await page.addScriptTag({path:path.join(__dirname,'../media/advisor-chat.js')});
     await page.evaluate(()=>{globalThis.requests=[];globalThis.panel=mountAdvisorChat(document.getElementById('chat-root'),message=>requests.push(message));});
@@ -119,6 +123,7 @@ assert.equal(requestProgressed(beforeSend,{...beforeSend,connection:undefined}),
       await zoomPage.goto('https://perfchecker.test/advice');
       const nativeZoom=await zoomPage.evaluate(()=>devicePixelRatio);
       assert(Math.abs(nativeZoom-Math.pow(1.2,2.75))<.01,'The regression actually applies Chromium native zoom, not a CSS transform');
+      await zoomPage.addStyleTag({content:hostDefaults});
       await zoomPage.addStyleTag({path:path.join(__dirname,'../media/advisor-chat.css')});
       await zoomPage.addScriptTag({path:path.join(__dirname,'../media/advisor-chat.js')});
       await zoomPage.evaluate(()=>{globalThis.panel=mountAdvisorChat(document.getElementById('chat-root'),()=>{});});
@@ -139,10 +144,20 @@ assert.equal(requestProgressed(beforeSend,{...beforeSend,connection:undefined}),
       assert.equal(await zoomPage.locator('.message.assistant .message-text').innerText(),zoomReply);
       // The responsive product moves scrolling to the document. Qualify that
       // same wheel routine without adding tabindex, changing CSS or text.
-      await zoomPage.setViewportSize({width:480,height:854});
-      const portraitViewport=await zoomPage.evaluate(()=>({width:innerWidth,documentWidth:document.documentElement.scrollWidth}));
-      assert(portraitViewport.width>=200&&portraitViewport.width<=650,'The source portrait window actually reaches the responsive breakpoint');
+      // The native 480px Code window leaves only 234 CSS pixels for its webview
+      // at this zoom after VS Code's activity bar and editor chrome.
+      await zoomPage.setViewportSize({width:Math.round(234*nativeZoom),height:854});
+      const portraitViewport=await zoomPage.evaluate(()=>({width:innerWidth,documentWidth:document.documentElement.scrollWidth,
+        bodyPadding:getComputedStyle(document.body).padding,overflow:getComputedStyle(document.documentElement).overflowX,
+        clipped:[...document.querySelectorAll('#chat-root *')].filter(node=>{
+          const bounds=node.getBoundingClientRect();return bounds.width>0&&(bounds.left<0||bounds.right>innerWidth);
+        }).map(node=>({tag:node.tagName,className:node.className,width:node.getBoundingClientRect().width}))}));
+      assert.equal(portraitViewport.width,234,'The regression reaches the actual native webview width');
+      console.log('Native-zoom webview layout:',JSON.stringify(portraitViewport));
       assert(portraitViewport.documentWidth<=portraitViewport.width,'The real native zoom and responsive product reflow without horizontal clipping');
+      assert.deepEqual(portraitViewport.clipped,[],'Every visible Chat control stays inside the actual webview width');
+      assert.equal(portraitViewport.bodyPadding,'0px','Product CSS explicitly resets the real VS Code body padding');
+      assert.notEqual(portraitViewport.overflow,'hidden','Overflow is solved by layout, never hidden');
       const portraitReply=Array.from({length:12},(_,i)=>`Advice ${i+1}: preserve separators, Unicode and input values.`).join('\n');
       await zoomPage.evaluate(value=>panel.receive(value),{...state,messages:[{role:'user',content:longUser},{role:'assistant',content:portraitReply}]});
       assert.equal(await zoomPage.locator('.transcript').evaluate(node=>getComputedStyle(node).maxHeight),'none');
