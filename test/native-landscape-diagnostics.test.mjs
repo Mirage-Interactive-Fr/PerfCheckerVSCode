@@ -41,10 +41,11 @@ test('Landscape observer coalesces bursts while a slow inspection is active with
   }finally{gate.resolve();await observer.stop(Date.now()+1000);}
 });
 
-test('Landscape observer stop prevents new work immediately and drains exactly the active inspection',async()=>{
+test('Landscape observer stop prevents new work immediately and drains exactly the active inspection',async t=>{
   const gate=deferred();let calls=0,finished=false;
   const observer=nativeLandscape.createCoalescingObserver(async()=>{calls++;await gate.promise;finished=true;},{interval:1});
-  const sample=observer.sample();await wait(5);
+  t.after(async()=>{gate.resolve();await observer.stop(Date.now()+1000);});
+  const sample=observer.sample();void sample.catch(()=>{});await wait(5);
   const stopping=observer.stop(Date.now()+1000);
   await assert.rejects(observer.sample(),/has stopped/);
   await wait(10);assert.equal(calls,1);assert.equal(finished,false);
@@ -52,20 +53,22 @@ test('Landscape observer stop prevents new work immediately and drains exactly t
   await wait(5);assert.equal(calls,1);assert.equal(finished,true);assert.equal(observer.idle,true);
 });
 
-test('Landscape observer retains the actual inspection error through sample and stop without retrying it',async()=>{
+test('Landscape observer retains the actual inspection error through sample and stop without retrying it',async t=>{
   const failure=new Error('owned incarnation is ambiguous'),errors=[];let calls=0;
   const observer=nativeLandscape.createCoalescingObserver(async()=>{calls++;throw failure;},{interval:1,onError:error=>errors.push(error)});
+  t.after(async()=>{try{await observer.stop(Date.now()+1000);}catch(error){assert.equal(error,failure);}});
   await assert.rejects(observer.sample(),error=>error===failure);
   await wait(5);await assert.rejects(observer.sample(),error=>error===failure);
   await assert.rejects(observer.stop(Date.now()+1000),error=>error===failure);
   assert.equal(calls,1);assert.deepEqual(errors,[failure]);assert.equal(observer.idle,true);
 });
 
-test('Landscape cleanup deadline includes an inspection already active before stop and forbids later reads',async()=>{
+test('Landscape cleanup deadline includes an inspection already active before stop and forbids later reads',async t=>{
   const gate=deferred(),errors=[];let laterReads=0;
   const observer=nativeLandscape.createCoalescingObserver(async check=>{
     await gate.promise;check();laterReads++;
   },{interval:1,onError:error=>errors.push(error)});
+  t.after(async()=>{gate.resolve();try{await observer.stop(Date.now()+1000);}catch(error){assert.match(error.message,/deadline expired/);}});
   const sample=observer.sample();void sample.catch(()=>{});await wait(5);
   const started=Date.now();
   await assert.rejects(observer.stop(started+30),/deadline expired/);
