@@ -168,8 +168,8 @@ jobs:
           const version=JSON.parse(fs.readFileSync('package.json')).version;
           if(version!=='1.0.2'&&!requested&&!newOrigin)throw Error('A new extension version requires an explicit candidate origin before archive reuse can be frozen.');
           if(version==='1.0.2'&&!requested&&!newOrigin){
-            // Product commit d4664ac689df53c613596df2f753e3bda2c2c845, tree 79efe7b7834237bac8a69c673f7b411877ad38de.
-            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38077221686\nREUSE_NAME=native-candidate-d4664ac689df53c613596df2f753e3bda2c2c845\nREUSE_SHA=771ff166e24e96ac1c7121bce8181cb4456089ea83b0356fc6d86593440dfa88\n');
+            // Product commit df3085c9ccd92014586cd2b718ced606c0b912b7, tree cb36c394f91834a61fd58b6fe6a54cdc54f15fc2.
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38109028537\nREUSE_NAME=native-candidate-df3085c9ccd92014586cd2b718ced606c0b912b7\nREUSE_SHA=5fe530420b0ef8c7b8c0bdf19bc6223a6bdfd10ea6db9396b9f3f6d10d537f13\n');
             console.log('Release 1.0.2 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
           }
           NODE
