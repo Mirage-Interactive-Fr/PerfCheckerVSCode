@@ -283,7 +283,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
   const observer=setInterval(()=>{void sample();},windows?1000:100);
   let deadline;const timeout=new Promise(resolve=>{deadline=setTimeout(()=>{expired=true;resolve({timeout:true});},Math.max(0,cleanupUntil-Date.now()));});
   let outcome;
-  try{await sample();outcome=await Promise.race([exit,timeout]);}
+  try{await sample();outcome=await Promise.race([exit,timeout]);receipt.outcome=outcome;}
   finally{
     clearTimeout(deadline);clearInterval(observer);cleanupUntil=Date.now()+20000;receipt.ownership.cleanupDeadlineAt=new Date(cleanupUntil).toISOString();
     await observation;child.stdin.end();
@@ -341,7 +341,7 @@ async function livingLandscapeProcesses(){
   return alive;
 }
 
-async function prepareLandscapeFixture(runtime){
+async function prepareLandscapeFixture(runtime,artifactRecord){
   assert.equal(process.platform,'linux','The native Landscape fixture requires Linux/X11');
   assert(/^1\.(?:1[3-9]|[2-9]\d)\./.test(runtime.version),'The real game requires Julia 1.13 or later');
   const input=process.env.PERFCHECKER_NATIVE_LANDSCAPE_SOURCE_ROOT;
@@ -418,6 +418,48 @@ Pkg.Types.write_manifest(env.manifest,env.manifest_file)
 `,root,...sdk.map(item=>item.directory)],{timeout:900000});
   assert.deepEqual(await fs.readFile(path.join(root,'Project.toml')),project,'Pkg preparation preserves the game tag Project.toml');
   for(const item of sdk)assert.equal(hash((await sourceDigest(item.directory)).join('')),item.sha256,'SDK runtime source remains identical to its archived tag');
+  // Install and compile this private SDK before the unchanged native 120-second
+  // import observation. This qualifies prepared operation, never a cold launch.
+  const preparedHashes=async()=>({
+    project:hash(await fs.readFile(path.join(root,'Project.toml'))),
+    manifest:hash(await fs.readFile(path.join(root,'Manifest.toml'))),
+    sdk:Object.fromEntries(await Promise.all(sdk.map(async item=>[item.name,hash((await sourceDigest(item.directory)).join(''))]))),
+  });
+  assert.equal(runnerEnvironment.JULIA_NUM_PRECOMPILE_TASKS,'1');
+  const preparation={status:'running',phase:'Landscape SDK cache preparation',startedAt:new Date().toISOString(),project:root,
+    packages:['EtenduBeautifulLandscape',...sdk.map(item=>item.name)],strict:true,timeoutMilliseconds:900000,
+    precompileTasks:1,hashesBefore:await preparedHashes(),
+    scope:'Explicit private SDK cache preparation with owned compilation children; native import remains 120 seconds; no cold-launch qualification'};
+  artifactRecord.landscapeSdkCachePreparation=preparation;
+  await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+  console.log('NATIVE_LANDSCAPE_SDK_PREPARATION_START '+JSON.stringify(preparation));
+  try{
+    const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${root}`,'-e',String.raw`
+println("CONTROLLER_PREFLIGHT_READY ",getpid());flush(stdout)
+@assert readline(stdin)=="OBSERVED"
+using Pkg
+started=time_ns()
+Pkg.precompile(;strict=true)
+println("LANDSCAPE_SDK_PREPARATION_COMPLETE_V1 ",(time_ns()-started)/1e9)
+`],preparation,{timeoutMs:preparation.timeoutMilliseconds});
+    await fs.writeFile(path.join(output,'landscape-sdk-cache-preparation.log'),text);
+    const complete=text.split(/\r?\n/).filter(line=>line.startsWith('LANDSCAPE_SDK_PREPARATION_COMPLETE_V1 '));
+    assert.equal(complete.length,1,'One completed strict SDK precompilation receipt is required');
+    preparation.precompileSeconds=Number(complete[0].slice('LANDSCAPE_SDK_PREPARATION_COMPLETE_V1 '.length));
+    assert(Number.isFinite(preparation.precompileSeconds)&&preparation.precompileSeconds>=0);
+    preparation.status='passed';
+  }catch(error){
+    preparation.status='failed';preparation.error=String(error);
+    if(error.commandOutput)await fs.writeFile(path.join(output,'landscape-sdk-cache-preparation.log'),error.commandOutput);
+    throw error;
+  }finally{
+    preparation.finishedAt=new Date().toISOString();preparation.elapsedSeconds=(Date.now()-Date.parse(preparation.startedAt))/1000;
+    preparation.hashesAfter=await preparedHashes();
+    if(JSON.stringify(preparation.hashesAfter)!==JSON.stringify(preparation.hashesBefore)){preparation.status='failed';preparation.hashMismatch=true;}
+    await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
+    console.log('NATIVE_LANDSCAPE_SDK_PREPARATION_END '+JSON.stringify(preparation));
+    assert.deepEqual(preparation.hashesAfter,preparation.hashesBefore,'Strict SDK precompilation preserves the exact Project, Manifest and five SDK archives');
+  }
   for(const [source,before]of snapshots)assert.deepEqual(await sourceSnapshot(source),before,'The human HEAD, status and project files remain unchanged');
   const executable=await fs.realpath(process.env.PERFCHECKER_TEST_XVFB||'/usr/bin/Xvfb');
   const tools=Object.fromEntries(await Promise.all(['xwd','xwininfo','vulkaninfo'].map(async name=>[name,await fs.realpath(`/usr/bin/${name}`)])));
@@ -443,7 +485,7 @@ Pkg.Types.write_manifest(env.manifest,env.manifest_file)
     display:{pid:displayChild.pid,name:display,private:true,rootIdentity:windowIdentity.trim(),executable,sha256:hash(await fs.readFile(executable))},
     tools:await Promise.all(Object.entries(tools).map(async([name,file])=>({name,path:file,sha256:hash(await fs.readFile(file)),...(name==='xwd'?{version:xwdVersion}:{})}))),
     icd:{path:icd,sha256:hash(await fs.readFile(icd))},
-    scope:'Real SDL/Vulkan llvmpipe software rendering; no physical GPU timing or physical presentation claim'}});
+    scope:'Prepared SDK; real SDL/Vulkan llvmpipe software rendering; no cold-launch, physical GPU timing or physical presentation claim'}});
 }
 
 try {
@@ -889,7 +931,7 @@ end
     await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', extension], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   }
   }else if(landscapeOnly){
-    landscapeFixture=await prepareLandscapeFixture(runtime);
+    landscapeFixture=await prepareLandscapeFixture(runtime,artifactRecord);
     artifactRecord.landscapeFixture=landscapeFixture.provenance;
     await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
   }
