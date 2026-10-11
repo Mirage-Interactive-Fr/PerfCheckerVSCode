@@ -152,3 +152,110 @@ test('Darwin identity cannot use missing-image revalidation to establish a new i
   await assert.rejects(value.run(),assert.AssertionError);assert.equal(value.snapshot().elapsed,0);
   assert.equal(value.observations.length,0);
 });
+
+// Use the real Pluto ownership closure: a recycled ParentProcessId does not prove
+// that a pre-existing Windows process descends from a new session incarnation.
+const plutoSource=await readFile(new URL('./native-pluto-controls.cjs',import.meta.url),'utf8');
+const ownershipSource=plutoSource.slice(plutoSource.indexOf('function processBirth('),plutoSource.indexOf('function plutoDescendants('));
+const descendants=new Function('assert',ownershipSource+';return ownedProcessDescendants;')(assert);
+const born=(pid,parent,createdAt)=>({pid,parent,createdAt});
+const leader=born(7112,9816,'2026-10-11T00:28:24.0735210Z');
+const consoleProcess=born(3016,7112,'2026-10-11T00:28:24.0772920Z');
+
+test('Pluto ownership excludes an impossible reused parent PID and its foreign subtree',()=>{
+  const foreign=born(6572,3016,'2026-10-10T22:20:47.0320540Z');
+  const child=born(4624,7112,'2026-10-11T00:28:32.7424170Z'),rejected=[];
+  const rows=[born(6080,6572,'2026-10-10T22:20:47.1019820Z'),foreign,consoleProcess,child,leader];
+  assert.deepEqual(new Set(descendants(rows,[leader],row=>rejected.push(row)).map(row=>row.pid)),new Set([7112,3016,4624]));
+  assert(rejected.length>0&&rejected.every(row=>row.pid===6572&&row.parentCreatedAt===consoleProcess.createdAt));
+});
+
+test('Pluto ownership preserves submillisecond birth ordering and allows equal timestamps',()=>{
+  const parent=born(81,10,'2026-10-11T00:28:24.0735210Z');
+  const earlier=born(82,81,'2026-10-11T00:28:24.0735209Z');
+  const same=born(83,81,parent.createdAt),later=born(84,81,'2026-10-11T00:28:24.0735211Z');
+  assert.deepEqual(descendants([parent,earlier,same,later],[parent]).map(row=>row.pid),[81,83,84]);
+});
+
+test('Pluto ownership does not adopt a recycled root incarnation or its children',()=>{
+  const recycled={...leader,createdAt:'2026-10-11T00:29:24.0735210Z'};
+  assert.deepEqual(descendants([recycled,born(90,7112,'2026-10-11T00:30:00Z')],[leader]),[]);
+});
+
+for(const [name,createdAt]of [['missing',null],['malformed','not-a-date'],['invalid calendar','2026-02-30T00:28:24Z']]){
+  test('Pluto ownership rejects the '+name+' descendant creation date',()=>{
+    assert.throws(()=>descendants([leader,born(90,leader.pid,createdAt)],[leader]),assert.AssertionError);
+  });
+  test('Pluto ownership rejects the '+name+' current root creation date',()=>{
+    assert.throws(()=>descendants([{...leader,createdAt}],[leader]),assert.AssertionError);
+  });
+}
+
+test('Pluto ownership cannot adopt grandchildren through a reused known parent incarnation',()=>{
+  const recycled={...consoleProcess,createdAt:'2026-10-11T00:29:00Z'};
+  assert.deepEqual(descendants([recycled,born(90,3016,'2026-10-11T00:30:00Z')],[consoleProcess]),[]);
+});
+
+// Exercise the actual Results document wait, including its native click boundary.
+const studioSource=await readFile(new URL('./native-studio-controls.cjs',import.meta.url),'utf8');
+const resultsSource=studioSource.slice(studioSource.indexOf('async function resultDocuments('),studioSource.indexOf('async function resetDesigner('));
+function resultsScenario({snapshots=[],fallback=[],clickError,readError,detached=false}={}){
+  let elapsed=0,clicks=0,reads=0;const observations=[];
+  const frame=(nonce,visible=true)=>({nonce,isDetached:()=>detached,parentFrame:()=>null,
+    locator:selector=>selector.startsWith('button')?{count:async()=>{if(readError)throw readError;return 1;},first:()=>({isVisible:async()=>visible})}:
+      {evaluate:async evaluate=>evaluate({nonce})}});
+  const frames=()=>{reads++;const value=snapshots.length?snapshots.shift():fallback;return value.map(row=>frame(...row));};
+  const context={browser:{contexts:()=>[{pages:()=>[{frames}]}]},log:(name,value)=>observations.push({name,...value})};
+  class Clock extends Date{static now(){return elapsed;}}
+  const output=new Function('assert','clickStudioAction','Date','setTimeout',resultsSource+';return output;')(
+    assert,async(_,action)=>{assert.equal(action,'results');clicks++;if(clickError)throw clickError;},Clock,(resolve,ms)=>{elapsed+=ms;resolve();});
+  return{run:()=>output(context),observations,snapshot:()=>({elapsed,clicks,reads})};
+}
+
+test('Results waits for the document produced by one click instead of its retained visible predecessor',async()=>{
+  const value=resultsScenario({snapshots:[[['old',false]],[['old',true]],[['old',true]],[['new',true]]]});
+  assert.equal((await value.run()).nonce,'new');assert.equal(value.snapshot().clicks,1);assert.equal(value.snapshot().elapsed,200);
+  assert.deepEqual(value.observations[0].previousNonces,['old']);assert.equal(value.observations[0].newDocumentObserved,true);
+});
+
+test('Results does not accept an unseen new document until it becomes visible',async()=>{
+  const value=resultsScenario({snapshots:[[['old',true]],[['new',false]],[['new',true]]]});
+  assert.equal((await value.run()).nonce,'new');assert.equal(value.snapshot().clicks,1);assert.equal(value.snapshot().elapsed,100);
+});
+
+test('Results times out after 60 seconds without replaying its native click',async()=>{
+  const value=resultsScenario({fallback:[['old',true]]});
+  await assert.rejects(value.run(),/single Results click renders its new visible document/);
+  assert.equal(value.snapshot().elapsed,60000);assert.equal(value.snapshot().clicks,1);
+});
+
+test('Results preserves a native click failure instead of retrying the action',async()=>{
+  const failure=new Error('native action failed'),value=resultsScenario({clickError:failure});
+  await assert.rejects(value.run(),error=>error===failure);assert.equal(value.snapshot().clicks,1);assert.equal(value.snapshot().elapsed,0);
+});
+
+test('Results preserves an inspection failure on an attached document',async()=>{
+  const failure=new Error('inspection unavailable'),value=resultsScenario({fallback:[['old',true]],readError:failure});
+  await assert.rejects(value.run(),error=>error===failure);assert.equal(value.snapshot().clicks,0);
+});
+
+test('Results records detached reads and never treats them as a completed action',async()=>{
+  const value=resultsScenario({snapshots:[[['old',true]]],readError:new Error('Frame was detached'),detached:true});
+  await assert.rejects(value.run(),/single Results click renders its new visible document/);
+  assert.equal(value.snapshot().clicks,1);assert(value.observations.every(row=>row.name==='native-results-document-observation-invalidated'));
+});
+
+test('Results accepts its first newly rendered document when no predecessor exists',async()=>{
+  const value=resultsScenario({snapshots:[[],[['new',true]]]});
+  assert.equal((await value.run()).nonce,'new');assert.equal(value.snapshot().clicks,1);
+});
+
+test('Results rejects two unexpected newly visible documents without repeating the click',async()=>{
+  const value=resultsScenario({snapshots:[[],[['new',true],['other',true]]]});
+  await assert.rejects(value.run(),assert.AssertionError);assert.equal(value.snapshot().clicks,1);
+});
+
+test('Results fails a document without an observable nonce',async()=>{
+  const value=resultsScenario({snapshots:[[],[['',true]]]});
+  await assert.rejects(value.run(),assert.AssertionError);assert.equal(value.snapshot().clicks,1);
+});

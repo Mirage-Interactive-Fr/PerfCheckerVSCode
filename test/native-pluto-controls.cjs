@@ -159,29 +159,74 @@ async function create(context, file, kind) {
   return state;
 }
 
+function processBirth(row){
+  assert(Number.isSafeInteger(row.pid)&&row.pid>0,'A physical process has a qualified PID');
+  const match=typeof row.createdAt==='string'&&row.createdAt.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/);
+  assert(match,'A physical process has a nonempty precise UTC creation date');
+  const seconds=Date.parse(match[1]+'Z');
+  assert(Number.isFinite(seconds)&&new Date(seconds).toISOString().slice(0,19)===match[1],
+    'A physical process creation date is a valid UTC instant');
+  return BigInt(seconds)*1000000n+BigInt((match[2]||'').padEnd(9,'0'));
+}
+
+function ownedProcessDescendants(rows,seeds,onExcluded=()=>{}){
+  const byPid=new Map();
+  for(const row of rows){assert(!byPid.has(row.pid),'A physical inventory has one row per PID');byPid.set(row.pid,row);}
+  const owned=new Map();
+  for(const seed of seeds){
+    processBirth(seed);
+    const current=byPid.get(seed.pid);
+    if(current){processBirth(current);if(current.createdAt===seed.createdAt)owned.set(current.pid,current);}
+  }
+  for(let changed=true;changed;){changed=false;for(const row of rows){
+    const parent=owned.get(row.parent);
+    if(!parent||owned.has(row.pid))continue;
+    if(processBirth(row)<processBirth(parent)){
+      onExcluded({pid:row.pid,createdAt:row.createdAt,parent:parent.pid,parentCreatedAt:parent.createdAt,
+        reason:'The child predates this parent incarnation'});continue;
+    }
+    owned.set(row.pid,row);changed=true;
+  }}
+  return [...owned.values()];
+}
+
+function plutoDescendants(context,stage,rows,seeds){
+  context.plutoRejectedParentage??=new Set();
+  return ownedProcessDescendants(rows,seeds,rejection=>{
+    const key=JSON.stringify(rejection);
+    if(!context.plutoRejectedParentage.has(key)){
+      context.plutoRejectedParentage.add(key);
+      context.log('pluto-rejected-impossible-parentage',{stage,...rejection});
+    }
+  });
+}
+
 let lastWindowsInventory;
 async function windowsProcesses(context,stage){
   const {stdout}=await execute('powershell.exe',['-NoProfile','-Command',
     "$ErrorActionPreference='Stop'; $rows=@(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;name=$_.Name;executable=$_.ExecutablePath;createdAt=$(if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null});pidType=$_.ProcessId.GetType().FullName;parentType=$_.ParentProcessId.GetType().FullName} }); $tcp=@(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalAddress -eq '127.0.0.1' } | ForEach-Object { @{pid=$_.OwningProcess;port=$_.LocalPort;address=$_.LocalAddress;state=[string]$_.State} }); @{rows=$rows;listeners=$tcp} | ConvertTo-Json -Depth 4 -Compress"]);
   const value=JSON.parse(stdout);assert(Array.isArray(value.rows));assert(Array.isArray(value.listeners));
   const expectedExecutable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
-  const direct=[];
+  const host=value.rows.find(row=>row.pid===process.pid);assert(host,'The extension host has an observed physical incarnation');
+  const hostBirth=processBirth(host),direct=[];
   for(const row of value.rows.filter(row=>row.parent===process.pid&&/^julia(?:\.exe)?$/i.test(row.name))){
     assert.equal(typeof row.pid,'number');assert.equal(typeof row.parent,'number');assert(typeof row.createdAt==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.createdAt)&&Number.isFinite(Date.parse(row.createdAt)),
       'The process has a nonempty parseable ISO creation date');
+    if(processBirth(row)<hostBirth){
+      context.log('pluto-rejected-impossible-parentage',{stage,pid:row.pid,createdAt:row.createdAt,
+        parent:host.pid,parentCreatedAt:host.createdAt,reason:'The Julia process predates this extension host incarnation'});continue;
+    }
     const canonicalExecutable=await fs.realpath(row.executable);
     if(canonicalExecutable.toLowerCase()===expectedExecutable.toLowerCase())direct.push({...row,canonicalExecutable});
   }
-  const owned=new Set(direct.map(row=>row.pid));
-  for(let changed=true;changed;){changed=false;for(const row of value.rows)
-    if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
+  const ownedRows=plutoDescendants(context,stage,value.rows,direct),owned=new Set(ownedRows.map(row=>row.pid));
   const signature=JSON.stringify({direct,descendants:value.rows.filter(row=>owned.has(row.pid)),listeners:value.listeners.filter(row=>owned.has(row.pid))});
   if(signature!==lastWindowsInventory){
     context.log('pluto-windows-process-inventory',{stage,hostPid:process.pid,expectedExecutable,
       direct,descendants:value.rows.filter(row=>owned.has(row.pid)),listeners:value.listeners.filter(row=>owned.has(row.pid)),
       commandArgumentsUnavailableAfterJuliaStartup:true});lastWindowsInventory=signature;
   }
-  return {...value,direct,ownedRows:value.rows.filter(row=>owned.has(row.pid))};
+  return {...value,direct,ownedRows};
 }
 async function sessionInventory(context,stage,port,known=[]){
   if(process.platform==='win32')return windowsProcesses(context,stage);
@@ -205,10 +250,7 @@ async function sessionOwner(context,state){
   assert.doesNotThrow(()=>process.kill(owner.pid,0),'The physical session owner is alive');
   context.log(process.platform==='win32'?'pluto-windows-session-owner':'pluto-macos-session-owner',{port,pid:owner.pid,createdAt:owner.createdAt,parent:owner.parent,
     canonicalExecutable:owner.canonicalExecutable,exactIframeListener:true,credentialsOmitted:true});
-  const owned=new Set([owner.pid]);
-  for(let changed=true;changed;){changed=false;for(const row of inventory.rows)
-    if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
-  return {...owner,descendants:inventory.rows.filter(row=>owned.has(row.pid))};
+  return {...owner,descendants:plutoDescendants(context,'running-session',inventory.rows,[owner])};
 }
 async function serverPids(context){
   if(['win32','darwin'].includes(process.platform)){
@@ -259,14 +301,8 @@ async function restartFailureCleanup(context,directory){
   const previous=settings.get('plutoProject','perf/pluto'),before=await serverPids(context);let startingPids=[];
   const startingIdentities=new Map();
   const remember=inventory=>{
-    const parents=new Set([...startingIdentities.values()].filter(prior=>
-      inventory.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt)).map(row=>row.pid));
-    for(let changed=true;changed;){changed=false;for(const row of inventory.rows){
-      if(!parents.has(row.parent)||parents.has(row.pid))continue;
-      assert(typeof row.createdAt==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.createdAt)&&Number.isFinite(Date.parse(row.createdAt)),
-        'Every observed descendant has a nonempty parseable ISO creation date');
-      startingIdentities.set(`${row.pid}:${row.createdAt}`,row);parents.add(row.pid);changed=true;
-    }}
+    for(const row of plutoDescendants(context,'failed-restart',inventory.rows,[...startingIdentities.values()]))
+      startingIdentities.set(`${row.pid}:${row.createdAt}`,row);
   };
   try{
     const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
@@ -1201,10 +1237,8 @@ exports.runPlots = async context => {
     context.log('pluto-plot-shutdown-phase',{stage:`${stage}:inventory-begin`});
     const before=await sessionInventory(context,stage,port,known);
     context.log('pluto-plot-shutdown-phase',{stage:`${stage}:inventory-end`});
-    const owned=new Set(known.filter(prior=>before.rows.some(row=>row.pid===prior.pid&&row.createdAt===prior.createdAt)).map(row=>row.pid));
-    for(let changed=true;changed;){changed=false;for(const row of before.rows)if(owned.has(row.parent)&&!owned.has(row.pid)){owned.add(row.pid);changed=true;}}
     const identities=new Map(known.map(row=>[`${row.pid}/${row.createdAt}`,row]));
-    for(const row of before.rows.filter(row=>owned.has(row.pid)))identities.set(`${row.pid}/${row.createdAt}`,row);
+    for(const row of plutoDescendants(context,stage,before.rows,known))identities.set(`${row.pid}/${row.createdAt}`,row);
     known=[...identities.values()];assert.equal(before.errors?.length||0,0,'Before Close/Stop, owned plot process inspection is qualified');
   };
   const inspectAfter=async(stage,deadline)=>{
