@@ -452,8 +452,62 @@ test('real owned server retries cleanup after a transient identity observation f
   }finally{foreign.kill('SIGKILL');await new Promise(resolve=>foreign.once('close',resolve));}
 },'ignore-eof'));
 
-test('Windows owned Job retries a failed owner stop while childClosed is false',{skip:process.platform!=='win32'},()=>fixture(async({root,create})=>{
-  const connector=await create().start(),pid=Number(await readFile(path.join(root,'server.pid'),'utf8'));
+test('Windows owned Job retries a failed owner stop while childClosed is false',{skip:process.platform!=='win32'},context=>fixture(async({root,create})=>{
+  const connector=create(),rpc=connector.rpc,startedAt=new Date().toISOString(),requests=[];
+  let pid,readyAt;
+  const safeError=error=>error?{name:/^[A-Za-z]+$/.test(error.name??'')?error.name:null,
+    code:/^[A-Z0-9_]+$/.test(error.code??'')?error.code:null,
+    rpcTimeout:error.message==='MCP request timed out. Reconnect the local server to continue.'}:null;
+  const state=async()=>({at:new Date().toISOString(),ownerPid:connector.child?.pid??null,serverPid:pid??null,
+    ownerAlive:connector.child?.pid?await alive(connector.child.pid).catch(()=>null):false,
+    serverAlive:pid?await alive(pid).catch(()=>null):false,childClosed:connector.childClosed,
+    closed:connector.closed,closing:!!connector.closing,storedFailure:safeError(connector.failure)});
+  connector.rpc=async function(...args){
+    const row={method:args[0],enteredAt:new Date().toISOString(),id:null,stage:'readiness'};requests.push(row);
+    try {
+      if(!readyAt){
+        // This test concerns retrying an owned stop, not cold PowerShell launch.
+        // Use the existing Windows private-output handshake bound before the
+        // first real RPC arms its unchanged five-second timer. The real server
+        // writes this PID only after its owner authenticated the private pipe,
+        // assigned it to the Job and resumed it; no protocol reply is supplied.
+        const deadline=Date.now()+10000;
+        while(true){
+          assert(Date.now()<deadline,'Windows fixture readiness exceeded the existing 10-second handshake bound');
+          if(this.failure)throw this.failure;
+          assert(!this.closed&&!this.closing&&!this.childClosed,'Windows owner closed before fixture readiness');
+          row.stage='owner-alive';
+          assert(Number.isSafeInteger(this.child?.pid)&&await alive(this.child.pid),'Real Windows owner must be alive');
+          row.stage='server-pid';
+          const value=await readFile(path.join(root,'server.pid'),'utf8').catch(error=>{if(error.code==='ENOENT')return '';throw error;});
+          if(value){
+            assert(/^[1-9][0-9]*$/.test(value)&&Number.isSafeInteger(Number(value)),'Fixture must report its real numeric PID');
+            pid=Number(value);assert.notEqual(pid,this.child.pid);
+            row.stage='owned-processes-alive';
+            assert(await alive(this.child.pid)&&await alive(pid),'Real Windows owner and fixture server must remain alive');
+            row.stage='private-reader';
+            assert(this.output&&this.child.protocolOutput===this.output&&!this.output.destroyed,'The private owned output reader must remain available');
+            if(this.failure)throw this.failure;
+            assert(!this.closed&&!this.closing&&!this.childClosed,'Windows owner must remain open before the first RPC');
+            break;
+          }
+          await pause(20);
+        }
+        row.readyState=await state();
+        assert(row.readyState.ownerAlive&&row.readyState.serverAlive,'Both real owned processes must still be alive before the first RPC');
+        if(this.failure)throw this.failure;
+        assert(Date.now()<deadline,'Windows fixture readiness exceeded the existing 10-second handshake bound');
+        readyAt=new Date().toISOString();
+      }
+      row.stage='rpc';row.invokedAt=new Date().toISOString();const sequence=this.sequence,pending=Reflect.apply(rpc,this,args);
+      row.id=this.sequence>sequence?this.sequence:null;
+      const result=await pending;row.resolved=true;return result;
+    }catch(error){row.resolved=false;row.error=safeError(error);throw error;}
+    finally{row.settledAt=new Date().toISOString();row.settledState=await state();}
+  };
+  try{await connector.start();}
+  finally{connector.rpc=rpc;context.diagnostic(JSON.stringify({windowsOwnedRetryStartup:{startedAt,readyAt:readyAt??null,
+    readinessLimitMs:10000,rpcTimeoutMs:connector.options.timeoutMs,requests,state:await state()}}));}
   const owner=connector.child,kill=owner.kill.bind(owner),foreign=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
   let first=true;
   owner.kill=(...args)=>{if(first){first=false;throw new Error('Transient fixture owner stop failure');}return kill(...args);};
