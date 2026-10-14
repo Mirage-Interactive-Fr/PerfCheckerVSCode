@@ -2,6 +2,78 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {TextDecoder} from 'node:util';
 
+// Passive native-test evidence only. No argv, environment, source, request or
+// arbitrary log payload is accepted; the process reader proves incarnations.
+export function nativeOperationSnapshot(value){
+  assert(Number.isSafeInteger(value.hostPid)&&value.hostPid>0);
+  assert(typeof value.expectedExecutable==='string'&&path.isAbsolute(value.expectedExecutable));
+  assert(Array.isArray(value.rows)&&value.rows.length<=32);
+  assert(Array.isArray(value.files??[])&&(value.files??[]).length<=4);
+  const rows=new Map(value.rows.map(row=>[row.pid,row]));
+  assert.equal(rows.size,value.rows.length,'Observation refuses ambiguous process identities');
+  const owned=pid=>{
+    const seen=new Set();
+    while(pid!==value.hostPid){
+      assert(!seen.has(pid),'Observation refuses a cyclic or foreign process ancestry');seen.add(pid);
+      const row=rows.get(pid);assert(row&&!row.identityOnly,'Observation requires verified process ownership');
+      assert(Number.isSafeInteger(row.pid)&&row.pid>0&&Number.isSafeInteger(row.parent)&&row.parent>0);
+      assert(typeof row.createdAt==='string'&&Number.isFinite(Date.parse(row.createdAt)));
+      pid=row.parent;
+    }
+  };
+  for(const row of rows.values())owned(row.pid);
+  return {hostPid:value.hostPid,processes:[...rows.values()].filter(row=>row.canonicalExecutable===value.expectedExecutable).map(row=>({
+    pid:row.pid,parent:row.parent,createdAt:row.createdAt,executable:row.canonicalExecutable,
+    ...(row.progress?{progress:Object.fromEntries(['state','elapsed','cpuTime','cpuPercent'].map(key=>{
+      const field=row.progress[key],pattern=key==='state'?/^[A-Z+<NLEsIlTRUXWZ]{1,8}$/:key==='cpuPercent'?/^\d+(?:\.\d+)?$/:/^[0-9:.-]{1,32}$/;
+      assert(typeof field==='string'&&field.length<=32&&pattern.test(field));return[key,field];}))}:{})})),
+    files:(value.files??[]).map(file=>{
+      assert(['suite','plan','controller-project','controller-manifest'].includes(file.name));
+      assert(typeof file.present==='boolean');
+      if(!file.present)return{name:file.name,present:false};
+      assert(Number.isSafeInteger(file.bytes)&&file.bytes>=0&&Number.isFinite(Date.parse(file.modifiedAt)));
+      return{name:file.name,present:true,bytes:file.bytes,modifiedAt:file.modifiedAt};
+    })};
+}
+
+export async function captureQualifiedNativeProgress(expected,beforeMappings,readProgress,readMappings){
+  assert(beforeMappings.includes(expected),'Progress observation requires the canonical executable before reading states');
+  const progress=await readProgress();
+  assert((await readMappings()).includes(expected),'Progress observation refuses a changed or uncertain executable');
+  return progress;
+}
+
+export async function observeNativeOperation(operation,run,{sample,record,deadlineAt,
+  intervalMs=15000,sampleTimeoutMs=2000,maxSamples=40}={}){
+  assert(['initialize','plan','diagnose'].includes(operation));assert.equal(typeof run,'function');
+  assert.equal(typeof sample,'function');assert.equal(typeof record,'function');
+  assert(Number.isFinite(deadlineAt)&&Number.isInteger(intervalMs)&&intervalMs>0&&Number.isInteger(sampleTimeoutMs)&&sampleTimeoutMs>0);
+  assert(Number.isInteger(maxSamples)&&maxSamples>0&&maxSamples<=64);
+  let stopped=false,active,timer,controller,count=0;
+  const emit=detail=>{try{record({operation,at:new Date().toISOString(),...detail});}catch{/* A diagnostic sink cannot change the real operation. */}};
+  const collect=()=>{
+    if(stopped||active||count>=maxSamples||Date.now()>=deadlineAt)return;
+    const abort=controller=new AbortController(),sampleDeadline=Math.min(deadlineAt,Date.now()+sampleTimeoutMs);
+    const expiry=setTimeout(()=>abort.abort(),Math.max(1,sampleDeadline-Date.now()));count++;
+    active=Promise.resolve().then(()=>sample({signal:abort.signal,deadlineAt:sampleDeadline})).then(value=>{
+      if(!stopped&&!abort.signal.aborted&&Date.now()<sampleDeadline)emit({stage:'sample',sequence:count,...nativeOperationSnapshot(value)});
+    }).catch(error=>{if(!stopped)emit({stage:'inspection-error',sequence:count,
+      errorClass:/^[A-Za-z]+$/.test(error?.name??'')?error.name:null,code:/^[A-Z0-9_]+$/.test(error?.code??'')?error.code:null});})
+      .finally(()=>{clearTimeout(expiry);active=undefined;});
+  };
+  try{
+    // Invoke the actual action before scheduling any potentially blocking read.
+    const pending=run();emit({stage:'started',deadlineAt:new Date(deadlineAt).toISOString()});
+    collect();timer=setInterval(collect,intervalMs);
+    return await pending;
+  }finally{
+    stopped=true;clearInterval(timer);controller?.abort();
+    let drained=!active,expiry;
+    try{if(active)drained=await Promise.race([active.then(()=>true),new Promise(resolve=>{expiry=setTimeout(()=>resolve(false),sampleTimeoutMs);})]);}
+    finally{clearTimeout(expiry);emit({stage:'observer-stopped',samples:count,drained});}
+  }
+}
+
 // A READY received during an asynchronous process inventory belongs to its next
 // snapshot. The caller still verifies that leader, parent and executable.
 export async function captureControllerInventory(readReadyPid,readRows){

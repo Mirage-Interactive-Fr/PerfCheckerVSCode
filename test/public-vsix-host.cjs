@@ -245,11 +245,12 @@ async function readDiagnosticRequest(context,argumentsText,deadline){
     scope:'Whitelisted request fields and response existence only; no import/analysis phase or log payload inferred'};
 }
 
-async function macProcessInventory(context,stage,port,knownIdentities=[],deadline){
+async function macProcessInventory(context,stage,port,knownIdentities=[],deadline,progressOnly){
   assert.equal(process.platform,'darwin');
   const bounded=maximum=>{if(deadline===undefined)return maximum;const remaining=deadline-Date.now();assert(remaining>0,'Observation stays inside the existing diagnosis report deadline');return Math.min(maximum,remaining);};
   const expectedExecutable=await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA);
-  const survey=execute('ps',['-eo','pid=,ppid=,args='],{timeout:bounded(10000),maxBuffer:4*1024*1024});
+  const observationOptions=progressOnly?{signal:progressOnly.signal}:{};
+  const survey=execute('ps',['-eo',progressOnly?'pid=,ppid=':'pid=,ppid=,args='],{timeout:bounded(10000),maxBuffer:4*1024*1024,...observationOptions});
   const observerPid=survey.child.pid,{stdout,stderr}=await survey;assert(!stderr.trim(),'Process survey has no stderr inspection error');
   const all=stdout.split('\n').flatMap(line=>{const match=/^\s*(\d+)\s+(\d+)(?:\s+(.*))?$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),arguments:match[3]||''}]:[];});
   const observer=all.find(row=>row.pid===observerPid);
@@ -261,24 +262,38 @@ async function macProcessInventory(context,stage,port,knownIdentities=[],deadlin
   }}
   const errors=[],rows=[];
   const relevant=all.filter(row=>row.pid!==process.pid&&(owned.has(row.pid)||knownIdentities.some(prior=>prior.pid===row.pid)));
+  if(progressOnly)assert(relevant.length<=32,'Passive operation observations have at most 32 owned processes');
   await Promise.all(relevant.map(async row=>{
     let before;
     try{
       const identity=async()=>{
-        const observed=await execute('ps',['-p',String(row.pid),'-o','ppid=','-o','lstart='],{timeout:bounded(3000)});
+        const observed=await execute('ps',['-p',String(row.pid),'-o','ppid=','-o','lstart='],{timeout:bounded(3000),...observationOptions});
         assert(!observed.stderr.trim(),'Process identity has no stderr inspection error');const value=observed.stdout.trim();
         const match=/^(\d+)\s+(.+)$/.exec(value);assert(match&&Number.isFinite(Date.parse(match[2])),'macOS supplies a real parent and lstart');
         return {parent:Number(match[1]),started:match[2],createdAt:new Date(Date.parse(match[2])).toISOString()};
       };
       before=await identity();assert.equal(before.parent,row.parent);
-      const observedMappings=await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:bounded(3000)});
+      const observedMappings=await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:bounded(3000),...observationOptions});
       assert(!observedMappings.stderr.trim(),'Executable inspection has no stderr error');
       const mappings=observedMappings.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
-      const canonicalMappings=await Promise.all(mappings.map(value=>fs.realpath(value).catch(()=>value)));
+      const canonicalMappings=await Promise.all(mappings.map(value=>progressOnly?fs.realpath(value):fs.realpath(value).catch(()=>value)));
+      let progress;
+      if(progressOnly&&canonicalMappings.includes(expectedExecutable)){
+        const {captureQualifiedNativeProgress}=await import('./native-controller-preflight.mjs');
+        progress=await captureQualifiedNativeProgress(expectedExecutable,canonicalMappings,async()=>{
+          const value=await execute('ps',['-p',String(row.pid),'-o','stat=','-o','etime=','-o','time=','-o','%cpu='],{timeout:bounded(3000),...observationOptions});
+          assert(!value.stderr.trim());const fields=value.stdout.trim().split(/\s+/);assert.equal(fields.length,4);
+          return{state:fields[0],elapsed:fields[1],cpuTime:fields[2],cpuPercent:fields[3]};
+        },async()=>{
+          const after=await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:bounded(3000),...observationOptions});
+          assert(!after.stderr.trim(),'Post-state executable inspection has no stderr error');
+          return Promise.all(after.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1))));
+        });
+      }
       assert.deepEqual(await identity(),before,'The observed process retains its parent and start identity while its executable is inspected');
       const projects=[...row.arguments.matchAll(/--project(?:=|\s+)([^\s]+)/g)].map(match=>match[1]).filter(value=>value.startsWith(process.env.PERFCHECKER_NATIVE_SESSION+path.sep));
       let diagnosticRequest;
-      if(process.env.PERFCHECKER_NATIVE_PHASE==='diagnosis'&&canonicalMappings.includes(expectedExecutable)&&row.arguments.includes('diagnostic_worker.jl')){
+      if(!progressOnly&&process.env.PERFCHECKER_NATIVE_PHASE==='diagnosis'&&canonicalMappings.includes(expectedExecutable)&&row.arguments.includes('diagnostic_worker.jl')){
         try{diagnosticRequest=await readDiagnosticRequest(context,row.arguments,deadline);
           const observedAfter=await execute('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:bounded(3000)});
           assert(!observedAfter.stderr.trim(),'Post-read executable inspection has no stderr error');
@@ -288,8 +303,8 @@ async function macProcessInventory(context,stage,port,knownIdentities=[],deadlin
         }catch(error){diagnosticRequest={status:'inspection-error',errorClass:error.name||'Error',code:typeof error.code==='string'?error.code:undefined};}
       }
       rows.push({pid:row.pid,...before,canonicalExecutable:canonicalMappings.includes(expectedExecutable)?expectedExecutable:undefined,
-        executableMappings:canonicalMappings.slice(0,8),projects,argumentsCharacters:row.arguments.length,...(diagnosticRequest?{diagnosticRequest}: {})});
-    }catch(error){if(before)rows.push({pid:row.pid,...before,identityOnly:true});errors.push({pid:row.pid,parent:row.parent,error:redact(error)});}
+        executableMappings:canonicalMappings.slice(0,8),projects,argumentsCharacters:row.arguments.length,...(progress?{progress}:{}),...(diagnosticRequest?{diagnosticRequest}: {})});
+    }catch(error){if(before)rows.push({pid:row.pid,...before,identityOnly:true});errors.push(progressOnly?{pid:row.pid,parent:row.parent,inspectionFailed:true}:{pid:row.pid,parent:row.parent,error:redact(error)});}
   }));
   let listeners=[];
   if(port!==undefined){
@@ -305,8 +320,26 @@ async function macProcessInventory(context,stage,port,knownIdentities=[],deadlin
   const inventory={stage,observedAt:new Date().toISOString(),hostPid:process.pid,expectedExecutable,observerPid,
     observerParentVerified:!!observer,presentPids:relevant.map(row=>row.pid),rows,direct:rows.filter(row=>row.parent===process.pid&&row.canonicalExecutable===expectedExecutable),listeners,errors};
   const signature=JSON.stringify({stage,rows,listeners,errors});
-  if(processObservationSignatures.get(context)!==signature){context.log('native-macos-owned-processes',inventory);processObservationSignatures.set(context,signature);}
+  if(!progressOnly&&processObservationSignatures.get(context)!==signature){context.log('native-macos-owned-processes',inventory);processObservationSignatures.set(context,signature);}
   return inventory;
+}
+
+async function observeOperationProgress(context,stage,{signal,deadlineAt}){
+  const inventory=await macProcessInventory(context,stage,undefined,[],deadlineAt,{signal});
+  assert(!inventory.errors.length,'An inspection error is not evidence of process absence');
+  const profile=process.env.PERFCHECKER_NATIVE_PROFILE;
+  const controller=stage==='initialize'?path.join(context.workspace,'perf','controller'):context.controller;
+  const files=[];
+  for(const [name,file]of [['suite',path.join(context.workspace,'perf','suite.jl')],
+    ['plan',path.join(profile,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','suite-plan.json')],
+    ['controller-project',path.join(controller,'Project.toml')],['controller-manifest',path.join(controller,'Manifest.toml')]]){
+    signal.throwIfAborted();assert(Date.now()<deadlineAt);
+    const stat=await fs.lstat(file).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
+    if(!stat){files.push({name,present:false});continue;}
+    assert(stat.isFile()&&!stat.isSymbolicLink(),'Metadata observations refuse links and non-files');
+    files.push({name,present:true,bytes:stat.size,modifiedAt:stat.mtime.toISOString()});
+  }
+  return{hostPid:process.pid,expectedExecutable:inventory.expectedExecutable,rows:inventory.rows,files};
 }
 
 async function observeNativeWork(context,stage){
@@ -622,6 +655,10 @@ exports.run = async () => {
       results: path.join(workspace, 'perf', 'results', 'vscode'), log, proof, findFrame,
       core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION,flushReport:()=>persist()};
     nativeContext=context;
+    const {observeNativeOperation}=await import('./native-controller-preflight.mjs');
+    context.observeOperation=(operation,run,deadlineAt)=>process.platform==='darwin'&&['fresh','configured','prepared'].includes(phase)?
+      observeNativeOperation(operation,run,{deadlineAt,sample:options=>observeOperationProgress(context,operation,options),
+        record:detail=>log('native-operation-progress',detail)}):run();
     if(process.platform==='darwin')context.processInventory=(stage,port,known)=>macProcessInventory(context,stage,port,known);
     if(['testitems','testitems-ready','suite','diagnosis','pluto'].includes(phase))context.observeWork=stage=>observeNativeWork(context,stage);
     else if(['configured','prepared'].includes(phase))context.observeWork=stage=>/testitems?/.test(stage)?observeNativeWork(context,stage):undefined;
@@ -733,6 +770,7 @@ exports.run = async () => {
         await assert.rejects(fs.access(suitePlanFile),{code:'ENOENT'},'Fresh setup must not reuse a stale plan from any workspace');
         const initializationStartedAt=Date.now(),initializationDeadline=initializationStartedAt+600000;
         const initializationRemaining=()=>{assert(Date.now()<initializationDeadline,'First-use setup must finish inside its original 600-second budget');return initializationDeadline-Date.now();};
+        const initialized=await context.observeOperation('initialize',async()=>{
         await studio.locator('#setup-workspace').click();
         await picker.waitFor({state:'visible',timeout:60000});
         await picker.locator('.monaco-list-row').filter({hasText:'Create controller environment'}).click();
@@ -745,7 +783,7 @@ exports.run = async () => {
           assert.equal(vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject','perf'),'perf','Failed production setup preserves the selected controller');
           assert(!await fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false));
           proof('bootstrap-awaiting-registration',{status:'prerequisite',minimum:minimumVersion,registry:'General',positiveBootstrapQualified:false,explicitConfirmation:true,nativeStudioClick:true});
-          return;
+          return false;
         }
         await eventually(()=>fs.stat(path.join(workspace,'perf','suite.jl')).then(()=>true).catch(()=>false),'Explicit first-use setup creates a real suite',initializationRemaining());
         await eventually(()=>vscode.workspace.getConfiguration('perfchecker',uri).get('runnerProject')===path.join('perf','controller'),'Controller setting is saved only after successful setup',initializationRemaining());
@@ -758,6 +796,9 @@ exports.run = async () => {
           }catch(error){if(error.code==='ENOENT'||error instanceof SyntaxError)return false;throw error;}
         },'The real initialization plan finishes before opening Feature suite',initializationRemaining());
         log('native-bootstrap-plan-ready',{...bootstrapPlan,elapsedMs:Date.now()-initializationStartedAt,maximumMs:600000,noAdditionalPlanRequested:true});
+        return true;
+        },initializationDeadline);
+        if(!initialized)return;
         await controls.runSelection(context);
         proof('bootstrap-first-install-and-measurement',{existingProjectWithoutPerfChecker:true,explicitConfirmation:true,core:`General ${minimumVersion}`,nativeStudioClick:true});
       });

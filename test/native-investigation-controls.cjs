@@ -87,6 +87,11 @@ async function reportAfter(context, before, action, timeout = 360000) {
 }
 
 async function action(context, label, name, timeout = 360000) {
+  if(name==='diagnose'&&context.observeOperation)return context.observeOperation('diagnose',()=>performAction(context,label,name,timeout),Date.now()+timeout);
+  return performAction(context,label,name,timeout);
+}
+
+async function performAction(context, label, name, timeout) {
   const before = await directories(reportRoot(context));
   const current = await view(context);
   await context.observeWork?.(`investigation-${name}-before-action`);
@@ -254,6 +259,10 @@ async function diagnose(context) {
   // This observation allowance leaves every execution limit and assertion intact.
   const result = await action(context, 'Diagnose selected', 'diagnose', process.platform==='darwin'?900000:360000);
   assert.equal(result.report.schema_version, 'perfchecker-diagnosis/1');
+  context.log('investigation-diagnosis-record-statuses',{records:result.report.records.slice(0,16).map(record=>({
+    tool:tools.includes(record.tool)?record.tool:'unlisted',
+    status:['complete','unavailable','timeout','cancelled','error','failed','invalid_evidence'].includes(record.status)?record.status:'unlisted',
+    ...(Number.isFinite(record.elapsed_seconds??record.worker_elapsed_seconds)?{elapsedSeconds:record.elapsed_seconds??record.worker_elapsed_seconds}:{})}))});
   for (const tool of tools) {
     const records = result.report.records.filter(record => record.tool === tool);
     assert.equal(records.length, 1, `${tool} has one actual worker result`);

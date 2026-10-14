@@ -85,6 +85,10 @@ async function options(view, selector) {
 }
 
 async function designer(context) {
+  return context.observeOperation?context.observeOperation('plan',()=>openDesigner(context),Date.now()+600000):openDesigner(context);
+}
+
+async function openDesigner(context) {
   await clickStudioAction(context, 'suite');
   // An attached empty #cards has no height while the real controller is loading.
   // Its visible owner and generated check-type controls identify a ready plan.

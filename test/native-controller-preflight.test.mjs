@@ -1,7 +1,85 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved} from './native-controller-preflight.mjs';
+import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,nativeOperationSnapshot,observeNativeOperation,captureQualifiedNativeProgress} from './native-controller-preflight.mjs';
+
+const observationDelay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const operationSnapshot=()=>({hostPid:10,expectedExecutable:process.execPath,
+  rows:[{pid:11,parent:10,createdAt:'2026-10-14T10:00:00.000Z',canonicalExecutable:process.execPath,
+    progress:{state:'R',elapsed:'00:12',cpuTime:'0:03.10',cpuPercent:'25.0'},argv:'private source',token:'private token'}],
+  files:[{name:'suite',present:false,contents:'private source'}],environment:'private environment'});
+
+test('native state observations revalidate the executable after reading progress',async()=>{
+  const order=[],progress={state:'R'};
+  assert.equal(await captureQualifiedNativeProgress(process.execPath,[process.execPath],async()=>{order.push('states');return progress;},
+    async()=>{order.push('image-after');return[process.execPath];}),progress);
+  assert.deepEqual(order,['states','image-after']);
+  await assert.rejects(captureQualifiedNativeProgress(process.execPath,[process.execPath],async()=>progress,async()=>['/other/executable']),/changed or uncertain executable/);
+  const unknown=Object.assign(new Error('canonical executable unavailable'),{code:'ENOENT'});
+  await assert.rejects(captureQualifiedNativeProgress(process.execPath,[process.execPath],async()=>progress,async()=>{throw unknown;}),error=>error===unknown);
+  let read=false;
+  await assert.rejects(captureQualifiedNativeProgress(process.execPath,[],async()=>{read=true;return progress;},async()=>[process.execPath]),/canonical executable before/);
+  assert.equal(read,false);
+});
+
+test('native operation evidence refuses foreign or ambiguous ownership and strips private payloads',()=>{
+  const value=operationSnapshot(),safe=nativeOperationSnapshot(value);
+  assert(!JSON.stringify(safe).includes('private'));
+  assert.deepEqual(safe.files,[{name:'suite',present:false}]);
+  for(const rows of [[{...value.rows[0],parent:999}],[...value.rows,...value.rows],
+    [{...value.rows[0],identityOnly:true}],[{...value.rows[0],createdAt:'unverified'}]])
+    assert.throws(()=>nativeOperationSnapshot({...value,rows}));
+  assert.throws(()=>nativeOperationSnapshot({...value,files:[{name:'user-source',present:true,bytes:1,modifiedAt:'2026-10-14T10:00:00Z'}]}));
+});
+
+test('native operation invokes the real action first and preserves its exact result',async()=>{
+  const order=[],records=[],result={actual:'result'};
+  const actual=await observeNativeOperation('plan',async()=>{order.push('action');await observationDelay(15);return result;},{
+    deadlineAt:Date.now()+1000,intervalMs:2,sampleTimeoutMs:100,maxSamples:2,
+    sample:async()=>{order.push('sample');return operationSnapshot();},record:row=>records.push(row)});
+  assert.equal(actual,result);assert.equal(order[0],'action');assert(order.includes('sample'));
+  assert(records.filter(row=>row.stage==='sample').length<=2);assert.equal(records.at(-1).stage,'observer-stopped');
+  assert.equal(records.at(-1).drained,true);
+});
+
+test('observation failure neither replaces a real rejection nor records its private contents',async()=>{
+  const primary=new Error('original operation rejection'),records=[];
+  await assert.rejects(observeNativeOperation('initialize',async()=>{await observationDelay(10);throw primary;},{
+    deadlineAt:Date.now()+1000,intervalMs:1,sampleTimeoutMs:100,maxSamples:1,
+    sample:async()=>{throw Object.assign(new Error('private token and argv'),{code:'EACCES'});},record:row=>records.push(row)}),error=>error===primary);
+  assert(records.some(row=>row.stage==='inspection-error'&&row.code==='EACCES'));
+  assert(!JSON.stringify(records).includes('private'));assert.equal(records.at(-1).drained,true);
+});
+
+test('native observer coalesces pending reads and aborts and drains them before returning',async()=>{
+  let active=0,maximum=0,calls=0,aborted=0;const records=[];
+  await observeNativeOperation('diagnose',async()=>{await observationDelay(20);return 'unchanged';},{
+    deadlineAt:Date.now()+1000,intervalMs:1,sampleTimeoutMs:100,maxSamples:10,
+    sample:({signal})=>new Promise(resolve=>{calls++;maximum=Math.max(maximum,++active);
+      signal.addEventListener('abort',()=>{aborted++;active--;resolve(operationSnapshot());},{once:true});}),record:row=>records.push(row)});
+  assert.equal(maximum,1);assert.equal(calls,1);assert.equal(active,0);assert.equal(aborted,1);
+  assert.equal(records.at(-1).drained,true);const count=records.length;
+  await observationDelay(10);assert.equal(calls,1);assert.equal(records.length,count);
+});
+
+test('late observations cannot qualify a snapshot or extend an expired operation oracle',async()=>{
+  const records=[],primary=new Error('original deadline');let finishSample,rejectOperation,started;
+  const entered=new Promise(resolve=>{started=resolve;});
+  const pending=observeNativeOperation('plan',()=>new Promise((resolve,reject)=>{rejectOperation=reject;}),{
+    deadlineAt:Date.now()+1000,intervalMs:1,sampleTimeoutMs:2,maxSamples:1,
+    sample:()=>new Promise(resolve=>{finishSample=()=>resolve(operationSnapshot());started();}),record:row=>records.push(row)});
+  await entered;rejectOperation(primary);
+  await assert.rejects(pending,error=>error===primary);assert.equal(records.at(-1).drained,false);
+  finishSample();await new Promise(resolve=>setImmediate(resolve));
+  assert(!records.some(row=>row.stage==='sample'));
+});
+
+test('a diagnostic sink failure preserves synchronous operation refusal and schedules no observer',async()=>{
+  const primary=new Error('original refusal');let sampled=false;
+  await assert.rejects(observeNativeOperation('initialize',()=>{throw primary;},{deadlineAt:Date.now()+100,
+    sample:async()=>{sampled=true;return operationSnapshot();},record:()=>{throw new Error('sink failed');}}),error=>error===primary);
+  assert.equal(sampled,false);
+});
 
 const readyLeader={pid:4924,parent:6176,executable:'C:\\Julia\\bin\\julia.exe'};
 const readiness={parent:6176,expected:readyLeader.executable,canonical:value=>value.toLowerCase()};
