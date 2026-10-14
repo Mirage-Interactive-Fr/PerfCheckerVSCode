@@ -3,9 +3,93 @@ import assert from 'node:assert/strict';
 import Module, {createRequire} from 'node:module';
 import {spawn as nativeSpawn} from 'node:child_process';
 import * as nativeChildProcess from 'node:child_process';
-import {mkdtemp, writeFile, readFile, mkdir, rm, realpath} from 'node:fs/promises';
+import * as entryFs from 'node:fs';
+import {randomBytes} from 'node:crypto';
+import {EventEmitter} from 'node:events';
+import {PassThrough} from 'node:stream';
+import {mkdtemp, writeFile, readFile, readdir, mkdir, rm, realpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+
+const entryVariable='PERFCHECKER_SACRIFICIAL_ENTRY',entryLimit=2048;
+const entryPhase=args=>args[0]==='--version'?'version':args[0]==='--help'?'global-help':
+  args[0]==='exec'&&args[1]==='--help'?'exec-help':args[0]==='login'&&args[1]==='status'?'login-status':'fixture-operation';
+const safeEntryError=error=>({name:['Error','TypeError','RangeError'].includes(error?.name)?error.name:'Error',
+  ...(typeof error?.code==='string'&&/^(?:E[A-Z0-9_]{1,30}|ERR_[A-Z0-9_]{1,40})$/.test(error.code)?{code:error.code}:{})});
+const sameEntryFile=(left,right)=>left.isFile()&&right.isFile()&&left.nlink===1n&&right.nlink===1n&&
+  left.ino!==0n&&left.birthtimeNs>0n&&left.dev===right.dev&&left.ino===right.ino&&left.birthtimeNs===right.birthtimeNs;
+function createEntryProbe(script,args){
+  const nonce=randomBytes(24).toString('hex'),file=path.join(path.dirname(script),`entry-${nonce}.json`);
+  const descriptor=entryFs.openSync(file,entryFs.constants.O_CREAT|entryFs.constants.O_EXCL|entryFs.constants.O_RDWR,0o600);
+  try{
+    const identity=entryFs.fstatSync(descriptor,{bigint:true});
+    if(!identity.isFile()||identity.nlink!==1n||identity.ino===0n||identity.birthtimeNs<=0n)throw new Error('Ambiguous private entry file');
+    return {file,nonce,identity,phase:entryPhase(args),image:entryFs.realpathSync(process.execPath),started:Date.now()};
+  }catch(error){entryFs.rmSync(file,{force:true});throw error;}
+  finally{entryFs.closeSync(descriptor);}
+}
+function inspectEntryProbe(probe,ownerPid,closed=Date.now()){
+  let descriptor;
+  const unavailable=(status,reason)=>({status,reason});
+  try{
+    const pathBefore=entryFs.lstatSync(probe.file,{bigint:true});
+    if(pathBefore.isSymbolicLink()||!sameEntryFile(probe.identity,pathBefore))return unavailable('refused','private-file-identity');
+    if(pathBefore.size>BigInt(entryLimit))return unavailable('refused','size-limit');
+    descriptor=entryFs.openSync(probe.file,entryFs.constants.O_RDONLY|(entryFs.constants.O_NOFOLLOW??0));
+    const before=entryFs.fstatSync(descriptor,{bigint:true});
+    if(!sameEntryFile(pathBefore,before)||before.size!==pathBefore.size)return unavailable('refused','private-file-identity');
+    const bytes=Buffer.alloc(entryLimit+1),count=entryFs.readSync(descriptor,bytes,0,bytes.length,0);
+    const after=entryFs.fstatSync(descriptor,{bigint:true}),pathAfter=entryFs.lstatSync(probe.file,{bigint:true});
+    if(!sameEntryFile(before,after)||!sameEntryFile(after,pathAfter)||before.size!==after.size||after.size!==BigInt(count)||
+      before.mtimeNs!==after.mtimeNs||after.mtimeNs!==pathAfter.mtimeNs)return unavailable('refused','private-file-changed');
+    if(count===0)return unavailable('unavailable','script-entry-not-observed');
+    if(count>entryLimit)return unavailable('refused','size-limit');
+    const value=JSON.parse(bytes.subarray(0,count).toString('utf8'));
+    if(!value||Array.isArray(value)||Object.keys(value).sort().join(',')!=='at,image,nonce,phase,pid,ppid,schema'||
+      value.schema!==1||value.nonce!==probe.nonce||value.phase!==probe.phase||value.image!==probe.image||
+      !Number.isSafeInteger(ownerPid)||ownerPid<=0||value.ppid!==ownerPid||!Number.isSafeInteger(value.pid)||value.pid<=0||value.pid===ownerPid||
+      !Number.isSafeInteger(value.at)||value.at<probe.started||value.at>closed)return unavailable('refused','entry-identity');
+    return {status:'script-entry-observed',phase:value.phase,pid:value.pid,ppid:value.ppid,image:'expected-native-node',at:value.at};
+  }catch(error){return {status:'unavailable',reason:'inspection-error',error:safeEntryError(error)};}
+  finally{if(descriptor!==undefined)try{entryFs.closeSync(descriptor);}catch{}}
+}
+function observeFixtureSpawn(delegate,args,options,script,record=value=>console.log(JSON.stringify(value))){
+  let probe,probeError,child;
+  try{probe=createEntryProbe(script,args);}catch(error){probeError=safeEntryError(error);}
+  const started=Date.now();let stdoutBytes=0,stderrBytes=0,firstOutput,spawnError,finished=false;
+  const finish=(code,signal,terminalEvent='close')=>{
+    if(finished)return;finished=true;
+    const closed=Date.now(),marker=probe?inspectEntryProbe(probe,child?.pid,closed):{status:'unavailable',reason:'probe-setup-error',error:probeError};
+    let markerRetired=true;
+    try{if(probe)entryFs.rmSync(probe.file,{force:true});}catch{markerRetired=false;}
+    try{record({event:'sacrificial-windows-cli-timing',phase:entryPhase(args),ownerPid:child?.pid??null,
+      terminalEvent,startedAt:started,...(terminalEvent==='close'?{closedAt:closed}:{eventAt:closed}),milliseconds:closed-started,firstOutputMilliseconds:firstOutput,
+      stdoutBytes,stderrBytes,code,signal,spawnError,marker,markerRetired});}catch{/* Diagnostic output never replaces the operation result. */}
+  };
+  try{
+    child=delegate(probe?{...options,env:{...options.env,[entryVariable]:JSON.stringify({file:probe.file,nonce:probe.nonce,
+      dev:String(probe.identity.dev),ino:String(probe.identity.ino),birthtimeNs:String(probe.identity.birthtimeNs),phase:probe.phase})}}:options);
+  }catch(error){spawnError=safeEntryError(error);finish(null,null,'synchronous-spawn-error');throw error;}
+  const output=(kind,chunk)=>{if(firstOutput===undefined)firstOutput=Date.now()-started;kind==='stdout'?stdoutBytes+=Buffer.byteLength(chunk):stderrBytes+=Buffer.byteLength(chunk);};
+  child.stdout.on('data',chunk=>output('stdout',chunk));child.stderr.on('data',chunk=>output('stderr',chunk));
+  child.once('error',error=>{spawnError=safeEntryError(error);finish(null,null,'spawn-error');});
+  child.once('close',finish);
+  return child;
+}
+function fixtureChildClose(child,cleanupMs=2000){
+  return new Promise((resolve,reject)=>{
+    let failure,timer;
+    const retire=()=>{clearTimeout(timer);child.removeListener('error',onError);child.removeListener('close',onClose);};
+    const onError=error=>{
+      failure??=error;
+      timer??=setTimeout(()=>{
+        retire();reject(Object.assign(new AggregateError([failure], 'Fixture child close was not observed after its original error.'),{cleanupQualified:false}));
+      },cleanupMs);
+    };
+    const onClose=(code,signal)=>{retire();failure?reject(failure):resolve({code,signal});};
+    child.on('error',onError);child.once('close',onClose);
+  });
+}
 
 // Exercise HTTP and real process lifetime with a sacrificial CLI, not a model response claim.
 let fixture;
@@ -14,15 +98,9 @@ Module._load = function(name, ...args) {
   if (name === './windowsOwnedProcess') {
     const owner = original.call(this, name, ...args);
     return {...owner, spawnWindowsOwnedProcess: (cli, argv, options) => {
-      const child=cli === 'sacrificial-codex' ? owner.spawnWindowsOwnedProcess(process.execPath,[fixture,...argv],options) : owner.spawnWindowsOwnedProcess(cli,argv,options);
-      if(cli==='sacrificial-codex'){
-        const started=Date.now();let stdoutBytes=0,stderrBytes=0,firstOutput;
-        const output=(kind,chunk)=>{if(firstOutput===undefined)firstOutput=Date.now()-started;kind==='stdout'?stdoutBytes+=Buffer.byteLength(chunk):stderrBytes+=Buffer.byteLength(chunk);};
-        child.stdout.on('data',chunk=>output('stdout',chunk));child.stderr.on('data',chunk=>output('stderr',chunk));
-        child.once('close',(code,signal)=>console.log(JSON.stringify({event:'sacrificial-windows-cli-timing',phase:argv[0]==='exec'?'exec-help':argv[0],
-          milliseconds:Date.now()-started,firstOutputMilliseconds:firstOutput,stdoutBytes,stderrBytes,code,signal})));
-      }
-      return child;
+      const script=fixture;
+      return cli === 'sacrificial-codex' ? observeFixtureSpawn(observedOptions=>
+        owner.spawnWindowsOwnedProcess(process.execPath,[script,...argv],observedOptions),argv,options,script) : owner.spawnWindowsOwnedProcess(cli,argv,options);
     }};
   }
   if (name === 'node:child_process') return {...nativeChildProcess, spawn: (cli, argv, options) =>
@@ -37,6 +115,17 @@ async function environment(run) {
   fixture = path.join(root, 'cli.cjs');
   await writeFile(fixture, `const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
 const args=process.argv.slice(2);
+const entry=process.env.PERFCHECKER_SACRIFICIAL_ENTRY;delete process.env.PERFCHECKER_SACRIFICIAL_ENTRY;
+if(entry){let fd;try{
+const probe=JSON.parse(entry);if(fs.lstatSync(probe.file).isSymbolicLink())throw Error('Private marker is a link');
+fd=fs.openSync(probe.file,fs.constants.O_WRONLY|(fs.constants.O_NOFOLLOW||0));
+const identity=fs.fstatSync(fd,{bigint:true});
+if(!identity.isFile()||identity.nlink!==1n||identity.size!==0n||String(identity.dev)!==probe.dev||String(identity.ino)!==probe.ino||String(identity.birthtimeNs)!==probe.birthtimeNs)throw Error('Private marker identity changed');
+const current=fs.lstatSync(probe.file,{bigint:true});if(current.isSymbolicLink()||current.dev!==identity.dev||current.ino!==identity.ino||current.birthtimeNs!==identity.birthtimeNs)throw Error('Private marker path changed');
+const phase=args[0]==='--version'?'version':args[0]==='--help'?'global-help':args[0]==='exec'&&args[1]==='--help'?'exec-help':args[0]==='login'&&args[1]==='status'?'login-status':'fixture-operation';
+const value=Buffer.from(JSON.stringify({schema:1,nonce:probe.nonce,phase,pid:process.pid,ppid:process.ppid,image:fs.realpathSync(process.execPath),at:Date.now()}));
+if(value.length<=2048)fs.writeSync(fd,value);
+}catch{}finally{if(fd!==undefined)try{fs.closeSync(fd)}catch{}}}
 function execImage(){const child=cp.spawn('/bin/sh',['-c','while [ ! -e "$1" ]; do sleep 0.02; done; exec /bin/sleep 1000','--',path.join(process.cwd(),'release-exec')],{stdio:'ignore'});fs.writeFileSync('exec-image.json',JSON.stringify({leader:process.pid,child:child.pid}));setInterval(()=>{if(fs.existsSync('release-parent'))process.exit(0)},10)}
 if(args[0]==='--exec-owner'){execImage();return}
 if(args[0]==='--cohort-detached'){const leaf=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync('cohort.json',JSON.stringify({middle:process.ppid,detached:process.pid,leaf:leaf.pid}));setInterval(()=>{},1000);return}
@@ -75,6 +164,80 @@ async function call(connector, method, params, signal) {
 }
 const tool = (connector, name, args, signal) => call(connector, 'tools/call', {name, arguments: args}, signal);
 async function until(read) {for (let i=0;i<(process.platform==='win32'?1000:100);i++) {try {return await read();} catch {await new Promise(r=>setTimeout(r,20));}} throw new Error('Fixture process did not start.');}
+
+test('CLI entry diagnostics preserve the delegated child and original spawn errors',async()=>environment(async root=>{
+  const child=Object.assign(new EventEmitter(),{pid:12345,stdout:new PassThrough(),stderr:new PassThrough()});
+  const options={cwd:root,env:{UNCHANGED:'yes'}},events=[];let calls=0,privateEntry;
+  assert.equal(observeFixtureSpawn(received=>{
+    calls++;assert.equal(received.cwd,options.cwd);assert.equal(received.env.UNCHANGED,'yes');
+    privateEntry=JSON.parse(received.env[entryVariable]);return child;
+  },['--version'],options,fixture,value=>events.push(value)),child);
+  assert.equal(calls,1);assert.equal(options.env[entryVariable],undefined);
+  await writeFile(privateEntry.file,JSON.stringify({schema:1,nonce:privateEntry.nonce,phase:'version',pid:12346,ppid:12345,
+    image:entryFs.realpathSync(process.execPath),at:Date.now()}));
+  child.stdout.write('private response payload');child.stderr.write('private error payload');child.emit('close',7,'SIGKILL');
+  assert.equal(events.length,1);assert.equal(events[0].code,7);assert.equal(events[0].signal,'SIGKILL');
+  assert.equal(events[0].marker.status,'script-entry-observed');assert.equal(events[0].marker.image,'expected-native-node');
+  assert.equal(events[0].stdoutBytes,24);assert.equal(events[0].stderrBytes,21);assert.equal(events[0].markerRetired,true);
+  assert(!entryFs.existsSync(privateEntry.file));assert.doesNotMatch(JSON.stringify(events),/private response|private error|entry-.*\.json/);
+  const originalError=Object.assign(new Error('private spawn details'),{code:'ENOENT'});
+  assert.throws(()=>observeFixtureSpawn(()=>{throw originalError;},['unlisted-sensitive-argument'],options,fixture,value=>events.push(value)),error=>error===originalError);
+  assert.equal(events.at(-1).phase,'fixture-operation');assert.equal(events.at(-1).terminalEvent,'synchronous-spawn-error');
+  assert.deepEqual(events.at(-1).spawnError,{name:'Error',code:'ENOENT'});assert.equal(events.at(-1).markerRetired,true);
+  assert.doesNotMatch(JSON.stringify(events),/private spawn details|unlisted-sensitive-argument/);
+  const asyncChild=Object.assign(new EventEmitter(),{stdout:new PassThrough(),stderr:new PassThrough()});
+  observeFixtureSpawn(()=>asyncChild,['--help'],options,fixture,value=>events.push(value));
+  asyncChild.emit('error',originalError);asyncChild.emit('close',null,null);
+  assert.equal(events.length,3);assert.equal(events.at(-1).terminalEvent,'spawn-error');assert.equal(events.at(-1).ownerPid,null);
+  assert.equal(events.at(-1).markerRetired,true);
+  assert.deepEqual(await readdir(root),['cli.cjs']);
+  const closing=new EventEmitter(),closed=fixtureChildClose(closing,100);let settled=false;
+  const handled=closed.catch(error=>{settled=true;return error;});closing.emit('error',originalError);
+  await Promise.resolve();assert.equal(settled,false,'An error must not finish the fixture before physical close');
+  closing.emit('close',null,'SIGTERM');assert.equal(await handled,originalError);
+  assert.equal(closing.listenerCount('error'),0);assert.equal(closing.listenerCount('close'),0);
+  const missingClose=new EventEmitter(),incomplete=fixtureChildClose(missingClose,10);missingClose.emit('error',originalError);
+  await assert.rejects(incomplete,error=>error instanceof AggregateError&&error.errors[0]===originalError&&error.cleanupQualified===false);
+  assert.equal(missingClose.listenerCount('error'),0);assert.equal(missingClose.listenerCount('close'),0);
+}));
+
+test('CLI entry diagnostics refuse stale, foreign or arbitrary marker records',async()=>environment(async root=>{
+  const probe=createEntryProbe(fixture,['--version']),owner=12345;
+  try{
+    assert.deepEqual(inspectEntryProbe(probe,owner),{status:'unavailable',reason:'script-entry-not-observed'});
+    const valid={schema:1,nonce:probe.nonce,phase:'version',pid:12346,ppid:owner,image:probe.image,at:Date.now()};
+    for(const changed of [{ppid:owner+1},{pid:owner},{nonce:'foreign'},{phase:'login-status'},{image:'unexpected'},
+      {at:probe.started-1},{at:Date.now()+60000},{token:'private secret'}]){
+      await writeFile(probe.file,JSON.stringify({...valid,...changed}));
+      const result=inspectEntryProbe(probe,owner);assert.deepEqual(result,{status:'refused',reason:'entry-identity'});
+      assert.doesNotMatch(JSON.stringify(result),/private secret|unexpected|foreign/);
+    }
+    await writeFile(probe.file,'{private invalid JSON');
+    assert.deepEqual(inspectEntryProbe(probe,owner),{status:'unavailable',reason:'inspection-error',error:{name:'Error'}});
+    await writeFile(probe.file,'x'.repeat(entryLimit+1));assert.deepEqual(inspectEntryProbe(probe,owner),{status:'refused',reason:'size-limit'});
+  }finally{await rm(probe.file,{force:true});}
+}));
+
+test('CLI entry diagnostics observe actual Node entry and refuse replaced files and links',async()=>environment(async root=>{
+  const probe=createEntryProbe(fixture,['--version']),retired=probe.file+'.retired';
+  try{
+    const child=nativeSpawn(process.execPath,[fixture,'--version'],{cwd:root,env:{...process.env,[entryVariable]:JSON.stringify({file:probe.file,
+      nonce:probe.nonce,dev:String(probe.identity.dev),ino:String(probe.identity.ino),birthtimeNs:String(probe.identity.birthtimeNs),phase:probe.phase})},
+      signal:AbortSignal.timeout(5000),stdio:['ignore','pipe','pipe']});
+    let stdout='',stderr='';child.stdout.on('data',chunk=>{stdout+=chunk;});child.stderr.on('data',chunk=>{stderr+=chunk;});
+    const result=await fixtureChildClose(child);
+    assert.deepEqual(result,{code:0,signal:null});assert.equal(stdout,'codex-cli 0.159.2\n');assert.equal(stderr,'');
+    const observed=inspectEntryProbe(probe,process.pid);assert.equal(observed.status,'script-entry-observed');
+    assert.equal(observed.pid,child.pid);assert.equal(observed.ppid,process.pid);assert.equal(observed.image,'expected-native-node');
+    entryFs.renameSync(probe.file,retired);await writeFile(probe.file,'private replacement');
+    assert.deepEqual(inspectEntryProbe(probe,12345),{status:'refused',reason:'private-file-identity'});
+    if(process.platform!=='win32'){
+      await rm(probe.file);entryFs.symlinkSync(retired,probe.file);
+      assert.deepEqual(inspectEntryProbe(probe,12345),{status:'refused',reason:'private-file-identity'});
+      assert.equal(JSON.parse(await readFile(retired,'utf8')).pid,child.pid);
+    }
+  }finally{await rm(probe.file,{force:true});await rm(retired,{force:true});}
+}));
 
 test('modern discovery is authenticated, stateless and never starts a CLI; legacy 2025 remains distinct',async()=>environment(async root=>{
   const connector=await new CodexConnector({cli:path.join(root,'must-not-run'),root}).start();
