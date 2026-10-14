@@ -13,7 +13,7 @@ import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
 import {nativePlatformContract,assertNativeJuliaArchitecture} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -235,10 +235,13 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
     return {...after,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
   };
   const survey=async()=>{
+    const {readyPid:observedReadyPid,rows}=await captureControllerInventory(()=>readyPid,async()=>{
     let rows;
     if(windows){const value=await inspectCommand(ownerExecutable,['-NoProfile','-Command',"$ErrorActionPreference='Stop'; @((Get-CimInstance Win32_Process -ErrorAction Stop) | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;started=$(if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null});executable=$_.ExecutablePath} }) | ConvertTo-Json -Compress"],{timeout:limit(10000),maxBuffer:4*1024*1024});rows=JSON.parse(value.stdout);assert(Array.isArray(rows));}
     else{const value=await inspectCommand('ps',['-eo','pid=,ppid=,pgid=,lstart=,stat='],{timeout:limit(3000),maxBuffer:4*1024*1024});rows=value.stdout.split('\n').flatMap(line=>{
       const match=/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+(\S+)\s*$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),group:Number(match[3]),started:match[4],state:match[5]}]:[];});}
+    return rows;
+    });
     lastRows=rows;const inspected=new Map();
     const read=async row=>{if(inspected.has(row.pid))return inspected.get(row.pid);try{const current=await inspect(row);inspected.set(row.pid,current);return current;}catch(error){errors.push(controllerInspectionFailure(error,{stage:'inspect',pid:row.pid,ownerPid:child.pid}));inspected.set(row.pid,undefined);return undefined;}};
     const original=rows.find(row=>row.pid===child.pid),owner=original&&await read(original);
@@ -280,7 +283,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
     const observation={observedAt:new Date().toISOString(),alive:[...live],unknown:unknown.map(row=>row.pid)};
     const signature=JSON.stringify({alive:observation.alive,unknown:observation.unknown});
     if(receipt.ownership.observations.at(-1)?.signature!==signature)receipt.ownership.observations.push({...observation,signature});
-    if(readyPid&&!started){const leader=inspected.get(readyPid);assert(leader&&live.has(readyPid));assert.equal(leader.parent,windows?child.pid:process.pid);assert.equal(canonical(leader.executable),canonical(expected));started=true;child.stdin.write('OBSERVED\n');}
+    if(controllerReadinessObserved({readyPid:observedReadyPid,started,identities:inspected,live,parent:windows?child.pid:process.pid,expected,canonical})){started=true;child.stdin.write('OBSERVED\n');}
     return [...live].map(pid=>records.get(pid));
   };
   let observation=Promise.resolve(),sampling=false;

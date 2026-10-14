@@ -1,7 +1,54 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import {controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
+import {controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved} from './native-controller-preflight.mjs';
+
+const readyLeader={pid:4924,parent:6176,executable:'C:\\Julia\\bin\\julia.exe'};
+const readiness={parent:6176,expected:readyLeader.executable,canonical:value=>value.toLowerCase()};
+
+test('READY received during an inventory waits for the next coherent snapshot',async()=>{
+  let readyPid,finishInventory,started=false;
+  const handshakes=[];
+  const observe=snapshot=>{
+    if(controllerReadinessObserved({...readiness,readyPid:snapshot.readyPid,started,
+      identities:new Map(snapshot.rows.map(row=>[row.pid,row])),live:new Set(snapshot.rows.map(row=>row.pid))})){
+      started=true;handshakes.push('OBSERVED\n');
+    }
+  };
+  const first=captureControllerInventory(()=>readyPid,()=>new Promise(resolve=>{finishInventory=resolve;}));
+  readyPid=4924;
+  const earlierRows=[{pid:6176,parent:6592}];
+  finishInventory(earlierRows);
+  const initial=await first;
+  assert.deepEqual(initial,{readyPid:undefined,rows:earlierRows},'Later stdout cannot qualify an earlier inventory');
+  observe(initial);assert.deepEqual(handshakes,[],'The previous inventory cannot send a handshake');
+  const currentRows=[...earlierRows,readyLeader];
+  const next=await captureControllerInventory(()=>readyPid,async()=>currentRows);
+  assert.deepEqual(next,{readyPid:4924,rows:currentRows},'The next inventory binds the received READY to its own rows');
+  observe(next);assert.deepEqual(handshakes,['OBSERVED\n']);
+  observe(next);assert.equal(handshakes.length,1,'The observed leader starts only once');
+});
+
+test('an inventory keeps its initial READY identity and propagates read failures',async()=>{
+  let readyPid=4924,finishInventory;
+  const pending=captureControllerInventory(()=>readyPid,()=>new Promise(resolve=>{finishInventory=resolve;}));
+  readyPid=9000;
+  const rows=[{pid:4924,parent:6176}];finishInventory(rows);
+  assert.deepEqual(await pending,{readyPid:4924,rows});
+  const failure=new Error('CIM inventory failed');
+  await assert.rejects(captureControllerInventory(()=>readyPid,async()=>{throw failure;}),error=>error===failure);
+});
+
+test('known READY still requires the live PID, original parent and executable',()=>{
+  const qualified={...readiness,readyPid:4924,started:false,identities:new Map([[4924,readyLeader]]),live:new Set([4924])};
+  assert.equal(controllerReadinessObserved(qualified),true);
+  for(const change of [
+    {identities:new Map()},
+    {live:new Set()},
+    ...[{parent:undefined},{parent:9000},{executable:undefined},{executable:'C:\\Other\\julia.exe'}]
+      .map(change=>({identities:new Map([[4924,{...readyLeader,...change}]])})),
+  ])assert.throws(()=>controllerReadinessObserved({...qualified,...change}),'Missing or changed ownership evidence is still a failure');
+});
 
 const project=path.resolve('controller','Project.toml'),coreRoot=path.resolve('packages','PerfChecker','Δ'),httpRoot=path.resolve('packages','HTTP','abc');
 const hex=value=>Buffer.from(value).toString('hex'),tree='a'.repeat(40),httpTree='b'.repeat(40);

@@ -2,6 +2,22 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {TextDecoder} from 'node:util';
 
+// A READY received during an asynchronous process inventory belongs to its next
+// snapshot. The caller still verifies that leader, parent and executable.
+export async function captureControllerInventory(readReadyPid,readRows){
+  const readyPid=readReadyPid();
+  return {readyPid,rows:await readRows()};
+}
+
+export function controllerReadinessObserved({readyPid,started,identities,live,parent,expected,canonical}){
+  if(!readyPid||started)return false;
+  const leader=identities.get(readyPid);
+  assert(leader&&live.has(readyPid));
+  assert.equal(leader.parent,parent);
+  assert.equal(canonical(leader.executable),canonical(expected));
+  return true;
+}
+
 // Pkg's LibGit2 checkout reads its own configuration search path. The Git CLI's
 // GIT_CONFIG_GLOBAL alone does not select that file for the embedded library.
 export const candidateGitSetupScript=String.raw`using LibGit2
