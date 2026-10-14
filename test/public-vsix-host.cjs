@@ -399,7 +399,13 @@ async function measureNativeTestItem(context,expectedPassed,options={}){
   await controls.clickStudioAction(context,'testing');
   const filename=options.file||'test/performance.jl',name=options.name||'Vector reduction';
   const row=windowPage.locator(`.monaco-list-row[aria-label*="${filename}"]`).filter({hasText:name}).first();
-  await row.waitFor({state:'visible',timeout:120000});await row.hover();
+  try{await row.waitFor({state:'visible',timeout:120000});}
+  catch(error){
+    try{await context.observeWork?.('testitems-discovery-not-ready');}
+    catch(diagnosticError){context.log('native-work-observation-error',{case:'testitems-discovery-not-ready',error:redact(diagnosticError)});}
+    throw error;
+  }
+  await row.hover();
   if(context.editorQualification)context.log('native-editor-visible-testing-item',{name,file:filename,matchingRows:await windowPage.locator(`.monaco-list-row[aria-label*="${filename}"]`).filter({hasText:name}).count(),
     visible:await row.isVisible(),ariaLabel:await row.getAttribute('aria-label'),runButtons:await row.locator('.action-label[title="Run Test"],.action-label[aria-label="Run Test"],.action-label.codicon-testing-run-icon').count()});
   await context.editorQualification?.surface('tagged-testing-before-run');
@@ -459,6 +465,9 @@ exports.run = async () => {
   assert(['x64','arm64'].includes(expectedArch),'The runner declares the expected native architecture');
   assert.equal(process.arch,expectedArch,'The actual Electron extension host must use the native architecture');
   const phase = process.env.PERFCHECKER_NATIVE_PHASE;
+  const {nativeFullCasePartition}=await import('./native-platform-contract.mjs');
+  const fullCasePartition=nativeFullCasePartition({partition:process.env.PERFCHECKER_NATIVE_FULL_PARTITION||'all',
+    stage:process.env.PERFCHECKER_NATIVE_STAGE,artifact:process.env.PERFCHECKER_NATIVE_MODE});
   const minimumVersion=process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION;
   assert(/^\d+\.\d+\.\d+$/.test(minimumVersion),'The runner declares the production registry minimum explicitly');
   const workspace = process.env.PERFCHECKER_NATIVE_WORKSPACE;
@@ -476,8 +485,9 @@ exports.run = async () => {
     {videoOffsetSeconds:(Date.now()-Date.parse(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT))/1000}:{})});
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,platform:process.platform,processArch:process.arch,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
-      coverage:process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
+      coverage:process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?(fullCasePartition.name==='all'?'first-install-studio-investigations-mcp-pluto':`full-native-${fullCasePartition.name}`):'first-install-and-first-run-smoke',
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:minimumVersion,available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
+      fullCasePartition:process.env.PERFCHECKER_NATIVE_STAGE==='full'?fullCasePartition:undefined,
       commands:commandCoverage(commands,checks),configuration:configurationCoverage(configurationProperties,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);
     pendingReport=pendingReport.then(()=>fs.writeFile(path.join(output,`${phase}.json`),report));
     return pendingReport;
@@ -485,7 +495,7 @@ exports.run = async () => {
   const retainEvidence=async name=>{
     const directory=path.join(output,'worker-evidence',phase,name);
     const origins=['perf/results','perf/notebooks'].map(relative=>({root:workspace,relative,prefix:''}));
-    if(['testitems-ready','suite','diagnosis','pluto'].includes(phase))origins.push({
+    if(['testitems','testitems-ready','suite','diagnosis','pluto','configured','prepared'].includes(phase))origins.push({
       root:path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode'),relative:'native-testitems',prefix:'host-storage'});
     if(phase==='landscape'){
       const root=process.env.PERFCHECKER_NATIVE_LANDSCAPE_WORKSPACE;
@@ -613,7 +623,8 @@ exports.run = async () => {
       core:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),coreVersion:process.env.PERFCHECKER_NATIVE_CORE_VERSION,flushReport:()=>persist()};
     nativeContext=context;
     if(process.platform==='darwin')context.processInventory=(stage,port,known)=>macProcessInventory(context,stage,port,known);
-    if(['testitems-ready','suite','diagnosis','pluto'].includes(phase))context.observeWork=stage=>observeNativeWork(context,stage);
+    if(['testitems','testitems-ready','suite','diagnosis','pluto'].includes(phase))context.observeWork=stage=>observeNativeWork(context,stage);
+    else if(['configured','prepared'].includes(phase))context.observeWork=stage=>/testitems?/.test(stage)?observeNativeWork(context,stage):undefined;
     if(phase==='diagnosis'&&process.platform==='darwin'&&process.env.PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP)context.observeDiagnosisRequest=(stage,deadline)=>macProcessInventory(context,stage,undefined,[],deadline);
     context.measureTestItem=options=>measureNativeTestItem(context,true,options);
     log('core-installation-provenance',phase==='fresh'?{mode:'first-install',controllerInitiallyAbsent:true,productionInstaller:`General ${minimumVersion}`,minimumAvailable:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:context.core);
@@ -827,18 +838,21 @@ exports.run = async () => {
         });
         await runSuiteCases(context,runCase,{testItem:true,complete:process.env.PERFCHECKER_NATIVE_STAGE==='full'});
         if (process.env.PERFCHECKER_NATIVE_STAGE === 'full') {
-          await runCase('native-all-studio-controls', () => controls.run(context));
-          await runCase('native-workbench-controls',()=>workbench.run(context));
-          await runCase('native-investigation-controls', () => investigations.run(context));
-          await runCase('native-investigation-limits',()=>require('./native-investigation-limits.cjs').run(context));
-          await runCase('native-enabled-narrative-protocol',()=>require('./native-narrative-controls.cjs').run(context));
-          await runCase('native-advisor-controls', () => advisor.run(context));
-          await runCase('native-mcp-controls', () => mcp.run(context));
-          if(process.env.PERFCHECKER_NATIVE_MODE==='candidate')await runCase('native-pluto-controls',()=>pluto.run(context));
-          await runCase('native-discovery-and-sync-after-pluto',async()=>{
-            await vscode.commands.executeCommand('perfchecker.discoverScenarios');
-            await vscode.commands.executeCommand('perfchecker.syncScenarios');
-          });
+          const callbacks={
+            'native-all-studio-controls':()=>controls.run(context),
+            'native-workbench-controls':()=>workbench.run(context),
+            'native-investigation-controls':()=>investigations.run(context),
+            'native-investigation-limits':()=>require('./native-investigation-limits.cjs').run(context),
+            'native-enabled-narrative-protocol':()=>require('./native-narrative-controls.cjs').run(context),
+            'native-advisor-controls':()=>advisor.run(context),
+            'native-mcp-controls':()=>mcp.run(context),
+            'native-pluto-controls':()=>pluto.run(context),
+            'native-discovery-and-sync-after-pluto':async()=>{
+              await vscode.commands.executeCommand('perfchecker.discoverScenarios');
+              await vscode.commands.executeCommand('perfchecker.syncScenarios');
+            }
+          };
+          for(const name of fullCasePartition.cases){assert.equal(typeof callbacks[name],'function');await runCase(name,callbacks[name]);}
         }
       }
     }

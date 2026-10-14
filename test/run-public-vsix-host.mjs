@@ -10,10 +10,10 @@ import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
-import {nativePlatformContract,assertNativeJuliaArchitecture} from './native-platform-contract.mjs';
+import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -53,6 +53,7 @@ async function assertCompanionRoute(info,name,revision){
 }
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
+const fullCasePartition=nativeFullCasePartition({partition:process.env.PERFCHECKER_NATIVE_FULL_PARTITION||'all',stage,artifact:mode});
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
 if(stage==='focused'&&!['bootstrap','general100','narrative','mcp','mcp-stdio','mcp-documented-install','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','saved-report','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
@@ -597,6 +598,7 @@ try {
   const cliProfile = await privateProfile(profile);
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
+    fullCasePartition:stage==='full'?fullCasePartition:undefined,
     runner:{platform:process.platform,processArch:process.arch,runnerArch:process.env.RUNNER_ARCH||null},runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,
       actualCommit:application.commit,applicationName:application.applicationName,applicationRelativePath:path.relative(path.dirname(vscode),application.application),
       cliRelativePath:path.relative(path.dirname(vscode),cli),privateDirectoryFlags}};
@@ -789,19 +791,30 @@ try {
     coreProvenance.diagnosticWorker={file:worker,sha256:createHash('sha256').update(await fs.readFile(worker)).digest('hex')};
   }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
-  if(stage==='targeted'||stage==='full'||stage==='focused'&&(['general100','mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
+  const prepareTestItemDiscovery=mode==='candidate'&&(stage==='full'||stage==='focused'&&['testitems','testitems-ready'].includes(caseGroup));
+  if(prepareTestItemDiscovery||stage==='targeted'||stage==='full'||stage==='focused'&&(['general100','mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
     // This is installation/cache preparation, not first-Send or a cold-start
     // measurement. Keep its explicit compilation cost and physical ownership
     // separate from the unchanged 180-second prepared-import qualification.
     const preparationBefore=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
     const preparation={status:'running',phase:'cache preparation',startedAt:new Date().toISOString(),project:controller,
-      packages:['PerfChecker','HTTP'],strict:true,timeoutMilliseconds:900000,hashesBefore:preparationBefore,
+      packages:['PerfChecker','HTTP',...(prepareTestItemDiscovery?['TestItemRunner']:[])],strict:true,timeoutMilliseconds:900000,hashesBefore:preparationBefore,
       automaticPrecompile:runnerEnvironment.JULIA_PKG_PRECOMPILE_AUTO,
       scope:'Explicit selected-package cache preparation with owned compilation children; no cold-start or native first-Send claim'};
     artifactRecord.controllerCachePreparation=preparation;await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
     try{
-      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',controllerCachePreparationScript,controller],preparation,{timeoutMs:preparation.timeoutMilliseconds});
+      const discoveryFile=path.join(output,'controller-testitem-discovery.json');
+      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',controllerCachePreparationScript,controller,
+        ...(prepareTestItemDiscovery?[workspace,discoveryFile]:[])],preparation,{timeoutMs:preparation.timeoutMilliseconds});
       await fs.writeFile(path.join(output,'controller-cache-preparation.log'),text);
+      if(prepareTestItemDiscovery){
+        preparation.testItemDiscovery=parseControllerTestItemDiscoveryReceipt(text,{project:await fs.realpath(path.join(controller,'Project.toml')),root:await fs.realpath(workspace)});
+        const listing=JSON.parse(await fs.readFile(discoveryFile,'utf8'));
+        assert.equal(listing.schema_version,preparation.testItemDiscovery.listingSchema);
+        assert.equal(listing.executed,false);assert.equal(await fs.realpath(listing.root),preparation.testItemDiscovery.root);
+        assert.deepEqual(listing.items.filter(item=>item.name==='Vector reduction'&&item.file.replaceAll('\\','/')==='test/performance.jl'),[preparation.testItemDiscovery.item]);
+        preparation.testItemDiscovery.listingSha256=createHash('sha256').update(await fs.readFile(discoveryFile)).digest('hex');
+      }
       const complete=text.split(/\r?\n/).filter(line=>line.startsWith('CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 '));
       assert.equal(complete.length,1,'Exactly one completed explicit cache-preparation receipt is required');
       preparation.precompileSeconds=Number(complete[0].slice('CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 '.length));

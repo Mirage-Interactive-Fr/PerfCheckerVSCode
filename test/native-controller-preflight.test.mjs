@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import {controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved} from './native-controller-preflight.mjs';
+import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved} from './native-controller-preflight.mjs';
 
 const readyLeader={pid:4924,parent:6176,executable:'C:\\Julia\\bin\\julia.exe'};
 const readiness={parent:6176,expected:readyLeader.executable,canonical:value=>value.toLowerCase()};
@@ -56,6 +56,22 @@ const fields=['CONTROLLER_IMPORT_RECEIPT_V1','175.935475','HTTPAdvisorExt',hex(p
   'PerfChecker','1.0.1',hex(coreRoot),hex(path.join(coreRoot,'src','PerfChecker.jl')),tree,tree,
   'HTTP','2.9.0',hex(httpRoot),hex(path.join(httpRoot,'src','HTTP.jl')),httpTree,httpTree];
 const parse=value=>parseControllerImportReceipt(value,{project,version:'1.0.1',tree});
+const discoveryRoot=path.resolve('fixture'),discovery={schema_version:'perfchecker-native-testitem-discovery/1',
+  project,root:discoveryRoot,startedAt:'2026-10-14T07:00:00.000Z',finishedAt:'2026-10-14T07:00:04.000Z',
+  elapsedSeconds:4,listingSchema:'perfchecker-testitems/1',listingRoot:discoveryRoot,executed:false,targetPrepared:false,
+  item:{name:'Vector reduction',file:'test/performance.jl'},TestItemRunner:{version:'1.3.2',source:path.resolve('packages','TestItemRunner','src','TestItemRunner.jl')}};
+const parseDiscovery=value=>parseControllerTestItemDiscoveryReceipt(value,{project,root:discoveryRoot});
+const discoveryLine=receipt=>'CONTROLLER_TESTITEM_DISCOVERY_V1 '+JSON.stringify(receipt);
+test('actual discovery preparation keeps timestamps, dependency identity and the missing target',()=>{
+  assert.deepEqual(parseDiscovery(discoveryLine(discovery)),discovery);
+  for(const change of [{project:path.resolve('other','Project.toml')},{root:path.resolve('other')},
+    {startedAt:'unknown'},{finishedAt:'2026-10-14T06:59:59.000Z'},{elapsedSeconds:-1},
+    {listingSchema:'other'},{listingRoot:'relative'},{executed:true},{targetPrepared:true},{item:{name:'Other',file:'test/performance.jl'}},
+    {item:{name:'Vector reduction',file:'different.jl'}},{TestItemRunner:{version:'unknown',source:'relative'}}])
+    assert.throws(()=>parseDiscovery(discoveryLine({...discovery,...change})));
+  assert.throws(()=>parseDiscovery(''));
+  assert.throws(()=>parseDiscovery(discoveryLine(discovery)+'\n'+discoveryLine(discovery)));
+});
 test('primitive preflight receipt preserves real import time, Unicode paths and both pinned source trees',()=>{
   const value=parse(`CONTROLLER_IMPORT_AFTER HTTP elapsed=175.935475\n${fields.join('\t')}\n`);
   assert.equal(value.elapsedSeconds,175.935475);assert.equal(value.packages[0].root,coreRoot);

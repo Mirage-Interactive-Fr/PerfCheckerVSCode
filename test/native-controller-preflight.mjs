@@ -74,9 +74,48 @@ end`;
 // prepared import; the owner/descendant observer also covers this process.
 export const controllerCachePreparationScript=String.raw`println("CONTROLLER_PREFLIGHT_READY ",getpid());flush(stdout);readline(stdin)
 using Pkg;Pkg.activate(ARGS[1]);started=time()
-println("CONTROLLER_CACHE_PREPARATION_BEGIN PerfChecker HTTP strict=true");flush(stdout)
-Pkg.precompile(["PerfChecker","HTTP"];strict=true)
+packages=["PerfChecker","HTTP"];discovery=length(ARGS)==3
+if discovery;push!(packages,"TestItemRunner");end
+println("CONTROLLER_CACHE_PREPARATION_BEGIN ",join(packages," ")," strict=true");flush(stdout)
+Pkg.precompile(packages;strict=true)
+if discovery
+ using Dates,PerfChecker,TestItemRunner
+ discovery_started=Dates.format(now(UTC),Dates.DateFormat("yyyy-mm-ddTHH:MM:SS.sssZ"));discovery_time=time()
+ @assert all(info.name!="PerfCheckerNativeFixture" for info in values(Pkg.dependencies()))
+ code=PerfChecker.perfchecker_main(["testitems","--root="*ARGS[2],"--project="*ARGS[1],"--output="*ARGS[3],"--list","--tags=","--exclude-tags="])
+ @assert code==0
+ listing=PerfChecker.JSON.parsefile(ARGS[3]);@assert listing["schema_version"]=="perfchecker-testitems/1";@assert listing["executed"]==false
+ matches=filter(item->item["name"]=="Vector reduction"&&replace(item["file"],'\\'=>'/')=="test/performance.jl",listing["items"])
+ @assert length(matches)==1
+ receipt=Dict("schema_version"=>"perfchecker-native-testitem-discovery/1","root"=>realpath(ARGS[2]),
+  "project"=>realpath(Base.active_project()),"startedAt"=>discovery_started,
+  "finishedAt"=>Dates.format(now(UTC),Dates.DateFormat("yyyy-mm-ddTHH:MM:SS.sssZ")),"elapsedSeconds"=>time()-discovery_time,
+  "listingSchema"=>listing["schema_version"],"listingRoot"=>listing["root"],"executed"=>listing["executed"],"item"=>only(matches),"targetPrepared"=>false,
+  "TestItemRunner"=>Dict("version"=>string(Base.pkgversion(TestItemRunner)),"source"=>realpath(pathof(TestItemRunner))))
+ print("CONTROLLER_TESTITEM_DISCOVERY_V1 ");PerfChecker.JSON.print(receipt);println();flush(stdout)
+end
 println("CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 ",time()-started);flush(stdout)`;
+
+export function parseControllerTestItemDiscoveryReceipt(text,{project,root}) {
+  const prefix='CONTROLLER_TESTITEM_DISCOVERY_V1 ';
+  const lines=text.split(/\r?\n/).filter(line=>line.startsWith('CONTROLLER_TESTITEM_DISCOVERY'));
+  assert.equal(lines.length,1,'Exactly one completed discovery receipt is required');
+  assert(lines[0].startsWith(prefix),'Unknown discovery receipt protocol');
+  const receipt=JSON.parse(lines[0].slice(prefix.length));
+  assert.equal(receipt.schema_version,'perfchecker-native-testitem-discovery/1');
+  assert.equal(receipt.project,project);assert.equal(receipt.root,root);
+  for(const key of ['startedAt','finishedAt'])assert(Number.isFinite(Date.parse(receipt[key])),'Discovery timestamps are required');
+  assert(Date.parse(receipt.finishedAt)>=Date.parse(receipt.startedAt),'Discovery timestamps preserve their order');
+  assert(Number.isFinite(receipt.elapsedSeconds)&&receipt.elapsedSeconds>=0);
+  assert.equal(receipt.listingSchema,'perfchecker-testitems/1');assert.equal(receipt.targetPrepared,false,
+    'Discovery preparation must not install the intentionally missing target');
+  assert.equal(receipt.executed,false,'The listing must not execute the missing-target workload');
+  assert(path.isAbsolute(receipt.listingRoot),'The actual listing root is retained');
+  assert.equal(receipt.item?.name,'Vector reduction');assert.equal(receipt.item?.file?.replaceAll('\\','/'),'test/performance.jl');
+  assert(/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(receipt.TestItemRunner?.version));
+  assert(path.isAbsolute(receipt.TestItemRunner?.source),'The loaded discovery dependency records its real source');
+  return receipt;
+}
 
 // Emit primitive fields rather than compiling a generic JSON writer after the
 // prepared HTTP import. All loading, identity checks and the 180 s budget remain real.
