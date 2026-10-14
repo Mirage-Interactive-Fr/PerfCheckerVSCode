@@ -8,6 +8,10 @@ import {resolveControllerProject, resolveWorkspaceFolder} from './workspace-root
 import {cancellableJulia, controllerCancellation} from './controllerCancellation';
 
 interface NativeItem {id: string; name: string; file: string; tags: string[]; source_sha256: string}
+interface NativeInvocation {
+  readonly folder: string; readonly root: string; readonly project: string; readonly reason: string;
+  readonly executable: string; readonly tags: readonly string[]; readonly excludeTags: readonly string[];
+}
 
 /** Native TestItemRunner declarations, with one controller per workspace folder. */
 export function registerNativeTestItems(context: vscode.ExtensionContext): void {
@@ -21,28 +25,40 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
     context.subscriptions.push(tests);
     let declarations: NativeItem[] = [];
     let busy = false;
+    const discoveries = new Map<string, {generation: {value: number}; promise: Promise<void>}>();
+    let latestDiscovery = 0;
     const setting = <T>(key: string, fallback: T) => vscode.workspace.getConfiguration('perfchecker', folder.uri).get<T>(key, fallback);
     const assertWorkspace = () => {
       if (!vscode.workspace.isTrusted || !vscode.workspace.workspaceFolders?.some(f => f.uri.toString() === folder.uri.toString()))
         throw new Error('Open the original trusted workspace before executing test items.');
     };
-    const invoke = async (args: string[], token?: vscode.CancellationToken): Promise<{code: number; payload: any}> => {
+    const captureInvocation = (): NativeInvocation => {
       assertWorkspace();
-      const controller = resolveControllerProject(folder.uri.fsPath,
-        vscode.workspace.getConfiguration('perfchecker', folder.uri));
-      output.appendLine(`Controller project: ${controller.project} (${controller.reason})`);
+      const configuration = vscode.workspace.getConfiguration('perfchecker', folder.uri);
+      const controller = resolveControllerProject(folder.uri.fsPath, configuration);
+      return Object.freeze({folder:folder.uri.toString(),root:folder.uri.fsPath,...controller,
+        executable:configuration.get('juliaExecutable','julia'),
+        tags:Object.freeze([...configuration.get<string[]>('testItemTags',[])]),
+        excludeTags:Object.freeze([...configuration.get<string[]>('testItemExcludeTags',[])])});
+    };
+    const invocationKey = (invocation: NativeInvocation) => JSON.stringify([
+      invocation.folder,invocation.root,invocation.project,invocation.executable,invocation.tags,invocation.excludeTags]);
+    const invoke = async (args: string[], token?: vscode.CancellationToken,
+        invocation: NativeInvocation = captureInvocation()): Promise<{code: number; payload: any}> => {
+      output.appendLine(`Controller project: ${invocation.project} (${invocation.reason})`);
       const directory = path.join(context.globalStorageUri.fsPath, 'native-testitems', randomUUID());
       await fs.mkdir(directory, {recursive:true});
       const destination = path.join(directory, 'result.json');
-      const project = controller.project;
+      const project = invocation.project;
       const env: NodeJS.ProcessEnv = {...process.env, JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)};
       delete env.JULIA_PROJECT;
       const code = await new Promise<number>((resolve,reject) => {
         if (token?.isCancellationRequested) {resolve(130); return;}
-        const child = spawn(setting('juliaExecutable','julia'), ['--startup-file=no',`--project=${project}`,
+        assertWorkspace();
+        const child = spawn(invocation.executable, ['--startup-file=no',`--project=${project}`,
           '-e',cancellableJulia('using PerfChecker, TestItemRunner; exit(perfchecker_main(ARGS))'),'--','testitems',
-          `--root=${folder.uri.fsPath}`,`--project=${project}`,`--output=${destination}`, ...args],
-          {cwd:folder.uri.fsPath,windowsHide:true,detached:process.platform!=='win32',env});
+          `--root=${invocation.root}`,`--project=${project}`,`--output=${destination}`, ...args],
+          {cwd:invocation.root,windowsHide:true,detached:process.platform!=='win32',env});
         const stop = controllerCancellation(child, (message, forced) => {
           output.appendLine(message); if (forced) void vscode.window.showWarningMessage(message);
         });
@@ -63,18 +79,30 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
       output.appendLine(`Evidence: ${destination}`);
       return {code,payload};
     };
-    const selectionArgs = () => [`--tags=${setting<string[]>('testItemTags',[]).join(',')}`,
-      `--exclude-tags=${setting<string[]>('testItemExcludeTags',[]).join(',')}`];
-    const refresh = async () => {
-      const {code,payload} = await invoke(['--list',...selectionArgs()]);
-      if (code || payload.schema_version !== 'perfchecker-testitems/1' || !Array.isArray(payload.items)) throw new Error('Unsupported test item listing.');
-      declarations = payload.items;
-      tests.items.replace(declarations.map(item=>{
-        const test = tests.createTestItem(item.id,item.name,vscode.Uri.file(path.resolve(folder.uri.fsPath,item.file)));
-        test.description = `${item.file} · ${item.tags.join(', ') || 'shared'}`;
-        test.tags = item.tags.map(tag=>new vscode.TestTag(tag));
-        return test;
-      }));
+    const selectionArgs = (invocation: NativeInvocation) => [`--tags=${invocation.tags.join(',')}`,
+      `--exclude-tags=${invocation.excludeTags.join(',')}`];
+    const refresh = (): Promise<void> => {
+      const generation = {value:++latestDiscovery};
+      let invocation: NativeInvocation;
+      try {invocation = captureInvocation();} catch (error) {return Promise.reject(error);}
+      const key = invocationKey(invocation);
+      const existing = discoveries.get(key);
+      if (existing) {existing.generation.value = generation.value;return existing.promise;}
+      const pending = (async () => {
+        const {code,payload} = await invoke(['--list',...selectionArgs(invocation)],undefined,invocation);
+        if (code || payload.schema_version !== 'perfchecker-testitems/1' || !Array.isArray(payload.items)) throw new Error('Unsupported test item listing.');
+        if (latestDiscovery !== generation.value) return;
+        try {if (invocationKey(captureInvocation()) !== key) return;} catch {return;}
+        declarations = payload.items;
+        tests.items.replace(declarations.map(item=>{
+          const test = tests.createTestItem(item.id,item.name,vscode.Uri.file(path.resolve(invocation.root,item.file)));
+          test.description = `${item.file} · ${item.tags.join(', ') || 'shared'}`;
+          test.tags = item.tags.map(tag=>new vscode.TestTag(tag));
+          return test;
+        }));
+      })().finally(() => {if (discoveries.get(key)?.promise === pending) discoveries.delete(key);});
+      discoveries.set(key,{generation,promise:pending});
+      return pending;
     };
     const run = async (request: vscode.TestRunRequest, token: vscode.CancellationToken) => {
       if (busy) throw new Error('A native test item run is already active in this folder.');
@@ -99,8 +127,9 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
           if (token.isCancellationRequested) {execution.skipped(item);continue;}
           execution.started(item);
           const samples = setting('testItemSamples',1);
-          const {code,payload} = await invoke([`--item-id=${item.id}`,...selectionArgs(),
-            `--samples=${samples}`,`--timeout=${setting('analysisTimeout',120)}`],token);
+          const invocation = captureInvocation();
+          const {code,payload} = await invoke([`--item-id=${item.id}`,...selectionArgs(invocation),
+            `--samples=${samples}`,`--timeout=${setting('analysisTimeout',120)}`],token,invocation);
           if (token.isCancellationRequested) {execution.skipped(item);continue;}
           const rows = payload?.schema_version==='perfchecker-testitem-run/1' ? payload.runs?.filter((r:any)=>r.item?.id===item.id) : undefined;
           const details=rows?.[0]?.samples?.map((sample:any)=>sample.message).filter((message:any)=>typeof message==='string').join('\n')??'';
