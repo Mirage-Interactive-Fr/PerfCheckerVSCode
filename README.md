@@ -153,8 +153,11 @@ Sorting breaks equivalent numeric ties by target label, with a release before
   `perfchecker.juliaExecutable`.
 - A controller environment in the opened package workspace, normally `perf`,
   containing PerfChecker.jl 1.0.1 or later and a `suite.jl` with `build_suite()`.
-  Guided setup and Pluto notebooks require 1.1.0; use that version for the
-  read-only worker-environment fixes.
+  New controller setup and Pluto installations or upgrades require Core 1.1.1
+  or newer in 1.x for ARM loading and the read-only worker-environment fixes. Existing
+  prepared controller and Pluto environments still accept Core 1.1.0; other CLI
+  actions remain compatible with Core 1.0.1. Installation and upgrades require
+  an explicit choice.
 
 The extension invokes the public PerfChecker CLI and reads only versioned JSON,
 JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundary.
@@ -220,8 +223,9 @@ the quality contract and `perf/live_provider.jl` before launch. The provider mus
 write `perfchecker-provider-result/1` JSON to `PERFCHECKER_OUTPUT`, using the
 explicit `--quality=<slug>` argument. It runs in the game project; PerfChecker runs
 in the folder's configured controller project. The controller must already contain
-PerfChecker.jl 1.0.1 or later. Core 1.1.0 is recommended for its read-only
-worker-environment fixes. No package installation or suite factory runs automatically.
+PerfChecker.jl 1.0.1 or later. Core 1.1.1 or newer in 1.x is recommended for ARM
+loading and the read-only worker-environment fixes. No package installation or
+suite factory runs automatically.
 
 The provider's `suite` is `etendu-beautiful-landscape-live`. Its `environment`
 contains `quality_profile`, effective `width` and `height`, `resolution_source`,
@@ -412,12 +416,12 @@ Implementation requires a separate explicit tool configuration in the chat's
 use a trusted agent that respects the path and can access the local filesystem.
 Preparation creates a checkpoint; application requires a separate reviewed action.
 The controller's public `chat` and `implement` commands remain compatible with
-PerfChecker.jl 1.0.1 or later. Core 1.1.0 is recommended for its read-only
-worker-environment fixes; upgrading requires an explicit choice. The extension does not
-install an agent backend. An MCP server may supply ordinary tools without an LLM
-or an implementation tool. Choose tools whose documented inputs and capabilities
-match the requested operation. Codex CLI is an optional connector, not a prerequisite
-for MCP.
+PerfChecker.jl 1.0.1 or later. Core 1.1.1 or newer in 1.x is recommended for ARM
+loading and the read-only worker-environment fixes; upgrading requires an explicit
+choice. The extension does not install an agent backend. An MCP server may supply
+ordinary tools without an LLM or an implementation tool. Choose tools whose
+documented inputs and capabilities match the requested operation. Codex CLI is
+an optional connector, not a prerequisite for MCP.
 
 See the canonical [MCP guide](https://perfchecker.mirageinteractive.fr/mcp-advisor.html)
 for provider configuration, credentials, supported revisions, transmission,
