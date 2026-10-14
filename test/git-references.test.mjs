@@ -84,13 +84,32 @@ test('actual remote Git timeout and cancellation close connections and allow a f
 
 test('unauthenticated HTTP Git fails visibly without asking for credentials', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'perfchecker-git-auth-'));
+  const keys=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_CONFIG_COUNT','GIT_CONFIG_PARAMETERS'];
+  const previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
   try {
-    await serverFixture((_request, response) => {
+    // Exercise Git's unauthenticated HTTP path, independently of credential
+    // helpers installed in a runner's user/system configuration.
+    const configuration=path.join(root,'empty.gitconfig');await writeFile(configuration,'');
+    process.env.GIT_CONFIG_GLOBAL=configuration;process.env.GIT_CONFIG_NOSYSTEM='1';
+    process.env.GIT_CONFIG_COUNT='0';delete process.env.GIT_CONFIG_PARAMETERS;
+    assert(!/credential\.helper\s*=/.test(await git(root,'config','--list')),'The HTTP fixture has no inherited credential helper');
+    let challenges=0,authorizationSent=false;
+    await serverFixture((request, response) => {
+      challenges++;authorizationSent||=Boolean(request.headers.authorization);
       response.writeHead(401, {'WWW-Authenticate': 'Basic realm="Fixture"'}); response.end();
     }, async source => {
       const started = Date.now();
-      await assert.rejects(discoverGitReferences(source, root), /Authenticate Git outside PerfChecker/);
-      assert.ok(Date.now() - started < 10000);
+      let rejection;
+      await assert.rejects(discoverGitReferences(source, root),error=>{
+        rejection=error;return /Authenticate Git outside PerfChecker/.test(String(error));
+      });
+      assert(challenges>0,'Git reached the actual unauthenticated HTTP server');
+      assert.equal(authorizationSent,false,'The unauthenticated fixture must not send credentials');
+      const elapsed=Date.now()-started;
+      assert.ok(elapsed<10000,`Unauthenticated HTTP rejection took ${elapsed} ms: ${String(rejection)}`);
     });
-  } finally {await rm(root, {recursive: true, force: true});}
+  } finally {
+    for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}
+    await rm(root, {recursive: true, force: true});
+  }
 });
