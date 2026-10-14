@@ -9,7 +9,8 @@ import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
-import {nativeCoreContract,CORE110_CANDIDATE} from './native-core-contract.mjs';
+import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
+import {nativePlatformContract,assertNativeJuliaArchitecture} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
 import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
@@ -30,7 +31,7 @@ const coreTree=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_TREE 
 const coreProvenance=nativeCoreContract({core:coreMode,artifact:mode,stage:process.env.PERFCHECKER_NATIVE_STAGE||'smoke',
   group:process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative',commit:process.env.PERFCHECKER_NATIVE_CORE_COMMIT||'',tree:process.env.PERFCHECKER_NATIVE_CORE_TREE||''});
 const expectedCoreVersion=coreProvenance.version;
-const minimumVersion=mode==='public'?'1.0.0':'1.1.0';
+const minimumVersion=mode==='public'?'1.0.0':'1.1.1';
 const installCore=coreMode==='candidate'?`${candidateGitSetupScript};Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]));${candidateCheckoutPermissionsScript}`:`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))${coreMode==='general100'?'; Pkg.pin(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))':''}`;
 // Read the actual dependency and Manifest route, not the declared fixture pin.
 const companionProvenance=String.raw`function native_provider_provenance(m)
@@ -499,7 +500,7 @@ println("LANDSCAPE_SDK_PREPARATION_COMPLETE_V1 ",(time_ns()-started)/1e9)
 
 try {
   await fs.mkdir(output, {recursive: true});
-  assertCI();
+  const architecture=assertCI();
   if(landscapeOnly){
     assert.equal(process.platform,'linux');await fs.mkdir(runnerEnvironment.XDG_RUNTIME_DIR,{mode:0o700});
     process.on('SIGINT',abortLandscape);process.on('SIGTERM',abortLandscape);
@@ -524,6 +525,7 @@ try {
   }else{
   const runtime = JSON.parse((await execute(julia, ['--startup-file=no', '-e',
     "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
+  assertNativeJuliaArchitecture(runtime,architecture,'PerfChecker runtime');
   julia = runtime.executable;
   let nativeNode,nodeProvenance;
   if(stage==='focused'&&caseGroup==='mcp-stdio'){
@@ -535,6 +537,7 @@ try {
   }
   const officialRuntime=JSON.parse((await execute(process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA||julia,['--startup-file=no','-e',
     "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
+  assertNativeJuliaArchitecture(officialRuntime,architecture,'Official Julia runtime');
   const expectedVersion = mode === 'public' ? '1.0.0' : JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version;
   const vscode = await downloadAndUnzipVSCode({version, cachePath: path.join(session, 'vscode')});
   const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscode, {reuseMachineInstall: true});
@@ -600,7 +603,7 @@ try {
   const versionsText=await minimumResponse.text(),minimumSection=versionsText.split('["'+minimumVersion+'"]')[1]?.split(/^\[/m)[0];
   const minimumTree=/^git-tree-sha1\s*=\s*"([a-f0-9]{40})"/m.exec(minimumSection||'')?.[1];
   const minimumAvailable=Boolean(minimumTree);
-  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,CORE110_CANDIDATE.tree,'Published General 1.1.0 must match the independently pinned Core source tree');
+  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,CORE111_CANDIDATE.tree,'Published General 1.1.1 must match the independently pinned Core source tree');
   const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml');
   if(!plutoTagResponse.ok&&plutoTagResponse.status!==404)throw new Error(`Cannot verify published Pluto companion tag: ${plutoTagResponse.status}`);
   const plutoTagAvailable=plutoTagResponse.ok&&/^version\s*=\s*"1\.0\.1"\s*$/m.test(await plutoTagResponse.text());
@@ -1039,5 +1042,7 @@ finally {
 
 function assertCI() {
   if (process.env.CI !== 'true') throw new Error('Native VS Code installation is restricted to disposable remote CI.');
-  if (process.arch !== 'x64') throw new Error(`The registered core hardware dependency requires the explicitly tested x64 host, got ${process.arch}`);
+  return nativePlatformContract({scope:process.env.PERFCHECKER_NATIVE_SCOPE||'all',event:process.env.GITHUB_EVENT_NAME,
+    artifact:mode,stage,group:caseGroup,core:coreMode,runnerArch:process.env.RUNNER_ARCH||'',
+    expectedArch:process.env.PERFCHECKER_NATIVE_EXPECTED_ARCH||'x64'});
 }

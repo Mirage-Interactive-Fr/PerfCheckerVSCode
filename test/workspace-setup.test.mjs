@@ -6,7 +6,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-test('explicit controller setup targets Core 1.1.0 without rewriting the selected older environment',async()=>{
+test('explicit controller setup requires corrected Core 1.x without rewriting the selected older environment',async()=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'perfchecker-controller-upgrade-'));
   const oldProject=path.join(root,'perf');await fs.mkdir(oldProject);
   const projectBytes='[deps]\n',manifestBytes='# Existing controller is preserved\n';
@@ -24,9 +24,10 @@ test('explicit controller setup targets Core 1.1.0 without rewriting the selecte
       showWarningMessage:async message=>{warnings.push(message);return 'Install controller';}}};
   // Exercise the real UI/setup orchestration while capturing Julia's invocation;
   // this fixture does not claim a package installation or run Julia.
+  let failInstall=false;
   const launch=(executable,args,options)=>{
     calls.push({executable,args,options});
-    const child=spawn(process.execPath,['-e',`process.exit(${calls.length===1?1:0})`],
+    const child=spawn(process.execPath,['-e',`process.exit(${calls.length===1||failInstall?1:0})`],
       {stdio:['pipe','pipe','pipe'],detached:process.platform!=='win32'});
     children.push(child);return child;
   };
@@ -37,15 +38,22 @@ test('explicit controller setup targets Core 1.1.0 without rewriting the selecte
     assert.equal(await prepare(folder,{append(){},appendLine(){}}),true);
     assert.equal(calls.length,2,'A rejected existing controller requires an explicit install choice');
     assert.match(calls[0].args.at(-1),/v"1\.1\.0" <= Base\.pkgversion\(PerfChecker\) < v"2\.0\.0"/);
-    assert.match(calls[1].args.at(-1),/Pkg\.add\(PackageSpec\(name="PerfChecker",version="1\.1\.0"\)\)/);
-    assert.match(calls[1].args.at(-1),/Base\.pkgversion\(PerfChecker\)==v"1\.1\.0"/);
+    assert.match(calls[1].args.at(-1),/Pkg\.add\(\[PackageSpec\(name="PerfChecker",version="1\.1\.1 - 1"\)/);
+    assert.match(calls[1].args.at(-1),/v"1\.1\.1" <= Base\.pkgversion\(PerfChecker\) < v"2\.0\.0"/);
+    assert.equal(calls[1].args.at(-1).match(/Pkg\.add\(/g).length,1,'Core and collectors resolve together before precompilation');
+    assert(!calls[1].args.at(-1).includes('PRESERVE_ALL'));
+    assert(!calls[1].args.at(-1).includes('Pkg.pin'),'Future compatible Core patches remain updateable');
     assert(!calls[1].args.at(-1).includes('Pkg.develop'),'Stable installation uses the registered package');
     assert(calls[1].args.includes(`--project=${path.join(root,'perf','controller')}`));
-    assert.match(warnings[0],/Install PerfChecker 1\.1\.0/);
+    assert.match(warnings[0],/Install PerfChecker 1\.1\.1 or newer in the 1\.x series/);
     assert.equal(values.get('runnerProject'),path.join('perf','controller'));
     assert.equal(values.get('scenarioProject'),path.join('perf','controller'));
     assert.equal(await fs.readFile(path.join(oldProject,'Project.toml'),'utf8'),projectBytes);
     assert.equal(await fs.readFile(path.join(oldProject,'Manifest.toml'),'utf8'),manifestBytes);
+    failInstall=true;
+    const savedSettings=new Map(values);
+    await assert.rejects(prepare(folder,{append(){},appendLine(){}}),/requires registered PerfChecker 1\.1\.1 or newer in the 1\.x series/);
+    assert.deepEqual(values,savedSettings,'A failed installation preserves the selected controller settings');
     assert(children.every(child=>child.exitCode!==null),'Owned setup invocations finish before return');
   }finally{
     for(const child of children)if(child.exitCode===null){child.kill('SIGKILL');await new Promise(resolve=>child.once('close',resolve));}

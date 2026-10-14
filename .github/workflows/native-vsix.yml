@@ -26,7 +26,7 @@ on:
       scope:
         description: All supported hosts, or an explicit focused platform
         type: choice
-        options: [all, linux, linux-stable, windows, windows-stable, macos-stable]
+        options: [all, linux, linux-stable, windows, windows-stable, macos-stable, arm-bootstrap]
         default: all
       core:
         description: Published General minimum, explicit legacy compatibility, or a pinned candidate
@@ -150,6 +150,10 @@ jobs:
       NATIVE_EVENT: ${{ github.event_name }}
       NATIVE_VSIX_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.artifact || 'candidate' }}
       NATIVE_NEW_ORIGIN: ${{ inputs.new_candidate_origin || 'false' }}
+      NATIVE_SCOPE: ${{ inputs.scope }}
+      NATIVE_STAGE: ${{ inputs.stage }}
+      NATIVE_CASE_GROUP: ${{ inputs.case_group }}
+      NATIVE_CORE: ${{ inputs.core }}
       REUSE_RUN: ${{ inputs.candidate_run }}
       REUSE_NAME: ${{ inputs.candidate_name }}
       REUSE_SHA: ${{ inputs.candidate_sha }}
@@ -157,9 +161,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Select the declared archive origin for qualification
         run: |
-          node <<'NODE'
-          const fs=require('fs'),e=process.env;
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import {assertNativeCampaignSelection} from './test/native-platform-contract.mjs';
+          const e=process.env;
+          assertNativeCampaignSelection({scope:e.NATIVE_SCOPE,event:e.NATIVE_EVENT,artifact:e.NATIVE_VSIX_MODE,
+            stage:e.NATIVE_STAGE,group:e.NATIVE_CASE_GROUP,core:e.NATIVE_CORE});
           const requested=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA].some(Boolean),newOrigin=e.NATIVE_NEW_ORIGIN==='true';
+          if(e.NATIVE_SCOPE==='arm-bootstrap'&&(!requested||newOrigin))throw Error('ARM bootstrap must reuse the original candidate archive; it never packages a second origin.');
           if(e.NATIVE_VSIX_MODE==='public'){
             if(requested||newOrigin)throw Error('Public reproduction uses its published release, not candidate-origin inputs');
             process.exit(0);
@@ -229,11 +238,11 @@ jobs:
   native-workflows:
     if: github.event_name != 'workflow_dispatch' || inputs.stage != 'connector-workers'
     needs: package
-    name: Native VSIX (${{ matrix.os }}, VS Code ${{ matrix.vscode }})
+    name: Native VSIX (${{ matrix.os }}, VS Code ${{ matrix.vscode }}${{ matrix.julia && format(', Julia {0}', matrix.julia) || '' }})
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-stable' && '[{"os":"macos-15-intel","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows' && '[{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'arm-bootstrap' && '[{"os":"ubuntu-24.04-arm","vscode":"stable","arch":"arm64","julia":"1.10"},{"os":"ubuntu-24.04-arm","vscode":"stable","arch":"arm64","julia":"1"},{"os":"macos-15","vscode":"stable","arch":"arm64","julia":"1.10"},{"os":"macos-15","vscode":"stable","arch":"arm64","julia":"1"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-stable' && '[{"os":"macos-15-intel","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows' && '[{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ (github.event_name != 'workflow_dispatch' || inputs.stage == 'full') && 180 || 150 }}
     env:
@@ -242,9 +251,11 @@ jobs:
       PERFCHECKER_NATIVE_CANDIDATE_SHA: ${{ needs.package.outputs.sha }}
       PERFCHECKER_NATIVE_STAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.stage || 'full' }}
       PERFCHECKER_NATIVE_CASE_GROUP: ${{ inputs.case_group }}
+      PERFCHECKER_NATIVE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'all' }}
+      PERFCHECKER_NATIVE_EXPECTED_ARCH: ${{ matrix.arch || 'x64' }}
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
-      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || '00e94c62a2080dba02782e451422ed98ea0b358a') || '' }}
-      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || '2563a09e7904f19592e8f658289566e76bf93c6c') || '' }}
+      PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || 'd079efd5c24c3dcac5b7550781822038e0ff780f') || '' }}
+      PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || '749f8eac351ed2a1f0bc110456f2eb37a3bc08ee') || '' }}
       PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
@@ -258,17 +269,18 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+          architecture: ${{ matrix.arch || 'x64' }}
           cache: npm
       - uses: julia-actions/setup-julia@v3
         id: runner-julia
         with:
-          version: ${{ github.event_name == 'workflow_dispatch' && inputs.backend_julia || '1' }}
-          arch: x64
+          version: ${{ matrix.julia || (github.event_name == 'workflow_dispatch' && inputs.backend_julia || '1') }}
+          arch: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x64' }}
       - uses: julia-actions/setup-julia@v3
         id: official-julia
         with:
           version: '1.12'
-          arch: x64
+          arch: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x64' }}
       - name: Preserve separate runtimes for PerfChecker and official Julia integration
         env:
           RUNNER_JULIA_BINDIR: ${{ steps.runner-julia.outputs.julia-bindir }}
@@ -315,5 +327,5 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: native-workflows-${{ matrix.os }}-${{ matrix.vscode }}
+          name: native-workflows-${{ matrix.os }}-${{ matrix.vscode }}${{ matrix.julia && format('-julia-{0}', matrix.julia) || '' }}
           path: native-qualification-results/

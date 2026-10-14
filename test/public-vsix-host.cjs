@@ -455,6 +455,9 @@ async function measureNativeTestItem(context,expectedPassed,options={}){
 
 exports.run = async () => {
   assert.equal(process.env.CI, 'true', 'Never run this host against a human VS Code installation');
+  const expectedArch=process.env.PERFCHECKER_NATIVE_EXPECTED_ARCH||'x64';
+  assert(['x64','arm64'].includes(expectedArch),'The runner declares the expected native architecture');
+  assert.equal(process.arch,expectedArch,'The actual Electron extension host must use the native architecture');
   const phase = process.env.PERFCHECKER_NATIVE_PHASE;
   const minimumVersion=process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION;
   assert(/^\d+\.\d+\.\d+$/.test(minimumVersion),'The runner declares the production registry minimum explicitly');
@@ -472,7 +475,7 @@ exports.run = async () => {
   const timing=()=>({observedAt:new Date().toISOString(),...(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT?
     {videoOffsetSeconds:(Date.now()-Date.parse(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT))/1000}:{})});
   const persist=(status='running')=>{
-    const report=JSON.stringify({status,phase,platform:process.platform,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
+    const report=JSON.stringify({status,phase,platform:process.platform,processArch:process.arch,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
       coverage:process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?'first-install-studio-investigations-mcp-pluto':'first-install-and-first-run-smoke',
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:minimumVersion,available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
       commands:commandCoverage(commands,checks),configuration:configurationCoverage(configurationProperties,checks),buttons:buttonCoverage(checks),activeCase,checks,failures},null,2);

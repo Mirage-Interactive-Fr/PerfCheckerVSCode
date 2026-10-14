@@ -361,12 +361,13 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
   const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-pluto-boundaries-'));
   const uri=file=>({scheme:'file',fsPath:file,toString:()=>`file://${file}`});
   const folder={name:'fixture',uri:uri(root)},messages=[],choices=[],scopes=[],values=new Map();
+  let selectedAction;
   const disposable=()=>({dispose(){}});
   const vscode={env:{openExternal:async()=>false},workspace:{isTrusted:true,workspaceFolders:[folder],getWorkspaceFolder:source=>source.fsPath.startsWith(root+path.sep)?folder:undefined,
     getConfiguration:(_name,scope)=>{scopes.push(scope);return{get:(key,fallback)=>values.has(key)?values.get(key):fallback};},onDidChangeWorkspaceFolders:disposable},
     Uri:{file:uri,joinPath:(base,...pieces)=>uri(path.join(base.fsPath,...pieces)),parse:value=>({toString:()=>value})},ViewColumn:{One:1},
     window:{createOutputChannel:()=>({append(){},appendLine(){},dispose(){}}),
-      showWarningMessage:async(message,_options,...actions)=>{messages.push(message);choices.push(actions);return undefined;}},
+      showWarningMessage:async(message,_options,...actions)=>{messages.push(message);choices.push(actions);return selectedAction;}},
   };
   const original=Module._load;
   Module._load=function(name,...args){return name==='vscode'?vscode:original.call(this,name,...args);};
@@ -377,7 +378,7 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
     assert.equal(await pluto.create(notebook,{kind:'suite'}),undefined);
     assert.equal(messages.length,1,'No package manager runs before the installation choice');
     assert.match(messages[0],/own Julia environment.*perf.*pluto/);
-    assert.match(messages[0],/Install registered PerfChecker 1\.1\.0, PerfCheckerPluto 1\.0\.1, Pluto 1\.0\.4/);
+    assert.match(messages[0],/Install registered PerfChecker 1\.1\.1 or newer in the 1\.x series, PerfCheckerPluto 1\.0\.1, Pluto 1\.0\.4/);
     assert.deepEqual(choices[0],['Install Pluto environment','Open setup guide']);
     assert.deepEqual(await readdir(root),[],'Declining setup creates neither an environment nor a notebook');
     vscode.workspace.isTrusted=false;
@@ -411,6 +412,36 @@ test('Pluto requires explicit installation, a trusted workspace and a native not
       assert.equal(await readFile(path.join(outdated,'Manifest.toml'),'utf8'),manifestBytes);
       assert.equal((await readdir(outdated)).length,2,'Declining does not install or rewrite this environment');
     }finally{pluto.command=originalCheck;}
+
+    // Capture both production installer routes after explicit consent. This
+    // checks their Julia recipes and isolation; it does not install packages.
+    try{
+      for(const [relative,action,expectedCalls] of [
+        ['perf/fresh-pluto','Install Pluto environment',1],
+        ['perf/pluto','Upgrade Pluto environment',2],
+      ]){
+        values.set('plutoProject',relative);selectedAction=action;
+        const installs=[];
+        pluto.command=async(...args)=>{
+          installs.push(args);
+          if(args[3]==='PerfChecker · Check Pluto environment')throw Error('Existing Pluto needs an explicit upgrade');
+          return '';
+        };
+        assert.equal(await pluto.ensureEnvironment(folder),path.join(root,relative));
+        assert.equal(installs.length,expectedCalls);
+        const recipe=installs.at(-1)[2];
+        assert.match(recipe,/Pkg\.add\(\[PackageSpec\(name="PerfChecker", version="1\.1\.1 - 1"\)/);
+        assert.match(recipe,/v"1\.1\.1" <= Base\.pkgversion\(PerfChecker\) < v"2\.0\.0"/);
+        assert.match(recipe,/subdir="packages\/PerfCheckerPluto", rev="v1\.0\.1"/);
+        assert.equal(recipe.match(/Pkg\.add\(/g).length,1,'Core, Pluto and its companion resolve together before precompilation');
+        assert(!recipe.includes('PRESERVE_ALL'));
+        assert(!recipe.includes('Pkg.pin'),'Future compatible Core patches remain updateable');
+        assert.equal(installs.at(-1)[1],path.join(root,relative));
+        assert.match(messages.at(-1),/Install registered PerfChecker 1\.1\.1 or newer in the 1\.x series/);
+      }
+      assert.equal(await readFile(path.join(outdated,'Project.toml'),'utf8'),projectBytes);
+      assert.equal(await readFile(path.join(outdated,'Manifest.toml'),'utf8'),manifestBytes);
+    }finally{pluto.command=originalCheck;selectedAction=undefined;values.delete('plutoProject');}
 
     const server=createServer((request,response)=>{
       const query=new URL(request.url,'http://localhost').searchParams;

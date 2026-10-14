@@ -1,11 +1,11 @@
 # PerfChecker for VS Code
 
-PerfChecker for VS Code 1.0.2 provides Studio, interactive plots, Julia tools, MCP
+PerfChecker for VS Code 1.0.3 provides Studio, interactive plots, Julia tools, MCP
 conversation, and reviewed agent implementation with Git recovery. Chat adapts to
-narrow VS Code webviews, and explicit controller setup installs PerfChecker.jl
-1.1.0. Guided setup and Pluto notebooks require Core 1.1.0; existing CLI
-controllers with Core 1.0.1 remain compatible. Core 1.1.0 is recommended for its
-read-only worker-environment fixes. Opening a workspace never installs or
+narrow VS Code webviews. New controller and Pluto installations require
+PerfChecker.jl 1.1.1 or newer in 1.x, which fixes loading on ARM.
+Existing prepared environments still accept Core 1.1.0, and CLI controllers
+with Core 1.0.1 remain compatible. Opening a workspace never installs or
 upgrades Julia packages.
 
 The user guides are maintained with PerfChecker.jl on its existing documentation host:
@@ -24,8 +24,9 @@ modify and asks before downloading packages. An existing package `Project.toml`
 alone does not make a measurement controller ready.
 
 Use **Create controller environment**, **Use an existing controller**, or **Read the setup guide**
-as appropriate. Guided setup requires registered PerfChecker.jl 1.1.0 or later.
-It asks before upgrading an existing controller; other CLI actions remain
+as appropriate. New installations require registered PerfChecker.jl 1.1.1 or
+newer in the 1.x series. Prepared environments still accept Core 1.1.0.
+Setup asks before installing or upgrading packages; other CLI actions remain
 compatible with a controller containing PerfChecker.jl 1.0.1.
 The starter installs measurement dependencies; add your package and its test
 dependencies explicitly to the selected controller before measuring test items.
@@ -43,7 +44,8 @@ For notebooks, select **New Pluto notebook** and choose **Feature suite** or
 **Investigation**. The extension uses real reactive Pluto `.jl` notebooks in an
 editor tab. Stable Pluto 1.0.4 and PerfCheckerPluto 1.0.1 use a separate `perf/pluto`
 Julia environment. The companion stays on its independent public `v1.0.1` tag;
-the Core requirement is 1.1.0. Installing or upgrading it requires an explicit choice and
+prepared environments require Core 1.1.0, while installation/upgrades request
+Core 1.1.1 or newer in 1.x. Installing or upgrading it requires an explicit choice and
 does not modify the MCP controller.
 Opening the notebook or changing selectors does not launch measurements.
 Use its Launch/Cancel/Refresh controls, and **Save completed reports** in a suite
@@ -163,8 +165,8 @@ JSONL and Markdown outputs. See [CONTRACT.md](CONTRACT.md) for the exact boundar
 Set-Location C:\path\to\PerfCheckerVSCode
 npm ci
 npm test
-npm run package -- --out perfchecker-vscode-1.0.2.vsix
-code --install-extension .\perfchecker-vscode-1.0.2.vsix --force
+npm run package -- --out perfchecker-vscode-1.0.3.vsix
+code --install-extension .\perfchecker-vscode-1.0.3.vsix --force
 ```
 
 Reload VS Code, open a Julia package workspace, then select the PerfChecker icon
@@ -363,7 +365,7 @@ against an existing project or your normal editor profile.
 ```powershell
 npm ci
 npm test
-npm run package -- --out perfchecker-vscode-1.0.2.vsix
+npm run package -- --out perfchecker-vscode-1.0.3.vsix
 ```
 
 `npm test` compiles TypeScript and runs the model/contract tests. The generated
@@ -371,8 +373,10 @@ npm run package -- --out perfchecker-vscode-1.0.2.vsix
 
 ## Marketplace publication
 
-Publish the stable extension only after PerfChecker.jl 1.1.0 is available in
+Publish version 1.0.3 only after PerfChecker.jl 1.1.1 is available in
 Julia's General registry. Build and test the exact VSIX before publishing it.
+Declare a new candidate origin for this version and reuse its qualified bytes
+for publication.
 
 The immutable Marketplace identity is
 `mirage-interactive-fr.perfchecker-vscode`. Repository extraction therefore does
@@ -382,7 +386,7 @@ For a manual stable release:
 
 ```powershell
 npx vsce login mirage-interactive-fr
-npx vsce publish --packagePath .\perfchecker-vscode-1.0.2.vsix
+npx vsce publish --packagePath .\perfchecker-vscode-1.0.3.vsix
 ```
 
 Publishing requires a free Microsoft identity and Marketplace publisher, not a
