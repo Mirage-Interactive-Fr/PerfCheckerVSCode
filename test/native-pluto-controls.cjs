@@ -1054,9 +1054,11 @@ exports.runFreshInstall = async context => {
         await createFolder.getByRole('button',{name:'OK',exact:true}).click({timeout:NATIVE_READINESS_MS});folderCreationConfirmed=true;
         context.log('native-ui-action',{surface:'Published Pluto save dialog',action:'Confirm creation of notebooks folder'});
       }
-      return await picker.locator('.monaco-list-row').filter({hasText:'Feature suite'}).isVisible();
-    },'The real Save dialog finishes folder creation and shows notebook kinds',NATIVE_READINESS_MS);
-    await picker.locator('.monaco-list-row').filter({hasText:'Feature suite'}).click({timeout:NATIVE_READINESS_MS});
+      const row=picker.locator('.monaco-list-row').filter({hasText:'Feature suite'});
+      if(!await row.isVisible())return false;
+      await row.click({timeout:10000});
+      return true;
+    },'The real Save dialog finishes folder creation and selects the Feature suite notebook kind',NATIVE_READINESS_MS);
     const install=windowPage.getByRole('button',{name:'Install Pluto environment',exact:true});
     await install.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});await install.click({timeout:NATIVE_READINESS_MS});
     const source=await eventually(()=>fs.readFile(file,'utf8'),'The real published installer generates the first native notebook',NATIVE_READINESS_MS);
