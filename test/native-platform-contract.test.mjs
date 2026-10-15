@@ -394,6 +394,43 @@ test('real reactive Cancel refresh retains its ninety-second window across neste
   assert.deepEqual(calls,[['click',90000],['idle',90000]]);
 });
 
+test('real active-reload baseline keeps the validated idle snapshot across adversarial UI reads',async()=>{
+  const source=readFileSync(new URL('./native-studio-controls.cjs',import.meta.url),'utf8');
+  const tree=ts.createSourceFile('native-studio-controls.cjs',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.JS);
+  const selection=tree.statements.find(node=>ts.isExpressionStatement(node)&&
+    ts.isBinaryExpression(node.expression)&&node.expression.left.getText(tree)==='exports.runSelection');
+  assert(selection&&ts.isArrowFunction(selection.expression.right),'The real runSelection implementation remains present');
+  const statements=selection.expression.right.body.statements;
+  const declarationIndex=name=>statements.findIndex(node=>ts.isVariableStatement(node)&&
+    node.declarationList.declarations.some(declaration=>declaration.name.getText(tree)===name));
+  const start=declarationIndex('state'),end=declarationIndex('launchCount');
+  assert(start>=0&&end>start,'The actual baseline capture remains between state and launchCount');
+  const AsyncFunction=Object.getPrototypeOf(async function(){}).constructor;
+  const capture=new AsyncFunction('state','eventually','controllerLaunches',
+    statements.slice(start+1,end).map(node=>node.getText(tree)).join('\n')+'\nreturn {idleState,beforeLaunches};');
+  for(const initiallyBusy of [false,true]){
+    let now=0,polls=0;
+    const eventually=actualFunction('./native-studio-controls.cjs','eventually',{
+      NATIVE_READINESS_MS,Date:{now:()=>now},setTimeout:(resolve,milliseconds)=>{
+        assert.equal(milliseconds,100,'The real polling interval remains unchanged');
+        assert(polls<4,'The simulated scheduler has a finite polling budget');
+        polls++;now+=NATIVE_READINESS_MS/4;resolve();
+      }
+    });
+    const idle={controls:{run:false,refresh:false,save:false,'add-target':false,'add-comparison':false},
+      inventory:[{id:'one',checks:[{name:'smoke',selected:true}]}],count:'1 selected',sort:'name',openAfterRun:false};
+    const busy=structuredClone(idle);busy.controls.run=busy.controls.refresh=busy.controls.save=true;
+    const observations=initiallyBusy?[busy,idle,busy]:[idle,busy];
+    let reads=0,launchReads=0;const launches=[{commands:['existing launch']}];
+    const result=await capture(async()=>{assert(reads<observations.length);return observations[reads++];},
+      eventually,async()=>{launchReads++;return launches;});
+    assert.equal(result.idleState,idle,'The baseline is the exact snapshot accepted by the real readiness callback');
+    assert.equal(reads,initiallyBusy?2:1,'There is no unvalidated read after readiness succeeds');
+    assert.equal(polls,initiallyBusy?1:0,'Only the simulated busy observation schedules a poll');
+    assert.equal(result.beforeLaunches,launches);assert.equal(launchReads,1);
+  }
+});
+
 test('native browser callbacks never capture the Node-only readiness constant',()=>{
   for(const file of ['public-vsix-host.cjs','native-workbench-controls.cjs','native-studio-controls.cjs',
     'native-pluto-controls.cjs','native-advisor-controls.cjs','native-investigation-controls.cjs',

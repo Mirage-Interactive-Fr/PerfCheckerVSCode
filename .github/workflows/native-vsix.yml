@@ -209,8 +209,8 @@ jobs:
             console.log('Release 1.0.2 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
           }
           if(version==='1.0.3'&&!requested&&!newOrigin){
-            // Product commit 73b99deb87efaf45bd5e96036f755e42c748bdab, tree 3722727a870402497078e63da78be90d606f5ed5.
-            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38653410110\nREUSE_NAME=native-candidate-73b99deb87efaf45bd5e96036f755e42c748bdab\nREUSE_SHA=bc61f9fa172069c61722e0691900d3ddf8a39ce143fd9d553b252304dbc55850\n');
+            // Product commit 4a27ae0d76a297c58d141c8396808e5d86e61ef3, tree a20c19dc66670bf39bb3e203ede0081f6048ddcf.
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38769699307\nREUSE_NAME=native-candidate-4a27ae0d76a297c58d141c8396808e5d86e61ef3\nREUSE_SHA=416ea51fa31471545b022ca37f7ab30901a2e36b871ba230b54bbeadb97943ec\n');
             console.log('Release 1.0.3 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
           }
           NODE
