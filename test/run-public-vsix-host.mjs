@@ -13,7 +13,7 @@ import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
 import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -53,6 +53,7 @@ async function assertCompanionRoute(info,name,revision){
 }
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
+const discoveryDiagnostic=process.env.PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC==='1';
 const fullCasePartition=nativeFullCasePartition({partition:process.env.PERFCHECKER_NATIVE_FULL_PARTITION||'all',stage,artifact:mode});
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
@@ -590,6 +591,23 @@ try {
     if(packageProvenance.sha256!==sha||packageProvenance.version!==expectedVersion)throw new Error('The candidate package provenance differs from the installed archive.');
     await fs.writeFile(path.join(output,'candidate.provenance.json'),JSON.stringify(packageProvenance,null,2));
   }
+  let discoveryObservation;
+  if(discoveryDiagnostic){
+    assertNativeDiscoveryDiagnostic({enabled:true,event:process.env.GITHUB_EVENT_NAME,artifact:mode,stage,
+      scope:process.env.PERFCHECKER_NATIVE_SCOPE,core:coreMode,partition:fullCasePartition.name,platform:process.platform,arch:process.arch,
+      backendJulia:process.env.PERFCHECKER_NATIVE_BACKEND_JULIA,originRun:packageProvenance?.run,
+      originName:`native-candidate-${packageProvenance?.commit}`,originSha:sha,coreCommit,coreTree,newOrigin:false});
+    assert.equal(packageProvenance.commit,'73b99deb87efaf45bd5e96036f755e42c748bdab');
+    assert.equal(packageProvenance.tree,'3722727a870402497078e63da78be90d606f5ed5');
+    assert.equal(packageProvenance.packagedOnceOn,'Linux');assert.equal(packageProvenance.version,'1.0.3');
+    let sampleSyntax;try{sampleSyntax=await verifyNativeSampleSyntax();}
+    catch(error){sampleSyntax={supported:false,reason:'installed-manual-inspection-unknown',
+      errorClass:/^[A-Za-z]+$/.test(error.name)?error.name:null,code:/^[A-Z0-9_]+$/.test(error.code||'')?error.code:null};}
+    discoveryObservation={diagnosticOnly:true,perturbing:true,qualifiesCanonicalProduct:false,sampleSyntax,
+      prelude:'Exact full fresh/configured preparation, then prepared prefix through native-testitem-measurement',
+      skippedAfter:['native-complete-suite-measurements','native-all-studio-controls','native-workbench-controls'],
+      origin:packageProvenance,uiOracleMs:120000,workerOracleMs:180000};
+  }
   const privateProfile=async root=>{
     const directories=privateDirectoryFlags.map(flag=>[flag,path.join(root,flag)]);
     await Promise.all(directories.map(([,directory])=>fs.mkdir(directory,{recursive:true})));
@@ -598,6 +616,7 @@ try {
   const cliProfile = await privateProfile(profile);
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
+    ...(discoveryDiagnostic?{discoveryObservation}:{}),
     fullCasePartition:stage==='full'?fullCasePartition:undefined,
     runner:{platform:process.platform,processArch:process.arch,runnerArch:process.env.RUNNER_ARCH||null},runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,
       actualCommit:application.commit,applicationName:application.applicationName,applicationRelativePath:path.relative(path.dirname(vscode),application.application),
@@ -667,6 +686,8 @@ try {
         assert(coreProvenance.diagnosticWorker,'The qualified Core preparation supplies its exact diagnostic worker');
       }
       const environment={...runnerEnvironment,...externalBrowser?.environment,...(phase==='landscape'?landscapeFixture.environment:{}),
+        ...(discoveryDiagnostic?{PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC:'1',
+          PERFCHECKER_NATIVE_DISCOVERY_OBSERVATION:JSON.stringify(discoveryObservation)}:{}),
         ...(diagnosticTemporaryRoot?{TMPDIR:diagnosticTemporaryRoot,PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP:diagnosticTemporaryRoot}:{}),
         PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,

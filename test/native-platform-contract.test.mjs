@@ -63,7 +63,7 @@ test('the real host dispatches every advertised shared-prefix case before its pa
   assert.deepEqual(calls,['controller-visible-in-studio','native-julia-terminal','native-pluto-without-jupyter']);
   const suiteStart=source.indexOf('async function runSuiteCases('),suiteEnd=source.indexOf('async function measureNativeTestItem(',suiteStart);
   assert(suiteStart>=0&&suiteEnd>suiteStart);
-  const suite=Function(`return (${source.slice(suiteStart,suiteEnd).trim()})`)();
+  const suite=Function('discoveryDiagnostic',`return (${source.slice(suiteStart,suiteEnd).trim()})`)(false);
   await suite({vscode:{Uri:{file:value=>value}},workspace:'/disposable-fixture'},runCase,{testItem:true,complete:true});
   const historicalPrefix=['controller-visible-in-studio','native-julia-terminal','native-pluto-without-jupyter',
     'native-suite-run-button','native-suite-save-palette','native-run-selection-command',
@@ -72,6 +72,28 @@ test('the real host dispatches every advertised shared-prefix case before its pa
   assert.deepEqual(nativeFullCasePartition({artifact:'candidate'}).sharedPrefix,historicalPrefix);
   assert(source.includes("await runSuiteCases(context,runCase,{testItem:true,complete:process.env.PERFCHECKER_NATIVE_STAGE==='full'});"),
     'Every full prepared partition still dispatches both the native test item and the complete suite');
+});
+
+test('the real diagnostic host keeps the seventh prefix and explicitly excludes only the following cases',async()=>{
+  const source=readFileSync(new URL('./public-vsix-host.cjs',import.meta.url),'utf8');
+  const suiteStart=source.indexOf('async function runSuiteCases('),suiteEnd=source.indexOf('async function measureNativeTestItem(',suiteStart);
+  assert(suiteStart>=0&&suiteEnd>suiteStart);
+  const suite=Function('discoveryDiagnostic','process',`return (${source.slice(suiteStart,suiteEnd).trim()})`)
+    (true,{env:{PERFCHECKER_NATIVE_PHASE:'prepared'}});
+  const calls=[],logs=[];
+  await suite({vscode:{Uri:{file:value=>value}},workspace:'/disposable-fixture',log:(name,detail)=>logs.push({name,...detail})},
+    async name=>{calls.push(name);return true;},{testItem:true,complete:true});
+  assert.deepEqual(calls,['native-suite-run-button','native-suite-save-palette','native-run-selection-command','native-testitem-measurement']);
+  assert.equal(logs.length,1);assert.equal(logs[0].name,'native-discovery-diagnostic-skipped-after-target');
+  assert.deepEqual(logs[0].cases,['native-complete-suite-measurements','native-all-studio-controls','native-workbench-controls']);
+  assert.equal(logs[0].qualifiesCanonicalProduct,false);
+  const tailStart=source.indexOf("if (process.env.PERFCHECKER_NATIVE_STAGE === 'full'&&!discoveryDiagnostic) {");
+  assert(tailStart>=0);let end=source.indexOf('{',tailStart),depth=1;
+  while(depth&&++end<source.length){if(source[end]==='{')depth++;if(source[end]==='}')depth--;}
+  assert.equal(depth,0);
+  const AsyncFunction=Object.getPrototypeOf(async function(){}).constructor;
+  await new AsyncFunction('process','discoveryDiagnostic',source.slice(tailStart,end+1))
+    ({env:{PERFCHECKER_NATIVE_STAGE:'full'}},true);
 });
 
 test('partitions cannot silently replace focused, public, ARM or other platform campaigns',()=>{
@@ -100,4 +122,6 @@ test('the actual workflow partitions only complete candidate Intel jobs and keep
   assert.equal(manual('arm-bootstrap','focused').length,4);
   assert(manual('arm-bootstrap','focused').every(lane=>lane.arch==='arm64'&&!lane.partition));
   assert.deepEqual(manual('windows-stable'),[{os:'windows-latest',vscode:'stable'}]);
+  assert.deepEqual(matrix('workflow_dispatch',{scope:'macos-stable',stage:'full',artifact:'candidate',discovery_diagnostic:true}),
+    [{os:'macos-15-intel',vscode:'stable',partition:'measure'}]);
 });
