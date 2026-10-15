@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import {EventEmitter} from 'node:events';
 import {writeSync} from 'node:fs';
-import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,nativeOperationSnapshot,observeNativeOperation,captureQualifiedNativeProgress,assertNativeDiscoveryDiagnostic,nativeDiscoverySpawnOutput,installNativeDiscoveryObserver,readBoundedNativeFile,nativeSampleProjection,nativeSampleManualContract,createNativeDiscoveryReaders,discoveryOwnedCommand} from './native-controller-preflight.mjs';
+import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,nativeOperationSnapshot,observeNativeOperation,captureQualifiedNativeProgress,assertNativeDiscoveryDiagnostic,nativeDiscoverySpawnOutput,installNativeDiscoveryObserver,readBoundedNativeFile,nativeSampleProjection,nativeSampleManualContract,createNativeDiscoveryReaders,discoveryOwnedCommand} from './native-controller-preflight.mjs';
 
 const nextObservationTurn=()=>new Promise(resolve=>setImmediate(resolve));
 const discoveryExpected={executable:'/private/Julia/bin/julia',project:'/private/controller',root:'/private/workspace',
@@ -372,6 +372,63 @@ test('failed inspection preserves target, timing and subprocess cause without we
 });
 
 const incarnation={pid:5280,parent:4607,group:4607,started:'26774',state:'R',executable:path.resolve('julia','bin','julia')};
+function newLinuxImageSurvey(changes={}){
+  const row={pid:4890,parent:4398,group:4398,started:'Thu Oct 15 19:31:06 2026',state:'Sl'};
+  const before={pid:4890,parent:4398,group:4398,started:'26774',state:'S'};
+  const error=Object.assign(new Error('The initial image read failed'),{code:'ENOENT',syscall:'realpath',path:'/proc/4890/exe'},changes.error);
+  const errors=[],diagnostics=[],survey=createControllerImageInspectionSurvey({platform:changes.platform??'linux',errors,diagnostics});
+  const failure=controllerInspectionFailure(error,{stage:'inspect',pid:4890,ownerPid:4398});
+  const context={row,before,current:{...before},qualified:false,ownerPid:4398,...changes.context};
+  const absent={stage:'unqualified-private-group-revalidation',pid:4890,initial:{...row},current:null,resolution:'proved-absent'};
+  const capture=()=>{survey.markLinuxImageFailure(error,context);survey.capture(error,failure);};
+  return {row,error,failure,errors,diagnostics,survey,absent,capture};
+}
+test('a new Linux image ENOENT resolves only through the existing absence proof in the same completed survey',()=>{
+  const f=newLinuxImageSurvey();f.capture();assert.deepEqual(f.errors,[]);
+  assert.equal(f.diagnostics[0].initialFailure,f.failure);assert.equal(f.diagnostics[0].resolution,'pending');
+  assert.equal(f.survey.resolveAbsent(f.row,f.absent,{qualified:false,live:false}),undefined);
+  f.survey.finish(true);assert.deepEqual(f.errors,[]);
+  assert.equal(f.diagnostics[0].resolution,'proved-absent-in-same-survey');assert.equal(f.diagnostics[0].revalidation,f.absent);
+  assert(!('executable'in f.diagnostics[0]));assert(!('identity'in f.diagnostics[0]));
+});
+test('only the exact realpath failure of a new private Linux image can be provisional',()=>{
+  for(const changes of [{platform:'darwin'},{error:{code:'ESRCH'}},{error:{code:'EACCES'}},{error:{syscall:'stat'}},
+    {error:{path:'/proc/4890/stat'}},{error:{path:'/proc/4891/exe'}},{context:{qualified:true}},{context:{ownerPid:9999}},
+    {context:{current:{pid:4890,parent:4398,group:4398,started:'26775',state:'S'}}},
+    {context:{current:{pid:4890,parent:1,group:4398,started:'26774',state:'S'}}},
+    {context:{current:{pid:4890,parent:4398,group:9999,started:'26774',state:'S'}}}]){
+    const f=newLinuxImageSurvey(changes);f.capture();f.survey.resolveAbsent(f.row,f.absent,{qualified:false,live:false});f.survey.finish(true);
+    assert.deepEqual(f.errors,[f.failure]);assert.deepEqual(f.diagnostics,[]);
+  }
+});
+test('live, zombie, changed, missing and unrelated absence evidence retain the original image failure',()=>{
+  for(const change of [{current:{pid:4890,state:'S'},resolution:'live-unqualified'},
+    {current:{pid:4890,state:'Z'},resolution:'proved-zombie-or-exited'},{current:undefined},{pid:4891},
+    {stage:'qualified-executable-revalidation'},{resolution:'inspection-failed'},{initial:undefined},
+    {initial:{parent:1,group:4398,started:'Thu Oct 15 19:31:06 2026',state:'Sl'}},
+    {initial:{parent:4398,group:9999,started:'Thu Oct 15 19:31:06 2026',state:'Sl'}},
+    {initial:{parent:4398,group:4398,started:'Thu Oct 15 19:31:07 2026',state:'Sl'}}]){
+    const f=newLinuxImageSurvey();f.capture();f.survey.resolveAbsent(f.row,{...f.absent,...change},{qualified:false,live:false});f.survey.finish(true);
+    assert.deepEqual(f.errors,[f.failure]);assert.equal(f.diagnostics[0].resolution,'fatal-absence-unproved');
+  }
+  for(const state of [{qualified:true,live:false},{qualified:false,live:true}]){
+    const f=newLinuxImageSurvey();f.capture();f.survey.resolveAbsent(f.row,f.absent,state);f.survey.finish(true);assert.deepEqual(f.errors,[f.failure]);
+  }
+  const unrelated=newLinuxImageSurvey();unrelated.capture();
+  unrelated.survey.resolveAbsent({...unrelated.row},unrelated.absent,{qualified:false,live:false});unrelated.survey.finish(true);
+  assert.deepEqual(unrelated.errors,[unrelated.failure]);
+  const missingProof=newLinuxImageSurvey();missingProof.capture();missingProof.survey.finish(true);
+  assert.deepEqual(missingProof.errors,[missingProof.failure]);
+});
+test('a survey exception or later survey cannot clear an original provisional image failure',()=>{
+  const f=newLinuxImageSurvey();f.capture();f.survey.resolveAbsent(f.row,f.absent,{qualified:false,live:false});f.survey.finish(false);
+  assert.deepEqual(f.errors,[f.failure]);assert.equal(f.diagnostics[0].resolution,'fatal-survey-incomplete');
+  const other=createControllerImageInspectionSurvey({platform:'linux',errors:f.errors,diagnostics:f.diagnostics});
+  other.resolveAbsent(f.row,f.absent,{qualified:false,live:false});other.finish(true);f.survey.finish(true);assert.deepEqual(f.errors,[f.failure]);
+  const unmarked=newLinuxImageSurvey();unmarked.survey.capture(unmarked.error,unmarked.failure);
+  unmarked.survey.resolveAbsent(unmarked.row,unmarked.absent,{qualified:false,live:false});unmarked.survey.finish(true);
+  assert.deepEqual(unmarked.errors,[unmarked.failure]);
+});
 const missing=code=>Object.assign(new Error('The qualified executable is temporarily unavailable'),{code});
 function executableRevalidation({states=[incarnation],images=[incarnation.executable],code='ENOENT',deadlineAt=5000,identity=incarnation}={}){
   let clock=0,stateReads=0,imageReads=0;const history=[];

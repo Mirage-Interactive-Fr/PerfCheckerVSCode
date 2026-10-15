@@ -553,13 +553,49 @@ export function parseControllerImportReceipt(text,{project,version,tree}){
   return {elapsedSeconds,extension:fields[2],activeProject,packages};
 }
 
-// Inspection failures remain fatal. Retain the evidence execFile supplies,
+// Retain inspection evidence without granting ownership or signal authority,
 // without its command/environment or unbounded stdout/stderr dumps.
 export function controllerInspectionFailure(error,{stage,pid,ownerPid}){
   return {stage,pid,ownerPid,observedAt:new Date().toISOString(),
     error:String(error.message??error).slice(0,4000),code:error.code??null,signal:error.signal??null,
     killed:typeof error.killed==='boolean'?error.killed:null,
     stderr:String(error.stderr??'').slice(-4000)};
+}
+
+// A new private-group member can exit between its image read and the existing
+// absence revalidation. Keep that exact error provisional only within one survey.
+export function createControllerImageInspectionSurvey({platform,errors,diagnostics}){
+  const origins=new WeakMap(),pending=[];let finished=false;
+  return {
+    markLinuxImageFailure(error,{row,before,current,qualified,ownerPid}){
+      if(finished||platform!=='linux'||qualified||!Number.isSafeInteger(row.pid)||row.pid<=0||
+        row.group!==ownerPid||before.group!==ownerPid||error?.code!=='ENOENT'||
+        error.syscall!=='realpath'||error.path!==`/proc/${row.pid}/exe`||
+        !current||['Z','X'].includes(current.state)||
+        !['pid','parent','group','started'].every(key=>current[key]===before[key])||before.pid!==row.pid)return;
+      origins.set(error,{row,ownerPid});
+    },
+    capture(error,failure){
+      const origin=origins.get(error);
+      if(finished||!origin||failure.stage!=='inspect'||failure.pid!==origin.row.pid||failure.ownerPid!==origin.ownerPid){errors.push(failure);return;}
+      const diagnostic={stage:'unqualified-linux-image-inspection',pid:failure.pid,ownerPid:failure.ownerPid,
+        initialFailure:failure,resolution:'pending'};
+      diagnostics.push(diagnostic);pending.push({origin,failure,diagnostic});
+    },
+    resolveAbsent(row,observation,{qualified,live}){
+      if(finished||qualified||live||observation.stage!=='unqualified-private-group-revalidation'||
+        observation.pid!==row.pid||observation.current!==null||observation.resolution!=='proved-absent'||
+        !['parent','group','started','state'].every(key=>observation.initial?.[key]===row[key]))return;
+      for(const entry of pending)if(entry.origin.row===row&&row.group===entry.origin.ownerPid)entry.proof=observation;
+    },
+    finish(completed){
+      if(finished)return;finished=true;
+      for(const entry of pending){
+        if(completed===true&&entry.proof){entry.diagnostic.resolution='proved-absent-in-same-survey';entry.diagnostic.revalidation=entry.proof;}
+        else{entry.diagnostic.resolution=completed===true?'fatal-absence-unproved':'fatal-survey-incomplete';errors.push(entry.failure);}
+      }
+    }
+  };
 }
 
 // Only an already qualified incarnation may resolve a transient /proc/exe

@@ -14,7 +14,7 @@ import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
 import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const {NATIVE_READINESS_MS,NATIVE_ACTIVITY_MINUTES,nativeReadinessPolicy,createNativeActivityBudget,waitForNativeAvailability}=readiness;
@@ -190,7 +190,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
     assert(typeof current.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(current.started)&&Number.isFinite(Date.parse(current.started)));
     return current;
   };
-  const inspect=async row=>{
+  const inspect=async(row,imageFailures)=>{
     if(windows){
       assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));
       if(typeof row.executable==='string'&&row.executable)return {...row,executable:await fs.realpath(row.executable)};
@@ -218,7 +218,8 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
         if(qualified)return revalidateQualifiedLinuxExecutable({identity:qualified,error,deadlineAt:cleanupUntil,readCurrent:linuxCurrent,
           readExecutable:pid=>fs.realpath(`/proc/${pid}/exe`),record:observation=>(receipt.ownership.revalidations??=[]).push(observation)});
         const current=await linuxCurrent(row.pid);
-        if(!current)return undefined;same(current);if(['Z','X'].includes(current.state))return undefined;throw error;}
+        if(!current)return undefined;same(current);if(['Z','X'].includes(current.state))return undefined;
+        imageFailures.markLinuxImageFailure(error,{row,before,current,qualified:Boolean(qualified),ownerPid:child.pid});throw error;}
       const after=await linuxCurrent(row.pid);if(!after)return undefined;same(after);if(['Z','X'].includes(after.state))return undefined;
       if(after.parent!==before.parent||after.state!==before.state)(receipt.ownership.revalidations??=[]).push({stage:'mutable-process-fields',pid:row.pid,
         started:after.started,group:after.group,beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
@@ -271,6 +272,9 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
     return {...after,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
   };
   const survey=async()=>{
+    const imageFailures=createControllerImageInspectionSurvey({platform:process.platform,errors,
+      diagnostics:receipt.ownership.imageInspectionFailures??=[]});let completed=false;
+    try{
     const {readyPid:observedReadyPid,rows}=await captureControllerInventory(()=>readyPid,async()=>{
     let rows;
     if(windows){const value=await inspectCommand(ownerExecutable,['-NoProfile','-Command',"$ErrorActionPreference='Stop'; @((Get-CimInstance Win32_Process -ErrorAction Stop) | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;started=$(if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null});executable=$_.ExecutablePath} }) | ConvertTo-Json -Compress"],{timeout:limit(10000),maxBuffer:4*1024*1024});rows=JSON.parse(value.stdout);assert(Array.isArray(rows));}
@@ -279,7 +283,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
     return rows;
     });
     lastRows=rows;const inspected=new Map();
-    const read=async row=>{if(inspected.has(row.pid))return inspected.get(row.pid);try{const current=await inspect(row);inspected.set(row.pid,current);return current;}catch(error){errors.push(controllerInspectionFailure(error,{stage:'inspect',pid:row.pid,ownerPid:child.pid}));inspected.set(row.pid,undefined);return undefined;}};
+    const read=async row=>{if(inspected.has(row.pid))return inspected.get(row.pid);try{const current=await inspect(row,imageFailures);inspected.set(row.pid,current);return current;}catch(error){imageFailures.capture(error,controllerInspectionFailure(error,{stage:'inspect',pid:row.pid,ownerPid:child.pid}));inspected.set(row.pid,undefined);return undefined;}};
     const original=rows.find(row=>row.pid===child.pid),owner=original&&await read(original);
     if(owner&&!records.size){assert.equal(owner.parent,process.pid);assert.equal(canonical(owner.executable),canonical(await fs.realpath(ownerExecutable)));records.set(owner.pid,owner);}
     const live=new Set();for(const prior of records.values()){
@@ -306,6 +310,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
         try{
           const current=await linuxCurrent(row.pid);observation.current=current??null;
           observation.resolution=!current?'proved-absent':['Z','X'].includes(current.state)?'proved-zombie-or-exited':'live-unqualified';
+          imageFailures.resolveAbsent(row,observation,{qualified:records.has(row.pid),live:live.has(row.pid)});
           if(!current||['Z','X'].includes(current.state))continue;
           // The ps member has no qualified incarnation yet. Even a reparented
           // or reused PID that is now alive remains unknown, never a gone proof.
@@ -320,7 +325,8 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
     const signature=JSON.stringify({alive:observation.alive,unknown:observation.unknown});
     if(receipt.ownership.observations.at(-1)?.signature!==signature)receipt.ownership.observations.push({...observation,signature});
     if(controllerReadinessObserved({readyPid:observedReadyPid,started,identities:inspected,live,parent:windows?child.pid:process.pid,expected,canonical})){started=true;child.stdin.write('OBSERVED\n');}
-    return [...live].map(pid=>records.get(pid));
+    const result=[...live].map(pid=>records.get(pid));completed=true;return result;
+    }finally{imageFailures.finish(completed);}
   };
   let observation=Promise.resolve(),sampling=false;
   const sample=()=>{if(sampling)return observation;sampling=true;observation=survey().catch(error=>errors.push(controllerInspectionFailure(error,{stage:'survey',pid:readyPid??child.pid,ownerPid:child.pid}))).finally(()=>{sampling=false;});return observation;};
