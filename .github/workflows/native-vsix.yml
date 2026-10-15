@@ -56,6 +56,11 @@ on:
         description: Diagnostic only; run one Windows Codex startup case with private launcher stage observations
         type: boolean
         default: false
+      windows_owner_diagnostic_mode:
+        description: Instrument a temporary copy, or observe the unchanged H2 owner externally; neither qualifies the product
+        type: choice
+        options: [instrumented, external]
+        default: instrumented
   pull_request:
     paths:
       - '.github/workflows/native-vsix.yml'
@@ -138,6 +143,7 @@ jobs:
         shell: bash
         env:
           PERFCHECKER_TEST_OWNER_DIAGNOSTIC: '1'
+          PERFCHECKER_TEST_OWNER_DIAGNOSTIC_MODE: ${{ inputs.windows_owner_diagnostic_mode }}
           PERFCHECKER_NATIVE_STAGE: ${{ inputs.stage }}
           PERFCHECKER_NATIVE_SCOPE: ${{ inputs.scope }}
         run: |
@@ -169,6 +175,7 @@ jobs:
       NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       NATIVE_CORE: ${{ inputs.core }}
       NATIVE_OWNER_DIAGNOSTIC: ${{ inputs.windows_owner_diagnostic || 'false' }}
+      NATIVE_OWNER_DIAGNOSTIC_MODE: ${{ inputs.windows_owner_diagnostic_mode || 'instrumented' }}
       NATIVE_CORE_COMMIT: ${{ inputs.core_commit }}
       NATIVE_CORE_TREE: ${{ inputs.core_tree }}
       REUSE_RUN: ${{ inputs.candidate_run }}
@@ -185,6 +192,9 @@ jobs:
           assertNativeCampaignSelection({scope:e.NATIVE_SCOPE,event:e.NATIVE_EVENT,artifact:e.NATIVE_VSIX_MODE,
             stage:e.NATIVE_STAGE,group:e.NATIVE_CASE_GROUP,core:e.NATIVE_CORE});
           const requested=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA].some(Boolean),newOrigin=e.NATIVE_NEW_ORIGIN==='true';
+          if(!['instrumented','external'].includes(e.NATIVE_OWNER_DIAGNOSTIC_MODE)||
+            (e.NATIVE_OWNER_DIAGNOSTIC_MODE==='external'&&e.NATIVE_OWNER_DIAGNOSTIC!=='true'))
+            throw Error('External owner observation requires the explicit diagnostic opt-in.');
           if(e.NATIVE_OWNER_DIAGNOSTIC==='true'&&(e.NATIVE_EVENT!=='workflow_dispatch'||
             e.NATIVE_VSIX_MODE!=='candidate'||e.NATIVE_STAGE!=='connector-workers'||e.NATIVE_SCOPE!=='windows-stable'||
             e.NATIVE_CORE!=='general'||e.NATIVE_CORE_COMMIT||e.NATIVE_CORE_TREE||newOrigin||

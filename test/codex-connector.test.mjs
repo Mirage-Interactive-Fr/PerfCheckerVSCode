@@ -249,9 +249,180 @@ function observeOwnerStages(delegate,args,options,state){
   state.timer=setTimeout(state.beforeDeadline,9000);
   return child;
 }
+function externalOwnerScript(context,nonce){
+  const literal=value=>"'"+value.replaceAll("'","''")+"'";
+  return [
+    "$ErrorActionPreference='Stop'",
+    '$ownerId='+context.ownerPid+';$parentId='+context.parentPid+';$deadline='+context.deadline+'L;$nonce='+JSON.stringify(nonce),
+    '$anchorOwner=$null;$anchorParent=$null',
+    'function Read-Identity([int]$id) {',
+    '  $p=Get-CimInstance Win32_Process -Filter ("ProcessId="+$id) -ErrorAction Stop',
+    '  if (!$p) { return $null }',
+    '  @{pid=[int]$p.ProcessId;parent=[int]$p.ParentProcessId;started=$p.CreationDate.ToUniversalTime().ToString("o");executable=$p.ExecutablePath;kernel=[string]$p.KernelModeTime;user=[string]$p.UserModeTime;state=$p.ExecutionState}',
+    '}',
+    'function Same-Identity($a,$b) { $null -ne $a -and $null -ne $b -and $a.pid -eq $b.pid -and $a.parent -eq $b.parent -and $a.started -eq $b.started -and $a.executable -eq $b.executable }',
+    'for ($index=0; $index -lt 3; $index++) {',
+    '  $due='+context.started+'L+@(0,5000,8000)[$index]',
+    '  while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $due -and [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline) { Start-Sleep -Milliseconds 20 }',
+    '  if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $deadline) { break }',
+    '  $beforeAt=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();$parentBefore=Read-Identity $parentId;$ownerBefore=Read-Identity $ownerId',
+    '  $reason=$null;$pairs=@();$queue=@()',
+    '  if (!$parentBefore -or !$ownerBefore -or $ownerBefore.parent -ne $parentId -or $ownerBefore.executable -ine '+literal(context.ownerExecutable)+' -or $parentBefore.executable -ine '+literal(context.parentExecutable)+') { $reason="initial-identity-unavailable" }',
+    '  elseif ([DateTimeOffset]::Parse($ownerBefore.started).ToUnixTimeMilliseconds() -lt '+(context.started-1)+'L -or [DateTimeOffset]::Parse($ownerBefore.started).ToUnixTimeMilliseconds() -gt '+(context.spawnedAt+1)+'L -or ($anchorOwner -and !(Same-Identity $anchorOwner $ownerBefore)) -or ($anchorParent -and !(Same-Identity $anchorParent $parentBefore))) { $reason="owner-incarnation-refused" }',
+    '  else {',
+    '    $anchorOwner=$ownerBefore;$anchorParent=$parentBefore',
+    '    $queue=@(@{identity=$ownerBefore;depth=0})',
+    '    while ($queue.Count -gt 0 -and !$reason) {',
+    '      $next=$queue[0];$queue=@($queue|Select-Object -Skip 1)',
+    '      $parentNow=Read-Identity $next.identity.pid',
+    '      if (!(Same-Identity $next.identity $parentNow)) { $reason="parent-identity-changed";break }',
+    '      if ($next.depth -ge 2) { continue }',
+    '      $rows=@(Get-CimInstance Win32_Process -Filter ("ParentProcessId="+$next.identity.pid) -ErrorAction Stop)',
+    '      if ($pairs.Count+$rows.Count -gt 7) { $reason="descendant-limit";break }',
+    '      foreach ($row in $rows) {',
+    '        $before=@{pid=[int]$row.ProcessId;parent=[int]$row.ParentProcessId;started=$row.CreationDate.ToUniversalTime().ToString("o");executable=$row.ExecutablePath;kernel=[string]$row.KernelModeTime;user=[string]$row.UserModeTime;state=$row.ExecutionState}',
+    '        $after=Read-Identity $before.pid',
+    '        if (!(Same-Identity $before $after)) { $reason="descendant-identity-changed";break }',
+    '        $pairs+=@{before=$before;after=$after;depth=$next.depth+1};$queue+=@{identity=$after;depth=$next.depth+1}',
+    '      }',
+    '      if (!(Same-Identity $next.identity (Read-Identity $next.identity.pid))) { $reason="parent-identity-changed" }',
+    '    }',
+    '  }',
+    '  $ownerAfter=Read-Identity $ownerId;$parentAfter=Read-Identity $parentId',
+    '  if (!(Same-Identity $ownerBefore $ownerAfter) -or !(Same-Identity $parentBefore $parentAfter)) { $reason="final-identity-unavailable" }',
+    '  $afterAt=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()',
+    '  @{schema=1;nonce=$nonce;observerPid=$PID;index=$index;beforeAt=$beforeAt;afterAt=$afterAt;reason=$reason;parent=@{before=$parentBefore;after=$parentAfter};owner=@{before=$ownerBefore;after=$ownerAfter};descendants=@($pairs)}|ConvertTo-Json -Depth 8 -Compress',
+    '  if ($reason) { break }',
+    '}'
+  ].join('\n');
+}
+function qualifyExternalOwnerFrame(frame,context,observerPid,nonce,receivedAt,canonical=entryFs.realpathSync){
+  const keys='afterAt,beforeAt,descendants,index,nonce,observerPid,owner,parent,reason,schema';
+  assert(frame&&Object.keys(frame).sort().join(',')===keys,'External frame schema is exact');
+  assert.equal(frame.schema,1);assert.equal(frame.nonce,nonce);assert.equal(frame.observerPid,observerPid);
+  assert(Number.isSafeInteger(observerPid)&&observerPid>0&&observerPid!==context.ownerPid&&observerPid!==context.parentPid);
+  assert(Number.isSafeInteger(frame.index)&&frame.index>=0&&frame.index<3);
+  assert(Number.isSafeInteger(frame.beforeAt)&&Number.isSafeInteger(frame.afterAt)&&frame.beforeAt>=context.started&&
+    frame.afterAt>=frame.beforeAt&&frame.afterAt<=receivedAt&&receivedAt<context.deadline,'External frame is timely');
+  assert.equal(frame.reason,null,'External inspection is conclusive');
+  const identify=(pair,expectedPid,expectedParent,expectedExecutable,latestBorn=frame.beforeAt)=>{
+    assert(pair&&Object.keys(pair).sort().join(',')==='after,before');
+    for(const row of [pair.before,pair.after]){
+      assert(row&&Object.keys(row).sort().join(',')==='executable,kernel,parent,pid,started,state,user');
+      assert(Number.isSafeInteger(row.pid)&&row.pid>0&&Number.isSafeInteger(row.parent)&&row.parent>0);
+      assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));
+      assert(typeof row.executable==='string'&&row.executable.length>0&&row.executable.length<=2048);
+      assert(typeof row.kernel==='string'&&/^\d{1,20}$/.test(row.kernel)&&typeof row.user==='string'&&/^\d{1,20}$/.test(row.user));
+      assert(row.state===null||Number.isSafeInteger(row.state)&&row.state>=0&&row.state<=10);
+    }
+    const before=pair.before,after=pair.after;
+    assert.equal(after.pid,before.pid);assert.equal(after.parent,before.parent);assert.equal(after.started,before.started);
+    const beforeImage=canonical(before.executable).toLowerCase(),afterImage=canonical(after.executable).toLowerCase();
+    assert.equal(afterImage,beforeImage);
+    if(expectedPid!==undefined)assert.equal(before.pid,expectedPid);
+    if(expectedParent!==undefined)assert.equal(before.parent,expectedParent);
+    if(expectedExecutable!==undefined)assert.equal(beforeImage,expectedExecutable.toLowerCase());
+    assert(BigInt(after.kernel)>=BigInt(before.kernel)&&BigInt(after.user)>=BigInt(before.user));
+    assert(Date.parse(before.started)<=latestBorn);
+    return {pid:before.pid,parent:before.parent,started:before.started,imageSha256:hashBytes(Buffer.from(beforeImage)),
+      before:{kernel:before.kernel,user:before.user,state:before.state},after:{kernel:after.kernel,user:after.user,state:after.state}};
+  };
+  const parent=identify(frame.parent,context.parentPid,undefined,context.parentExecutable);
+  const owner=identify(frame.owner,context.ownerPid,context.parentPid,context.ownerExecutable);
+  assert(Date.parse(owner.started)>=context.started-1&&Date.parse(owner.started)<=context.spawnedAt+1&&
+    Date.parse(owner.started)>=Date.parse(parent.started));
+  assert(Array.isArray(frame.descendants)&&frame.descendants.length<=7);
+  const known=new Map([[owner.pid,{...owner,depth:0}]]),descendants=[];
+  for(const pair of frame.descendants){
+    assert(pair&&Object.keys(pair).sort().join(',')==='after,before,depth'&&[1,2].includes(pair.depth));
+    const row=identify({before:pair.before,after:pair.after},undefined,undefined,undefined,frame.afterAt);
+    const parentRow=known.get(row.parent);
+    assert(parentRow&&pair.depth===parentRow.depth+1&&!known.has(row.pid),'Only qualified descendant links are followed');
+    assert(Date.parse(row.started)>=Date.parse(parentRow.started));
+    known.set(row.pid,{...row,depth:pair.depth});descendants.push({...row,depth:pair.depth});
+  }
+  return {index:frame.index,beforeAt:frame.beforeAt,afterAt:frame.afterAt,receivedAt,parent,owner,descendants};
+}
+function observeExternalOwner(delegate,args,options,state){
+  const started=Date.now();let child,done;
+  state.started=started;state.closed=false;state.complete=new Promise(resolve=>{done=resolve;});
+  try{child=delegate(options);}catch(error){state.spawnError=safeEntryError(error);state.spawnFailed=true;state.closed=true;done();throw error;}
+  const spawnedAt=Date.now();
+  state.child=child;
+  const external=state.external={samples:[],unknown:[],closed:false,started:false};
+  const stop=reason=>{
+    clearTimeout(external.timer);external.stopReason??=reason;
+    if(external.child&&!external.closed&&!external.stopRequested){
+      external.stopRequested=true;
+      try{external.child.kill('SIGKILL');}catch(error){external.unknown.push({reason:'observer-stop-error',error:safeEntryError(error)});}
+    }
+  };
+  external.stop=stop;
+  child.once('error',error=>{state.spawnError=safeEntryError(error);});
+  child.once('close',(code,signal)=>{state.closed=true;state.outcome={code,signal};stop('owner-closed');done();});
+  let context;
+  try{
+    assert(Number.isSafeInteger(child.pid)&&child.pid>0);
+    const powershell=state.externalExecutable??path.join(process.env.SystemRoot??'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
+    context=Object.freeze({started,spawnedAt,deadline:started+9000,ownerPid:child.pid,parentPid:process.pid,
+      ownerExecutable:powershell,parentExecutable:process.execPath,cwd:options.cwd});
+  }catch(error){external.unknown.push({reason:'context-unavailable',error:safeEntryError(error)});}
+  queueMicrotask(()=>{
+    if(!context||state.closed){external.closed=true;external.unknown.push({reason:state.closed?'owner-closed-before-observer':'context-unavailable'});return;}
+    const nonce=randomBytes(24).toString('hex');let resolveClose,stdout='',stdoutBytes=0,stderrBytes=0;
+    external.complete=new Promise(resolve=>{resolveClose=resolve;});
+    const finish=(code,signal)=>{
+      if(external.closed)return;external.closed=true;clearTimeout(external.timer);
+      if(stdout.trim())external.unknown.push({reason:'partial-observer-frame'});
+      external.outcome={code,signal};resolveClose();
+    };
+    const accept=line=>{
+      try{
+        assert(!state.closed,'Owner close precedes this frame');assert(line.length<=16384);
+        const frame=JSON.parse(line);
+        assert(frame.index===external.samples.length,'External frames are ordered without retries');
+        const sample=qualifyExternalOwnerFrame(frame,context,external.child.pid,nonce,Date.now());
+        const anchor={ownerStarted:sample.owner.started,parentStarted:sample.parent.started};
+        if(external.anchor)assert.deepEqual(anchor,external.anchor,'Owner and parent incarnations remain fixed');
+        else external.anchor=anchor;
+        external.samples.push(sample);
+      }catch(error){external.unknown.push({reason:'frame-refused',error:safeEntryError(error)});stop('frame-refused');}
+    };
+    try{
+      // The original command has returned and armed its own 10s timer before any observer I/O.
+      context=Object.freeze({...context,ownerExecutable:entryFs.realpathSync(context.ownerExecutable),
+        parentExecutable:entryFs.realpathSync(context.parentExecutable)});
+      external.context=context;
+      assert(Date.now()<context.deadline,'External observer preparation is timely');
+      const spawnObserver=state.externalSpawn??nativeSpawn;
+      external.child=spawnObserver(context.ownerExecutable,['-NoLogo','-NoProfile','-NonInteractive','-Command',externalOwnerScript(context,nonce)],
+        {cwd:context.cwd,windowsHide:true,stdio:['ignore','pipe','pipe']});
+      external.started=true;
+      external.child.once('error',error=>{external.unknown.push({reason:'observer-error',error:safeEntryError(error)});});
+      external.child.once('close',finish);
+      assert(Number.isSafeInteger(external.child.pid)&&external.child.pid>0&&
+        external.child.pid!==context.ownerPid&&external.child.pid!==context.parentPid,'Observer is distinct from owner and caller');
+      external.child.stdout.on('data',chunk=>{
+        stdoutBytes+=chunk.length;
+        if(stdoutBytes>65536){external.unknown.push({reason:'stdout-limit'});stop('stdout-limit');return;}
+        stdout+=chunk.toString('utf8');
+        let newline;while((newline=stdout.indexOf('\n'))>=0){const line=stdout.slice(0,newline).replace(/\r$/,'');stdout=stdout.slice(newline+1);if(line)accept(line);}
+      });
+      external.child.stderr.on('data',chunk=>{stderrBytes+=chunk.length;if(stderrBytes>2048)stop('stderr-limit');});
+      if(!external.closed)external.timer=setTimeout(()=>stop('absolute-deadline'),Math.max(0,context.deadline-Date.now()));
+    }catch(error){
+      external.unknown.push({reason:'observer-spawn-error',error:safeEntryError(error)});
+      if(!external.child){external.spawnFailed=true;external.closed=true;resolveClose();}
+      else stop('observer-setup-error');
+    }
+  });
+  return child;
+}
 async function prepareOwnerDiagnostic(root){
   if(process.env.PERFCHECKER_TEST_OWNER_DIAGNOSTIC!=='1')return;
   assertOwnerDiagnosticContext();
+  const mode=process.env.PERFCHECKER_TEST_OWNER_DIAGNOSTIC_MODE||'instrumented';
+  assert(['instrumented','external'].includes(mode),'Owner diagnostic mode is explicit');
   const archive=JSON.parse(await readFile(path.resolve('native-qualification-results/connector-workers-archive.json'),'utf8'));
   assert.equal(archive.sha256,ownerDiagnosticOrigin.sha256);assert.deepEqual(archive.origin,ownerDiagnosticOrigin);
   assert.equal(archive.compiled,false);
@@ -261,6 +432,10 @@ async function prepareOwnerDiagnostic(root){
     assert.equal(archive.entries.find(entry=>entry.path===name)?.sha256,expected);sources[name]=bytes;
   }
   const dir=await mkdtemp(path.join(root,'owner-diagnostic-'));
+  if(mode==='external'){
+    ownerDiagnosticStates.set(root,{mode,dir,sources,used:false,diagnosticOnly:true});
+    return;
+  }
   await mkdir(path.join(dir,'dist'));await mkdir(path.join(dir,'resources'));
   const probe=createOwnerStageProbe(dir);
   const launcher=instrumentOwnerLauncher(sources['resources/windows-owned-process.ps1'].toString('utf8'),probe);
@@ -272,22 +447,33 @@ async function prepareOwnerDiagnostic(root){
 }
 async function retireOwnerDiagnostic(root,cleanupMs=2000){
   const state=ownerDiagnosticStates.get(root);if(!state)return true;
+  await Promise.resolve(); // Drain the already-scheduled observer start, without delaying the product launch.
+  state.external?.stop('diagnostic-finally');
   clearTimeout(state.timer);
   let timer;
-  if(state.complete&&!state.closed)await Promise.race([state.complete,new Promise(resolve=>{timer=setTimeout(resolve,cleanupMs);})]);
+  const pending=[state.complete&&!state.closed?state.complete:undefined,
+    state.external?.complete&&!state.external.closed?state.external.complete:undefined].filter(Boolean);
+  if(pending.length)await Promise.race([Promise.all(pending),new Promise(resolve=>{timer=setTimeout(resolve,cleanupMs);})]);
   clearTimeout(timer);clearTimeout(state.timer);
   const physicallyClosed=Boolean(state.child)&&state.closed===true;
-  const safelyRetired=!state.used||state.spawnFailed===true||physicallyClosed;
+  const observerClosed=state.mode!=='external'||state.external?.closed===true||state.external?.started!==true;
+  const safelyRetired=(!state.used||state.spawnFailed===true||physicallyClosed)&&observerClosed;
   let originalFilesUnchanged=false,cleanupError;
   try{originalFilesUnchanged=Object.entries(state.sources).every(([name,bytes])=>entryFs.readFileSync(path.resolve(name)).equals(bytes));}
   catch(error){cleanupError=safeEntryError(error);}
   let removed=false;
   if(safelyRetired)try{await rm(state.dir,{recursive:true,force:true});removed=true;}catch(error){cleanupError=safeEntryError(error);}
   const afterRefused=state.after?.status==='unobserved'&&!['no-stage-observed','close-not-observed','synchronous-spawn-error'].includes(state.after.reason);
+  const observerStopFailed=state.external?.unknown.some(row=>row.reason==='observer-stop-error')??false;
   const result={schema:'perfchecker-windows-owner-diagnostic/1',diagnosticOnly:true,qualifiesCanonicalProduct:false,
+    mode:state.mode??'instrumented',...(state.mode==='external'?{observerPerturbing:true,
+      externalObserver:{physicalClose:state.external?.started===true&&state.external.closed===true,
+        started:state.external?.started===true,pid:state.external?.child?.pid??null,
+        samples:state.external?.samples??[],unknown:state.external?.unknown??[],outcome:state.external?.outcome,
+        stopReason:state.external?.stopReason}}:{}),
     origin:ownerDiagnosticOrigin,originalHashes:ownerDiagnosticHashes,instrumentedLauncherSha256:state.launcherSha256,
     used:state.used,ownerPid:state.child?.pid??null,beforeDeadline:state.before??{status:'unobserved',reason:'closed-before-observation'},
-    afterClose:state.after??{status:'unobserved',reason:state.spawnFailed?'synchronous-spawn-error':'close-not-observed'},
+    afterClose:state.after??{status:'unobserved',reason:state.mode==='external'?'external-owner-observation':state.spawnFailed?'synchronous-spawn-error':'close-not-observed'},
     spawnError:state.spawnError,outcome:state.outcome,physicalClose:physicallyClosed,
     originalFilesUnchanged,observerCleanupQualified:safelyRetired&&removed,temporaryFilesRetained:!removed,cleanupError};
   let receiptError;
@@ -296,7 +482,7 @@ async function retireOwnerDiagnostic(root,cleanupMs=2000){
     else entryFs.writeFileSync(path.resolve('native-qualification-results/windows-owner-startup.json'),JSON.stringify(result,null,2),{flag:'wx'});
   }catch(error){receiptError=error;console.log(JSON.stringify({event:'owner-diagnostic-record-error',error:safeEntryError(error)}));}
   finally{ownerDiagnosticStates.delete(root);}
-  if(!safelyRetired||!removed||!originalFilesUnchanged||afterRefused||receiptError)
+  if(!safelyRetired||!removed||!originalFilesUnchanged||afterRefused||observerStopFailed||receiptError)
     throw Object.assign(new Error('Windows owner diagnostic security, receipt or retirement was not qualified.'),
       {observerRetired:safelyRetired&&removed,diagnosticError:receiptError? safeEntryError(receiptError):cleanupError});
   return safelyRetired&&removed;
@@ -311,7 +497,10 @@ Module._load = function(name, ...args) {
       return cli === 'sacrificial-codex' ? observeFixtureSpawn(observedOptions=>
         {const state=ownerDiagnosticStates.get(path.dirname(script));
           if(state&&!state.used&&argv[0]==='--version'){
-            state.used=true;return observeOwnerStages(next=>state.owner.spawnWindowsOwnedProcess(process.execPath,[script,...argv],next),argv,observedOptions,state);
+            state.used=true;
+            return state.mode==='external'?
+              observeExternalOwner(next=>owner.spawnWindowsOwnedProcess(process.execPath,[script,...argv],next),argv,observedOptions,state):
+              observeOwnerStages(next=>state.owner.spawnWindowsOwnedProcess(process.execPath,[script,...argv],next),argv,observedOptions,state);
           }
           return owner.spawnWindowsOwnedProcess(process.execPath,[script,...argv],observedOptions);
         },argv,options,script) : owner.spawnWindowsOwnedProcess(cli,argv,options);
@@ -438,7 +627,8 @@ test('owner stage diagnostic refuses foreign identities, partial writes, replace
     await writeFile(f.probe.file,JSON.stringify({...row,nonce:'foreign'})+'\n',{flag:'wx'});
     assert.equal(inspect().status,'unobserved');assert.equal(f.probe.identity,undefined);assert.equal(f.probe.pathObserved,true);
     await rm(f.probe.file);assert.equal(inspect().reason,'inspection-error');assert.equal(f.probe.identity,undefined);
-    await writeFile(f.probe.file,JSON.stringify(row)+'\n',{flag:'wx'});assert.equal(inspect().status,'observed');
+    await writeFile(f.probe.file,'',{flag:'wx'});row.at=Date.now();
+    await writeFile(f.probe.file,JSON.stringify(row)+'\n');assert.equal(inspect().status,'observed');
     assert(f.probe.identity);const boundIdentity=f.probe.identity;
     assert.doesNotMatch(JSON.stringify(inspect()),new RegExp(f.probe.nonce));
     for(const bad of [{nonce:'foreign'},{ownerPid:owner+1},{ownerStarted:'1'},{ownerStarted:Number(row.ownerStarted)},{phase:'arbitrary-private-text'},{at:started-1}]) {
@@ -549,6 +739,126 @@ test('owner stage diagnostic retains the direct request error when retirement an
       /security, receipt or retirement/.test(error.errors[1].message)&&error.errors[2]===removeError);
     assert.equal(entryFs.existsSync(path.join(fixtureRoot,'diagnostic-copy')),false);
   }finally{if(fixtureRoot)await rm(fixtureRoot,{recursive:true,force:true});}
+});
+function externalFrame(context,observerPid,nonce,index=0){
+  const row=(pid,parent,started)=>({pid,parent,started:new Date(started).toISOString(),executable:process.execPath,kernel:'0',user:'0',state:null});
+  const parent=row(context.parentPid,process.ppid,context.started-1000),owner=row(context.ownerPid,context.parentPid,context.started);
+  return {schema:1,nonce,observerPid,index,beforeAt:context.started,afterAt:Date.now(),reason:null,
+    parent:{before:{...parent},after:{...parent}},owner:{before:{...owner},after:{...owner}},descendants:[]};
+}
+function fakeExternalChild(pid){
+  const child=Object.assign(new EventEmitter(),{pid,stdout:new PassThrough(),stderr:new PassThrough(),kills:0});
+  child.kill=()=>{child.kills++;return true;};return child;
+}
+test('external owner observation starts after the real delegate returns and freezes the invocation',async()=>{
+  const f=await ownerStageFixture(),owner=fakeExternalChild(32201),observer=fakeExternalChild(32202),order=[];
+  const options={cwd:f.root,env:{PRIVATE:'not observable'}};
+  Object.assign(f.state,{mode:'external',externalExecutable:process.execPath,externalSpawn:(image,args,received)=>{
+    order.push('observer');assert.deepEqual(order,['delegate','returned','observer']);
+    assert.equal(image,entryFs.realpathSync(process.execPath));assert.equal(received.cwd,f.root);assert.equal(received.env,undefined);
+    assert.doesNotMatch(args.at(-1),/Add-Type|CommandLine|Get-CimInstance Win32_Process\s+-ErrorAction/);
+    assert.match(args.at(-1),/ParentProcessId=/);return observer;
+  }});
+  try{
+    ownerDiagnosticStates.set(f.root,f.state);
+    assert.equal(observeExternalOwner(received=>{order.push('delegate');assert.equal(received,options);return owner;},['--version'],options,f.state),owner);
+    order.push('returned');options.cwd='later mutation';f.state.externalExecutable='later mutation';
+    await new Promise(resolve=>setImmediate(resolve));assert.equal(f.state.external.started,true);
+    const retiring=retireOwnerDiagnostic(f.root);owner.emit('close',0,null);
+    observer.emit('close',null,'SIGKILL');assert.equal(await retiring,true);
+    assert.equal(owner.kills,0);assert.equal(observer.kills,1);
+    assert.equal(f.records[0].observerPerturbing,true);assert.equal(f.records[0].qualifiesCanonicalProduct,false);
+    assert.equal(f.records[0].externalObserver.physicalClose,true);assert.equal(f.records[0].originalFilesUnchanged,true);
+    assert.doesNotMatch(JSON.stringify(f.records),/not observable|later mutation/);
+  }finally{owner.emit('close',0,null);observer.emit('close',null,'SIGKILL');clearTimeout(f.state.external?.timer);ownerDiagnosticStates.delete(f.root);await rm(f.root,{recursive:true,force:true});}
+});
+test('external owner frames refuse late or replaced identities and accept a child born during collection',()=>{
+  const started=Date.now(),context={started,spawnedAt:started+1,deadline:started+9000,ownerPid:32203,parentPid:process.pid,
+    ownerExecutable:entryFs.realpathSync(process.execPath),parentExecutable:entryFs.realpathSync(process.execPath)};
+  const valid=externalFrame(context,32204,'nonce');valid.afterAt=started+200;
+  const descendant={pid:32205,parent:context.ownerPid,started:new Date(started+100).toISOString(),
+    executable:process.execPath,kernel:'0',user:'0',state:null};
+  valid.descendants=[{depth:1,before:{...descendant},after:{...descendant,user:'1'}}];
+  assert.equal(qualifyExternalOwnerFrame(valid,context,32204,'nonce',started+201).descendants.length,1);
+  for(const modify of [
+    f=>{f.owner.before.started=f.owner.after.started=new Date(started+50).toISOString();},
+    f=>{f.owner.after.parent++;},f=>{f.owner.after.started=new Date(started+1).toISOString();},
+    f=>{f.parent.after.started=new Date(started-900).toISOString();},
+    f=>{f.descendants[0].before.parent=f.descendants[0].after.parent=999;},
+    f=>{f.descendants[0].depth=3;},f=>{f.reason='inspection-failed';},
+    f=>{f.observerPid=context.ownerPid;},f=>{f.owner.after.executable='/unavailable-private-image';}
+  ]){
+    const bad=structuredClone(valid);modify(bad);assert.throws(()=>qualifyExternalOwnerFrame(bad,context,32204,'nonce',started+201));
+  }
+  assert.throws(()=>qualifyExternalOwnerFrame(valid,context,32204,'nonce',context.deadline));
+  assert.throws(()=>qualifyExternalOwnerFrame(valid,context,context.ownerPid,'nonce',started+201));
+});
+test('external owner observation fixes incarnations across frames and never kills the real owner',async()=>{
+  const f=await ownerStageFixture(),owner=fakeExternalChild(32206),observer=fakeExternalChild(32207);let script;
+  Object.assign(f.state,{mode:'external',externalExecutable:process.execPath,externalSpawn:(_image,args)=>{script=args.at(-1);return observer;}});
+  try{
+    ownerDiagnosticStates.set(f.root,f.state);observeExternalOwner(()=>owner,['--version'],{cwd:f.root},f.state);
+    await new Promise(resolve=>setImmediate(resolve));
+    const nonce=JSON.parse(/;\$nonce=("(?:[^"\\]|\\.)*")/.exec(script)[1]),context=f.state.external.context;
+    observer.stdout.write(JSON.stringify(externalFrame(context,observer.pid,nonce))+'\n');
+    assert.equal(f.state.external.samples.length,1);
+    const changed=externalFrame(context,observer.pid,nonce,1);
+    changed.parent.before.started=changed.parent.after.started=new Date(context.started-900).toISOString();
+    observer.stdout.write(JSON.stringify(changed)+'\n');
+    assert.equal(f.state.external.samples.length,1);assert.equal(observer.kills,1);assert.equal(owner.kills,0);
+    assert.equal(f.state.external.unknown[0].reason,'frame-refused');
+    owner.emit('close',0,null);observer.emit('close',null,'SIGKILL');assert.equal(await retireOwnerDiagnostic(f.root),true);
+  }finally{owner.emit('close',0,null);observer.emit('close',null,'SIGKILL');clearTimeout(f.state.external?.timer);ownerDiagnosticStates.delete(f.root);await rm(f.root,{recursive:true,force:true});}
+});
+test('external owner observation does not start after close and retains an observer without physical close',async()=>{
+  const early=await ownerStageFixture(),late=await ownerStageFixture(),owner=fakeExternalChild(32208),observer=fakeExternalChild(32209);
+  try{
+    let starts=0;
+    Object.assign(early.state,{mode:'external',externalExecutable:process.execPath,externalSpawn:()=>{starts++;return observer;}});
+    ownerDiagnosticStates.set(early.root,early.state);observeExternalOwner(()=>owner,['--version'],{},early.state);
+    owner.emit('close',0,null);await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(starts,0);assert.equal(await retireOwnerDiagnostic(early.root),true);
+    const secondOwner=fakeExternalChild(32210);
+    Object.assign(late.state,{mode:'external',externalExecutable:process.execPath,externalSpawn:()=>observer});
+    ownerDiagnosticStates.set(late.root,late.state);observeExternalOwner(()=>secondOwner,['--version'],{},late.state);
+    await new Promise(resolve=>setImmediate(resolve));secondOwner.emit('close',1,null);
+    await assert.rejects(retireOwnerDiagnostic(late.root,20),error=>error.observerRetired===false);
+    assert.equal(entryFs.existsSync(late.dir),true);assert.equal(late.records[0].observerCleanupQualified,false);
+    assert.equal(secondOwner.kills,0);assert.equal(observer.kills,1);
+  }finally{observer.emit('close',null,'SIGKILL');clearTimeout(early.state.external?.timer);clearTimeout(late.state.external?.timer);ownerDiagnosticStates.delete(early.root);ownerDiagnosticStates.delete(late.root);await rm(early.root,{recursive:true,force:true});await rm(late.root,{recursive:true,force:true});}
+});
+test('external observer stop errors cannot interrupt owner close and preserve the original failure directly',async()=>{
+  const originalError=new Error('original request failure'),records=[];let rootSeen;
+  await assert.rejects(environment(async root=>{
+    rootSeen=root;const dir=path.join(root,'observer');await mkdir(dir);
+    const owner=fakeExternalChild(32211),observer=fakeExternalChild(32212);
+    observer.kill=()=>{throw new Error('observer stop failed');};
+    const state={mode:'external',dir,used:true,sources:{},externalExecutable:process.execPath,externalSpawn:()=>observer,
+      record:value=>records.push(value)};
+    ownerDiagnosticStates.set(root,state);observeExternalOwner(()=>owner,['--version'],{cwd:root},state);
+    await new Promise(resolve=>setImmediate(resolve));let originalListenerCompleted=false;
+    owner.on('close',()=>{originalListenerCompleted=true;});
+    assert.doesNotThrow(()=>owner.emit('close',1,null));assert.equal(originalListenerCompleted,true);
+    observer.emit('close',0,null);throw originalError;
+  }),error=>error instanceof AggregateError&&error.errors[0]===originalError&&error.errors.length===2);
+  assert.equal(records[0].externalObserver.physicalClose,true);
+  assert.equal(records[0].externalObserver.unknown[0].reason,'observer-stop-error');assert.equal(entryFs.existsSync(rootSeen),false);
+});
+test('external owner observation refuses a fourth frame and bounds private diagnostic output',async()=>{
+  const f=await ownerStageFixture(),owner=fakeExternalChild(32213),observer=fakeExternalChild(32214);let script;
+  Object.assign(f.state,{mode:'external',externalExecutable:process.execPath,externalSpawn:(_image,args)=>{script=args.at(-1);return observer;}});
+  try{
+    ownerDiagnosticStates.set(f.root,f.state);observeExternalOwner(()=>owner,['--version'],{cwd:f.root},f.state);
+    await new Promise(resolve=>setImmediate(resolve));
+    const nonce=JSON.parse(/;\$nonce=("(?:[^"\\]|\\.)*")/.exec(script)[1]),context=f.state.external.context;
+    for(let index=0;index<3;index++)observer.stdout.write(JSON.stringify(externalFrame(context,observer.pid,nonce,index))+'\n');
+    assert.equal(f.state.external.samples.length,3);
+    observer.stdout.write(JSON.stringify(externalFrame(context,observer.pid,nonce,3))+'\n');
+    observer.stdout.write('PRIVATE'.repeat(12000));assert.equal(observer.kills,1);assert.equal(owner.kills,0);
+    assert.equal(f.state.external.samples.length,3);
+    owner.emit('close',0,null);observer.emit('close',null,'SIGKILL');await retireOwnerDiagnostic(f.root);
+    assert.doesNotMatch(JSON.stringify(f.records),/PRIVATE/);
+  }finally{owner.emit('close',0,null);observer.emit('close',null,'SIGKILL');clearTimeout(f.state.external?.timer);ownerDiagnosticStates.delete(f.root);await rm(f.root,{recursive:true,force:true});}
 });
 async function until(read) {for (let i=0;i<(process.platform==='win32'?1000:100);i++) {try {return await read();} catch {await new Promise(r=>setTimeout(r,20));}} throw new Error('Fixture process did not start.');}
 
