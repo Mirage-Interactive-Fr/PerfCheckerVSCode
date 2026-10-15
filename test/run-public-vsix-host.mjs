@@ -568,7 +568,7 @@ try {
   await fs.writeFile(path.join(workspace, 'Project.toml'), 'name = "PerfCheckerNativeFixture"\nuuid = "6af56806-e0b1-4f34-88bf-fde69d8a8679"\nversion = "0.1.0"\n');
   // Keep actual workload frames in the target package, rather than inlining them
   // into an external perf script. Both workloads allocate inside their own source.
-  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nBase.@noinline wait_task(x) = (values=fill(x,1_000_000); sleep(0.005); values[1])\nend\n');
+  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nBase.@noinline function profile_sum_squares(xs)\n total=0.0\n for _ in 1:64\n  total+=sum_squares(xs)\n end\n total\nend\nBase.@noinline wait_task(x) = (values=fill(x,1_000_000); sleep(0.005); values[1])\nend\n');
   await fs.writeFile(path.join(workspace, 'test', 'performance.jl'), 'using TestItems\n@testitem "Vector reduction" tags=[:performance] begin\n data=collect(1:10_000)\n @test sum(data)==50_005_000\nend\n');
   const vsix = path.join(session, 'perfchecker.vsix');
   if (mode === 'public') {
@@ -852,7 +852,9 @@ try {
   await fs.rm(path.join(workspace,'perf','results'),{recursive:true,force:true});
   await fs.rm(path.join(workspace,'perf','perfchecker-ui.json'),{force:true});
   await fs.writeFile(path.join(workspace, 'perf', 'sum.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs) = perf_workload(xs) == 333833500.0\n');
-  await fs.writeFile(path.join(workspace,'perf','profile-sum.jl'),'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1_000_000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs,result) = isapprox(result,1_000_000.0*1_000_001.0*2_000_001.0/6;rtol=1e-12)\n');
+  // Keep a sustained, checked batch inside the target module while each fresh
+  // profile operation owns its own sampling window; ordinary collectors stay small.
+  await fs.writeFile(path.join(workspace,'perf','profile-sum.jl'),'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1_000_000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.profile_sum_squares(xs)\nperf_oracle(xs,result) = isapprox(result,64*(1_000_000.0*1_000_001.0*2_000_001.0/6);rtol=1e-12)\n');
   await fs.writeFile(path.join(workspace, 'perf', 'wait.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = 42\nperf_workload(x) = PerfCheckerNativeFixture.wait_task(x)\nperf_oracle(x) = perf_workload(x) == 42\n');
   await fs.writeFile(path.join(workspace, 'perf', 'cases.jl'), 'make_sum_case(p) = (prepare=()->collect(1.0:1000.0), operation=xs->sum(xs.^2), verify=(xs,result)->result==333833500.0)\nmake_wait_case(p) = (prepare=()->42, operation=x->(sleep(0.005);x), verify=(x,result)->result==42)\nmake_cancel_case(p) = (prepare=()->42, operation=x->(write(p["marker"],"running");sleep(30);x), verify=(x,result)->result==42)\n');
   // A distinct bounded workload gives CPU sampling actual operation time;
