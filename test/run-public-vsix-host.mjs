@@ -13,7 +13,7 @@ import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
 import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const output = path.join(repository, 'native-qualification-results');
@@ -600,10 +600,10 @@ try {
     assert.equal(packageProvenance.commit,'73b99deb87efaf45bd5e96036f755e42c748bdab');
     assert.equal(packageProvenance.tree,'3722727a870402497078e63da78be90d606f5ed5');
     assert.equal(packageProvenance.packagedOnceOn,'Linux');assert.equal(packageProvenance.version,'1.0.3');
-    let sampleSyntax;try{sampleSyntax=await verifyNativeSampleSyntax();}
-    catch(error){sampleSyntax={supported:false,reason:'installed-manual-inspection-unknown',
-      errorClass:/^[A-Za-z]+$/.test(error.name)?error.name:null,code:/^[A-Z0-9_]+$/.test(error.code||'')?error.code:null};}
-    discoveryObservation={diagnosticOnly:true,perturbing:true,qualifiesCanonicalProduct:false,sampleSyntax,
+    discoveryObservation={diagnosticOnly:true,perturbing:true,qualifiesCanonicalProduct:false,mode:'passive-completion',
+      observationWindowMs:180000,externalObserverProcesses:0,
+      processObservationsDuringDiscovery:false,
+      observationScope:'Exact original ChildProcess/output UUID; passive metadata only, no CPU, ps, lsof, sample or manual inspection',
       prelude:'Exact full fresh/configured preparation, then prepared prefix through native-testitem-measurement',
       skippedAfter:['native-complete-suite-measurements','native-all-studio-controls','native-workbench-controls'],
       origin:packageProvenance,uiOracleMs:120000,workerOracleMs:180000};
@@ -687,7 +687,10 @@ try {
       }
       const environment={...runnerEnvironment,...externalBrowser?.environment,...(phase==='landscape'?landscapeFixture.environment:{}),
         ...(discoveryDiagnostic?{PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC:'1',
-          PERFCHECKER_NATIVE_DISCOVERY_OBSERVATION:JSON.stringify(discoveryObservation)}:{}),
+          PERFCHECKER_NATIVE_DISCOVERY_OBSERVATION:JSON.stringify(discoveryObservation),
+          // A conservative observation cap computed before launch; the existing
+          // independent 130-minute phase timer below remains unchanged.
+          ...(phase==='prepared'?{PERFCHECKER_NATIVE_DISCOVERY_PHASE_DEADLINE_AT:new Date(Date.now()+130*60*1000).toISOString()}:{} )}:{}),
         ...(diagnosticTemporaryRoot?{TMPDIR:diagnosticTemporaryRoot,PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP:diagnosticTemporaryRoot}:{}),
         PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,

@@ -432,26 +432,33 @@ async function runSuiteCases(context,runCase,options={}){
 
 async function measureNativeTestItem(context,expectedPassed,options={}){
   if(!discoveryDiagnostic||process.env.PERFCHECKER_NATIVE_PHASE!=='prepared')return measureNativeTestItemBody(context,expectedPassed,options);
-  const {installNativeDiscoveryObserver,createNativeDiscoveryReaders}=await import('./native-controller-preflight.mjs');
+  const {installPassiveNativeDiscoveryObserver,createNativeDiscoveryReaders,readNativeDiscoverySource}=await import('./native-controller-preflight.mjs');
   const childProcess=require('node:child_process'),settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
   const {cancellableJulia}=require(path.join(context.extension.extensionPath,'dist','controllerCancellation.js'));
   const expected={root:context.workspace,project:context.controller,executable:settings.get('juliaExecutable','julia'),
-    canonicalExecutable:await fs.realpath(process.env.PERFCHECKER_NATIVE_JULIA),
+    stableOutput:true,sourceFile:path.join(context.workspace,'test','performance.jl'),
     expression:cancellableJulia('using PerfChecker, TestItemRunner; exit(perfchecker_main(ARGS))'),
     outputRoot:path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage','mirage-interactive-fr.perfchecker-vscode','native-testitems')};
   assert.equal(settings.get('runnerProject'),context.controller);assert.deepEqual(settings.get('testItemTags',[]),[]);
   assert.deepEqual(settings.get('testItemExcludeTags',[]),[]);
+  const phaseDeadlineAt=Date.parse(process.env.PERFCHECKER_NATIVE_DISCOVERY_PHASE_DEADLINE_AT);
+  assert(Number.isFinite(phaseDeadlineAt)&&phaseDeadlineAt>Date.now());
+  expected.sourceSha256=await readNativeDiscoverySource(expected.sourceFile,
+    {signal:new AbortController().signal,deadlineAt:Math.min(phaseDeadlineAt,Date.now()+2000)});
+  const sameContext=()=>{const current=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
+    return context.vscode.workspace.isTrusted&&context.vscode.workspace.workspaceFolders?.some(folder=>folder.uri.fsPath===context.workspace)&&
+      current.get('juliaExecutable','julia')===expected.executable&&current.get('runnerProject')===expected.project&&
+      JSON.stringify(current.get('testItemTags',[]))==='[]'&&JSON.stringify(current.get('testItemExcludeTags',[]))==='[]';};
+  assert.equal(context.discoveryObservation.mode,'passive-completion');
   const record=detail=>context.log('native-discovery-observation',detail);
-  const readers=createNativeDiscoveryReaders(expected,{sampleSyntax:context.discoveryObservation.sampleSyntax,record});
-  const observer=installNativeDiscoveryObserver({childProcess,expected,observe:readers.observe,readListing:readers.readListing,record});
-  let result,original;const cleanup=[];
-  try{result=await measureNativeTestItemBody(context,expectedPassed,options);}catch(error){original=error;}
-  finally{
-    try{await observer.retire();}catch(error){cleanup.push(error);}
-    try{await readers.retire();}catch(error){cleanup.push(error);}
-  }
-  if(cleanup.length)throw new AggregateError(original?[original,...cleanup]:cleanup,'Discovery observation or its physical retirement failed');
-  if(original)throw original;return result;
+  const readers=createNativeDiscoveryReaders(expected,{record});
+  const observer=installPassiveNativeDiscoveryObserver({childProcess,expected,readListing:readers.readListing,
+    retireReaders:readers.retire,record,phaseDeadlineAt,contextUnchanged:sameContext});
+  let result,original;
+  try{result=await measureNativeTestItemBody({...context,observeWork:undefined,
+    discoveryUiStarted:()=>observer.uiStarted(),discoveryUiOutcome:(status,probe,error)=>observer.uiOutcome(status,probe,error)},expectedPassed,options);}
+  catch(error){original=error;}
+  await observer.finish(original);return result;
 }
 
 async function measureNativeTestItemBody(context,expectedPassed,options={}){
@@ -463,12 +470,15 @@ async function measureNativeTestItemBody(context,expectedPassed,options={}){
   const row=windowPage.locator(`.monaco-list-row[aria-label*="${filename}"]`).filter({hasText:name}).first();
   if(discoveryDiagnostic&&process.env.PERFCHECKER_NATIVE_PHASE==='prepared')context.log('native-discovery-ui-oracle-start',
     {uiOracleMs:120000,diagnosticOnly:true,qualifiesCanonicalProduct:false});
+  context.discoveryUiStarted?.();
   try{await row.waitFor({state:'visible',timeout:120000});}
   catch(error){
+    context.discoveryUiOutcome?.('failed',()=>row.isVisible(),error);
     try{await context.observeWork?.('testitems-discovery-not-ready');}
     catch(diagnosticError){context.log('native-work-observation-error',{case:'testitems-discovery-not-ready',error:redact(diagnosticError)});}
     throw error;
   }
+  context.discoveryUiOutcome?.('passed');
   if(discoveryDiagnostic&&process.env.PERFCHECKER_NATIVE_PHASE==='prepared')context.log('native-discovery-ui-row-observed',
     {surface:'visible-Testing-row',testControllerPublication:'unknown',diagnosticOnly:true,qualifiesCanonicalProduct:false});
   await row.hover();
@@ -594,8 +604,10 @@ exports.run = async () => {
     log('native-case-start',{action:name});
     console.log(`NATIVE_CASE_START ${phase} ${name}`);
     let observation=Promise.resolve();
-    const observe=stage=>{observation=observation.then(()=>nativeContext?.observeWork?.(stage)).catch(error=>log('native-work-observation-error',{case:name,error:redact(error)}));return observation;};
-    const observer=nativeContext?.observeWork?setInterval(()=>{void observe(`${name}-pending`);},60000):undefined;
+    const passiveDiscovery=name==='native-testitem-measurement'&&phase==='prepared'&&nativeContext?.discoveryObservation?.mode==='passive-completion';
+    const observe=stage=>{if(passiveDiscovery)return observation;
+      observation=observation.then(()=>nativeContext?.observeWork?.(stage)).catch(error=>log('native-work-observation-error',{case:name,error:redact(error)}));return observation;};
+    const observer=nativeContext?.observeWork&&!passiveDiscovery?setInterval(()=>{void observe(`${name}-pending`);},60000):undefined;
     try {
       await observe(`${name}-before-action`);
       if((await vscode.commands.getCommands(true)).includes('notifications.clearAll'))await vscode.commands.executeCommand('notifications.clearAll');

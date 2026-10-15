@@ -5,7 +5,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import {EventEmitter} from 'node:events';
 import {writeSync} from 'node:fs';
-import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,nativeOperationSnapshot,observeNativeOperation,captureQualifiedNativeProgress,assertNativeDiscoveryDiagnostic,nativeDiscoverySpawnOutput,installNativeDiscoveryObserver,readBoundedNativeFile,nativeSampleProjection,nativeSampleManualContract,createNativeDiscoveryReaders,discoveryOwnedCommand} from './native-controller-preflight.mjs';
+import {createHash} from 'node:crypto';
+import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,nativeOperationSnapshot,observeNativeOperation,captureQualifiedNativeProgress,assertNativeDiscoveryDiagnostic,nativeDiscoverySpawnOutput,installNativeDiscoveryObserver,installPassiveNativeDiscoveryObserver,readBoundedNativeFile,nativeSampleProjection,nativeSampleManualContract,createNativeDiscoveryReaders,discoveryOwnedCommand} from './native-controller-preflight.mjs';
 
 const nextObservationTurn=()=>new Promise(resolve=>setImmediate(resolve));
 const discoveryExpected={executable:'/private/Julia/bin/julia',project:'/private/controller',root:'/private/workspace',
@@ -20,6 +21,161 @@ const diagnosticSelection=()=>({enabled:true,event:'workflow_dispatch',artifact:
   originName:'native-candidate-73b99deb87efaf45bd5e96036f755e42c748bdab',
   originSha:'bc61f9fa172069c61722e0691900d3ddf8a39ce143fd9d553b252304dbc55850',
   coreCommit:'d079efd5c24c3dcac5b7550781822038e0ff780f',coreTree:'749f8eac351ed2a1f0bc110456f2eb37a3bc08ee',newOrigin:false});
+
+function passiveDiscoveryFixture(changes={}){
+  const records=[],calls=[],child=observationChild(),clock={at:1000,mono:0};let retired=0,reads=0;
+  child.kill=()=>assert.fail('The passive diagnostic never signals the original Julia child');
+  const cp={spawn:function(){calls.push({self:this,args:[...arguments]});return child;}},original=cp.spawn;
+  const valid={status:'valid-listing',targetMatches:1,sourceMatches:true,directoryBoundBeforeClose:true};
+  const observer=installPassiveNativeDiscoveryObserver({childProcess:cp,expected:discoveryExpected,
+    now:()=>clock.at,monotonic:()=>clock.mono,phaseDeadlineAt:1000000,record:row=>records.push(row),
+    readListing:async capture=>{reads++;return capture.closed?valid:{status:'not-observed'};},
+    retireReaders:async()=>{retired++;},...changes});
+  const spawn=()=>cp.spawn(discoveryExpected.executable,discoveryArgs(),{cwd:discoveryExpected.root});
+  const advance=ms=>{clock.at+=ms;clock.mono+=ms;};
+  const close=(code=0)=>{child.exitCode=code;child.emit('exit',code,null);child.emit('close',code,null);};
+  return{observer,records,calls,child,cp,original,clock,spawn,advance,close,get retired(){return retired;},get reads(){return reads;}};
+}
+
+test('passive discovery delegates the original handle and streams once and observes close before UI120',async()=>{
+  const f=passiveDiscoveryFixture();assert.equal(f.spawn(),f.child);assert.equal(f.reads,0);
+  assert.equal(f.calls.length,1);assert.equal(f.calls[0].self,f.cp);assert.equal(f.calls[0].args.length,3);
+  assert.equal(f.child.stdout.listenerCount('data'),0);assert.equal(f.child.stderr.listenerCount('data'),0);
+  await nextObservationTurn();f.observer.uiStarted();f.advance(104000);f.close();
+  f.observer.uiOutcome('passed');await f.observer.finish();
+  assert.equal(f.cp.spawn,f.original);assert.equal(f.retired,1);assert.equal(f.calls.length,1);
+  const spawn=f.records.find(r=>r.stage==='product-spawn-returned'),close=f.records.find(r=>r.stage==='product-close');
+  assert.equal(spawn.parent,process.pid);assert.equal(spawn.uuidSha256,close.uuidSha256);assert.equal(close.code,0);
+  assert.equal(close.elapsedMs,104000);assert(f.records.some(r=>r.stage==='passive-listing-read'&&r.trigger==='after-close'));
+  assert(!JSON.stringify(f.records).includes('/private/'));assert.equal(f.records.at(-1).drained,true);
+});
+
+test('passive completion after failed UI120 never replaces that error or performs a late Run Test',async()=>{
+  const f=passiveDiscoveryFixture(),primary=new Error('original UI120 refusal');let visibleCalls=0,settled=false;
+  f.spawn();await nextObservationTurn();f.observer.uiStarted();f.advance(120001);
+  f.observer.uiOutcome('failed',async()=>{visibleCalls++;return true;},primary);
+  const finished=f.observer.finish(primary);finished.then(()=>{settled=true;},()=>{settled=true;});
+  await nextObservationTurn();assert.equal(settled,false);assert.equal(visibleCalls,0);
+  f.advance(30000);f.close();await assert.rejects(finished,error=>error===primary);
+  assert.equal(visibleCalls,1);assert.equal(f.calls.length,1);assert.equal(f.retired,1);
+  const fail=f.records.find(r=>r.stage==='original-ui-oracle-settled'),late=f.records.find(r=>r.stage==='passive-ui-row-query');
+  assert.equal(fail.status,'failed');assert.equal(fail.elapsedMs,120001);assert.equal(late.visibleAtObservation,true);
+  assert.equal(late.originalUiVerdict,'failed');assert.equal(late.lateRunTestPerformed,false);
+  assert.equal(late.testControllerPublication,'unknown');assert.equal(late.publishingRefresh,'unknown');
+});
+
+test('a valid JSON after nonzero close is inconclusive and cannot trigger the late UI probe',async()=>{
+  const f=passiveDiscoveryFixture(),primary=new Error('UI oracle');let visible=0;
+  f.spawn();await nextObservationTurn();f.advance(120001);f.observer.uiOutcome('failed',()=>{visible++;return true;});f.close(1);
+  await assert.rejects(f.observer.finish(primary),error=>error===primary);assert.equal(visible,0);
+  assert.equal(f.records.find(r=>r.stage==='passive-completion-outcome').completion,'inconclusive');
+});
+
+test('exit without physical close stays unknown at observation180 and no inferred PID is signalled',async()=>{
+  const f=passiveDiscoveryFixture(),primary=new Error('UI oracle');f.spawn();await nextObservationTurn();
+  f.observer.uiOutcome('failed',()=>assert.fail('No UI query without physical close'));
+  f.child.emit('exit',0,null);f.advance(180001);await assert.rejects(f.observer.finish(primary),error=>error===primary);
+  assert.equal(f.records.find(r=>r.stage==='passive-completion-unknown').productCloseObserved,false);
+  assert.equal(f.records.at(-1).productCloseObserved,false);assert.equal(f.retired,1);
+});
+
+test('phase abort clips the passive wait without affecting the original child or failure',async()=>{
+  const abort=new AbortController(),f=passiveDiscoveryFixture({signal:abort.signal}),primary=new Error('UI oracle');
+  f.spawn();await nextObservationTurn();f.observer.uiOutcome('failed');const finished=f.observer.finish(primary);
+  await nextObservationTurn();abort.abort();await assert.rejects(finished,error=>error===primary);
+  assert.equal(f.calls.length,1);assert.equal(f.retired,1);assert.equal(f.records.at(-1).drained,true);
+});
+
+test('changed discovery context refuses a late row attribution and false visibility remains unknown',async()=>{
+  for(const contextUnchanged of [()=>false,()=>true]){
+    const f=passiveDiscoveryFixture({contextUnchanged}),primary=new Error('UI oracle');let reads=0;
+    f.spawn();await nextObservationTurn();f.advance(120001);f.observer.uiOutcome('failed',()=>{reads++;return false;});f.close();
+    await assert.rejects(f.observer.finish(primary),error=>error===primary);
+    const row=f.records.find(r=>r.stage==='passive-ui-row-query');assert.equal(row?.visibleAtObservation??'unknown','unknown');
+    assert.equal(reads,contextUnchanged()?1:0);
+  }
+});
+
+test('passive retirement is idempotent and cleanup errors retain the exact primary error directly first',async()=>{
+  const primary=new Error('original UI error'),cleanup=new Error('reader retirement');let retired=0;
+  const f=passiveDiscoveryFixture({retireReaders:async()=>{retired++;throw cleanup;}});
+  f.spawn();await nextObservationTurn();f.observer.uiOutcome('failed');f.advance(180001);
+  const first=f.observer.finish(primary),second=f.observer.finish(new Error('must not replace original'));
+  assert.equal(first,second);await assert.rejects(first,error=>error instanceof AggregateError&&error.errors[0]===primary&&error.errors[1]===cleanup);
+  assert.equal(retired,1);assert.equal(f.cp.spawn,f.original);
+});
+
+test('passive callback after retirement is never emitted and an undrained reader is explicit',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});let release;
+  const f=passiveDiscoveryFixture({readListing:()=>new Promise(resolve=>{release=resolve;})}),primary=new Error('UI oracle');
+  f.spawn();await nextObservationTurn();f.observer.uiOutcome('failed');f.advance(180001);
+  const finished=f.observer.finish(primary);const rejected=assert.rejects(finished,error=>error instanceof AggregateError&&error.errors[0]===primary);
+  await nextObservationTurn();t.mock.timers.tick(5001);await rejected;
+  assert.equal(f.records.at(-1).drained,false);const before=f.records.length;
+  release({status:'valid-listing'});await nextObservationTurn();assert.equal(f.records.length,before);assert.equal(f.retired,1);
+});
+
+test('passive matching preserves synchronous errors and exact arguments and refuses ambiguous invocations',async()=>{
+  const primary=new Error('original synchronous refusal'),cp={spawn(){assert.equal(arguments.length,2);throw primary;}};
+  const observer=installPassiveNativeDiscoveryObserver({childProcess:cp,expected:discoveryExpected,phaseDeadlineAt:Date.now()+1000,
+    readListing:()=>assert.fail('A refused spawn cannot read files'),retireReaders:async()=>{},record:()=>{}});
+  assert.throws(()=>cp.spawn('other',[]),error=>error===primary);
+  await assert.rejects(observer.finish(primary),error=>error instanceof AggregateError&&error.errors[0]===primary);
+  const f=passiveDiscoveryFixture();f.spawn();await nextObservationTurn();f.spawn();await nextObservationTurn();
+  f.observer.uiOutcome('failed');f.advance(180001);
+  await assert.rejects(f.observer.finish(primary),error=>error instanceof AggregateError&&error.errors[0]===primary);
+  assert.equal(f.calls.length,2);assert.equal(f.reads,1);assert.equal(f.retired,1);
+});
+
+test('a backward UTC clock cannot extend the monotonic passive observation window',async()=>{
+  const f=passiveDiscoveryFixture(),primary=new Error('UI oracle');f.spawn();await nextObservationTurn();
+  f.observer.uiOutcome('failed',()=>assert.fail('An expired monotonic observation cannot query UI'));
+  f.clock.at=-1000000;f.clock.mono=180001;await assert.rejects(f.observer.finish(primary),error=>error===primary);
+  assert(f.records.some(row=>row.stage==='passive-completion-unknown'));assert.equal(f.retired,1);
+});
+
+async function withPassiveListing(run){
+  const temporary=await fs.mkdtemp(path.join(os.tmpdir(),'pc-passive-listing-')),root=await fs.realpath(temporary),directory=path.join(root,'output');
+  await fs.mkdir(directory);await fs.mkdir(path.join(root,'test'));
+  const sourceFile=path.join(root,'test','performance.jl'),source='private disposable test fixture';await fs.writeFile(sourceFile,source);
+  const sourceSha256=createHash('sha256').update(source).digest('hex'),output=path.join(directory,'result.json');
+  const readers=createNativeDiscoveryReaders({...discoveryExpected,root,stableOutput:true,sourceFile,sourceSha256},{record:()=>{}});
+  const capture={output,pid:123,parent:process.pid,closed:false},options={signal:new AbortController().signal,deadlineAt:Date.now()+10000};
+  const listing={schema_version:'perfchecker-testitems/1',executed:false,root,items:[{name:'Vector reduction',file:'test/performance.jl',id:'private target',source_sha256:sourceSha256}]};
+  const write=()=>fs.writeFile(output,JSON.stringify(listing));
+  try{await run({root,directory,sourceFile,output,readers,capture,options,listing,write});}
+  finally{await readers.retire();await fs.rm(root,{recursive:true,force:true});}
+}
+
+test('passive listing binds its private directory before close and checks the exact target and source',async()=>{
+  await withPassiveListing(async f=>{
+    const absent=await f.readers.readListing(f.capture,f.options);assert.equal(absent.status,'not-observed');assert.equal(absent.directoryBoundBeforeClose,true);
+    await f.write();f.capture.closed=true;const value=await f.readers.readListing(f.capture,f.options);
+    assert.equal(value.targetMatches,1);assert.equal(value.sourceMatches,true);assert.equal(value.directoryBoundBeforeClose,true);
+    assert.equal(value.targetIds.length,1);assert(!JSON.stringify(value).includes(f.root));
+    await fs.unlink(f.output);await assert.rejects(f.readers.readListing(f.capture,f.options));
+  });
+});
+
+test('passive listing refuses a replaced parent, substituted file, zero target or mismatched source',async()=>{
+  for(const mode of ['parent','file','target','source'])await withPassiveListing(async f=>{
+    await f.write();await f.readers.readListing(f.capture,f.options);
+    if(mode==='parent'){await fs.rename(f.directory,f.directory+'-original');await fs.mkdir(f.directory);await f.write();}
+    if(mode==='file'){await fs.rename(f.output,f.output+'-original');await f.write();}
+    if(mode==='target'){f.listing.items=[];await f.write();}
+    if(mode==='source')await fs.writeFile(f.sourceFile,'changed private fixture');
+    await assert.rejects(f.readers.readListing(f.capture,f.options));
+  });
+});
+
+test('passive listing refuses links, excessive size and phase abort and labels an anchor first acquired after close',async()=>{
+  await withPassiveListing(async f=>{
+    f.capture.closed=true;await f.write();const value=await f.readers.readListing(f.capture,f.options);assert.equal(value.directoryBoundBeforeClose,false);
+    await fs.writeFile(f.output,Buffer.alloc(262145));await assert.rejects(f.readers.readListing(f.capture,f.options));
+    await fs.unlink(f.output);await fs.symlink(f.sourceFile,f.output);await assert.rejects(f.readers.readListing(f.capture,f.options));
+    const aborted=AbortSignal.abort();await assert.rejects(f.readers.readListing(f.capture,{...f.options,signal:aborted}));
+  });
+});
 
 test('discovery diagnostic refuses another host, phase, product, Core or origin and is inert when off',()=>{
   assert.doesNotThrow(()=>assertNativeDiscoveryDiagnostic({enabled:false,stage:'irrelevant'}));

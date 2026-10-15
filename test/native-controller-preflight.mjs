@@ -6,6 +6,7 @@ import {constants as fileFlags} from 'node:fs';
 import {createHash} from 'node:crypto';
 import os from 'node:os';
 import {gunzipSync} from 'node:zlib';
+import {performance} from 'node:perf_hooks';
 
 const discoveryHash=value=>createHash('sha256').update(value).digest('hex');
 
@@ -40,14 +41,25 @@ export async function discoveryOwnedCommand(spawn,file,args,{signal,deadlineAt,s
   return await pending;
 }
 
-export async function readBoundedNativeFile(handle,size,maximum){
+export async function readBoundedNativeFile(handle,size,maximum,check=()=>{}){
   assert(Number.isSafeInteger(size)&&size>=0&&size<=maximum);
   const bytes=Buffer.alloc(size+1);let count=0;
-  while(count<bytes.length){const result=await handle.read(bytes,count,bytes.length-count,count);
+  while(count<bytes.length){check();const result=await handle.read(bytes,count,bytes.length-count,count);check();
     assert(Number.isInteger(result.bytesRead)&&result.bytesRead>=0&&result.bytesRead<=bytes.length-count);
     if(!result.bytesRead)break;count+=result.bytesRead;}
   assert.equal(count,size,'A bounded diagnostic read refuses growth or a short read');
   return bytes.subarray(0,count);
+}
+
+export async function readNativeDiscoverySource(file,{signal,deadlineAt}){
+  const check=()=>assert(!signal.aborted&&Date.now()<deadlineAt);check();
+  const before=await fs.lstat(file);check();
+  assert(before.isFile()&&!before.isSymbolicLink()&&before.nlink===1&&before.size<=262144);
+  const same=stat=>['dev','ino','size','mtimeMs','ctimeMs','nlink'].every(key=>stat[key]===before[key]);
+  const handle=await fs.open(file,fileFlags.O_RDONLY|fileFlags.O_NOFOLLOW);
+  try{check();assert(same(await handle.stat()));check();const bytes=await readBoundedNativeFile(handle,before.size,262144,check);
+    assert(same(await handle.stat()));check();assert(same(await fs.lstat(file)));check();return discoveryHash(bytes);}
+  finally{await handle.close();}
 }
 
 export function nativeSampleProjection(bytes){
@@ -103,29 +115,47 @@ export async function verifyNativeSampleSyntax(){
 
 export function createNativeDiscoveryReaders(expected,{sampleSyntax,record}={}){
   const states=[],temporary=[];let incarnation,imageIdentity,sampled=false;
+  const outputIdentities=new WeakMap();
   const check=(capture,options)=>{assert(!options.signal.aborted&&Date.now()<options.deadlineAt);
     assert(!capture.exited&&!capture.closed,'A product exit invalidates live-process observations');};
   const sameFile=(a,b)=>['dev','ino','size','mtimeMs','nlink'].every(key=>a[key]===b[key]);
   const readListing=async(capture,options)=>{
-    assert(!options.signal.aborted&&Date.now()<options.deadlineAt);
-    const directory=path.dirname(capture.output),parent=await fs.lstat(directory),canonicalDirectory=await fs.realpath(directory);
+    const within=()=>assert(!options.signal.aborted&&Date.now()<options.deadlineAt);within();
+    const directory=path.dirname(capture.output),parent=await fs.lstat(directory);within();const canonicalDirectory=await fs.realpath(directory);within();
     assert(parent.isDirectory()&&!parent.isSymbolicLink());
-    const recheckParent=async()=>{const after=await fs.lstat(directory);assert(after.isDirectory()&&!after.isSymbolicLink());
-      assert.equal(after.dev,parent.dev);assert.equal(after.ino,parent.ino);assert.equal(await fs.realpath(directory),canonicalDirectory);};
-    let before;try{before=await fs.lstat(capture.output);}catch(error){if(error.code==='ENOENT'){await recheckParent();return{status:'not-observed'};}throw error;}
+    let bound;
+    if(expected.stableOutput){
+      bound=outputIdentities.get(capture);
+      if(bound){assert.equal(parent.dev,bound.dev);assert.equal(parent.ino,bound.ino);assert.equal(canonicalDirectory,bound.canonical);}
+      else{bound={dev:parent.dev,ino:parent.ino,canonical:canonicalDirectory,at:new Date().toISOString(),beforeClose:!capture.closed};outputIdentities.set(capture,bound);}
+    }
+    const recheckParent=async()=>{within();const after=await fs.lstat(directory);within();assert(after.isDirectory()&&!after.isSymbolicLink());
+      assert.equal(after.dev,parent.dev);assert.equal(after.ino,parent.ino);assert.equal(await fs.realpath(directory),canonicalDirectory);within();};
+    let before;try{within();before=await fs.lstat(capture.output);within();}catch(error){if(error.code==='ENOENT'&&!bound?.file){await recheckParent();return{status:'not-observed',
+      ...(bound?{directoryBoundBeforeClose:bound.beforeClose,directoryBoundAt:bound.at}:{} )};}throw error;}
     assert(before.isFile()&&!before.isSymbolicLink()&&before.nlink===1&&before.size<=262144);
-    const handle=await fs.open(capture.output,fileFlags.O_RDONLY|fileFlags.O_NOFOLLOW);
-    try{assert(sameFile(before,await handle.stat()));const bytes=await readBoundedNativeFile(handle,before.size,262144);
-      assert.equal(bytes.length,before.size);assert(sameFile(before,await handle.stat()));assert(sameFile(before,await fs.lstat(capture.output)));
+    if(bound){if(bound.file){assert.equal(before.dev,bound.file.dev);assert.equal(before.ino,bound.file.ino);}
+      else bound.file={dev:before.dev,ino:before.ino};}
+    within();const handle=await fs.open(capture.output,fileFlags.O_RDONLY|fileFlags.O_NOFOLLOW);
+    try{within();assert(sameFile(before,await handle.stat()));within();const bytes=await readBoundedNativeFile(handle,before.size,262144,within);
+      assert.equal(bytes.length,before.size);assert(sameFile(before,await handle.stat()));within();assert(sameFile(before,await fs.lstat(capture.output)));within();
       await recheckParent();
       const value=JSON.parse(bytes);assert.equal(value.schema_version,'perfchecker-testitems/1');assert.equal(value.root,expected.root);
       assert.equal(value.executed,false);assert(Array.isArray(value.items)&&value.items.length<=1024);
       const selected=value.items.filter(item=>item.name==='Vector reduction'&&typeof item.file==='string'&&item.file.replaceAll('\\','/')==='test/performance.jl');
       assert(selected.length<=4&&selected.every(item=>typeof item.id==='string'&&item.id.length<=128));
+      if(expected.stableOutput){
+        assert.equal(selected.length,1,'Passive completion requires exactly the expected target');
+        assert(selected[0].id.length>0&&selected[0].source_sha256===expected.sourceSha256);
+        assert.equal(await readNativeDiscoverySource(expected.sourceFile,options),expected.sourceSha256);
+      }
       assert(!options.signal.aborted&&Date.now()<options.deadlineAt);
       return{status:'valid-listing',schema:value.schema_version,sha256:discoveryHash(bytes),bytes:bytes.length,
         modifiedAt:before.mtime.toISOString(),rootMatches:true,items:value.items.length,targetMatches:selected.length,
-        targetIds:selected.map(item=>discoveryHash(String(item.id)))};
+        targetIds:selected.map(item=>discoveryHash(String(item.id))),
+        ...(bound?{directoryBoundAt:bound.at,directoryBoundBeforeClose:bound.beforeClose,
+          directoryIdentity:{device:bound.dev,inode:bound.ino,canonicalSha256:discoveryHash(bound.canonical)},
+          sourceMatches:true,sourceSha256:expected.sourceSha256}:{} )};
     }finally{await handle.close();}
   };
   const observe=async(capture,options)=>{
@@ -293,6 +323,143 @@ export function installNativeDiscoveryObserver({childProcess,expected,observe,re
       productCloseObserved:captures.length===1&&captures[0].closed});
     if(!drained)errors.push(new Error('Discovery observer physical drain was not established'));
     if(errors.length)throw new AggregateError(errors,'Discovery diagnostic retirement failed');
+  }};
+}
+
+// This observer follows the original ChildProcess handle, never a PID lookup.
+// Its 180-second window is diagnostic only, not a CLI or Run Test deadline.
+export function installPassiveNativeDiscoveryObserver({childProcess,expected,readListing,retireReaders,record,
+    phaseDeadlineAt,signal,contextUnchanged=()=>true,now=Date.now,monotonic=()=>performance.now()}){
+  assert(Number.isFinite(phaseDeadlineAt)&&phaseDeadlineAt>now());
+  expected=Object.freeze({...expected});
+  const originalSpawn=childProcess.spawn,captures=[],errors=[];
+  let stopped=false,active,abortController,uiStatus,visibleRow,uiRead=false,uiStartedMono,finishing;
+  const remaining=capture=>Math.min(capture.deadlineAt-now(),capture.deadlineMono-monotonic());
+  const inWindow=capture=>!stopped&&!signal?.aborted&&remaining(capture)>0;
+  const emit=(value,retirement=false)=>{if(stopped&&!retirement)return;try{record({diagnosticOnly:true,perturbing:true,qualifiesCanonicalProduct:false,
+    mode:'passive-completion',observedAt:new Date(now()).toISOString(),...value});}
+    catch{errors.push(new Error('Passive discovery diagnostic sink failed'));}};
+  const safeError=error=>{try{return{errorClass:/^[A-Za-z]+$/.test(error?.name??'')?error.name:null,
+    code:/^[A-Z0-9_]+$/.test(error?.code??'')?error.code:null};}catch{return{errorClass:null,code:null};}};
+  const read=(capture,stage)=>{
+    if(!inWindow(capture)||active||captures.length!==1)return;
+    const abort=abortController=new AbortController(),deadlineAt=Math.min(capture.deadlineAt,now()+2000);
+    const onAbort=()=>abort.abort();signal?.addEventListener('abort',onAbort,{once:true});
+    const timer=setTimeout(()=>abort.abort(),Math.max(0,Math.min(deadlineAt-now(),remaining(capture))));
+    const startedAt=now(),startedMono=monotonic();
+    active=Promise.resolve().then(()=>readListing(capture,{signal:abort.signal,deadlineAt})).then(listing=>{
+      if(!inWindow(capture)||abort.signal.aborted||now()>=deadlineAt){emit({stage:'passive-listing-unknown',pid:capture.pid,
+        uuidSha256:capture.uuidSha256,reason:'observation-deadline-or-stop'});return;}
+      if(stage==='after-close'&&capture.closed)capture.listing=listing;
+      emit({stage:'passive-listing-read',trigger:stage,pid:capture.pid,uuidSha256:capture.uuidSha256,
+        readStartedAt:new Date(startedAt).toISOString(),readFinishedAt:new Date(now()).toISOString(),listing,
+        readElapsedMs:monotonic()-startedMono,
+        historical:stage==='after-close',productCloseObserved:capture.closed});
+    }).catch(error=>{if(!stopped)emit({stage:'passive-listing-unknown',pid:capture.pid,uuidSha256:capture.uuidSha256,
+      step:'listing-open-read',...safeError(error)});}).finally(()=>{clearTimeout(timer);signal?.removeEventListener('abort',onAbort);active=undefined;});
+    return active;
+  };
+  const closeRead=capture=>capture.closeReadPromise??=Promise.resolve().then(async()=>{if(active)await active;return read(capture,'after-close');});
+  function wrapper(file,args,options){
+    const startedAt=now(),startedMono=monotonic(),child=Reflect.apply(originalSpawn,this,arguments),spawnedAt=now(),spawnedMono=monotonic();
+    try{
+      const output=nativeDiscoverySpawnOutput(file,args,options,expected);
+      if(!output||stopped)return child;
+      assert(Number.isSafeInteger(child.pid)&&child.pid>0&&child.pid!==process.pid);
+      const capture={pid:child.pid,parent:process.pid,startedAt,spawnedAt,startedMono,output,child,
+        uuidSha256:discoveryHash(path.basename(path.dirname(output))),
+        deadlineAt:Math.min(startedAt+180000,phaseDeadlineAt),deadlineMono:startedMono+Math.min(180000,phaseDeadlineAt-startedAt),exited:false,closed:false};
+      captures.push(capture);
+      const outcome=(code,signal)=>({code:Number.isInteger(code)?code:null,signal:typeof signal==='string'&&/^SIG[A-Z0-9]+$/.test(signal)?signal:null});
+      const exit=(code,signal)=>{capture.exited=true;capture.exitAt=now();const elapsedMs=monotonic()-startedMono;queueMicrotask(()=>emit({stage:'product-exit',
+        pid:capture.pid,uuidSha256:capture.uuidSha256,...outcome(code,signal),eventAt:new Date(capture.exitAt).toISOString(),
+        elapsedMs}));};
+      const close=(code,signal)=>{capture.closed=true;capture.closeAt=now();capture.closeMono=monotonic();capture.outcome=outcome(code,signal);
+        queueMicrotask(()=>emit({stage:'product-close',pid:capture.pid,uuidSha256:capture.uuidSha256,
+          ...capture.outcome,eventAt:new Date(capture.closeAt).toISOString(),elapsedMs:capture.closeMono-startedMono}));
+        void closeRead(capture);capture.resolveClose?.();};
+      const error=value=>queueMicrotask(()=>emit({stage:'product-error',pid:capture.pid,uuidSha256:capture.uuidSha256,...safeError(value)}));
+      capture.remove=()=>{child.removeListener('exit',exit);child.removeListener('close',close);child.removeListener('error',error);};
+      child.once('exit',exit);child.once('close',close);child.once('error',error);
+      queueMicrotask(()=>{
+        if(stopped)return;
+        emit({stage:'product-spawn-returned',pid:capture.pid,parent:capture.parent,uuidSha256:capture.uuidSha256,
+          startedAt:new Date(startedAt).toISOString(),spawnedAt:new Date(spawnedAt).toISOString(),invocation:captures.length,
+          spawnElapsedMs:spawnedMono-startedMono,
+          observationDeadlineAt:new Date(capture.deadlineAt).toISOString(),observationWindowMs:180000,
+          identityScope:'Original ChildProcess handle and exact private spawn inputs; no live PID inspection'});
+        if(captures.length!==1){errors.push(new Error('Multiple passive discovery invocations'));return;}
+        void read(capture,'spawn-binding');
+      });
+    }catch{errors.push(new Error('Passive discovery observer setup failed'));}
+    return child;
+  }
+  childProcess.spawn=wrapper;
+  return{captures,uiStarted(){if(stopped)return;uiStartedMono=monotonic();emit({stage:'original-ui-oracle-start',uiOracleMs:120000});},uiOutcome(status,probe,error){
+    if(stopped)return;
+    if(!['passed','failed'].includes(status)||uiStatus){errors.push(new Error('Ambiguous original discovery UI outcome'));return;}
+    uiStatus=status;visibleRow=probe;
+    emit({stage:'original-ui-oracle-settled',status,uiOracleMs:120000,
+      elapsedMs:uiStartedMono===undefined?null:monotonic()-uiStartedMono,...(error?safeError(error):{}),lateRunTestPermitted:false});
+  },finish(original){
+    if(finishing)return finishing;
+    finishing=(async()=>{
+    const cleanup=[];
+    try{
+      const capture=captures.length===1?captures[0]:undefined;
+      if(uiStatus==='failed'&&capture){
+        emit({stage:'passive-completion-window',originalUiVerdict:'failed',pid:capture.pid,uuidSha256:capture.uuidSha256,
+          deadlineAt:new Date(capture.deadlineAt).toISOString(),notAProductDeadline:true});
+        if(!capture.closed&&inWindow(capture)){
+          let timer;const aborted=()=>capture.resolveClose?.();try{await new Promise(resolve=>{capture.resolveClose=resolve;
+            signal?.addEventListener('abort',aborted,{once:true});
+            timer=setTimeout(resolve,Math.max(0,remaining(capture)));if(capture.closed||signal?.aborted)resolve();});}
+          finally{clearTimeout(timer);capture.resolveClose=undefined;signal?.removeEventListener('abort',aborted);}
+        }
+        if(capture.closed&&capture.closeAt<capture.deadlineAt&&capture.closeMono<capture.deadlineMono&&inWindow(capture)){
+          let timer;try{await Promise.race([closeRead(capture),new Promise(resolve=>{timer=setTimeout(resolve,Math.max(0,remaining(capture)));})]);}
+          finally{clearTimeout(timer);}
+          const complete=capture.outcome.code===0&&capture.outcome.signal===null&&capture.listing?.status==='valid-listing'&&
+            capture.listing.directoryBoundBeforeClose===true&&capture.listing.targetMatches===1&&capture.listing.sourceMatches===true;
+          emit({stage:'passive-completion-outcome',pid:capture.pid,uuidSha256:capture.uuidSha256,
+            completion:complete?'close-zero-valid-target-from-bound-directory':'inconclusive',originalUiVerdict:'failed'});
+          if(complete&&inWindow(capture)&&contextUnchanged()===true&&typeof visibleRow==='function'){
+            uiRead=true;const startedAt=now(),startedMono=monotonic(),deadlineAt=Math.min(capture.deadlineAt,now()+2000);
+            const abort=abortController=new AbortController();let timer;
+            active=Promise.resolve().then(()=>visibleRow()).then(visible=>{
+              if(inWindow(capture)&&!abort.signal.aborted&&now()<deadlineAt){const unchanged=contextUnchanged()===true;emit({stage:'passive-ui-row-query',pid:capture.pid,
+                uuidSha256:capture.uuidSha256,queryStartedAt:new Date(startedAt).toISOString(),
+                queryFinishedAt:new Date(now()).toISOString(),queryElapsedMs:monotonic()-startedMono,
+                visibleAtObservation:visible===true&&unchanged?true:'unknown',contextMatchedBeforeQuery:true,contextMatchedAfterQuery:unchanged,
+                testControllerPublication:'unknown',publishingRefresh:'unknown',originalUiVerdict:'failed',lateRunTestPerformed:false});}
+            }).catch(error=>{if(!stopped)emit({stage:'passive-ui-row-unknown',...safeError(error)});});
+            try{await Promise.race([active,new Promise(resolve=>{timer=setTimeout(()=>{abort.abort();emit({stage:'passive-ui-row-unknown',reason:'query-deadline'});resolve();},Math.max(0,deadlineAt-now()));})]);}
+            finally{clearTimeout(timer);}
+          }else if(complete)emit({stage:'passive-ui-row-unknown',reason:'context-changed-or-observation-expired'});
+        }else emit({stage:'passive-completion-unknown',pid:capture.pid,uuidSha256:capture.uuidSha256,
+          reason:'observation-window-expired',productCloseObserved:capture.closed});
+      }else if(capture?.closed&&inWindow(capture)){
+        let timer;try{await Promise.race([closeRead(capture),new Promise(resolve=>{timer=setTimeout(resolve,Math.min(5000,Math.max(0,remaining(capture))));})]);}
+        finally{clearTimeout(timer);}
+      }
+    }catch(error){cleanup.push(error);}
+    finally{
+      stopped=true;abortController?.abort();
+      if(childProcess.spawn===wrapper)childProcess.spawn=originalSpawn;
+      else cleanup.push(new Error('Another spawn hook replaced the passive observer'));
+      let drained=!active,timer;
+      try{if(active)drained=await Promise.race([active.then(()=>true,()=>true),new Promise(resolve=>{timer=setTimeout(()=>resolve(false),5000);})]);}
+      finally{clearTimeout(timer);for(const capture of captures)try{capture.remove?.();}catch(error){cleanup.push(error);}}
+      emit({stage:'passive-observer-retired',drained,invocations:captures.length,originalUiVerdict:uiStatus??'unknown',
+        productCloseObserved:captures.length===1&&captures[0].closed,lateUiQueryAttempted:uiRead,externalObserverProcesses:0},true);
+      if(!drained)cleanup.push(new Error('Passive discovery reader drain is unknown'));
+      if(captures.length!==1)cleanup.push(new Error('Exactly one original discovery invocation is required'));
+      try{await retireReaders();}catch(error){cleanup.push(error);}
+    }
+    cleanup.push(...errors);
+    if(cleanup.length)throw new AggregateError(original?[original,...cleanup]:cleanup,'Passive discovery observation or retirement failed');
+    if(original)throw original;
+    })();return finishing;
   }};
 }
 
