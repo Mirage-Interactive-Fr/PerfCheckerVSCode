@@ -9,6 +9,7 @@ const {promisify}=require('node:util');
 const execute=promisify(execFile);
 const processObservationSignatures=new WeakMap();
 const discoveryDiagnostic=process.env.PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC==='1';
+const investigationDiagnostic=process.env.PERFCHECKER_NATIVE_INVESTIGATION_DIAGNOSTIC==='1';
 const {chromium} = require('playwright');
 const controls = require('./native-studio-controls.cjs');
 const mcp = require('./native-mcp-controls.cjs');
@@ -461,9 +462,15 @@ async function measureNativeTestItemBody(context,expectedPassed,options={}){
   await controls.clickStudioAction(context,'testing');
   const filename=options.file||'test/performance.jl',name=options.name||'Vector reduction';
   const row=windowPage.locator(`.monaco-list-row[aria-label*="${filename}"]`).filter({hasText:name}).first();
+  // This isolated UI diagnostic tests a recalibrated positive appearance
+  // allowance; AA, its negative case and every execution oracle remain intact.
+  const appearanceOracleMs=investigationDiagnostic&&expectedPassed?180000:120000;
+  if(investigationDiagnostic)context.log('native-testitem-appearance-oracle',{
+    uiOracleMs:appearanceOracleMs,expectedPassed,previousAAOracleMs:120000,runTestEvidenceOracleMs:180000,
+    scope:'Visible Testing row only; no product CLI deadline',diagnosticOnly:true,qualifiesCanonicalProduct:false});
   if(discoveryDiagnostic&&process.env.PERFCHECKER_NATIVE_PHASE==='prepared')context.log('native-discovery-ui-oracle-start',
     {uiOracleMs:120000,diagnosticOnly:true,qualifiesCanonicalProduct:false});
-  try{await row.waitFor({state:'visible',timeout:120000});}
+  try{await row.waitFor({state:'visible',timeout:appearanceOracleMs});}
   catch(error){
     try{await context.observeWork?.('testitems-discovery-not-ready');}
     catch(diagnosticError){context.log('native-work-observation-error',{case:'testitems-discovery-not-ready',error:redact(diagnosticError)});}
@@ -531,10 +538,22 @@ exports.run = async () => {
   assert(['x64','arm64'].includes(expectedArch),'The runner declares the expected native architecture');
   assert.equal(process.arch,expectedArch,'The actual Electron extension host must use the native architecture');
   const phase = process.env.PERFCHECKER_NATIVE_PHASE;
-  const {nativeFullCasePartition}=await import('./native-platform-contract.mjs');
+  const {nativeFullCasePartition,assertNativeInvestigationDiagnostic}=await import('./native-platform-contract.mjs');
   const fullCasePartition=nativeFullCasePartition({partition:process.env.PERFCHECKER_NATIVE_FULL_PARTITION||'all',
     stage:process.env.PERFCHECKER_NATIVE_STAGE,artifact:process.env.PERFCHECKER_NATIVE_MODE});
-  let discoveryObservation;
+  let discoveryObservation,investigationObservation;
+  if(investigationDiagnostic){
+    investigationObservation=JSON.parse(process.env.PERFCHECKER_NATIVE_INVESTIGATION_OBSERVATION);
+    investigationObservation={...investigationObservation,positiveTestingAppearanceOracleMs:180000,
+      previousAATestingAppearanceOracleMs:120000,negativeTestingAppearanceOracleMs:120000,navigationOracleMs:120000,runTestEvidenceOracleMs:180000};
+    const core=JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),origin=investigationObservation.origin;
+    assertNativeInvestigationDiagnostic({enabled:true,discoveryDiagnostic,event:process.env.GITHUB_EVENT_NAME,
+      artifact:process.env.PERFCHECKER_NATIVE_MODE,stage:process.env.PERFCHECKER_NATIVE_STAGE,
+      scope:process.env.PERFCHECKER_NATIVE_SCOPE,core:core.mode,partition:fullCasePartition.name,
+      backendJulia:process.env.PERFCHECKER_NATIVE_BACKEND_JULIA,originRun:origin.run,originName:`native-candidate-${origin.commit}`,
+      originSha:process.env.PERFCHECKER_NATIVE_SHA,coreCommit:core.commit,coreTree:core.tree,platform:process.platform,arch:process.arch});
+    assert.equal(origin.tree,'3722727a870402497078e63da78be90d606f5ed5');
+  }
   if(discoveryDiagnostic){
     discoveryObservation=JSON.parse(process.env.PERFCHECKER_NATIVE_DISCOVERY_OBSERVATION);
     const {assertNativeDiscoveryDiagnostic}=await import('./native-controller-preflight.mjs');
@@ -562,7 +581,8 @@ exports.run = async () => {
     {videoOffsetSeconds:(Date.now()-Date.parse(process.env.PERFCHECKER_NATIVE_VIDEO_STARTED_AT))/1000}:{})});
   const persist=(status='running')=>{
     const report=JSON.stringify({status,phase,platform:process.platform,processArch:process.arch,vscode:vscode.version,extension:process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION,invocation:process.env.PERFCHECKER_NATIVE_INVOCATION,
-      coverage:discoveryDiagnostic?'nonqualifying-full-prelude-testitem-discovery':process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?(fullCasePartition.name==='all'?'first-install-studio-investigations-mcp-pluto':`full-native-${fullCasePartition.name}`):'first-install-and-first-run-smoke',
+      coverage:investigationDiagnostic?'nonqualifying-full-prelude-investigation-ui':discoveryDiagnostic?'nonqualifying-full-prelude-testitem-discovery':process.env.PERFCHECKER_NATIVE_STAGE==='focused'?`focused-native-${process.env.PERFCHECKER_NATIVE_CASE_GROUP}`:process.env.PERFCHECKER_NATIVE_STAGE==='targeted'?'actual-workspace-reload-and-controlled-narrative-protocol':process.env.PERFCHECKER_NATIVE_STAGE==='full'?(fullCasePartition.name==='all'?'first-install-studio-investigations-mcp-pluto':`full-native-${fullCasePartition.name}`):'first-install-and-first-run-smoke',
+      ...(investigationDiagnostic?{investigationObservation}:{}),
       ...(discoveryDiagnostic?{discoveryObservation}:{}),
       core:phase==='fresh'?{mode:'production-first-install',registry:'General',version:minimumVersion,available:process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_AVAILABLE==='true'}:JSON.parse(process.env.PERFCHECKER_NATIVE_CORE_PROVENANCE),
       fullCasePartition:process.env.PERFCHECKER_NATIVE_STAGE==='full'?fullCasePartition:undefined,
@@ -696,6 +716,7 @@ exports.run = async () => {
     }else{
     const uri = vscode.Uri.file(workspace);
     const context = {vscode, browser, windowPage, workspace,
+      ...(investigationDiagnostic?{extension,investigationObservation}:{}),
       ...(discoveryDiagnostic?{extension,discoveryObservation}:{}),
       controller: process.env.PERFCHECKER_NATIVE_CONTROLLER, target: process.env.PERFCHECKER_NATIVE_TARGET,
       results: path.join(workspace, 'perf', 'results', 'vscode'), log, proof, findFrame,

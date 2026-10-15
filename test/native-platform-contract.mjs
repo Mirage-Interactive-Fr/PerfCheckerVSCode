@@ -25,6 +25,21 @@ export function assertNativeJuliaArchitecture(runtime,contract,label) {
   assert.equal(runtime.arch,contract.julia,`${label} must use the native Julia architecture`);
 }
 
+export function assertNativeInvestigationDiagnostic({enabled=false,discoveryDiagnostic=false,event,artifact,stage,scope,core,
+  partition='investigation',backendJulia,originRun,originName,originSha,coreCommit,coreTree,newOrigin=false,platform,arch}) {
+  assert(!(enabled&&discoveryDiagnostic),'Investigation and discovery diagnostics are mutually exclusive');
+  if(!enabled)return;
+  assert.equal(event,'workflow_dispatch');assert.equal(artifact,'candidate');assert.equal(stage,'full');
+  assert.equal(scope,'macos-stable');assert.equal(core,'candidate');assert.equal(partition,'investigation');
+  assert.equal(backendJulia,'1');assert.equal(newOrigin,false);
+  assert.equal(String(originRun),'38653410110');
+  assert.equal(originName,'native-candidate-73b99deb87efaf45bd5e96036f755e42c748bdab');
+  assert.equal(originSha,'bc61f9fa172069c61722e0691900d3ddf8a39ce143fd9d553b252304dbc55850');
+  assert.equal(coreCommit,'d079efd5c24c3dcac5b7550781822038e0ff780f');
+  assert.equal(coreTree,'749f8eac351ed2a1f0bc110456f2eb37a3bc08ee');
+  if(platform!==undefined)assert.equal(platform,'darwin');if(arch!==undefined)assert.equal(arch,'x64');
+}
+
 // Historical Intel partitions remain available for reproduction and the
 // explicit discovery diagnostic; they are not part of the new group union.
 const legacyFullCasePartitions=Object.freeze({
@@ -51,7 +66,7 @@ const nativeHostConfigurations=Object.freeze([
 ].map(Object.freeze));
 
 export function nativeWorkflowMatrix({event,scope='all',artifact='candidate',stage='full',group='narrative',core='general',
-  discoveryDiagnostic=false}={}){
+  discoveryDiagnostic=false,investigationDiagnostic=false}={}){
   assert(['pull_request','workflow_dispatch'].includes(event),'Unknown native workflow event');
   assert(['all','linux','linux-stable','windows','windows-stable','macos-stable','arm-bootstrap'].includes(scope),'Unknown native scope');
   assert(['candidate','public'].includes(artifact),'Unknown native archive mode');
@@ -60,6 +75,13 @@ export function nativeWorkflowMatrix({event,scope='all',artifact='candidate',sta
     lane.os.startsWith('windows')?'Windows x64':lane.os==='macos-15'?'Apple Silicon':'macOS Intel';
     return{...lane,name:`Native — ${platform} — VS Code ${lane.vscode}${lane.julia?` — Julia ${lane.julia==='1'?'stable':lane.julia}`:''} — ${label}`,
       artifactName:`native-workflows-${lane.os}-${lane.vscode}${lane.julia?`-julia-${lane.julia}`:''}${lane.partition?`-${lane.partition}`:''}`};};
+  assert(!(discoveryDiagnostic&&investigationDiagnostic),'Diagnostics are mutually exclusive');
+  if(investigationDiagnostic){
+    assert.equal(event,'workflow_dispatch');assert.equal(scope,'macos-stable');assert.equal(artifact,'candidate');
+    assert.equal(stage,'full');assert.equal(core,'candidate');
+    return[{...named({os:'macos-15-intel',vscode:'stable',partition:'investigation'},'Investigations UI'),
+      name:'DIAG — macOS Intel — Investigations UI'}];
+  }
   if(discoveryDiagnostic){
     assert.equal(event,'workflow_dispatch');assert.equal(scope,'macos-stable');assert.equal(artifact,'candidate');
     assert.equal(stage,'full');assert.equal(core,'candidate');

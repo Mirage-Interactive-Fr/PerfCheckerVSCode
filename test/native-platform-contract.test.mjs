@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {assertNativeCampaignSelection,nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition,nativeFullFunctionalGroups,nativeWorkflowMatrix} from './native-platform-contract.mjs';
+import {assertNativeCampaignSelection,nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition,nativeFullFunctionalGroups,nativeWorkflowMatrix,assertNativeInvestigationDiagnostic} from './native-platform-contract.mjs';
 
 const historicalCases=['native-all-studio-controls','native-workbench-controls','native-investigation-controls',
   'native-investigation-limits','native-enabled-narrative-protocol','native-advisor-controls',
@@ -166,7 +166,8 @@ test('the actual package output selects unique functional jobs for every complet
     Function('fs','nativeWorkflowMatrix','process',script)({appendFileSync(file,text){assert.equal(file,'memory-output');assert.equal(output,undefined);output=text;}},
       nativeWorkflowMatrix,{env:{GITHUB_OUTPUT:'memory-output',NATIVE_EVENT:event,NATIVE_SCOPE:inputs.scope,
         NATIVE_VSIX_MODE:inputs.artifact||'candidate',NATIVE_STAGE:inputs.stage,NATIVE_CASE_GROUP:inputs.group,
-        NATIVE_CORE:inputs.core||'candidate',NATIVE_DISCOVERY_DIAGNOSTIC:String(inputs.discovery_diagnostic||false)}});
+        NATIVE_CORE:inputs.core||'candidate',NATIVE_DISCOVERY_DIAGNOSTIC:String(inputs.discovery_diagnostic||false),
+        NATIVE_INVESTIGATION_DIAGNOSTIC:String(inputs.investigation_diagnostic||false)}});
     assert(output.startsWith('matrix=')&&output.endsWith('\n'));return JSON.parse(output.slice(7));};
   assert(workflow.includes('matrix: ${{ steps.matrix.outputs.matrix }}'));
   assert(workflow.includes('include: ${{ fromJSON(needs.package.outputs.matrix) }}'));
@@ -197,10 +198,32 @@ test('the actual package output selects unique functional jobs for every complet
   const diagnostic=manual('macos-stable','full','candidate',{discovery_diagnostic:true});assert.equal(diagnostic.length,1);
   assert.equal(diagnostic[0].partition,'measure');
   assert.equal(diagnostic[0].name,'Diagnostic — macOS Intel — VS Code stable — TestItem discovery — non-qualifying');
+  const ui=manual('macos-stable','full','candidate',{investigation_diagnostic:true});
+  assert.equal(ui.length,1);assert.equal(ui[0].partition,'investigation');assert.equal(ui[0].name,'DIAG — macOS Intel — Investigations UI');
+  assert.throws(()=>manual('macos-stable','full','candidate',{investigation_diagnostic:true,discovery_diagnostic:true}));
   for(const change of [{scope:'unknown'},{artifact:'unknown'},{stage:'unknown'},{event:'unknown'}])
     assert.throws(()=>nativeWorkflowMatrix({event:'workflow_dispatch',...change}));
   for(const change of [{scope:'all'},{stage:'focused'},{artifact:'public'},{core:'general'},{event:'pull_request'}])
     assert.throws(()=>nativeWorkflowMatrix({event:'workflow_dispatch',scope:'macos-stable',stage:'full',artifact:'candidate',core:'candidate',discoveryDiagnostic:true,...change}));
+});
+
+test('Investigation UI observation requires its explicit immutable Intel campaign and leaves OFF unchanged',()=>{
+  const selection={enabled:true,event:'workflow_dispatch',artifact:'candidate',stage:'full',scope:'macos-stable',core:'candidate',
+    partition:'investigation',backendJulia:'1',originRun:'38653410110',originName:'native-candidate-73b99deb87efaf45bd5e96036f755e42c748bdab',
+    originSha:'bc61f9fa172069c61722e0691900d3ddf8a39ce143fd9d553b252304dbc55850',
+    coreCommit:'d079efd5c24c3dcac5b7550781822038e0ff780f',coreTree:'749f8eac351ed2a1f0bc110456f2eb37a3bc08ee',platform:'darwin',arch:'x64'};
+  assertNativeInvestigationDiagnostic(selection);assert.doesNotThrow(()=>assertNativeInvestigationDiagnostic({enabled:false}));
+  for(const change of [{discoveryDiagnostic:true},{event:'pull_request'},{artifact:'public'},{stage:'focused'},{scope:'all'},
+    {core:'general'},{partition:'measure'},{backendJulia:'1.10'},{originRun:'1'},{originName:'other'},
+    {originSha:'0'.repeat(64)},{coreCommit:'0'.repeat(40)},{coreTree:'0'.repeat(40)},{newOrigin:true},{platform:'linux'},{arch:'arm64'}])
+    assert.throws(()=>assertNativeInvestigationDiagnostic({...selection,...change}));
+  for(const change of [{event:'pull_request'},{artifact:'public'},{stage:'focused'},{scope:'all'},{core:'general'}])
+    assert.throws(()=>nativeWorkflowMatrix({...selection,investigationDiagnostic:true,...change}));
+  assert.equal(nativeWorkflowMatrix({event:'pull_request',investigationDiagnostic:false}).length,35);
+  const driver=readFileSync(new URL('./run-public-vsix-host.mjs',import.meta.url),'utf8'),host=readFileSync(new URL('./public-vsix-host.cjs',import.meta.url),'utf8');
+  for(const source of [driver,host])assert(source.includes('assertNativeInvestigationDiagnostic({'));
+  assert(driver.includes('Exact full fresh/configured preparation and all eight prepared prefixes; investigation tail unchanged'));
+  assert(host.includes("'native-investigation-controls':()=>investigations.run(context)"));
 });
 
 test('functional splitting preserves the real three-phase preparation and all existing time limits',()=>{

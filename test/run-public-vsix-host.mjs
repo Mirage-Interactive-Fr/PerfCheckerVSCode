@@ -10,7 +10,7 @@ import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
-import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
+import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition,assertNativeInvestigationDiagnostic} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
 import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
@@ -54,6 +54,7 @@ async function assertCompanionRoute(info,name,revision){
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
 const discoveryDiagnostic=process.env.PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC==='1';
+const investigationDiagnostic=process.env.PERFCHECKER_NATIVE_INVESTIGATION_DIAGNOSTIC==='1';
 const fullCasePartition=nativeFullCasePartition({partition:process.env.PERFCHECKER_NATIVE_FULL_PARTITION||'all',stage,artifact:mode});
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
@@ -591,7 +592,21 @@ try {
     if(packageProvenance.sha256!==sha||packageProvenance.version!==expectedVersion)throw new Error('The candidate package provenance differs from the installed archive.');
     await fs.writeFile(path.join(output,'candidate.provenance.json'),JSON.stringify(packageProvenance,null,2));
   }
-  let discoveryObservation;
+  let discoveryObservation,investigationObservation;
+  assertNativeInvestigationDiagnostic({enabled:investigationDiagnostic,discoveryDiagnostic,event:process.env.GITHUB_EVENT_NAME,
+    artifact:mode,stage,scope:process.env.PERFCHECKER_NATIVE_SCOPE,core:coreMode,partition:fullCasePartition.name,
+    backendJulia:process.env.PERFCHECKER_NATIVE_BACKEND_JULIA,originRun:packageProvenance?.run,
+    originName:`native-candidate-${packageProvenance?.commit}`,originSha:sha,coreCommit,coreTree,newOrigin:false,platform:process.platform,arch:process.arch});
+  if(investigationDiagnostic){
+    assert.equal(packageProvenance.tree,'3722727a870402497078e63da78be90d606f5ed5');
+    assert.equal(packageProvenance.packagedOnceOn,'Linux');assert.equal(packageProvenance.version,'1.0.3');
+    investigationObservation={diagnosticOnly:true,perturbing:true,qualifiesCanonicalProduct:false,
+      mode:'first-acquisition-failure',snapshotMaximum:4,snapshotTimeoutMs:2000,drainMs:2500,
+      listeners:'Only the existing Investigation tail, removed in finally',
+      prelude:'Exact full fresh/configured preparation and all eight prepared prefixes; investigation tail unchanged',
+      limitations:['Navigation or detachment is not panel disposal','Missing script errors do not prove ready/state handshake',
+        'DOM capture describes its observation instant, not the earlier acquisition deadline'],origin:packageProvenance};
+  }
   if(discoveryDiagnostic){
     assertNativeDiscoveryDiagnostic({enabled:true,event:process.env.GITHUB_EVENT_NAME,artifact:mode,stage,
       scope:process.env.PERFCHECKER_NATIVE_SCOPE,core:coreMode,partition:fullCasePartition.name,platform:process.platform,arch:process.arch,
@@ -616,6 +631,7 @@ try {
   const cliProfile = await privateProfile(profile);
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
+    ...(investigationDiagnostic?{investigationObservation}:{}),
     ...(discoveryDiagnostic?{discoveryObservation}:{}),
     fullCasePartition:stage==='full'?fullCasePartition:undefined,
     runner:{platform:process.platform,processArch:process.arch,runnerArch:process.env.RUNNER_ARCH||null},runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,
@@ -686,6 +702,9 @@ try {
         assert(coreProvenance.diagnosticWorker,'The qualified Core preparation supplies its exact diagnostic worker');
       }
       const environment={...runnerEnvironment,...externalBrowser?.environment,...(phase==='landscape'?landscapeFixture.environment:{}),
+        ...(investigationDiagnostic?{PERFCHECKER_NATIVE_INVESTIGATION_DIAGNOSTIC:'1',
+          PERFCHECKER_NATIVE_INVESTIGATION_OBSERVATION:JSON.stringify({...investigationObservation,
+            phaseDeadlineAt:new Date(Date.now()+(phase==='prepared'?130:40)*60000).toISOString()})}:{}),
         ...(discoveryDiagnostic?{PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC:'1',
           PERFCHECKER_NATIVE_DISCOVERY_OBSERVATION:JSON.stringify(discoveryObservation)}:{}),
         ...(diagnosticTemporaryRoot?{TMPDIR:diagnosticTemporaryRoot,PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP:diagnosticTemporaryRoot}:{}),

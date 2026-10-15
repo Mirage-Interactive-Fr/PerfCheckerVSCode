@@ -9,6 +9,139 @@ const {tmpdir} = require('node:os');
 const reportNames = {discover: 'discovery', run: 'run', diagnose: 'diagnosis',
   advise: 'advice', compare: 'comparison', tools: 'tools', sync: 'sync', investigate: 'investigation'};
 
+// Test-only, opt-in observations of the existing UI operations. No panel API,
+// command, browser request or Julia process is replaced or added.
+async function investigationDomSnapshot(frame,page,{deadlineAt,isStopped}) {
+  const check=()=>assert(!isStopped()&&Date.now()<deadlineAt,'UI snapshot observation window remains open');check();
+  const result={attached:!frame.isDetached(),ancestorVisibility:[]};
+  if(!result.attached)return result;
+  for(let current=frame,depth=0;current.parentFrame()&&depth<8;current=current.parentFrame(),depth++){
+    check();const element=await current.frameElement();
+    try{check();result.ancestorVisibility.push(await element.isVisible());check();}finally{await element.dispose();}
+  }
+  check();
+  result.dom=await frame.evaluate(()=>{
+    const count=selector=>Math.min(100,document.querySelectorAll(selector).length);
+    const visible=selector=>{const node=document.querySelector(selector);if(!node)return false;
+      const style=getComputedStyle(node),rect=node.getBoundingClientRect();
+      return style.visibility!=='hidden'&&style.display!=='none'&&rect.width>0&&rect.height>0;};
+    return{readyState:document.readyState,appCount:count('#app'),appChildren:Math.min(100,document.querySelector('#app')?.children.length||0),
+      navCount:count('#app nav[aria-label="Investigation views"]'),navVisible:visible('#app nav[aria-label="Investigation views"]'),
+      statusCount:count('#app .status'),busy:!!document.querySelector('#app .status.busy'),error:!!document.querySelector('#app .status.error')};
+  });
+  check();
+  // Private association only: these URLs never enter the projected observation.
+  result.scriptUrls=await frame.evaluate(()=>Array.from(document.scripts).slice(0,4).map(script=>script.src.length<=8192?script.src:null));
+  check();
+  result.hasDialog=await page.evaluate(()=>Array.from(document.querySelectorAll('[role="dialog"],.quick-input-widget')).slice(0,32)
+    .some(node=>{const style=getComputedStyle(node),rect=node.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&rect.width>0&&rect.height>0;}));
+  check();return result;
+}
+
+exports.createInvestigationViewDiagnostic=function(context,{scriptPath,deadlineAt=Date.now()+130*60000,
+  readSnapshot=investigationDomSnapshot,snapshotMs=2000,drainMs=2500}={}){
+  assert(path.isAbsolute(scriptPath));assert(Number.isFinite(deadlineAt));assert(snapshotMs>0&&snapshotMs<=2000&&drainMs>0&&drainMs<=2500);
+  const frames=new WeakMap(),requests=new WeakMap(),listeners=[],pending=new Set(),scriptBindings=[],outbox=[];let nextFrame=0,events=0,snapshots=0;
+  let stopped=false,active=false,lastFrame,group,finishPromise,sinkError,firstFailure=false,inconclusiveScriptErrors=0,evictedScriptRequests=0;
+  const fixedPurposes=new Set(['view','report-after-view','measurement-findings-view','teardown-view']);
+  const fixedStages=new Set(['before-command','command-returned','before-find-frame','frame-acquired','acquired','failed','report-assertions-complete','cleanup-confirmed']);
+  const fixedGroups=new Set(['read-only-saved-diagnostic-import','discovery-selection-proposals','adopt-real-shared-factory',
+    'reject-invalid-and-duplicate-adoption','measure-real-shared-factory','measure-shared-collectors-profiles','diagnose-real-analyzers',
+    'advise-from-saved-evidence','compare-real-measurements','bounded-investigation','sync-tools-history','cancel-active-scenario-worker']);
+  const digest=value=>createHash('sha256').update(String(value).slice(0,16384)).digest('hex');
+  const flush=()=>{for(const detail of outbox.splice(0))try{context.log('native-investigation-ui-observation',detail);}catch(error){sinkError??=error;}};
+  const emit=detail=>{const reserved=detail.event?.startsWith('snapshot')||detail.event==='acquisition'&&detail.stage==='failed'&&!firstFailure;
+    if(stopped||events>=(reserved?264:256))return;events++;
+    outbox.push({observedAt:new Date().toISOString(),group:fixedGroups.has(group)?group:'unlisted',...detail});queueMicrotask(()=>{if(!stopped)flush();});};
+  const track=frame=>{let identity=frames.get(frame);if(!identity){identity={id:++nextFrame,generation:0,valid:false,everAcquired:false};frames.set(frame,identity);}
+    return identity;};
+  const acquired=frame=>{const identity=track(frame);identity.valid=true;identity.everAcquired=true;lastFrame=frame;return identity;};
+  const expectedScript=value=>{try{const url=new URL(value);return ['https:','vscode-webview-resource:','vscode-file:'].includes(url.protocol)
+    &&decodeURIComponent(url.pathname).replaceAll('\\','/')===scriptPath.replaceAll('\\','/');}catch{return false;}};
+  const safeError=error=>({errorClass:['Error','TypeError','ReferenceError','SyntaxError','TimeoutError'].includes(error?.name)?error.name:'unlisted',
+    errorSha256:digest(`${error?.name||''}\n${error?.message||''}\n${error?.stack||''}`),errorHashScope:'first-16KiB'});
+  const listen=(emitter,event,callback)=>{const safe=(...args)=>{if(stopped||Date.now()>=deadlineAt)return;try{callback(...args);}catch(error){emit({event:'observer-unknown',stage:'event',...safeError(error)});}};
+    emitter.on(event,safe);listeners.push(()=>emitter.off(event,safe));};
+  for(const page of new Set([context.windowPage,...(context.browser?.contexts().flatMap(value=>value.pages())||[])])){
+    listen(page,'request',request=>{if(!expectedScript(request.url()))return;
+      const frame=request.frame();if(!frame)return;const identity=track(frame);
+      const binding={page,frame:request.frame(),generation:identity.generation,url:request.url(),verified:false,active:true};requests.set(request,binding);
+      if(scriptBindings.length===8){scriptBindings.shift().active=false;evictedScriptRequests=Math.min(1000,evictedScriptRequests+1);}
+      scriptBindings.push(binding);
+    });
+    listen(page,'requestfailed',request=>{const binding=requests.get(request),identity=binding&&frames.get(binding.frame);
+      if(!binding?.active||!identity||identity.generation!==binding.generation||request.url()!==binding.url)return;
+      binding.failureSha256=digest(request.failure()?.errorText||'');binding.failedAt=new Date().toISOString();
+      if(binding.verified&&identity.valid)emit({event:'script-request-failed',frame:identity.id,generation:identity.generation,
+        script:'investigation.js',failureSha256:binding.failureSha256});});
+    listen(page,'pageerror',error=>{const stack=String(error.stack||'').slice(0,16384);
+      // Only complete V8 stack entries are eligible, never the message/header
+      // or an arbitrary URL citation inside a foreign frame.
+      const positions=stack.split('\n').slice(1,65).map(line=>/^\s+at ([^\s()]+):([1-9]\d{0,6}):([1-9]\d{0,6})$/.exec(line)
+        ||/^\s+at [^()\r\n]{1,160} \(([^\s()]+):([1-9]\d{0,6}):([1-9]\d{0,6})\)$/.exec(line)).filter(Boolean);
+      const matches=scriptBindings.filter(binding=>binding.page===page&&binding.verified&&frames.get(binding.frame)?.valid
+        &&frames.get(binding.frame).generation===binding.generation&&positions.some(position=>position[1]===binding.url));
+      const unique=matches.filter((binding,index)=>matches.findIndex(other=>other.frame===binding.frame&&other.generation===binding.generation&&other.url===binding.url)===index);
+      if(unique.length!==1){inconclusiveScriptErrors=Math.min(100,inconclusiveScriptErrors+1);return;}
+      const binding=unique[0],identity=frames.get(binding.frame),position=positions.find(position=>position[1]===binding.url);
+      emit({event:'script-error',frame:identity.id,generation:identity.generation,script:'investigation.js',line:Number(position[2]),column:Number(position[3]),...safeError(error)});});
+    for(const event of ['framenavigated','framedetached'])listen(page,event,frame=>{const identity=frames.get(frame);if(!identity)return;
+      identity.generation++;identity.valid=false;if(identity.everAcquired)emit({event,frame:identity.id,generation:identity.generation,documentAssociation:'invalidated',panelDisposed:'unknown'});});
+  }
+  const project=value=>{
+    const result={attached:typeof value?.attached==='boolean'?value.attached:null,
+      ancestorVisibility:Array.isArray(value?.ancestorVisibility)?value.ancestorVisibility.slice(0,8).map(item=>typeof item==='boolean'?item:null):[],
+      hasDialog:typeof value?.hasDialog==='boolean'?value.hasDialog:null};
+    if(value?.dom){result.dom={readyState:['loading','interactive','complete'].includes(value.dom.readyState)?value.dom.readyState:'unknown'};
+      for(const key of ['appCount','appChildren','navCount','statusCount'])result.dom[key]=Number.isInteger(value.dom[key])&&value.dom[key]>=0&&value.dom[key]<=100?value.dom[key]:null;
+      for(const key of ['navVisible','busy','error'])result.dom[key]=typeof value.dom[key]==='boolean'?value.dom[key]:null;}
+    return result;
+  };
+  const capture=(purpose,stage,frame)=>{
+    if(stopped||Date.now()>=deadlineAt||snapshots>=4)return;
+    if(active)return;active=true;snapshots++;
+    const identity=frame&&frames.get(frame),generation=identity?.generation,valid=identity?.valid;
+    const sequence=snapshots,until=Math.min(deadlineAt,Date.now()+snapshotMs);
+    const operation=Promise.resolve().then(()=>valid?readSnapshot(frame,frame.page(),{deadlineAt:until,isStopped:()=>stopped}):{attached:frame?!frame.isDetached():null});pending.add(operation);
+    let timer;Promise.race([operation,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Snapshot deadline')),Math.max(0,until-Date.now()));})])
+      .then(value=>{if(!stopped&&Date.now()<until&&(!identity||identity.generation===generation&&identity.valid===valid)){
+          if(valid)for(const binding of scriptBindings.filter(binding=>binding.frame===frame&&binding.generation===generation)){
+            binding.verified=Array.isArray(value.scriptUrls)&&value.scriptUrls.slice(0,4).some(url=>url===binding.url&&expectedScript(url));
+            if(binding.verified&&binding.failureSha256)emit({event:'script-request-failed',frame:identity.id,generation,
+              script:'investigation.js',failureSha256:binding.failureSha256,failedAt:binding.failedAt,historical:true});
+          }
+          emit({event:'snapshot',sequence,purpose,stage,frame:identity?.id||null,generation:generation??null,
+            documentAssociation:valid?'previously-acquired':'unknown-or-invalidated',...project(value)});
+        }
+        else emit({event:'snapshot-unknown',sequence,purpose,stage,reason:'deadline'});},error=>emit({event:'snapshot-unknown',sequence,purpose,stage,...safeError(error)}))
+      .catch(error=>emit({event:'snapshot-unknown',sequence,purpose,stage,...safeError(error)})).finally(()=>clearTimeout(timer));
+    void operation.then(()=>{},()=>{}).finally(()=>{pending.delete(operation);active=false;});
+  };
+  return{
+    group(name){group=name;},
+    mark(purpose,stage,frame,error){if(stopped||Date.now()>=deadlineAt)return;purpose=fixedPurposes.has(purpose)?purpose:'view';
+      stage=fixedStages.has(stage)?stage:'unlisted';
+      if(frame)acquired(frame);
+      emit({event:'acquisition',purpose,stage,frame:frame?frames.get(frame).id:null,
+        generation:frame?frames.get(frame).generation:null,...(stage==='failed'?safeError(error):{})});
+      if(stage==='failed'&&!firstFailure){firstFailure=true;capture(purpose,stage,frame||lastFrame);}
+    },
+    report(action,report){emit({event:'report-read',action:Object.hasOwn(reportNames,action)?action:'unlisted',
+      schema:report?.schema_version==='perfchecker-scenario-run/1'?report.schema_version:'other',
+      runs:Array.isArray(report?.runs)?Math.min(report.runs.length,100):null});},
+    finish(){if(finishPromise)return finishPromise;flush();stopped=true;
+      finishPromise=(async()=>{const errors=[];for(const remove of listeners)try{remove();}catch(error){errors.push(error);}
+        let timer;const drained=await Promise.race([Promise.allSettled([...pending]).then(()=>true),
+          new Promise(resolve=>{timer=setTimeout(()=>resolve(false),drainMs);})]);clearTimeout(timer);
+        try{context.log('native-investigation-ui-retired',{observedAt:new Date().toISOString(),snapshots,events,drained,
+          listenersRemoved:errors.length===0,inconclusiveScriptErrors,unassociatedScriptRequests:scriptBindings.filter(binding=>!binding.verified).length,
+          evictedScriptRequests,eventLimitReached:events>=256,
+          qualifiesCanonicalProduct:false,perturbing:true});}catch(error){errors.push(error);}
+        if(!drained)errors.push(new Error('Investigation diagnostic drain inconclusive'));if(sinkError)errors.push(sinkError);
+        if(errors.length)throw new AggregateError(errors,'Investigation diagnostic retirement failed');})();return finishPromise;}
+  };
+};
+
 async function eventually(read, description, timeout = 120000) {
   const deadline = Date.now() + timeout;
   let last;
@@ -23,15 +156,22 @@ function configuration(context) {
   return context.vscode.workspace.getConfiguration('perfchecker', context.vscode.Uri.file(context.workspace));
 }
 
-async function view(context) {
-  await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
-  const result = await context.findFrame('#app nav[aria-label="Investigation views"]');
-  await result.locator('#app p.status').waitFor({state: 'visible'});
-  return result;
+async function view(context,purpose='view') {
+  const diagnostic=context.investigationViewDiagnostic;
+  diagnostic?.mark(purpose,'before-command');
+  try{
+    const command=context.vscode.commands.executeCommand('perfchecker.openInvestigations');
+    diagnostic?.mark(purpose,'command-returned');await command;
+    diagnostic?.mark(purpose,'before-find-frame');
+    const result = await context.findFrame('#app nav[aria-label="Investigation views"]');
+    diagnostic?.mark(purpose,'frame-acquired',result);
+    await result.locator('#app p.status').waitFor({state: 'visible'});
+    diagnostic?.mark(purpose,'acquired',result);return result;
+  }catch(error){diagnostic?.mark(purpose,'failed',undefined,error);throw error;}
 }
 
-async function tab(context, name) {
-  const result = await view(context);
+async function tab(context, name,purpose='view') {
+  const result = await view(context,purpose);
   await result.getByRole('button', {name, exact: true}).click();
   await eventually(async () => (await result.getByRole('button', {name, exact: true}).getAttribute('aria-current')) === 'page', `${name} investigation view`);
   return result;
@@ -73,11 +213,13 @@ async function reportAfter(context, before, action, timeout = 360000) {
   }, `real Julia ${action} report`, timeout);
   reportObserved=true;
   reportObservedAt=new Date().toISOString();
-  const current = await view(context);
+  context.investigationViewDiagnostic?.report(action,found.report);
+  const current = await view(context,'report-after-view');
   await eventually(async () => !(await current.locator('#app .status').getAttribute('class')).includes('busy'), `${action} controller completes cleanup`, Math.min(timeout,360000));
   assert.equal(await current.getByRole('button', {name: 'Cancel', exact: true}).isDisabled(), true);
   cleanupConfirmed=true;
   cleanupConfirmedAt=new Date().toISOString();
+  context.investigationViewDiagnostic?.mark('report-after-view','cleanup-confirmed',current);
   return found;
   }finally{
     if(action==='diagnose')context.log('investigation-diagnosis-observation-result',{
@@ -239,7 +381,8 @@ async function measure(context) {
   assert.equal(run.qualification.availability, 'complete');
   assert.equal(run.qualification.correctness, 'passed');
   assert(run.summaries.some(summary => summary.metric === 'julia.wall.time' && summary.samples >= 2));
-  const current = await tab(context, 'Findings & advice');
+  context.investigationViewDiagnostic?.mark('measurement-findings-view','report-assertions-complete');
+  const current = await tab(context, 'Findings & advice','measurement-findings-view');
   const chart = current.locator('svg.sample-chart');
   assert(await chart.count(), 'Actual measured observations produce a sample chart');
   await chart.locator('circle').first().focus();
@@ -503,7 +646,7 @@ async function savedImport(context) {
 }
 exports.runSavedImport=savedImport;
 
-exports.run = async (context,options={}) => {
+async function runControls(context,options={}) {
   assert.equal(process.env.CI, 'true', 'Use disposable remote CI profiles, never the user VS Code');
   assert(path.isAbsolute(context.workspace));
   const settings = configuration(context);
@@ -532,6 +675,7 @@ exports.run = async (context,options={}) => {
     ];
     let blockedBy;
     for (const [name, callback] of cases.filter(([name])=>!options.diagnosisOnly||['discovery-selection-proposals','adopt-real-shared-factory','diagnose-real-analyzers'].includes(name))) {
+      context.investigationViewDiagnostic?.group(name);
       if(options.diagnosisOnly&&blockedBy){
         failures.push(new Error(`${name}: Blocked by ${blockedBy}`));
         context.log(`investigation-${name}-blocked`,{status:'blocked',blockedBy});continue;
@@ -542,7 +686,7 @@ exports.run = async (context,options={}) => {
   } finally {
     await context.vscode.commands.executeCommand('perfchecker.cancelInvestigation').catch(() => {});
     try {
-      const current = await view(context);
+      const current = await view(context,'teardown-view');
       await eventually(async () => !(await current.locator('#app .status').getAttribute('class')).includes('busy'), 'Investigation teardown waits for worker cleanup', 120000);
     } catch (error) {failures.push(new Error(`investigation-teardown: ${error.message}`, {cause: error}));}
     await fs.writeFile(catalog, originalCatalog);
@@ -550,5 +694,16 @@ exports.run = async (context,options={}) => {
     for (const key of keys) await configuration(context).update(key, previous[key], context.vscode.ConfigurationTarget.WorkspaceFolder);
   }
   if (failures.length) throw new AggregateError(failures, `${failures.length} real investigation control groups failed`);
+}
+exports.run=async(context,options={})=>{
+  if(!context.investigationObservation)return runControls(context,options);
+  const diagnostic=exports.createInvestigationViewDiagnostic(context,{scriptPath:path.join(context.extension.extensionPath,'media','investigation.js'),
+    ...(context.investigationObservation.phaseDeadlineAt?{deadlineAt:Date.parse(context.investigationObservation.phaseDeadlineAt)}:{})});
+  let result,originalFailure,retirementFailure;
+  try{result=await runControls({...context,investigationViewDiagnostic:diagnostic},options);}catch(error){originalFailure=error;}
+  try{await diagnostic.finish();}catch(error){retirementFailure=error;}
+  if(retirementFailure)throw new AggregateError([...(originalFailure?[originalFailure]:[]),retirementFailure],'Investigation UI diagnostic failed');
+  if(originalFailure)throw originalFailure;return result;
 };
+exports.investigationDiagnosticControls={view,tab,reportAfter,readSnapshot:investigationDomSnapshot};
 exports.runDiagnosis=context=>exports.run(context,{diagnosisOnly:true});
