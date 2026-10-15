@@ -1199,8 +1199,8 @@ exports.runSelection = async context => {
     .map(id=>[id,document.getElementById(id).disabled])),inventory:[...document.querySelectorAll('#cards .card')].map(card=>({id:card.dataset.id,
       colour:card.querySelector('input.label').value,checks:[...card.querySelectorAll('.check-option')].map(check=>({name:check.querySelector('.check-name').textContent,selected:check.querySelector('input').checked}))})),
     count:document.getElementById('count').textContent,sort:document.getElementById('sort').value,openAfterRun:document.getElementById('open-after-run').checked}));
-  await eventually(async()=>Object.values((await state()).controls).every(disabled=>!disabled),'The saved real run panel returns to idle before launching');
-  const idleState=await state(),beforeLaunches=await controllerLaunches();
+  const idleState=await eventually(async()=>{const snapshot=await state();return Object.values(snapshot.controls).every(disabled=>!disabled)&&snapshot;},'The saved real run panel returns to idle before launching');
+  const beforeLaunches=await controllerLaunches();
   const launchCount=entries=>entries.reduce((sum,item)=>sum+item.commands.length,0);
   context.log('native-ui-action',{surface:'Suite designer',action:'Run selected check'});
   await view.locator('#run').click({timeout:NATIVE_READINESS_MS});
