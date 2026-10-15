@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {assertNativeCampaignSelection,nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
+import {assertNativeCampaignSelection,nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition,nativeFullFunctionalGroups,nativeWorkflowMatrix} from './native-platform-contract.mjs';
+
+const historicalCases=['native-all-studio-controls','native-workbench-controls','native-investigation-controls',
+  'native-investigation-limits','native-enabled-narrative-protocol','native-advisor-controls',
+  'native-mcp-controls','native-pluto-controls','native-discovery-and-sync-after-pluto'];
+const historicalPrefix=['controller-visible-in-studio','native-julia-terminal','native-pluto-without-jupyter',
+  'native-suite-run-button','native-suite-save-palette','native-run-selection-command',
+  'native-testitem-measurement','native-complete-suite-measurements'];
 
 const arm={scope:'arm-bootstrap',event:'workflow_dispatch',artifact:'candidate',stage:'focused',
   group:'bootstrap',core:'general',arch:'arm64',runnerArch:'ARM64',expectedArch:'arm64'};
@@ -35,15 +42,25 @@ test('existing campaigns retain x64 and reject incidental ARM execution',()=>{
   }
 });
 
-test('Intel partitions preserve the full ordered case union and every shared prefix',()=>{
+test('seven functional groups preserve every historical case and shared prefix without mixing legacy partitions',()=>{
+  assert.deepEqual(nativeFullFunctionalGroups.map(group=>group.id),
+    ['studio','workbench','investigation','investigation-limits','narrative','advisor','mcp-pluto']);
+  assert.deepEqual(nativeFullFunctionalGroups.flatMap(group=>group.cases),historicalCases);
+  assert.equal(new Set(nativeFullFunctionalGroups.flatMap(group=>group.cases)).size,9);
+  for(const platform of ['linux','win32','darwin'])for(const group of nativeFullFunctionalGroups){
+    const partition=nativeFullCasePartition({partition:group.id,platform,arch:'x64',stage:'full',artifact:'candidate'});
+    assert.deepEqual(partition.sharedPrefix,historicalPrefix);assert.deepEqual(partition.cases,group.cases);
+  }
+  assert.deepEqual(nativeFullFunctionalGroups.at(-1).cases,
+    ['native-mcp-controls','native-pluto-controls','native-discovery-and-sync-after-pluto']);
+});
+
+test('historical Intel partitions remain separately reproducible with their original ordered union',()=>{
   const campaign={platform:'darwin',arch:'x64',stage:'full',artifact:'candidate'};
   const all=nativeFullCasePartition(campaign);
   const partitions=['measure','investigate','agentic'].map(partition=>nativeFullCasePartition({...campaign,partition}));
-  const historical=['native-all-studio-controls','native-workbench-controls','native-investigation-controls',
-    'native-investigation-limits','native-enabled-narrative-protocol','native-advisor-controls',
-    'native-mcp-controls','native-pluto-controls','native-discovery-and-sync-after-pluto'];
-  assert.deepEqual(all.cases,historical,'The independently enumerated historical tail must remain complete');
-  assert.deepEqual(partitions.flatMap(partition=>partition.cases),historical);
+  assert.deepEqual(all.cases,historicalCases,'The independently enumerated historical tail must remain complete');
+  assert.deepEqual(partitions.flatMap(partition=>partition.cases),historicalCases);
   assert.equal(new Set(all.cases).size,all.cases.length,'No full case is accidentally duplicated or lost');
   for(const partition of partitions)assert.deepEqual(partition.sharedPrefix,all.sharedPrefix);
   assert.deepEqual(partitions[2].cases.slice(-3),['native-mcp-controls','native-pluto-controls','native-discovery-and-sync-after-pluto'],
@@ -65,13 +82,45 @@ test('the real host dispatches every advertised shared-prefix case before its pa
   assert(suiteStart>=0&&suiteEnd>suiteStart);
   const suite=Function('discoveryDiagnostic',`return (${source.slice(suiteStart,suiteEnd).trim()})`)(false);
   await suite({vscode:{Uri:{file:value=>value}},workspace:'/disposable-fixture'},runCase,{testItem:true,complete:true});
-  const historicalPrefix=['controller-visible-in-studio','native-julia-terminal','native-pluto-without-jupyter',
-    'native-suite-run-button','native-suite-save-palette','native-run-selection-command',
-    'native-testitem-measurement','native-complete-suite-measurements'];
   assert.deepEqual(calls,historicalPrefix);
   assert.deepEqual(nativeFullCasePartition({artifact:'candidate'}).sharedPrefix,historicalPrefix);
   assert(source.includes("await runSuiteCases(context,runCase,{testItem:true,complete:process.env.PERFCHECKER_NATIVE_STAGE==='full'});"),
     'Every full prepared partition still dispatches both the native test item and the complete suite');
+});
+
+test('each real full dispatcher executes eight prefixes followed by only its functional tail in one context',async()=>{
+  const source=readFileSync(new URL('./public-vsix-host.cjs',import.meta.url),'utf8');
+  const prefixStart=source.indexOf("await runCase('controller-visible-in-studio'"),prefixEnd=source.indexOf("if (phase === 'configured'",prefixStart);
+  const suiteStart=source.indexOf('async function runSuiteCases('),suiteEnd=source.indexOf('async function measureNativeTestItem(',suiteStart);
+  const tailStart=source.indexOf("if (process.env.PERFCHECKER_NATIVE_STAGE === 'full'&&!discoveryDiagnostic) {");
+  assert(prefixStart>=0&&prefixEnd>prefixStart&&suiteStart>=0&&suiteEnd>suiteStart&&tailStart>=0);
+  let end=source.indexOf('{',tailStart),depth=1;
+  while(depth&&++end<source.length){if(source[end]==='{')depth++;if(source[end]==='}')depth--;}
+  assert.equal(depth,0);
+  const AsyncFunction=Object.getPrototypeOf(async function(){}).constructor;
+  const prefix=new AsyncFunction('runCase','process',source.slice(prefixStart,prefixEnd));
+  const suite=Function('discoveryDiagnostic',`return (${source.slice(suiteStart,suiteEnd).trim()})`)(false);
+  const tail=new AsyncFunction('process','discoveryDiagnostic','runCase','context','fullCasePartition','assert',
+    'controls','workbench','investigations','require','advisor','mcp','pluto','vscode',source.slice(tailStart,end+1));
+  for(const platform of ['linux','win32','darwin'])for(const group of nativeFullFunctionalGroups){
+    const calls=[],effects=[],context={vscode:{Uri:{file:value=>value}},workspace:'/disposable-fixture'};
+    const noEffects=async name=>{calls.push(name);return true;};
+    await prefix(noEffects,{env:{PERFCHECKER_NATIVE_MODE:'candidate'}});await suite(context,noEffects,{testItem:true,complete:true});
+    const effect=name=>async actual=>{assert.equal(actual,context);effects.push(name);};
+    const modules={
+      './native-investigation-limits.cjs':{run:effect('native-investigation-limits')},
+      './native-narrative-controls.cjs':{run:effect('native-enabled-narrative-protocol')}
+    };
+    const vscode={commands:{executeCommand:async command=>{effects.push(command);}}};
+    await tail({env:{PERFCHECKER_NATIVE_STAGE:'full'}},false,async(name,run)=>{calls.push(name);await run();},context,
+      nativeFullCasePartition({partition:group.id,platform,arch:'x64',stage:'full',artifact:'candidate'}),assert,
+      {run:effect('native-all-studio-controls')},{run:effect('native-workbench-controls')},
+      {run:effect('native-investigation-controls')},name=>{assert(Object.hasOwn(modules,name));return modules[name];},
+      {run:effect('native-advisor-controls')},{run:effect('native-mcp-controls')},{run:effect('native-pluto-controls')},vscode);
+    assert.deepEqual(calls,[...historicalPrefix,...group.cases]);
+    assert.deepEqual(effects,group.id==='mcp-pluto'?
+      ['native-mcp-controls','native-pluto-controls','perfchecker.discoverScenarios','perfchecker.syncScenarios']:group.cases);
+  }
 });
 
 test('the real diagnostic host keeps the seventh prefix and explicitly excludes only the following cases',async()=>{
@@ -102,26 +151,67 @@ test('partitions cannot silently replace focused, public, ARM or other platform 
     {arch:'arm64'},{stage:'focused'},{stage:'smoke'},{artifact:'public'}])
     assert.throws(()=>nativeFullCasePartition({...campaign,...change}));
   assert(!nativeFullCasePartition({artifact:'public'}).cases.includes('native-pluto-controls'));
+  for(const partition of nativeFullFunctionalGroups.map(group=>group.id))for(const change of
+    [{partition:'unknown'},{platform:'freebsd'},{arch:'arm64'},{stage:'focused'},{stage:'smoke'},{artifact:'public'}])
+    assert.throws(()=>nativeFullCasePartition({...campaign,partition,...change}));
 });
 
-test('the actual workflow partitions only complete candidate Intel jobs and keeps every other lane',()=>{
+test('the actual package output selects unique functional jobs for every complete candidate host',()=>{
   const workflow=readFileSync(new URL('../.github/workflows/native-vsix.yml',import.meta.url),'utf8');
-  const expression=workflow.split('\n').find(line=>line.includes('include: ${{ fromJSON(')).split('${{ ')[1].split(' }}')[0];
-  const matrix=(event,inputs={})=>Function('github','inputs','fromJSON',`return ${expression}`)({event_name:event},inputs,JSON.parse);
+  const step=workflow.indexOf('id: matrix'),start=workflow.indexOf("node --input-type=module <<'NODE'",step)+"node --input-type=module <<'NODE'".length;
+  const end=workflow.indexOf('\n          NODE',start);assert(step>=0&&end>start);
+  assert(step<workflow.indexOf('Select the declared archive origin for qualification'));
+  const script=workflow.slice(start,end).split('\n').filter(line=>!line.trim().startsWith('import ')).join('\n');
+  const matrix=(event,inputs={})=>{let output;
+    Function('fs','nativeWorkflowMatrix','process',script)({appendFileSync(file,text){assert.equal(file,'memory-output');assert.equal(output,undefined);output=text;}},
+      nativeWorkflowMatrix,{env:{GITHUB_OUTPUT:'memory-output',NATIVE_EVENT:event,NATIVE_SCOPE:inputs.scope,
+        NATIVE_VSIX_MODE:inputs.artifact||'candidate',NATIVE_STAGE:inputs.stage,NATIVE_CASE_GROUP:inputs.group,
+        NATIVE_CORE:inputs.core||'candidate',NATIVE_DISCOVERY_DIAGNOSTIC:String(inputs.discovery_diagnostic||false)}});
+    assert(output.startsWith('matrix=')&&output.endsWith('\n'));return JSON.parse(output.slice(7));};
+  assert(workflow.includes('matrix: ${{ steps.matrix.outputs.matrix }}'));
+  assert(workflow.includes('include: ${{ fromJSON(needs.package.outputs.matrix) }}'));
+  assert(workflow.includes('name: ${{ matrix.name }}'));assert(workflow.includes('name: ${{ matrix.artifactName }}'));
   const full=matrix('pull_request');
-  assert.deepEqual(full.filter(lane=>lane.os!=='macos-15-intel'),[
-    {os:'ubuntu-latest',vscode:'1.96.0'},{os:'ubuntu-latest',vscode:'stable'},
-    {os:'windows-latest',vscode:'1.96.0'},{os:'windows-latest',vscode:'stable'}]);
-  assert.deepEqual(full.filter(lane=>lane.os==='macos-15-intel').map(lane=>lane.partition),['measure','investigate','agentic']);
-  const manual=(scope,stage='full',artifact='candidate')=>matrix('workflow_dispatch',{scope,stage,artifact});
-  assert.equal(manual('macos-stable').length,3);
-  assert.deepEqual(manual('macos-stable','focused'),[{os:'macos-15-intel',vscode:'stable'}]);
+  assert.equal(full.length,35);assert.equal(new Set(full.map(lane=>lane.name)).size,35);
+  assert.equal(new Set(full.map(lane=>lane.artifactName)).size,35);
+  for(const [os,vscode]of [['ubuntu-latest','1.96.0'],['ubuntu-latest','stable'],['windows-latest','1.96.0'],['windows-latest','stable'],['macos-15-intel','stable']]){
+    const lanes=full.filter(lane=>lane.os===os&&lane.vscode===vscode);assert.equal(lanes.length,7);
+    assert.deepEqual(lanes.map(lane=>lane.partition),['studio','workbench','investigation','investigation-limits','narrative','advisor','mcp-pluto']);
+    assert(lanes.every(lane=>lane.name.includes(`VS Code ${vscode}`)&&lane.name.includes(os==='macos-15-intel'?'macOS Intel':'x64')));
+  }
+  const manual=(scope,stage='full',artifact='candidate',extra={})=>matrix('workflow_dispatch',{scope,stage,artifact,...extra});
+  assert.equal(manual('all').length,35);for(const scope of ['linux','windows'])assert.equal(manual(scope).length,14);
+  for(const scope of ['linux-stable','windows-stable','macos-stable'])assert.equal(manual(scope).length,7);
+  assert.deepEqual(manual('macos-stable','focused').map(({os,vscode})=>({os,vscode})),[{os:'macos-15-intel',vscode:'stable'}]);
   assert.equal(manual('all','full','public').length,5);
   assert(manual('all','full','public').every(lane=>!lane.partition));
-  assert.equal(manual('all','focused').length,5);
-  assert.equal(manual('arm-bootstrap','focused').length,4);
-  assert(manual('arm-bootstrap','focused').every(lane=>lane.arch==='arm64'&&!lane.partition));
-  assert.deepEqual(manual('windows-stable'),[{os:'windows-latest',vscode:'stable'}]);
-  assert.deepEqual(matrix('workflow_dispatch',{scope:'macos-stable',stage:'full',artifact:'candidate',discovery_diagnostic:true}),
-    [{os:'macos-15-intel',vscode:'stable',partition:'measure'}]);
+  assert.deepEqual(manual('all','full','public').map(({os,vscode})=>({os,vscode})),[
+    {os:'ubuntu-latest',vscode:'1.96.0'},{os:'ubuntu-latest',vscode:'stable'},
+    {os:'windows-latest',vscode:'1.96.0'},{os:'windows-latest',vscode:'stable'},{os:'macos-15-intel',vscode:'stable'}]);
+  for(const stage of ['focused','smoke','targeted','core-external','connector-workers']){
+    assert.equal(manual('all',stage).length,5);assert(manual('all',stage).every(lane=>!lane.partition));
+  }
+  const arm=manual('arm-bootstrap','focused','candidate',{core:'general',group:'bootstrap'});assert.equal(arm.length,4);
+  assert(arm.every(lane=>lane.arch==='arm64'&&!lane.partition&&lane.name.includes(lane.os==='macos-15'?'Apple Silicon':'Linux ARM64')&&lane.name.includes('Julia')));
+  assert.equal(new Set(arm.map(lane=>lane.name)).size,4);assert.equal(new Set(arm.map(lane=>lane.artifactName)).size,4);
+  const diagnostic=manual('macos-stable','full','candidate',{discovery_diagnostic:true});assert.equal(diagnostic.length,1);
+  assert.equal(diagnostic[0].partition,'measure');
+  assert.equal(diagnostic[0].name,'Diagnostic — macOS Intel — VS Code stable — TestItem discovery — non-qualifying');
+  for(const change of [{scope:'unknown'},{artifact:'unknown'},{stage:'unknown'},{event:'unknown'}])
+    assert.throws(()=>nativeWorkflowMatrix({event:'workflow_dispatch',...change}));
+  for(const change of [{scope:'all'},{stage:'focused'},{artifact:'public'},{core:'general'},{event:'pull_request'}])
+    assert.throws(()=>nativeWorkflowMatrix({event:'workflow_dispatch',scope:'macos-stable',stage:'full',artifact:'candidate',core:'candidate',discoveryDiagnostic:true,...change}));
+});
+
+test('functional splitting preserves the real three-phase preparation and all existing time limits',()=>{
+  const workflow=readFileSync(new URL('../.github/workflows/native-vsix.yml',import.meta.url),'utf8');
+  const driver=readFileSync(new URL('./run-public-vsix-host.mjs',import.meta.url),'utf8');
+  assert(workflow.includes("timeout-minutes: ${{ (github.event_name != 'workflow_dispatch' || inputs.stage == 'full') && 180 || 150 }}"));
+  assert(driver.includes("const completeCampaign=['smoke','full'].includes(stage);"));
+  assert(driver.includes("if(completeCampaign||bootstrapOnly)await launch('fresh');"));
+  assert(driver.includes("if(completeCampaign)await launch('configured');"));
+  assert(driver.includes("else await launch('prepared');"));
+  assert(driver.includes("phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?130"));
+  assert(workflow.includes("if: runner.os == 'Linux' && matrix.vscode == 'stable' && (env.PERFCHECKER_NATIVE_STAGE == 'full' || env.PERFCHECKER_NATIVE_CASE_GROUP == 'mcp-pluto')"),
+    'Every complete group preserves the actual host prerequisite condition without a partition exception');
 });

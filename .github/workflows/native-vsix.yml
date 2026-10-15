@@ -150,6 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.digest.outputs.sha }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     env:
       NATIVE_EVENT: ${{ github.event_name }}
       NATIVE_DISCOVERY_DIAGNOSTIC: ${{ inputs.discovery_diagnostic || 'false' }}
@@ -167,6 +168,18 @@ jobs:
       REUSE_SHA: ${{ inputs.candidate_sha }}
     steps:
       - uses: actions/checkout@v7
+      - name: Select native functions and supported host configurations
+        id: matrix
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import {nativeWorkflowMatrix} from './test/native-platform-contract.mjs';
+          const e=process.env;
+          const matrix=nativeWorkflowMatrix({event:e.NATIVE_EVENT,scope:e.NATIVE_SCOPE||'all',
+            artifact:e.NATIVE_VSIX_MODE,stage:e.NATIVE_STAGE||'full',group:e.NATIVE_CASE_GROUP||'narrative',
+            core:e.NATIVE_CORE||'candidate',discoveryDiagnostic:e.NATIVE_DISCOVERY_DIAGNOSTIC==='true'});
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,'matrix='+JSON.stringify(matrix)+'\n');
+          NODE
       - name: Select the declared archive origin for qualification
         run: |
           node --input-type=module <<'NODE'
@@ -256,11 +269,11 @@ jobs:
   native-workflows:
     if: github.event_name != 'workflow_dispatch' || inputs.stage != 'connector-workers'
     needs: package
-    name: Native VSIX (${{ matrix.os }}, VS Code ${{ matrix.vscode }}${{ matrix.julia && format(', Julia {0}', matrix.julia) || '' }}${{ matrix.partition && format(', {0}', matrix.partition) || '' }}${{ inputs.discovery_diagnostic && ', discovery diagnostic' || '' }})
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.discovery_diagnostic && '[{"os":"macos-15-intel","vscode":"stable","partition":"measure"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'arm-bootstrap' && '[{"os":"ubuntu-24.04-arm","vscode":"stable","arch":"arm64","julia":"1.10"},{"os":"ubuntu-24.04-arm","vscode":"stable","arch":"arm64","julia":"1"},{"os":"macos-15","vscode":"stable","arch":"arm64","julia":"1.10"},{"os":"macos-15","vscode":"stable","arch":"arm64","julia":"1"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-stable' && (inputs.artifact == 'candidate' && inputs.stage == 'full' && '[{"os":"macos-15-intel","vscode":"stable","partition":"measure"},{"os":"macos-15-intel","vscode":"stable","partition":"investigate"},{"os":"macos-15-intel","vscode":"stable","partition":"agentic"}]' || '[{"os":"macos-15-intel","vscode":"stable"}]') || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-stable' && '[{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'windows' && '[{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux-stable' && '[{"os":"ubuntu-latest","vscode":"stable"}]' || github.event_name == 'workflow_dispatch' && inputs.scope == 'linux' && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"}]' || ((github.event_name != 'workflow_dispatch' || inputs.artifact == 'candidate' && inputs.stage == 'full') && '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable","partition":"measure"},{"os":"macos-15-intel","vscode":"stable","partition":"investigate"},{"os":"macos-15-intel","vscode":"stable","partition":"agentic"}]' || '[{"os":"ubuntu-latest","vscode":"1.96.0"},{"os":"ubuntu-latest","vscode":"stable"},{"os":"windows-latest","vscode":"1.96.0"},{"os":"windows-latest","vscode":"stable"},{"os":"macos-15-intel","vscode":"stable"}]')) }}
+        include: ${{ fromJSON(needs.package.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ (github.event_name != 'workflow_dispatch' || inputs.stage == 'full') && 180 || 150 }}
     env:
@@ -349,5 +362,5 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: native-workflows-${{ matrix.os }}-${{ matrix.vscode }}${{ matrix.julia && format('-julia-{0}', matrix.julia) || '' }}${{ matrix.partition && format('-{0}', matrix.partition) || '' }}
+          name: ${{ matrix.artifactName }}
           path: native-qualification-results/
