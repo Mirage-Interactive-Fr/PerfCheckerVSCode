@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const http = require('node:http');
 const {createHash, randomUUID} = require('node:crypto');
+const {isDeepStrictEqual} = require('node:util');
 
 const marker = 'Controlled protocol fixture: collect more comparable samples before drawing a performance conclusion.';
 const customInstructions = 'Native qualification instruction: distinguish measured allocation evidence from hypotheses.';
@@ -35,6 +36,47 @@ async function tab(context, name) {
   await eventually(async () => await frame.getByRole('button', {name, exact: true}).getAttribute('aria-current') === 'page', name);
   return frame;
 }
+
+async function reloadMeasuredEvidence(context, measured, stage) {
+  assert.equal(measured.report.schema_version, 'perfchecker-scenario-run/1');
+  assert(measured.report.runs.length > 0);
+  assert(measured.report.runs.every(run => run.qualification.availability === 'complete' && run.qualification.correctness === 'passed'));
+  const expectedRuns = JSON.parse(JSON.stringify(measured.report.runs));
+  context.log('native-narrative-history-reload-start', {stage, reportId: measured.id});
+  const frame = await tab(context, 'Saved evidence');
+  const card = frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^run ·/})}).first();
+  const heading = await card.getByRole('heading', {name: /^run ·/}).innerText();
+  assert.match(heading, /^run · \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+  const created = heading.slice('run · '.length);
+  context.log('native-narrative-history-open-click', {stage, created, reportId: measured.id});
+  await card.getByRole('button', {name: 'Open evidence', exact: true}).click();
+  // The click changes tabs before loadHistory has read and published its report.
+  // Match both the selected history timestamp and every rendered measured run.
+  await eventually(async () => {
+    const observed = await frame.locator('#app').evaluate(app => {
+      const status = app.querySelector('.status');
+      const buttons = [...app.querySelectorAll('button')];
+      return {
+        status: status?.textContent?.trim(), busy: status?.classList.contains('busy'),
+        view: app.querySelector('nav[aria-label="Investigation views"] button[aria-current="page"]')?.textContent,
+        cancelDisabled: buttons.find(button => button.textContent === 'Cancel')?.disabled,
+        explainDisabled: buttons.find(button => button.textContent === 'Explain with configured model')?.disabled,
+        narrative: [...app.querySelectorAll('h2')].some(heading => heading.textContent === 'Optional model explanation'),
+        imported: Boolean(app.querySelector('.imported-diagnostic')),
+        runs: [...app.querySelectorAll('details')]
+          .filter(detail => detail.querySelector(':scope > summary')?.textContent === 'Qualification and measurement evidence')
+          .map(detail => JSON.parse(detail.querySelector(':scope > pre').textContent)),
+      };
+    }, undefined, {timeout: 1000});
+    return observed.status === `Saved evidence · ${created}` && observed.busy === false &&
+      observed.view === 'Findings & advice' && observed.cancelDisabled === true && observed.explainDisabled === false &&
+      observed.narrative === false && observed.imported === false && isDeepStrictEqual(observed.runs, expectedRuns);
+  }, 'The exact saved measurement is loaded and idle before Explain');
+  context.proof('native-narrative-history-measured-ack', {stage, created, reportId: measured.id, runs: expectedRuns.length});
+  return frame;
+}
+
+exports.reloadMeasuredEvidence = reloadMeasuredEvidence;
 
 async function directories(root) {
   return new Set(await fs.readdir(root).catch(error => {if (error.code === 'ENOENT') return []; throw error;}));
@@ -276,19 +318,19 @@ exports.run = async context => {
       samples: 2, status: narrative.report.status, authority: narrative.report.authority, visible: true, jsonAndMarkdown: true});
 
     // Reload the real saved measurement so no QuickPick or synthetic history is needed for another explanation.
-    frame = await tab(context, 'Saved evidence');
-    await frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^run ·/})}).first()
-      .getByRole('button', {name: 'Open evidence', exact: true}).click();
-    frame = await tab(context, 'Findings & advice');
+    frame = await reloadMeasuredEvidence(context, measured, 'before-cancel');
     fixture.mode = 'hold';
     const before = await directories(root);
     await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).click();
     await eventually(() => fixture.blocked, 'second actual HTTP generation request arrives', 240000);
+    context.proof('native-narrative-http-held', {stage: 'before-cancel', requests: fixture.requests.length});
     assert.equal(fixture.requests.length, 2);
     assert.equal(fixture.blocked.closed, false, 'Generation is actually in flight when Cancel is clicked');
     assert.equal(await frame.getByRole('button', {name: 'Cancel', exact: true}).isEnabled(), true);
+    context.log('native-narrative-cancel-click', {stage: 'active-http'});
     await frame.getByRole('button', {name: 'Cancel', exact: true}).click();
     await eventually(() => fixture.blocked.closed, 'cancellation closes the active model HTTP socket before fixture teardown', 180000);
+    context.proof('native-narrative-http-closed', {stage: 'cancelled'});
     frame = await idle(context);
     assert.match(await frame.locator('#app .status').innerText(), /Cancelled after controller cleanup/);
     assert.deepEqual(fixture.errors, []);
@@ -306,15 +348,14 @@ exports.run = async context => {
     context.proof('native-narrative-cancel-active-http', {activeRequestReceived: true, socketClosedBeforeFixtureCleanup: true,
       controllerCleanupComplete: true, configurationPreserved: true, sourceAndMeasurementUnchanged: true, retainedLog: true});
 
+    context.log('native-narrative-deadline-configuration-start', {configuredSeconds: 45});
     await configuration(context).update('advisorTimeout', 45, context.vscode.ConfigurationTarget.WorkspaceFolder);
     fixture.blocked = undefined;
     const timeoutBefore = await directories(root);
-    frame = await tab(context, 'Saved evidence');
-    await frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^run ·/})}).first()
-      .getByRole('button', {name: 'Open evidence', exact: true}).click();
-    frame = await tab(context, 'Findings & advice');
+    frame = await reloadMeasuredEvidence(context, measured, 'before-deadline');
     await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).click();
     await eventually(() => fixture.blocked, 'The real third HTTP request reaches the deadline fixture', 180000);
+    context.proof('native-narrative-http-held', {stage: 'before-deadline', requests: fixture.requests.length});
     const held = fixture.blocked; assert.equal(held.closed, false);
     const expired = await reportAfter(context, root, timeoutBefore, 'narrate');
     assert.equal(expired.report.status, 'timeout', 'The Core request deadline expires without a Cancel click');
@@ -327,6 +368,7 @@ exports.run = async context => {
       noCancelClick: true, coreStatus: expired.report.status, socketClosedBeforeFixtureCleanup: true,
       nativeOutcomeVisible: true, measuredEvidencePreserved: true});
   } finally {
+    context.log('native-narrative-finally-entered');
     // Only the sacrificial workspace-folder settings are restored; global/user configuration is never written.
     try {
       const frame = await view(context);
@@ -335,10 +377,13 @@ exports.run = async context => {
         await idle(context);
       }
     } finally {
+      context.log('native-narrative-fixture-close-start');
       await fixture.close();
+      context.proof('native-narrative-fixture-close-complete');
       if (previousToken === undefined) delete process.env[keyEnvironment]; else process.env[keyEnvironment] = previousToken;
       for (const [key, value] of previous) await cfg.update(key, value, context.vscode.ConfigurationTarget.WorkspaceFolder);
       for (const [key, value] of previous) assert.deepEqual(configuration(context).inspect(key)?.workspaceFolderValue, value);
+      context.proof('native-narrative-settings-restored');
     }
   }
 };
