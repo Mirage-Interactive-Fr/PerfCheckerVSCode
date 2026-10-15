@@ -52,6 +52,10 @@ on:
         description: Explicitly declare a new candidate origin after product changes; otherwise reuse the frozen release archive
         type: boolean
         default: false
+      windows_owner_diagnostic:
+        description: Diagnostic only; run one Windows Codex startup case with private launcher stage observations
+        type: boolean
+        default: false
   pull_request:
     paths:
       - '.github/workflows/native-vsix.yml'
@@ -124,12 +128,22 @@ jobs:
           }).catch(error=>{console.error(error);process.exitCode=1;});
           NODE
       - name: Observe CLI ownership before fixture teardown (no VS Code, models or credentials)
+        if: inputs.windows_owner_diagnostic != true
         shell: bash
         run: |
           mkdir -p native-qualification-results
           node --test --test-concurrency=1 test/windows-owned-process.test.mjs test/codex-connector.test.mjs test/mcp-stdio.test.mjs test/posix-process-cohort.test.mjs > native-qualification-results/connector-workers.tap 2>&1
+      - name: Observe only the first Windows Codex version probe (diagnostic, not product qualification)
+        if: inputs.windows_owner_diagnostic == true
+        shell: bash
+        env:
+          PERFCHECKER_TEST_OWNER_DIAGNOSTIC: '1'
+          PERFCHECKER_NATIVE_STAGE: ${{ inputs.stage }}
+          PERFCHECKER_NATIVE_SCOPE: ${{ inputs.scope }}
+        run: |
+          node --test --test-concurrency=1 --test-name-pattern='^authenticated local MCP exposes two exact tools and never forwards its token to Codex$' test/codex-connector.test.mjs > native-qualification-results/windows-owner-startup.tap 2>&1
       - name: Verify complete Windows checkpoint paths on the immutable product
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.windows_owner_diagnostic != true
         shell: bash
         env:
           PERFCHECKER_TEST_CHECKPOINT_PATHS: '1'
@@ -154,6 +168,9 @@ jobs:
       NATIVE_STAGE: ${{ inputs.stage }}
       NATIVE_CASE_GROUP: ${{ inputs.case_group }}
       NATIVE_CORE: ${{ inputs.core }}
+      NATIVE_OWNER_DIAGNOSTIC: ${{ inputs.windows_owner_diagnostic || 'false' }}
+      NATIVE_CORE_COMMIT: ${{ inputs.core_commit }}
+      NATIVE_CORE_TREE: ${{ inputs.core_tree }}
       REUSE_RUN: ${{ inputs.candidate_run }}
       REUSE_NAME: ${{ inputs.candidate_name }}
       REUSE_SHA: ${{ inputs.candidate_sha }}
@@ -168,6 +185,12 @@ jobs:
           assertNativeCampaignSelection({scope:e.NATIVE_SCOPE,event:e.NATIVE_EVENT,artifact:e.NATIVE_VSIX_MODE,
             stage:e.NATIVE_STAGE,group:e.NATIVE_CASE_GROUP,core:e.NATIVE_CORE});
           const requested=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA].some(Boolean),newOrigin=e.NATIVE_NEW_ORIGIN==='true';
+          if(e.NATIVE_OWNER_DIAGNOSTIC==='true'&&(e.NATIVE_EVENT!=='workflow_dispatch'||
+            e.NATIVE_VSIX_MODE!=='candidate'||e.NATIVE_STAGE!=='connector-workers'||e.NATIVE_SCOPE!=='windows-stable'||
+            e.NATIVE_CORE!=='general'||e.NATIVE_CORE_COMMIT||e.NATIVE_CORE_TREE||newOrigin||
+            e.REUSE_RUN!=='38653410110'||e.REUSE_NAME!=='native-candidate-73b99deb87efaf45bd5e96036f755e42c748bdab'||
+            e.REUSE_SHA!=='bc61f9fa172069c61722e0691900d3ddf8a39ce143fd9d553b252304dbc55850'))
+            throw Error('Windows owner diagnostics require an explicit single Windows connector campaign reusing the final H2 archive.');
           if(e.NATIVE_SCOPE==='arm-bootstrap'&&(!requested||newOrigin))throw Error('ARM bootstrap must reuse the original candidate archive; it never packages a second origin.');
           if(e.NATIVE_VSIX_MODE==='public'){
             if(requested||newOrigin)throw Error('Public reproduction uses its published release, not candidate-origin inputs');

@@ -4,7 +4,7 @@ import Module, {createRequire} from 'node:module';
 import {spawn as nativeSpawn} from 'node:child_process';
 import * as nativeChildProcess from 'node:child_process';
 import * as entryFs from 'node:fs';
-import {randomBytes} from 'node:crypto';
+import {randomBytes, createHash} from 'node:crypto';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
 import {mkdtemp, writeFile, readFile, readdir, mkdir, rm, realpath} from 'node:fs/promises';
@@ -92,6 +92,215 @@ function fixtureChildClose(child,cleanupMs=2000){
 }
 
 // Exercise HTTP and real process lifetime with a sacrificial CLI, not a model response claim.
+const ownerDiagnosticOrigin={
+  sha256:'bc61f9fa172069c61722e0691900d3ddf8a39ce143fd9d553b252304dbc55850',
+  version:'1.0.3',commit:'73b99deb87efaf45bd5e96036f755e42c748bdab',
+  tree:'3722727a870402497078e63da78be90d606f5ed5',packagedOnceOn:'Linux',run:'38653410110'
+};
+const ownerDiagnosticHashes={
+  'dist/windowsOwnedProcess.js':'8abf0b32d794c7f35a257c5abaae395adc842b44d6b6d8088bd3f40247765ca0',
+  'resources/windows-owned-process.ps1':'c859b0009de31a60246c2a487752dcedb4a5c9b9f06c0a862a14771a9596c318'
+};
+const ownerStageNames=['powershell-entry','add-type-complete','parent-verified','job-configured','native-suspended','job-assigned','native-resumed'];
+const ownerTraceLimit=8192,fileTimeEpoch=116444736000000000n;
+const ownerDiagnosticStates=new Map(),hashBytes=bytes=>createHash('sha256').update(bytes).digest('hex');
+function assertOwnerDiagnosticContext(platform=process.platform,env=process.env){
+  if(platform!=='win32'||env.GITHUB_EVENT_NAME!=='workflow_dispatch'||
+    env.PERFCHECKER_NATIVE_STAGE!=='connector-workers'||env.PERFCHECKER_NATIVE_SCOPE!=='windows-stable')
+    throw new Error('Owner stage diagnostics require the explicit Windows-only connector workflow.');
+}
+function createOwnerStageProbe(dir){
+  const nonce=randomBytes(24).toString('hex');
+  return {file:path.join(dir,`owner-${nonce}.jsonl`),nonce};
+}
+function instrumentOwnerLauncher(source,probe){
+  const ps=value=>"'"+value.replaceAll("'","''")+"'";
+  const psEntry=[
+    '# Diagnostic-only observer; failures never replace the original launcher outcome.',
+    '$diagnosticStream=$null',
+    'try {',
+    '  $tracePath='+ps(probe.file)+'; $traceNonce='+ps(probe.nonce),
+    '  $diagnosticStream=[IO.FileStream]::new($tracePath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)',
+    '  $row=[ordered]@{schema=1;nonce=$traceNonce;phase="powershell-entry";ownerPid=$PID;ownerStarted=[Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().ToFileTimeUtc().ToString();at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();childPid=0;childStarted=$null}',
+    '  $bytes=[Text.Encoding]::UTF8.GetBytes(($row|ConvertTo-Json -Compress)+[Environment]::NewLine)',
+    '  if ($bytes.Length -le 1024) { $diagnosticStream.Write($bytes,0,$bytes.Length);$diagnosticStream.Flush() }',
+    '} catch {}',
+    ''
+  ].join('\n');
+  const traceMethod=[
+    '    // Diagnostic-only stages; original process/Job calls and errors are unchanged.',
+    '    public static System.IO.FileStream DiagnosticStream;',
+    '    public static void ObserveStartupStage(string phase,uint child,IntPtr childHandle) {',
+    '        try {',
+    '            if (Array.IndexOf(new string[] { "add-type-complete","parent-verified","job-configured","native-suspended","job-assigned","native-resumed" },phase)<0) return;',
+    '            var stream=DiagnosticStream; if(stream==null || !stream.CanWrite) return;',
+    '            long created,ended,kernel,user,childCreated=0;',
+    '            if (!GetProcessTimes(GetCurrentProcess(),out created,out ended,out kernel,out user)) return;',
+    '            if (child!=0 && (childHandle==IntPtr.Zero || !GetProcessTimes(childHandle,out childCreated,out ended,out kernel,out user))) return;',
+    '            if (stream.Length>'+ownerTraceLimit+'-1024) return;',
+    '                string record="{\\"schema\\":1,\\"nonce\\":\\"'+probe.nonce+'\\",\\"phase\\":\\""+phase+"\\",\\"ownerPid\\":"+Process.GetCurrentProcess().Id+",\\"ownerStarted\\":\\""+created+"\\",\\"at\\":"+DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()+",\\"childPid\\":"+child+",\\"childStarted\\":"+(child==0?"null":"\\""+childCreated+"\\"")+"}\\n";',
+    '                byte[] bytes=Encoding.UTF8.GetBytes(record); if(bytes.Length>1024)return;',
+    '                stream.Position=stream.Length;stream.Write(bytes,0,bytes.Length);stream.Flush();',
+    '        } catch { }',
+    '    }',
+    ''
+  ].join('\n');
+  const injections=[
+    ["$ErrorActionPreference = 'Stop'\n",psEntry],
+    ['    static void Check(bool success,string operation) {\n',traceMethod,'before'],
+    ["'@\n",'    try { [PerfCheckerOwnedProcess]::DiagnosticStream=$diagnosticStream; [PerfCheckerOwnedProcess]::ObserveStartupStage("add-type-complete",0,[IntPtr]::Zero) } catch {}\n'],
+    ['            if (WaitForSingleObject(parent,0)!=258) throw new InvalidOperationException("The owner parent has already stopped.");\n','            ObserveStartupStage("parent-verified",0,IntPtr.Zero);\n'],
+    ['            Check(SetInformationJobObject(job,9,ref limits,(uint)Marshal.SizeOf(typeof(ExtendedLimits))),"Set private Job limits");\n','            ObserveStartupStage("job-configured",0,IntPtr.Zero);\n'],
+    ['            Check(CreateProcessW(application,command,IntPtr.Zero,IntPtr.Zero,true,0x00080004,IntPtr.Zero,directory,ref startup,out process),"Create suspended native process");\n','            ObserveStartupStage("native-suspended",process.processId,process.process);\n'],
+    ['            Check(AssignProcessToJobObject(job,process.process),"Assign native process to private Job"); assigned=true;\n','            ObserveStartupStage("job-assigned",process.processId,process.process);\n'],
+    ['            if (ResumeThread(process.thread)==0xffffffff) throw new Win32Exception(Marshal.GetLastWin32Error(),"Resume owned process");\n','            ObserveStartupStage("native-resumed",process.processId,process.process);\n'],
+    ["    [Console]::Error.WriteLine('PerfChecker Windows process owner failed: ' + $_.Exception.Message)\n    exit 1\n}", ' finally { if ($diagnosticStream) { try { $diagnosticStream.Dispose() } catch {} } }']
+  ];
+  let result=source;
+  for(const [anchor,addition,where] of injections){
+    if(source.split(anchor).length!==2)throw new Error('Canonical owner diagnostic anchor is not unique.');
+    result=result.replace(anchor,where==='before'?addition+anchor:anchor+addition);
+  }
+  let restored=result;
+  for(const [anchor,addition,where] of [...injections].reverse())
+    restored=restored.replace(where==='before'?addition+anchor:anchor+addition,anchor);
+  assert.equal(restored,source);
+  return result;
+}
+function readOwnerStages(probe,ownerPid,started,observedAt){
+  let descriptor;
+  const absent=reason=>({status:'unobserved',reason,observedAt});
+  try{
+    let beforePath;
+    try{beforePath=entryFs.lstatSync(probe.file,{bigint:true});}
+    catch(error){
+      if(error.code==='ENOENT'&&!probe.identity&&!probe.pathObserved)return absent('no-stage-observed');
+      throw error;
+    }
+    probe.pathObserved=true;
+    if(beforePath.isSymbolicLink()||!sameEntryFile(probe.identity??beforePath,beforePath))return absent('private-file-identity');
+    if(beforePath.size>BigInt(ownerTraceLimit))return absent('size-limit');
+    descriptor=entryFs.openSync(probe.file,entryFs.constants.O_RDONLY|(entryFs.constants.O_NOFOLLOW??0));
+    const before=entryFs.fstatSync(descriptor,{bigint:true}),buffer=Buffer.alloc(ownerTraceLimit+1);
+    if(!sameEntryFile(beforePath,before)||before.size!==beforePath.size)return absent('private-file-identity');
+    const count=entryFs.readSync(descriptor,buffer,0,buffer.length,0);
+    const after=entryFs.fstatSync(descriptor,{bigint:true}),afterPath=entryFs.lstatSync(probe.file,{bigint:true});
+    if(!sameEntryFile(before,after)||!sameEntryFile(after,afterPath)||count!==Number(before.size)||
+      before.size!==after.size||after.mtimeNs!==before.mtimeNs||after.mtimeNs!==afterPath.mtimeNs)return absent('private-file-changed');
+    if(count===0)return absent('no-stage-observed');
+    if(count>ownerTraceLimit)return absent('size-limit');
+    const text=buffer.subarray(0,count).toString('utf8');
+    if(!text.endsWith('\n'))return absent('partial-stage-write');
+    const rows=text.trim().split(/\r?\n/).map(line=>JSON.parse(line));
+    if(rows.length>ownerStageNames.length)return absent('stage-limit');
+    let incarnation,previous=started,childIdentity,previousPhase=-1;
+    const stages=[];
+    for(const row of rows){
+      const phaseIndex=ownerStageNames.indexOf(row?.phase);
+      if(!row||Object.keys(row).sort().join(',')!=='at,childPid,childStarted,nonce,ownerPid,ownerStarted,phase,schema'||
+        row.schema!==1||row.nonce!==probe.nonce||phaseIndex<=previousPhase||row.ownerPid!==ownerPid||
+        !Number.isSafeInteger(ownerPid)||ownerPid<=0||typeof row.ownerStarted!=='string'||!/^[0-9]{17,19}$/.test(row.ownerStarted)||
+        !Number.isSafeInteger(row.at)||row.at<previous||row.at>observedAt)return absent('stage-identity');
+      const born=Number((BigInt(row.ownerStarted)-fileTimeEpoch)/10000n);
+      if(born<started-1||born>row.at||incarnation&&incarnation!==row.ownerStarted)return absent('owner-incarnation');
+      incarnation=row.ownerStarted;previous=row.at;previousPhase=phaseIndex;
+      if(phaseIndex<4){if(row.childPid!==0||row.childStarted!==null)return absent('child-identity');}
+      else{
+        if(!Number.isSafeInteger(row.childPid)||row.childPid<=0||row.childPid===ownerPid||
+          typeof row.childStarted!=='string'||!/^[0-9]{17,19}$/.test(row.childStarted)||BigInt(row.childStarted)<BigInt(incarnation)||
+          Number((BigInt(row.childStarted)-fileTimeEpoch)/10000n)>row.at)return absent('child-identity');
+        const identity=row.childPid+':'+row.childStarted;
+        if(childIdentity&&childIdentity!==identity)return absent('child-incarnation');
+        childIdentity=identity;
+      }
+      stages.push({phase:row.phase,ownerPid:row.ownerPid,ownerStarted:row.ownerStarted,at:row.at,
+        ...(row.childPid?{childPid:row.childPid,childStarted:row.childStarted}:{})});
+    }
+    const createdAt=Number(before.birthtimeNs/1000000n);
+    if(createdAt<started-1||createdAt>stages[0].at||createdAt>observedAt)return absent('private-file-creation-window');
+    // Bind the first identity only after every row and the actual owner window is verified.
+    probe.identity??=before;
+    return {status:'observed',observedAt,stages};
+  }catch(error){return {...absent('inspection-error'),error:safeEntryError(error)};}
+  finally{if(descriptor!==undefined)try{entryFs.closeSync(descriptor);}catch{}}
+}
+function observeOwnerStages(delegate,args,options,state){
+  const started=Date.now();let child,done;
+  state.started=started;state.closed=false;state.complete=new Promise(resolve=>{done=resolve;});
+  const finish=(code,signal)=>{
+    if(state.closed)return;state.closed=true;clearTimeout(state.timer);
+    state.after=readOwnerStages(state.probe,child?.pid,started,Date.now());state.outcome={code,signal};done();
+  };
+  try{child=delegate(options);}catch(error){
+    state.spawnError=safeEntryError(error);state.spawnFailed=true;state.closed=true;done();throw error;
+  }
+  state.child=child;
+  child.once('error',error=>{state.spawnError=safeEntryError(error);});
+  child.once('close',finish);
+  state.beforeDeadline=()=>{
+    const at=Date.now();
+    if(state.closed||at>=started+10000){
+      state.before={status:'unobserved',reason:state.closed?'already-closed':'pre-deadline-observation-missed',observedAt:at};return;
+    }
+    const snapshot=readOwnerStages(state.probe,child.pid,started,at),completedAt=Date.now();
+    state.before=completedAt<started+10000?{...snapshot,completedAt}:
+      {status:'unobserved',reason:'pre-deadline-observation-missed',observedAt:at,completedAt};
+  };
+  state.timer=setTimeout(state.beforeDeadline,9000);
+  return child;
+}
+async function prepareOwnerDiagnostic(root){
+  if(process.env.PERFCHECKER_TEST_OWNER_DIAGNOSTIC!=='1')return;
+  assertOwnerDiagnosticContext();
+  const archive=JSON.parse(await readFile(path.resolve('native-qualification-results/connector-workers-archive.json'),'utf8'));
+  assert.equal(archive.sha256,ownerDiagnosticOrigin.sha256);assert.deepEqual(archive.origin,ownerDiagnosticOrigin);
+  assert.equal(archive.compiled,false);
+  const sources={};
+  for(const [name,expected] of Object.entries(ownerDiagnosticHashes)){
+    const bytes=await readFile(path.resolve(name));assert.equal(hashBytes(bytes),expected);
+    assert.equal(archive.entries.find(entry=>entry.path===name)?.sha256,expected);sources[name]=bytes;
+  }
+  const dir=await mkdtemp(path.join(root,'owner-diagnostic-'));
+  await mkdir(path.join(dir,'dist'));await mkdir(path.join(dir,'resources'));
+  const probe=createOwnerStageProbe(dir);
+  const launcher=instrumentOwnerLauncher(sources['resources/windows-owned-process.ps1'].toString('utf8'),probe);
+  await writeFile(path.join(dir,'dist/windowsOwnedProcess.js'),sources['dist/windowsOwnedProcess.js'],{flag:'wx'});
+  await writeFile(path.join(dir,'resources/windows-owned-process.ps1'),launcher,{flag:'wx'});
+  const state={probe,dir,sources,used:false,diagnosticOnly:true,launcherSha256:hashBytes(Buffer.from(launcher))};
+  state.owner=require(path.join(dir,'dist/windowsOwnedProcess.js'));
+  ownerDiagnosticStates.set(root,state);
+}
+async function retireOwnerDiagnostic(root,cleanupMs=2000){
+  const state=ownerDiagnosticStates.get(root);if(!state)return true;
+  clearTimeout(state.timer);
+  let timer;
+  if(state.complete&&!state.closed)await Promise.race([state.complete,new Promise(resolve=>{timer=setTimeout(resolve,cleanupMs);})]);
+  clearTimeout(timer);clearTimeout(state.timer);
+  const physicallyClosed=Boolean(state.child)&&state.closed===true;
+  const safelyRetired=!state.used||state.spawnFailed===true||physicallyClosed;
+  let originalFilesUnchanged=false,cleanupError;
+  try{originalFilesUnchanged=Object.entries(state.sources).every(([name,bytes])=>entryFs.readFileSync(path.resolve(name)).equals(bytes));}
+  catch(error){cleanupError=safeEntryError(error);}
+  let removed=false;
+  if(safelyRetired)try{await rm(state.dir,{recursive:true,force:true});removed=true;}catch(error){cleanupError=safeEntryError(error);}
+  const afterRefused=state.after?.status==='unobserved'&&!['no-stage-observed','close-not-observed','synchronous-spawn-error'].includes(state.after.reason);
+  const result={schema:'perfchecker-windows-owner-diagnostic/1',diagnosticOnly:true,qualifiesCanonicalProduct:false,
+    origin:ownerDiagnosticOrigin,originalHashes:ownerDiagnosticHashes,instrumentedLauncherSha256:state.launcherSha256,
+    used:state.used,ownerPid:state.child?.pid??null,beforeDeadline:state.before??{status:'unobserved',reason:'closed-before-observation'},
+    afterClose:state.after??{status:'unobserved',reason:state.spawnFailed?'synchronous-spawn-error':'close-not-observed'},
+    spawnError:state.spawnError,outcome:state.outcome,physicalClose:physicallyClosed,
+    originalFilesUnchanged,observerCleanupQualified:safelyRetired&&removed,temporaryFilesRetained:!removed,cleanupError};
+  let receiptError;
+  try{
+    if(state.record)state.record(result);
+    else entryFs.writeFileSync(path.resolve('native-qualification-results/windows-owner-startup.json'),JSON.stringify(result,null,2),{flag:'wx'});
+  }catch(error){receiptError=error;console.log(JSON.stringify({event:'owner-diagnostic-record-error',error:safeEntryError(error)}));}
+  finally{ownerDiagnosticStates.delete(root);}
+  if(!safelyRetired||!removed||!originalFilesUnchanged||afterRefused||receiptError)
+    throw Object.assign(new Error('Windows owner diagnostic security, receipt or retirement was not qualified.'),
+      {observerRetired:safelyRetired&&removed,diagnosticError:receiptError? safeEntryError(receiptError):cleanupError});
+  return safelyRetired&&removed;
+}
 let fixture;
 const require = createRequire(import.meta.url), original = Module._load;
 Module._load = function(name, ...args) {
@@ -100,7 +309,12 @@ Module._load = function(name, ...args) {
     return {...owner, spawnWindowsOwnedProcess: (cli, argv, options) => {
       const script=fixture;
       return cli === 'sacrificial-codex' ? observeFixtureSpawn(observedOptions=>
-        owner.spawnWindowsOwnedProcess(process.execPath,[script,...argv],observedOptions),argv,options,script) : owner.spawnWindowsOwnedProcess(cli,argv,options);
+        {const state=ownerDiagnosticStates.get(path.dirname(script));
+          if(state&&!state.used&&argv[0]==='--version'){
+            state.used=true;return observeOwnerStages(next=>state.owner.spawnWindowsOwnedProcess(process.execPath,[script,...argv],next),argv,observedOptions,state);
+          }
+          return owner.spawnWindowsOwnedProcess(process.execPath,[script,...argv],observedOptions);
+        },argv,options,script) : owner.spawnWindowsOwnedProcess(cli,argv,options);
     }};
   }
   if (name === 'node:child_process') return {...nativeChildProcess, spawn: (cli, argv, options) =>
@@ -110,7 +324,7 @@ Module._load = function(name, ...args) {
 let CodexConnector, inspectCodex, shutdownCodexPreflights;
 try {({CodexConnector, inspectCodex, shutdownCodexPreflights} = require('../dist/codexConnector.js'));} finally {Module._load = original;}
 
-async function environment(run) {
+async function environment(run,removeRoot=rm) {
   const root = await mkdtemp(path.join(tmpdir(), 'perfchecker-codex-contract-'));
   fixture = path.join(root, 'cli.cjs');
   await writeFile(fixture, `const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
@@ -142,7 +356,19 @@ if(prompt.includes('EXIT_WITH_CHILD')||prompt.includes('OWNED_ACTIVE_CHILD')){co
 if(prompt.includes('SLOW')){const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)']);fs.writeFileSync(path.join(process.cwd(),'descendant.pid'),String(child.pid));setInterval(()=>{},1000);return}
 if(args[args.indexOf('--sandbox')+1]==='workspace-write')fs.writeFileSync(path.join(process.cwd(),'source.txt'),'optimized\\n');
 fs.writeFileSync(args[args.indexOf('--output-last-message')+1],prompt.includes('OVERSIZED')?'x'.repeat(64001):'Review the allocation evidence and verify the suggested changes.');});`);
-  try {await run(root);} finally {delete process.env.PERFCHECKER_FAKE_AUTH; await rm(root, {recursive: true, force: true});}
+  let originalFailure,result;const cleanupErrors=[];
+  try {result=await run(root);} catch(error){originalFailure=error;} finally {
+    delete process.env.PERFCHECKER_FAKE_AUTH;
+    let retired=true;
+    try{retired=await retireOwnerDiagnostic(root);}catch(error){retired=error.observerRetired===true;cleanupErrors.push(error);}
+    if(retired)try{await removeRoot(root,{recursive:true,force:true});}catch(error){cleanupErrors.push(error);}
+  }
+  if(cleanupErrors.length){
+    if(originalFailure)throw new AggregateError([originalFailure,...cleanupErrors],originalFailure.message+' Windows owner diagnostic retirement failed.');
+    if(cleanupErrors.length===1)throw cleanupErrors[0];
+    throw new AggregateError(cleanupErrors,'Windows owner diagnostic retirement failed.');
+  }
+  if(originalFailure)throw originalFailure;return result;
 }
 const metadata=version=>({'io.modelcontextprotocol/protocolVersion':version,
   'io.modelcontextprotocol/clientInfo':{name:'Connector contract test',version:'1'},
@@ -163,6 +389,167 @@ async function call(connector, method, params, signal) {
   return message.result;
 }
 const tool = (connector, name, args, signal) => call(connector, 'tools/call', {name, arguments: args}, signal);
+
+async function ownerStageFixture(){
+  const root=await mkdtemp(path.join(tmpdir(),'perfchecker-owner-stage-')),dir=path.join(root,'copy');
+  await mkdir(dir);
+  const probe=createOwnerStageProbe(dir),originalFile=path.join(root,'original-module');
+  const bytes=Buffer.from('unchanged original module');await writeFile(originalFile,bytes);
+  const records=[],state={dir,probe,used:true,sources:{[originalFile]:bytes},record:value=>records.push(value)};
+  return {root,dir,probe,state,records};
+}
+function ownerStageRow(probe,owner,started,phase='powershell-entry'){
+  const at=Math.max(started,Date.now()),child=ownerStageNames.indexOf(phase)>=4;
+  return {schema:1,nonce:probe.nonce,phase,ownerPid:owner,
+    ownerStarted:String(fileTimeEpoch+BigInt(started)*10000n),at,
+    childPid:child?owner+1:0,childStarted:child?String(fileTimeEpoch+BigInt(started)*10000n):null};
+}
+test('owner stage diagnostic is opt-in and changes only annotations in the actual H2 launcher',async()=>{
+  const f=await ownerStageFixture();
+  try{
+    const context={GITHUB_EVENT_NAME:'workflow_dispatch',PERFCHECKER_NATIVE_STAGE:'connector-workers',PERFCHECKER_NATIVE_SCOPE:'windows-stable'};
+    assert.doesNotThrow(()=>assertOwnerDiagnosticContext('win32',context));
+    for(const bad of [{GITHUB_EVENT_NAME:'pull_request'},{PERFCHECKER_NATIVE_STAGE:'full'},{PERFCHECKER_NATIVE_SCOPE:'all'}])
+      assert.throws(()=>assertOwnerDiagnosticContext('win32',{...context,...bad}),/explicit Windows-only/);
+    assert.throws(()=>assertOwnerDiagnosticContext('linux',context),/explicit Windows-only/);
+    const source=await readFile(new URL('../resources/windows-owned-process.ps1',import.meta.url),'utf8');
+    assert.equal(hashBytes(Buffer.from(source)),ownerDiagnosticHashes['resources/windows-owned-process.ps1']);
+    const changed=instrumentOwnerLauncher(source,f.probe);
+    assert.equal((changed.match(/Check\(CreateProcessW\(/g)||[]).length,1);
+    assert.equal((changed.match(/Check\(AssignProcessToJobObject\(/g)||[]).length,1);
+    assert.equal((changed.match(/if \(ResumeThread\(/g)||[]).length,1);
+    assert.equal(entryFs.existsSync(f.probe.file),false);
+    assert.equal((changed.match(/\[IO.FileStream\]::new/g)||[]).length,1);
+    assert(changed.includes('[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read'));
+    assert(changed.includes('DiagnosticStream=$diagnosticStream'));
+    assert(changed.includes('var stream=DiagnosticStream;'));
+    assert.doesNotMatch(changed,/new System\.IO\.FileStream|System\.IO\.FileMode\.Open/);
+    assert(changed.includes('$diagnosticStream.Dispose()'));
+    assert(changed.includes('KILL_ON_JOB_CLOSE; no breakaway.'));
+    assert.throws(()=>instrumentOwnerLauncher(source.replace('static void Check(bool success,string operation)','changed Check(bool success,string operation)'),f.probe),/canonical|anchor/i);
+  }finally{await rm(f.root,{recursive:true,force:true});}
+});
+test('owner stage diagnostic refuses foreign identities, partial writes, replacement and oversized records',async()=>{
+  const f=await ownerStageFixture(),started=Date.now(),owner=32101;
+  const inspect=()=>readOwnerStages(f.probe,owner,started,Date.now());
+  try{
+    assert.equal(inspect().status,'unobserved');assert.equal(f.probe.identity,undefined);
+    const row=ownerStageRow(f.probe,owner,started);
+    await writeFile(f.probe.file,JSON.stringify({...row,nonce:'foreign'})+'\n',{flag:'wx'});
+    assert.equal(inspect().status,'unobserved');assert.equal(f.probe.identity,undefined);assert.equal(f.probe.pathObserved,true);
+    await rm(f.probe.file);assert.equal(inspect().reason,'inspection-error');assert.equal(f.probe.identity,undefined);
+    await writeFile(f.probe.file,JSON.stringify(row)+'\n',{flag:'wx'});assert.equal(inspect().status,'observed');
+    assert(f.probe.identity);const boundIdentity=f.probe.identity;
+    assert.doesNotMatch(JSON.stringify(inspect()),new RegExp(f.probe.nonce));
+    for(const bad of [{nonce:'foreign'},{ownerPid:owner+1},{ownerStarted:'1'},{ownerStarted:Number(row.ownerStarted)},{phase:'arbitrary-private-text'},{at:started-1}]) {
+      await writeFile(f.probe.file,JSON.stringify({...row,...bad})+'\n');assert.equal(inspect().status,'unobserved');
+      assert.equal(f.probe.identity,boundIdentity);
+    }
+    await writeFile(f.probe.file,JSON.stringify(row));assert.equal(inspect().reason,'partial-stage-write');
+    await writeFile(f.probe.file,'x'.repeat(ownerTraceLimit+1));assert.equal(inspect().reason,'size-limit');
+    await writeFile(f.probe.file,JSON.stringify(row)+'\n'+JSON.stringify(row)+'\n');assert.equal(inspect().status,'unobserved');
+    entryFs.renameSync(f.probe.file,path.join(f.dir,'replaced-marker'));
+    assert.equal(inspect().reason,'inspection-error');assert.equal(f.probe.identity,boundIdentity);
+    await writeFile(f.probe.file,JSON.stringify(row)+'\n');
+    assert.equal(inspect().reason,'private-file-identity');
+  }finally{await rm(f.root,{recursive:true,force:true});}
+});
+test('owner stage diagnostic preserves delegation and waits for physical close before retirement',async()=>{
+  const f=await ownerStageFixture(),child=new EventEmitter(),options={cwd:f.root,env:{PRIVATE:'not observed'}};
+  child.pid=32102;let calls=0,settled=false;const errors=[],originalError=new Error('original delegated failure');
+  child.on('error',error=>errors.push(error));
+  try{
+    ownerDiagnosticStates.set(f.root,f.state);
+    const actual=observeOwnerStages(received=>{calls++;assert.equal(received,options);return child;},['--version'],options,f.state);
+    assert.equal(actual,child);assert.equal(calls,1);
+    await writeFile(f.probe.file,JSON.stringify(ownerStageRow(f.probe,child.pid,f.state.started))+'\n');
+    f.state.beforeDeadline();assert.equal(f.state.before.status,'observed');
+    const retiring=retireOwnerDiagnostic(f.root).then(value=>{settled=true;return value;});
+    child.emit('error',originalError);await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(settled,false);assert.equal(f.state.closed,false);assert.equal(errors[0],originalError);
+    child.emit('close',17,null);assert.equal(await retiring,true);
+    assert.equal(f.records[0].physicalClose,true);assert.equal(f.records[0].observerCleanupQualified,true);
+    assert.equal(f.records[0].qualifiesCanonicalProduct,false);assert.equal(f.records[0].originalFilesUnchanged,true);
+    assert.deepEqual(f.records[0].outcome,{code:17,signal:null});
+    assert.doesNotMatch(JSON.stringify(f.records),new RegExp(f.probe.nonce+'|not observed'));
+    assert.equal(entryFs.existsSync(f.dir),false);assert.equal(ownerDiagnosticStates.has(f.root),false);
+  }finally{child.emit('close',17,null);clearTimeout(f.state.timer);ownerDiagnosticStates.delete(f.root);await rm(f.root,{recursive:true,force:true});}
+});
+test('owner stage diagnostic rejects a missed observation deadline and retains uncertain cleanup',async t=>{
+  const f=await ownerStageFixture(),child=new EventEmitter();child.pid=32103;let kills=0;child.kill=()=>{kills++;};
+  try{
+    ownerDiagnosticStates.set(f.root,f.state);
+    observeOwnerStages(()=>child,['--version'],{},f.state);
+    t.mock.method(Date,'now',()=>f.state.started+10000);
+    f.state.beforeDeadline();t.mock.restoreAll();
+    assert.equal(f.state.before.reason,'pre-deadline-observation-missed');
+    await assert.rejects(retireOwnerDiagnostic(f.root,20),error=>error.observerRetired===false);
+    assert.equal(f.records[0].physicalClose,false);assert.equal(f.records[0].observerCleanupQualified,false);
+    assert.equal(f.records[0].temporaryFilesRetained,true);assert.equal(kills,0);
+    assert.equal(entryFs.existsSync(f.dir),true);assert.equal(ownerDiagnosticStates.has(f.root),false);
+  }finally{t.mock.restoreAll();child.emit('close',null,'SIGKILL');clearTimeout(f.state.timer);ownerDiagnosticStates.delete(f.root);await rm(f.root,{recursive:true,force:true});}
+});
+test('owner stage diagnostic preserves synchronous spawn errors and refuses a failed receipt',async()=>{
+  const f=await ownerStageFixture(),originalError=new Error('original spawn failure');
+  try{
+    ownerDiagnosticStates.set(f.root,f.state);
+    assert.throws(()=>observeOwnerStages(()=>{throw originalError;},['--version'],{},f.state),error=>error===originalError);
+    f.state.record=()=>{throw new Error('private diagnostic sink failure');};
+    await assert.rejects(retireOwnerDiagnostic(f.root),error=>error.observerRetired===true);
+    assert.equal(entryFs.existsSync(f.dir),false);assert.equal(ownerDiagnosticStates.has(f.root),false);
+  }finally{ownerDiagnosticStates.delete(f.root);await rm(f.root,{recursive:true,force:true});}
+});
+test('owner stage diagnostic treats a never-created trace as unknown after physical close and preserves the original failure',async()=>{
+  const originalError=new Error('original request failure'),records=[];let fixtureRoot;
+  await assert.rejects(environment(async root=>{
+    fixtureRoot=root;
+    const dir=path.join(root,'diagnostic-copy');await mkdir(dir);
+    const state={dir,probe:createOwnerStageProbe(dir),used:true,sources:{},record:value=>records.push(value)};
+    ownerDiagnosticStates.set(root,state);
+    const child=new EventEmitter();child.pid=32105;
+    observeOwnerStages(()=>child,['--version'],{},state);
+    state.beforeDeadline();assert.equal(state.before.reason,'no-stage-observed');
+    assert.equal(state.probe.pathObserved,undefined);assert.equal(state.probe.identity,undefined);
+    child.emit('close',null,'SIGKILL');
+    throw originalError;
+  }),error=>error===originalError);
+  assert.equal(records[0].afterClose.reason,'no-stage-observed');
+  assert.equal(records[0].physicalClose,true);assert.equal(records[0].observerCleanupQualified,true);
+  assert.equal(records[0].qualifiesCanonicalProduct,false);assert.equal(entryFs.existsSync(fixtureRoot),false);
+});
+test('owner stage diagnostic reports modified originals without replacing the original request error',async()=>{
+  const originalError=new Error('original request failure'),records=[];let fixtureRoot;
+  await assert.rejects(environment(async root=>{
+    fixtureRoot=root;
+    const dir=path.join(root,'diagnostic-copy');await mkdir(dir);
+    const probe=createOwnerStageProbe(dir),file=path.join(root,'original-module');
+    const bytes=Buffer.from('original bytes');await writeFile(file,bytes);
+    const state={dir,probe,used:true,sources:{[file]:bytes},record:value=>records.push(value)};
+    ownerDiagnosticStates.set(root,state);
+    const child=new EventEmitter();child.pid=32104;
+    observeOwnerStages(()=>child,['--version'],{},state);
+    await writeFile(file,'modified bytes');child.emit('close',0,null);
+    throw originalError;
+  }),error=>error instanceof AggregateError&&error.errors[0]===originalError&&
+    /security, receipt or retirement/.test(error.errors[1].message));
+  assert.equal(records[0].originalFilesUnchanged,false);assert.equal(records[0].physicalClose,true);
+  assert.equal(records[0].qualifiesCanonicalProduct,false);assert.equal(entryFs.existsSync(fixtureRoot),false);
+});
+test('owner stage diagnostic retains the direct request error when retirement and root removal both fail',async()=>{
+  const originalError=new Error('original request failure'),removeError=new Error('root removal failure');let fixtureRoot;
+  try{
+    await assert.rejects(environment(async root=>{
+      fixtureRoot=root;
+      const dir=path.join(root,'diagnostic-copy');await mkdir(dir);
+      const state={dir,probe:createOwnerStageProbe(dir),used:false,sources:{},record:()=>{throw new Error('receipt failure');}};
+      ownerDiagnosticStates.set(root,state);
+      throw originalError;
+    },async(root,options)=>{assert.equal(root,fixtureRoot);assert.deepEqual(options,{recursive:true,force:true});throw removeError;}),
+    error=>error instanceof AggregateError&&error.errors.length===3&&error.errors[0]===originalError&&
+      /security, receipt or retirement/.test(error.errors[1].message)&&error.errors[2]===removeError);
+    assert.equal(entryFs.existsSync(path.join(fixtureRoot,'diagnostic-copy')),false);
+  }finally{if(fixtureRoot)await rm(fixtureRoot,{recursive:true,force:true});}
+});
 async function until(read) {for (let i=0;i<(process.platform==='win32'?1000:100);i++) {try {return await read();} catch {await new Promise(r=>setTimeout(r,20));}} throw new Error('Fixture process did not start.');}
 
 test('CLI entry diagnostics preserve the delegated child and original spawn errors',async()=>environment(async root=>{
@@ -293,6 +680,7 @@ test('modern discovery is authenticated, stateless and never starts a CLI; legac
 }));
 
 test('authenticated local MCP exposes two exact tools and never forwards its token to Codex', async () => environment(async root => {
+  await prepareOwnerDiagnostic(root);
   assert.equal(await inspectCodex('sacrificial-codex', root), 'codex-cli 0.159.2');
   process.env.PERFCHECKER_FAKE_AUTH = 'no'; await assert.rejects(inspectCodex('sacrificial-codex', root), /not authenticated/);
   delete process.env.PERFCHECKER_FAKE_AUTH;
