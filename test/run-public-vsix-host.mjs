@@ -984,6 +984,8 @@ function build_suite()
  features=FeatureSpec[]
  for (workload,file) in [(:sum_squares,"sum.jl"),(:wait_task,"wait.jl")], backend in [:benchmark,:chairmark,:profile,:wall_profile,:profile_alloc,:alloc]
   options=Dict{Symbol,Any}(:samples=>3,:seconds=>0.03,:evals=>1,:repeat=>false,:targets=>["PerfCheckerNativeFixture"],:profile_seconds=>0.5,:profile_delay=>0.0005,:profile_repetitions=>3,:sample_rate=>1.0)
+  # wait_task only reads its immutable input; reuse keeps one continuous wall-profiling window.
+  workload===:wait_task && backend===:wall_profile && (options[:state_policy]=:reuse)
   entrypoint=workload===:sum_squares && backend in (:profile,:wall_profile) ? "profile-sum.jl" : file
   push!(features,FeatureSpec(Symbol(workload,"_",backend);workload,backend,entrypoint=joinpath(@__DIR__,entrypoint),options,oracle=OracleSpec()))
  end
