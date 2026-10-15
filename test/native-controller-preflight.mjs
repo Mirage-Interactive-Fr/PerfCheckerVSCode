@@ -102,7 +102,7 @@ export async function verifyNativeSampleSyntax(){
 }
 
 export function createNativeDiscoveryReaders(expected,{sampleSyntax,record}={}){
-  const states=[],temporary=[];let incarnation,sampled=false;
+  const states=[],temporary=[];let incarnation,imageIdentity,sampled=false;
   const check=(capture,options)=>{assert(!options.signal.aborted&&Date.now()<options.deadlineAt);
     assert(!capture.exited&&!capture.closed,'A product exit invalidates live-process observations');};
   const sameFile=(a,b)=>['dev','ino','size','mtimeMs','nlink'].every(key=>a[key]===b[key]);
@@ -139,8 +139,20 @@ export function createNativeDiscoveryReaders(expected,{sampleSyntax,record}={}){
       assert.equal(value.parent,capture.parent);assert(value.createdAt>=capture.startedAt-1000&&value.createdAt<=capture.spawnedAt+1000);
       if(incarnation)assert.deepEqual(value,incarnation);else incarnation=value;return value;};
     const mappings=async()=>{check(capture,options);const raw=(await command('/usr/sbin/lsof',['-a','-p',String(capture.pid),'-d','txt','-Fn'])).toString('utf8');
-      const images=await Promise.all(raw.split('\n').filter(line=>line.startsWith('n')).map(line=>fs.realpath(line.slice(1))));
-      assert(images.includes(expected.canonicalExecutable),'The original canonical Julia image must remain mapped');return images;};
+      const lines=raw.split('\n'),pids=lines.filter(line=>line.startsWith('p'));
+      assert(pids.length>0&&pids.every(line=>/^p[1-9]\d*$/.test(line)&&Number(line.slice(1))===capture.pid),
+        'The lsof process identity must match the captured Julia PID');
+      assert(lines.includes('n'+expected.canonicalExecutable),'The expected Julia image remains mapped');
+      const keys=['dev','ino','size','mtimeMs','ctimeMs','nlink','mode'];
+      const identityOf=stat=>{assert(stat.isFile()&&!stat.isSymbolicLink());
+        const value=Object.fromEntries(keys.map(key=>[key,stat[key]]));assert(Object.values(value).every(Number.isFinite));return value;};
+      const before=identityOf(await fs.lstat(expected.canonicalExecutable));
+      assert.equal(await fs.realpath(expected.canonicalExecutable),expected.canonicalExecutable,
+        'The expected Julia image must retain its exact canonical path');
+      const after=identityOf(await fs.lstat(expected.canonicalExecutable));assert.deepEqual(after,before);
+      if(imageIdentity)assert.deepEqual(after,imageIdentity);else imageIdentity=after;
+      check(capture,options);
+    };
     const before=await step('identity-before',identity);await step('image-before',mappings);
     const fields=await step('cpu',async()=>{const fields=(await command('/bin/ps',['-p',String(capture.pid),'-o','stat=','-o','etime=','-o','time=','-o','%cpu='])).toString('utf8').trim().split(/\s+/);
       assert.equal(fields.length,4);assert(/^[A-Z+<NLEsIlTRUXWZ]{1,8}$/.test(fields[0]));assert(fields.slice(1,3).every(v=>/^[\d:.-]{1,32}$/.test(v)));

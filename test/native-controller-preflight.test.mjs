@@ -137,6 +137,95 @@ test('sample projection accepts only finite known symbols and hashes unknown or 
   assert.throws(()=>nativeSampleProjection(Buffer.alloc(2000001)));
 });
 
+async function withDiscoveryImage(run){
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'pc-discovery-image-'));
+  const image=path.join(await fs.realpath(directory),'julia');await fs.writeFile(image,'qualified image');
+  const created=Date.now(),records=[],children=[],expected={...discoveryExpected,canonicalExecutable:image};
+  const capture={pid:123,parent:process.pid,startedAt:created,spawnedAt:created,exited:false,closed:false};
+  const control={mappings:()=>['p123','n'+expected.canonicalExecutable],
+    identity:()=>process.pid+' '+new Date(created).toString(),cpu:async()=>{}};
+  const originalSpawn=(file,args)=>{const child=observationChild(400+children.length);children.push(child);
+    queueMicrotask(()=>{void(async()=>{
+      let text;if(file.endsWith('lsof'))text=control.mappings().join('\n')+'\n';
+      else if(args.includes('lstart='))text=control.identity()+'\n';
+      else{await control.cpu();text='R 00:01 0:00.13 3.3\n';}
+      child.stdout.emit('data',Buffer.from(text));child.exitCode=0;child.emit('exit',0,null);child.emit('close',0,null);
+    })().catch(error=>{child.emit('error',error);child.exitCode=1;child.emit('exit',1,null);child.emit('close',1,null);});});
+    return child;};
+  const readers=createNativeDiscoveryReaders(expected,{record:row=>records.push(row)});
+  const observe=changes=>readers.observe(capture,{signal:new AbortController().signal,deadlineAt:Date.now()+1000,
+    originalSpawn,sample:false,...changes});
+  const replace=async()=>{const replacement=path.join(directory,'replacement');await fs.writeFile(replacement,'replacement image');await fs.rename(replacement,image);};
+  try{await run({image,directory,expected,capture,control,records,observe,replace});}
+  finally{await readers.retire();assert.equal(records.at(-1).physicalClose,true);
+    assert(children.every(child=>child.exitCode!==null));await fs.rm(directory,{recursive:true,force:true});}
+}
+
+test('discovery qualifies the exact expected mapped image despite an unrelated missing mapping and duplicate exact entries',async()=>{
+  await withDiscoveryImage(async f=>{
+    f.control.mappings=()=>['p123','n'+path.join(f.directory,'PRIVATE missing mapping'),'n'+f.image,'n'+f.image];
+    for(let sequence=1;sequence<=2;sequence++){
+      const value=await f.observe({sequence});assert.equal(value.qualified,true);assert.equal(value.pid,123);
+      assert.equal(value.executable.basename,'julia');assert.equal(value.executable.pathSha256.length,64);
+      assert(!JSON.stringify(value).includes(f.directory));
+    }
+    assert(!JSON.stringify(f.records).includes('PRIVATE'));assert(!JSON.stringify(f.records).includes(f.directory));
+  });
+});
+
+test('discovery refuses missing, basename-only or foreign-PID image mappings without adopting another image',async()=>{
+  for(const kind of ['missing','basename','no-pid','foreign-pid','mixed-pids','malformed-pid'])await withDiscoveryImage(async f=>{
+    f.control.mappings=()=>kind==='missing'?['p123']:
+      kind==='basename'?['p123','n'+path.join(f.directory,'other','julia')]:kind==='no-pid'?['n'+f.image]:
+      kind==='foreign-pid'?['p124','n'+f.image]:kind==='mixed-pids'?['p123','n'+f.image,'p124','n'+f.image]:['punknown','n'+f.image];
+    let cpu=false;f.control.cpu=async()=>{cpu=true;};
+    await assert.rejects(f.observe(),error=>error.diagnosticStage==='image-before');assert.equal(cpu,false);
+  });
+});
+
+test('discovery refuses a noncanonical expected path and an expected image which disappeared',async()=>{
+  await withDiscoveryImage(async f=>{const alias=path.join(f.directory,'alias');await fs.symlink(f.image,alias);
+    f.expected.canonicalExecutable=alias;
+    await assert.rejects(f.observe(),error=>error.diagnosticStage==='image-before');
+  });
+  await withDiscoveryImage(async f=>{await fs.unlink(f.image);
+    await assert.rejects(f.observe(),error=>error.diagnosticStage==='image-before'&&error.code==='ENOENT');
+  });
+});
+
+test('discovery anchors the expected file incarnation across observations and refuses replacement',async()=>{
+  await withDiscoveryImage(async f=>{assert.equal((await f.observe()).qualified,true);await f.replace();
+    await assert.rejects(f.observe(),error=>error.diagnosticStage==='image-before');
+  });
+});
+
+test('discovery rechecks the exact image after CPU observation and refuses replacement or removal',async()=>{
+  for(const kind of ['replace','remove'])await withDiscoveryImage(async f=>{
+    f.control.cpu=()=>kind==='replace'?f.replace():fs.unlink(f.image);
+    await assert.rejects(f.observe(),error=>error.diagnosticStage==='image-after'&&(kind!=='remove'||error.code==='ENOENT'));
+  });
+});
+
+test('discovery refuses changed process parent or incarnation before and after CPU observation',async()=>{
+  for(const kind of ['parent','incarnation'])await withDiscoveryImage(async f=>{
+    await f.observe();f.control.identity=()=>kind==='parent'?(process.pid+1)+' '+new Date(f.capture.startedAt).toString():
+      process.pid+' '+new Date(f.capture.startedAt+2000).toString();
+    await assert.rejects(f.observe(),error=>error.diagnosticStage==='identity-before');
+  });
+  await withDiscoveryImage(async f=>{f.control.cpu=async()=>{f.control.identity=()=>(process.pid+1)+' '+new Date(f.capture.startedAt).toString();};
+    await assert.rejects(f.observe(),error=>error.diagnosticStage==='identity-after');
+  });
+});
+
+test('discovery retains exit and abort refusals around the exact expected image',async()=>{
+  await withDiscoveryImage(async f=>{f.control.cpu=async()=>{f.capture.exited=true;};
+    await assert.rejects(f.observe(),error=>error.diagnosticStage==='image-after');
+  });
+  await withDiscoveryImage(async f=>{const abort=new AbortController();f.control.cpu=async()=>abort.abort();
+    await assert.rejects(f.observe({signal:abort.signal}),error=>error.diagnosticStage==='image-after');
+  });
+});
+
 test('sample temporary directories retire after chmod or open fails without launching a sample writer',async()=>{
   const realChmod=fs.chmod,realOpen=fs.open,realMkdtemp=fs.mkdtemp;
   for(const failingMethod of ['chmod','open']){
