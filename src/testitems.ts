@@ -12,23 +12,44 @@ interface NativeInvocation {
   readonly folder: string; readonly root: string; readonly project: string; readonly reason: string;
   readonly executable: string; readonly tags: readonly string[]; readonly excludeTags: readonly string[];
 }
+const discoveryShutdowns = new Set<() => void>();
+
+/** Stop queued discoveries before deactivation snapshots the active controller processes. */
+export function shutdownNativeTestItems(): void {
+  for (const stop of [...discoveryShutdowns]) stop();
+}
 
 /** Native TestItemRunner declarations, with one controller per workspace folder. */
 export function registerNativeTestItems(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('PerfChecker test items');
   context.subscriptions.push(output);
-  const controls = new Map<string, {refresh: () => Promise<void>; run: (request: vscode.TestRunRequest, token: vscode.CancellationToken) => Promise<void>}>();
+  const controls = new Map<string, {refresh: () => Promise<void>; run: (request: vscode.TestRunRequest, token: vscode.CancellationToken) => Promise<void>; stop: () => void}>();
+  let stopped = false;
+  const stoppedError = () => new Error('Native test item discovery has stopped.');
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    for (const control of controls.values()) control.stop();
+    discoveryShutdowns.delete(stop);
+  };
+  discoveryShutdowns.add(stop);
+  context.subscriptions.push({dispose:stop});
   const ensureController = (folder: vscode.WorkspaceFolder) => {
+    if (stopped) throw stoppedError();
     const existing = controls.get(folder.uri.toString());
     if (existing) return existing;
     const tests = vscode.tests.createTestController(`perfchecker.testitems.${folder.uri.toString()}`, `PerfChecker — measures · ${folder.name}`);
     context.subscriptions.push(tests);
     let declarations: NativeItem[] = [];
     let busy = false;
-    const discoveries = new Map<string, {generation: {value: number}; promise: Promise<void>}>();
+    type Discovery = {invocation: NativeInvocation; generation: number; promise: Promise<void>;
+      resolve: () => void; reject: (error: unknown) => void};
+    type DiscoveryQueue = {running: Discovery; queued?: Discovery};
+    const discoveries = new Map<string, DiscoveryQueue>();
     let latestDiscovery = 0;
     const setting = <T>(key: string, fallback: T) => vscode.workspace.getConfiguration('perfchecker', folder.uri).get<T>(key, fallback);
     const assertWorkspace = () => {
+      if (stopped) throw stoppedError();
       if (!vscode.workspace.isTrusted || !vscode.workspace.workspaceFolders?.some(f => f.uri.toString() === folder.uri.toString()))
         throw new Error('Open the original trusted workspace before executing test items.');
     };
@@ -44,7 +65,8 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
     const invocationKey = (invocation: NativeInvocation) => JSON.stringify([
       invocation.folder,invocation.root,invocation.project,invocation.executable,invocation.tags,invocation.excludeTags]);
     const invoke = async (args: string[], token?: vscode.CancellationToken,
-        invocation: NativeInvocation = captureInvocation()): Promise<{code: number; payload: any}> => {
+        invocation: NativeInvocation = captureInvocation(),
+        lifecycle?: {closed?: Promise<void>; physicallyClosed?: boolean; beforeSpawn?: () => void}): Promise<{code: number; payload: any}> => {
       output.appendLine(`Controller project: ${invocation.project} (${invocation.reason})`);
       const directory = path.join(context.globalStorageUri.fsPath, 'native-testitems', randomUUID());
       await fs.mkdir(directory, {recursive:true});
@@ -55,10 +77,12 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
       const code = await new Promise<number>((resolve,reject) => {
         if (token?.isCancellationRequested) {resolve(130); return;}
         assertWorkspace();
+        lifecycle?.beforeSpawn?.();
         const child = spawn(invocation.executable, ['--startup-file=no',`--project=${project}`,
           '-e',cancellableJulia('using PerfChecker, TestItemRunner; exit(perfchecker_main(ARGS))'),'--','testitems',
           `--root=${invocation.root}`,`--project=${project}`,`--output=${destination}`, ...args],
           {cwd:invocation.root,windowsHide:true,detached:process.platform!=='win32',env});
+        if (lifecycle) lifecycle.closed = new Promise<void>(resolve => child.once('close', () => {lifecycle.physicallyClosed = true; resolve();}));
         const stop = controllerCancellation(child, (message, forced) => {
           output.appendLine(message); if (forced) void vscode.window.showWarningMessage(message);
         });
@@ -81,17 +105,22 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
     };
     const selectionArgs = (invocation: NativeInvocation) => [`--tags=${invocation.tags.join(',')}`,
       `--exclude-tags=${invocation.excludeTags.join(',')}`];
-    const refresh = (): Promise<void> => {
-      const generation = {value:++latestDiscovery};
-      let invocation: NativeInvocation;
-      try {invocation = captureInvocation();} catch (error) {return Promise.reject(error);}
-      const key = invocationKey(invocation);
-      const existing = discoveries.get(key);
-      if (existing) {existing.generation.value = generation.value;return existing.promise;}
+    const createDiscovery = (invocation: NativeInvocation, generation: number): Discovery => {
+      let resolve!: () => void, reject!: (error: unknown) => void;
+      const promise = new Promise<void>((completed, failed) => {resolve = completed; reject = failed;});
+      return {invocation,generation,promise,resolve,reject};
+    };
+    const startDiscovery = (key: string, queue: DiscoveryQueue, discovery: Discovery, deferred = false): void => {
+      const invocation = discovery.invocation;
+      const lifecycle: {closed?: Promise<void>; physicallyClosed?: boolean; beforeSpawn?: () => void} = {};
+      if (deferred) lifecycle.beforeSpawn = () => {
+        if (invocationKey(captureInvocation()) !== key)
+          throw new Error('The test item discovery settings changed before the queued refresh started. Refresh again.');
+      };
       const pending = (async () => {
-        const {code,payload} = await invoke(['--list',...selectionArgs(invocation)],undefined,invocation);
+        const {code,payload} = await invoke(['--list',...selectionArgs(invocation)],undefined,invocation,lifecycle);
         if (code || payload.schema_version !== 'perfchecker-testitems/1' || !Array.isArray(payload.items)) throw new Error('Unsupported test item listing.');
-        if (latestDiscovery !== generation.value) return;
+        if (latestDiscovery !== discovery.generation) return;
         try {if (invocationKey(captureInvocation()) !== key) return;} catch {return;}
         declarations = payload.items;
         tests.items.replace(declarations.map(item=>{
@@ -100,9 +129,36 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
           test.tags = item.tags.map(tag=>new vscode.TestTag(tag));
           return test;
         }));
-      })().finally(() => {if (discoveries.get(key)?.promise === pending) discoveries.delete(key);});
-      discoveries.set(key,{generation,promise:pending});
-      return pending;
+      })();
+      const release = () => {
+        if (discoveries.get(key) !== queue || queue.running !== discovery) return;
+        const next = queue.queued;
+        if (next) {queue.queued = undefined; queue.running = next; startDiscovery(key,queue,next,true);}
+        else discoveries.delete(key);
+      };
+      void pending.then(() => {release(); discovery.resolve();}, error => {
+        // A spawn error can reject invoke before physical close. Preserve that
+        // error immediately, but keep the signature occupied until close.
+        if (!lifecycle.closed || lifecycle.physicallyClosed) release();
+        else void lifecycle.closed.then(release);
+        discovery.reject(error);
+      });
+    };
+    const refresh = (force = false): Promise<void> => {
+      const generation = ++latestDiscovery;
+      let invocation: NativeInvocation;
+      try {invocation = captureInvocation();} catch (error) {return Promise.reject(error);}
+      const key = invocationKey(invocation),existing = discoveries.get(key);
+      if (existing) {
+        const joined = existing.queued ?? (force ? undefined : existing.running);
+        if (joined) {joined.generation = generation; return joined.promise;}
+        const queued = createDiscovery(invocation,generation);
+        existing.queued = queued;
+        return queued.promise;
+      }
+      const running = createDiscovery(invocation,generation),queue = {running};
+      discoveries.set(key,queue); startDiscovery(key,queue,running);
+      return running.promise;
     };
     const run = async (request: vscode.TestRunRequest, token: vscode.CancellationToken) => {
       if (busy) throw new Error('A native test item run is already active in this folder.');
@@ -155,9 +211,15 @@ export function registerNativeTestItems(context: vscode.ExtensionContext): void 
       } finally {execution.end();busy=false;}
     };
     tests.resolveHandler = () => refresh();
-    tests.refreshHandler = () => refresh();
+    tests.refreshHandler = () => refresh(true);
     tests.createRunProfile('PerfChecker — measures',vscode.TestRunProfileKind.Run,run,true);
-    const control = {refresh,run};
+    const control = {refresh: () => refresh(true),run,stop: () => {
+      ++latestDiscovery;
+      for (const queue of discoveries.values()) {
+        queue.queued?.reject(stoppedError());
+        queue.queued = undefined;
+      }
+    }};
     controls.set(folder.uri.toString(),control);
     return control;
   };
