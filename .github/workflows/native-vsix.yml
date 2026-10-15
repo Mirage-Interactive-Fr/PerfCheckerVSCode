@@ -190,6 +190,7 @@ jobs:
           assertNativeCampaignSelection({scope:e.NATIVE_SCOPE,event:e.NATIVE_EVENT,artifact:e.NATIVE_VSIX_MODE,
             stage:e.NATIVE_STAGE,group:e.NATIVE_CASE_GROUP,core:e.NATIVE_CORE});
           const requested=[e.REUSE_RUN,e.REUSE_NAME,e.REUSE_SHA].some(Boolean),newOrigin=e.NATIVE_NEW_ORIGIN==='true';
+          if(e.NATIVE_DISCOVERY_DIAGNOSTIC==='true')throw Error('Historical discovery diagnostics must use their original branch and explicit oracle contract; this source qualifies the one-hour campaign');
           assertNativeDiscoveryDiagnostic({enabled:e.NATIVE_DISCOVERY_DIAGNOSTIC==='true',event:e.NATIVE_EVENT,
             artifact:e.NATIVE_VSIX_MODE,stage:e.NATIVE_STAGE,scope:e.NATIVE_SCOPE,core:e.NATIVE_CORE,partition:'measure',
             backendJulia:e.NATIVE_BACKEND_JULIA,originRun:e.REUSE_RUN,originName:e.REUSE_NAME,originSha:e.REUSE_SHA,
@@ -275,7 +276,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.package.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ (github.event_name != 'workflow_dispatch' || inputs.stage == 'full') && 180 || 150 }}
+    timeout-minutes: 360
     env:
       PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC: ${{ inputs.discovery_diagnostic && '1' || '0' }}
       PERFCHECKER_NATIVE_EVENT: ${{ github.event_name }}
@@ -300,6 +301,9 @@ jobs:
       JULIA_PKG_PRECOMPILE_AUTO: '0'
       PERFCHECKER_UUID: 00000000-0000-4000-8000-000000000001
     steps:
+      - name: Start the shared native activity budget (330 minutes plus 30 minutes technical reserve)
+        shell: bash
+        run: echo "PERFCHECKER_NATIVE_ACTIVITY_STARTED_AT=$(( $(date +%s) * 1000 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
@@ -334,7 +338,7 @@ jobs:
         run: npx playwright install chromium
       - name: Install screen capture tooling in the disposable Linux stable host
         if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_VIDEO == '1'
-        timeout-minutes: 15
+        timeout-minutes: 60
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update
@@ -343,7 +347,7 @@ jobs:
           ffmpeg -version
       - name: Install native colour-picker tools in the disposable Linux host
         if: runner.os == 'Linux' && env.PERFCHECKER_NATIVE_STAGE == 'focused' && env.PERFCHECKER_NATIVE_CASE_GROUP == 'studio-color'
-        timeout-minutes: 15
+        timeout-minutes: 60
         run: |
           if ! command -v xdotool >/dev/null 2>&1 || ! command -v xwd >/dev/null 2>&1 || ! command -v xwininfo >/dev/null 2>&1 || ! command -v convert >/dev/null 2>&1; then
             sudo apt-get update

@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import path from 'node:path';
+import readiness from './native-readiness.cjs';
+const {NATIVE_READINESS_MS}=readiness;
 
 // Exercise the actual native harness observer with controlled kernel reads.
 // No signal API is supplied: uncertainty can never cause a process signal.
@@ -199,7 +201,7 @@ test('Pluto ownership cannot adopt grandchildren through a reused known parent i
 // Exercise the actual Results document wait, including its native click boundary.
 const studioSource=await readFile(new URL('./native-studio-controls.cjs',import.meta.url),'utf8');
 const resultsSource=studioSource.slice(studioSource.indexOf('async function resultDocuments('),studioSource.indexOf('async function resetDesigner('));
-function resultsScenario({snapshots=[],fallback=[],clickError,readError,detached=false}={}){
+function resultsScenario({snapshots=[],fallback=[],clickError,readError,detached=false,clockAdvance=0}={}){
   let elapsed=0,clicks=0,reads=0;const observations=[];
   const frame=(nonce,visible=true)=>({nonce,isDetached:()=>detached,parentFrame:()=>null,
     locator:selector=>selector.startsWith('button')?{count:async()=>{if(readError)throw readError;return 1;},first:()=>({isVisible:async()=>visible})}:
@@ -207,8 +209,9 @@ function resultsScenario({snapshots=[],fallback=[],clickError,readError,detached
   const frames=()=>{reads++;const value=snapshots.length?snapshots.shift():fallback;return value.map(row=>frame(...row));};
   const context={browser:{contexts:()=>[{pages:()=>[{frames}]}]},log:(name,value)=>observations.push({name,...value})};
   class Clock extends Date{static now(){return elapsed;}}
-  const output=new Function('assert','clickStudioAction','Date','setTimeout',resultsSource+';return output;')(
-    assert,async(_,action)=>{assert.equal(action,'results');clicks++;if(clickError)throw clickError;},Clock,(resolve,ms)=>{elapsed+=ms;resolve();});
+  const output=new Function('assert','clickStudioAction','Date','setTimeout','NATIVE_READINESS_MS',resultsSource+';return output;')(
+    assert,async(_,action)=>{assert.equal(action,'results');clicks++;if(clickError)throw clickError;},Clock,
+    (resolve,ms)=>{assert.equal(ms,100);elapsed+=Math.max(ms,clockAdvance);resolve();},NATIVE_READINESS_MS);
   return{run:()=>output(context),observations,snapshot:()=>({elapsed,clicks,reads})};
 }
 
@@ -223,10 +226,15 @@ test('Results does not accept an unseen new document until it becomes visible',a
   assert.equal((await value.run()).nonce,'new');assert.equal(value.snapshot().clicks,1);assert.equal(value.snapshot().elapsed,100);
 });
 
-test('Results times out after 60 seconds without replaying its native click',async()=>{
-  const value=resultsScenario({fallback:[['old',true]]});
+test('Results waits beyond the former bound for its exact new document without replaying its native click',async()=>{
+  const value=resultsScenario({snapshots:[[['old',true]],[['old',true]],[['new',true]]],clockAdvance:30*60000});
+  assert.equal((await value.run()).nonce,'new');assert.equal(value.snapshot().elapsed,30*60000);assert.equal(value.snapshot().clicks,1);
+});
+
+test('Results times out after one hour without replaying its native click',async()=>{
+  const value=resultsScenario({fallback:[['old',true]],clockAdvance:60000});
   await assert.rejects(value.run(),/single Results click renders its new visible document/);
-  assert.equal(value.snapshot().elapsed,60000);assert.equal(value.snapshot().clicks,1);
+  assert.equal(value.snapshot().elapsed,3600000);assert.equal(value.snapshot().clicks,1);
 });
 
 test('Results preserves a native click failure instead of retrying the action',async()=>{
@@ -240,7 +248,7 @@ test('Results preserves an inspection failure on an attached document',async()=>
 });
 
 test('Results records detached reads and never treats them as a completed action',async()=>{
-  const value=resultsScenario({snapshots:[[['old',true]]],readError:new Error('Frame was detached'),detached:true});
+  const value=resultsScenario({snapshots:[[['old',true]]],readError:new Error('Frame was detached'),detached:true,clockAdvance:60000});
   await assert.rejects(value.run(),/single Results click renders its new visible document/);
   assert.equal(value.snapshot().clicks,1);assert(value.observations.every(row=>row.name==='native-results-document-observation-invalidated'));
 });

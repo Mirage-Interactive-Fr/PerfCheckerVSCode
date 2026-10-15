@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS}=require('./native-readiness.cjs');
 // Real public VSIX controls, real General Julia workers, and disposable CI fixtures only.
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
@@ -9,7 +10,7 @@ const {tmpdir} = require('node:os');
 const reportNames = {discover: 'discovery', run: 'run', diagnose: 'diagnosis',
   advise: 'advice', compare: 'comparison', tools: 'tools', sync: 'sync', investigate: 'investigation'};
 
-async function eventually(read, description, timeout = 120000) {
+async function eventually(read, description, timeout = NATIVE_READINESS_MS) {
   const deadline = Date.now() + timeout;
   let last;
   while (Date.now() < deadline) {
@@ -23,17 +24,17 @@ function configuration(context) {
   return context.vscode.workspace.getConfiguration('perfchecker', context.vscode.Uri.file(context.workspace));
 }
 
-async function view(context) {
+async function view(context,timeout=NATIVE_READINESS_MS) {
   await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
-  const result = await context.findFrame('#app nav[aria-label="Investigation views"]');
-  await result.locator('#app p.status').waitFor({state: 'visible'});
+  const result = await context.findFrame('#app nav[aria-label="Investigation views"]',{timeout});
+  await result.locator('#app p.status').waitFor({state: 'visible',timeout});
   return result;
 }
 
 async function tab(context, name) {
   const result = await view(context);
-  await result.getByRole('button', {name, exact: true}).click();
-  await eventually(async () => (await result.getByRole('button', {name, exact: true}).getAttribute('aria-current')) === 'page', `${name} investigation view`);
+  await result.getByRole('button', {name, exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async () => (await result.getByRole('button', {name, exact: true}).getAttribute('aria-current',{timeout:NATIVE_READINESS_MS})) === 'page', `${name} investigation view`);
   return result;
 }
 
@@ -47,12 +48,12 @@ function reportRoot(context) {
   return path.resolve(context.workspace, configuration(context).get('investigationReports', 'perf/results/investigations'));
 }
 
-async function reportAfter(context, before, action, timeout = 360000) {
+async function reportAfter(context, before, action, timeout = NATIVE_READINESS_MS) {
   const root = reportRoot(context);
   const observationStarted=Date.now(),observationDeadline=observationStarted+timeout;let nextObservation=0;
   if(action==='diagnose')context.log('investigation-diagnosis-observation-budget',{
     timeoutMilliseconds:timeout,startedAt:new Date(observationStarted).toISOString(),deadlineAt:new Date(observationDeadline).toISOString(),
-    scope:'Native test observation only; analyzer and investigation execution budgets are unchanged'});
+    scope:'One-hour availability and positive analyzer fixture execution; intentional timeout/budget fixtures remain separate and unchanged'});
   let reportObserved=false,cleanupConfirmed=false,reportObservedAt,cleanupConfirmedAt;
   try{
   const found = await eventually(async () => {
@@ -74,8 +75,8 @@ async function reportAfter(context, before, action, timeout = 360000) {
   reportObserved=true;
   reportObservedAt=new Date().toISOString();
   const current = await view(context);
-  await eventually(async () => !(await current.locator('#app .status').getAttribute('class')).includes('busy'), `${action} controller completes cleanup`, Math.min(timeout,360000));
-  assert.equal(await current.getByRole('button', {name: 'Cancel', exact: true}).isDisabled(), true);
+  await eventually(async () => !(await current.locator('#app .status').getAttribute('class',{timeout:30000})).includes('busy'), `${action} controller completes cleanup`, Math.min(timeout,360000));
+  assert.equal(await current.getByRole('button', {name: 'Cancel', exact: true}).isDisabled({timeout:30000}), true);
   cleanupConfirmed=true;
   cleanupConfirmedAt=new Date().toISOString();
   return found;
@@ -86,7 +87,7 @@ async function reportAfter(context, before, action, timeout = 360000) {
   }
 }
 
-async function action(context, label, name, timeout = 360000) {
+async function action(context, label, name, timeout = NATIVE_READINESS_MS) {
   if(name==='diagnose'&&context.observeOperation)return context.observeOperation('diagnose',()=>performAction(context,label,name,timeout),Date.now()+timeout);
   return performAction(context,label,name,timeout);
 }
@@ -95,7 +96,7 @@ async function performAction(context, label, name, timeout) {
   const before = await directories(reportRoot(context));
   const current = await view(context);
   await context.observeWork?.(`investigation-${name}-before-action`);
-  await current.getByRole('button', {name: label, exact: true}).click();
+  await current.getByRole('button', {name: label, exact: true}).click({timeout:NATIVE_READINESS_MS});
   const result=await reportAfter(context, before, name, timeout);
   await context.observeWork?.(`investigation-${name}-completed-before-teardown`);
   return result;
@@ -103,26 +104,26 @@ async function performAction(context, label, name, timeout) {
 
 async function quickPick(context, title, choice = 0) {
   const widget = context.windowPage.locator('.quick-input-widget');
-  await widget.waitFor({state: 'visible', timeout: 30000});
-  await eventually(async () => (await widget.innerText()).includes(title), `native quick pick ${title}`, 30000);
+  await widget.waitFor({state: 'visible', timeout: NATIVE_READINESS_MS});
+  await eventually(async () => (await widget.innerText({timeout:NATIVE_READINESS_MS})).includes(title), `native quick pick ${title}`, NATIVE_READINESS_MS);
   const choices = widget.locator('.monaco-list-row[role="option"]');
   if (typeof choice === 'string') {
     const selected = choices.filter({hasText: choice});
-    await eventually(async () => (await selected.count()) === 1, `saved evidence ${choice}`, 30000);
-    await selected.click();
+    await eventually(async () => (await selected.count()) === 1, `saved evidence ${choice}`, NATIVE_READINESS_MS);
+    await selected.click({timeout:NATIVE_READINESS_MS});
   } else {
-    await eventually(async () => (await choices.count()) > choice, `saved evidence choice ${choice}`, 30000);
-    await choices.nth(choice).click();
+    await eventually(async () => (await choices.count()) > choice, `saved evidence choice ${choice}`, NATIVE_READINESS_MS);
+    await choices.nth(choice).click({timeout:NATIVE_READINESS_MS});
   }
 }
 
 async function selectScenario(context, id, implementation) {
   const current = await tab(context, 'Scenarios');
-  await current.getByRole('button', {name: 'Clear selection', exact: true}).click();
+  await current.getByRole('button', {name: 'Clear selection', exact: true}).click({timeout:NATIVE_READINESS_MS});
   const cards = current.locator('article.card').filter({has: current.locator('.scenario-title strong', {hasText: id})});
   const card = cards.filter({has: current.locator('.implementation', {hasText: implementation})}).first();
-  await card.locator('.scenario-title input').check();
-  assert.match(await current.locator('#app').innerText(), /1 selected/);
+  await card.locator('.scenario-title input').check({timeout:NATIVE_READINESS_MS});
+  assert.match(await current.locator('#app').innerText({timeout:NATIVE_READINESS_MS}), /1 selected/);
   return current;
 }
 
@@ -133,7 +134,7 @@ async function selectTools(context, names) {
   for (const text of tools) {
     const tool = text.split(' · ')[0];
     const input = fieldset.locator('label').filter({hasText: text}).locator('input');
-    if (names.includes(tool)) await input.check(); else await input.uncheck();
+    if (names.includes(tool)) await input.check({timeout:NATIVE_READINESS_MS}); else await input.uncheck({timeout:NATIVE_READINESS_MS});
   }
   for (const name of names) assert(tools.some(text => text.startsWith(`${name} ·`)), `${name} analyzer is declared by General controller`);
   return current;
@@ -148,29 +149,29 @@ async function discover(context) {
   assert(result.report.analyzers.some(item => item.tool === 'jet'));
   const current = await tab(context, 'Scenarios');
   for (const name of ['Scenarios', 'Findings & advice', 'Before / after', 'Saved evidence']) {
-    await current.getByRole('button', {name, exact: true}).click();
-    assert.equal(await current.getByRole('button', {name, exact: true}).getAttribute('aria-current'), 'page');
+    await current.getByRole('button', {name, exact: true}).click({timeout:NATIVE_READINESS_MS});
+    assert.equal(await current.getByRole('button', {name, exact: true}).getAttribute('aria-current',{timeout:NATIVE_READINESS_MS}), 'page');
   }
-  await current.getByRole('button', {name: 'Scenarios', exact: true}).click();
-  await current.getByRole('button', {name: 'Select all declared', exact: true}).click();
+  await current.getByRole('button', {name: 'Scenarios', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await current.getByRole('button', {name: 'Select all declared', exact: true}).click({timeout:NATIVE_READINESS_MS});
   const selected = result.report.declared.length;
-  assert.match(await current.locator('#app').innerText(), new RegExp(`${selected} selected`));
-  await current.getByRole('searchbox', {name: 'Filter scenarios'}).fill('absent-native-fixture');
-  await current.getByRole('searchbox', {name: 'Filter scenarios'}).press('Tab');
+  assert.match(await current.locator('#app').innerText({timeout:NATIVE_READINESS_MS}), new RegExp(`${selected} selected`));
+  await current.getByRole('searchbox', {name: 'Filter scenarios'}).fill('absent-native-fixture',{timeout:NATIVE_READINESS_MS});
+  await current.getByRole('searchbox', {name: 'Filter scenarios'}).press('Tab',{timeout:NATIVE_READINESS_MS});
   assert.equal(await current.locator('.scenario-title').count(), 0);
-  assert.match(await current.locator('#app').innerText(), new RegExp(`${selected} selected`));
-  await current.getByRole('button', {name: 'Clear selection', exact: true}).click();
-  assert.equal(await current.getByRole('button', {name: 'Measure selected', exact: true}).isDisabled(), true);
-  await current.getByRole('searchbox', {name: 'Filter scenarios'}).fill('');
-  await current.getByRole('searchbox', {name: 'Filter scenarios'}).press('Tab');
+  assert.match(await current.locator('#app').innerText({timeout:NATIVE_READINESS_MS}), new RegExp(`${selected} selected`));
+  await current.getByRole('button', {name: 'Clear selection', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.equal(await current.getByRole('button', {name: 'Measure selected', exact: true}).isDisabled({timeout:NATIVE_READINESS_MS}), true);
+  await current.getByRole('searchbox', {name: 'Filter scenarios'}).fill('',{timeout:NATIVE_READINESS_MS});
+  await current.getByRole('searchbox', {name: 'Filter scenarios'}).press('Tab',{timeout:NATIVE_READINESS_MS});
   await selectScenario(context, 'sum_squares', 'allocating');
   await selectTools(context, []);
-  assert.equal(await current.getByRole('button', {name: 'Diagnose selected', exact: true}).isDisabled(), true);
-  assert.equal(await current.getByRole('button', {name: 'Investigate selected', exact: true}).isDisabled(), true);
+  assert.equal(await current.getByRole('button', {name: 'Diagnose selected', exact: true}).isDisabled({timeout:NATIVE_READINESS_MS}), true);
+  assert.equal(await current.getByRole('button', {name: 'Investigate selected', exact: true}).isDisabled({timeout:NATIVE_READINESS_MS}), true);
   await selectTools(context, ['jet', 'alloccheck', 'latency']);
 
   const candidate = result.report.candidates[0];
-  await current.locator('article.proposal').first().getByRole('button', {name: 'Prepare shared case', exact: true}).click();
+  await current.locator('article.proposal').first().getByRole('button', {name: 'Prepare shared case', exact: true}).click({timeout:NATIVE_READINESS_MS});
   await eventually(() => context.vscode.window.activeTextEditor?.document.isUntitled, 'Prepare shared case opens a real untitled Julia draft');
   assert(context.vscode.window.activeTextEditor.document.getText().includes('prepare'));
   const source = result.report.declared.find(item => item.id === 'sum_squares').source;
@@ -185,17 +186,17 @@ async function discover(context) {
 async function adopt(context, id, factory, parameters = {}) {
   const current = await tab(context, 'Scenarios');
   const form = current.locator('details.card').filter({has: current.locator('summary', {hasText: 'Adopt a shared factory into the catalogue'})});
-  await form.locator('summary').click();
-  await form.locator('input[name="id"]').fill(id);
-  await form.locator('input[name="source"]').fill('perf/cases.jl');
-  await form.locator('input[name="factory"]').fill(factory);
-  await form.locator('input[name="implementation"]').fill('ui');
-  await form.locator('textarea').nth(0).fill('{ invalid');
-  await form.getByRole('button', {name: 'Add declaration', exact: true}).click();
-  assert.match(await form.getByRole('alert').innerText(), /Invalid input/);
-  await form.locator('textarea').nth(0).fill(JSON.stringify(parameters));
+  await form.locator('summary').click({timeout:NATIVE_READINESS_MS});
+  await form.locator('input[name="id"]').fill(id,{timeout:NATIVE_READINESS_MS});
+  await form.locator('input[name="source"]').fill('perf/cases.jl',{timeout:NATIVE_READINESS_MS});
+  await form.locator('input[name="factory"]').fill(factory,{timeout:NATIVE_READINESS_MS});
+  await form.locator('input[name="implementation"]').fill('ui',{timeout:NATIVE_READINESS_MS});
+  await form.locator('textarea').nth(0).fill('{ invalid',{timeout:NATIVE_READINESS_MS});
+  await form.getByRole('button', {name: 'Add declaration', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.match(await form.getByRole('alert').innerText({timeout:NATIVE_READINESS_MS}), /Invalid input/);
+  await form.locator('textarea').nth(0).fill(JSON.stringify(parameters),{timeout:NATIVE_READINESS_MS});
   const before = await directories(reportRoot(context));
-  await form.getByRole('button', {name: 'Add declaration', exact: true}).click();
+  await form.getByRole('button', {name: 'Add declaration', exact: true}).click({timeout:NATIVE_READINESS_MS});
   const result = await reportAfter(context, before, 'discover');
   assert(result.report.declared.some(item => item.id === id && item.factory === factory));
   const catalog = path.resolve(context.workspace, configuration(context).get('scenarioCatalog', 'perf/scenarios.toml'));
@@ -215,15 +216,15 @@ async function rejectAdoption(context) {
   for (const testCase of cases) {
     const current = await tab(context, 'Scenarios');
     const form = current.locator('details.card').filter({has: current.locator('summary', {hasText: 'Adopt a shared factory into the catalogue'})});
-    if ((await form.getAttribute('open')) === null) await form.locator('summary').click();
-    await form.locator('input[name="id"]').fill(testCase.id);
-    await form.locator('input[name="source"]').fill('perf/cases.jl');
-    await form.locator('input[name="factory"]').fill('make_sum_case');
-    await form.locator('input[name="implementation"]').fill('ui');
-    await form.locator('textarea').nth(0).fill(testCase.parameters);
-    await form.locator('textarea').nth(1).fill(testCase.fixtures);
-    await form.getByRole('button', {name: 'Add declaration', exact: true}).click();
-    await eventually(async () => testCase.error.test(await current.locator('#app .status').innerText()), `Invalid or duplicate declaration ${testCase.id} is rejected`);
+    if ((await form.getAttribute('open',{timeout:NATIVE_READINESS_MS})) === null) await form.locator('summary').click({timeout:NATIVE_READINESS_MS});
+    await form.locator('input[name="id"]').fill(testCase.id,{timeout:NATIVE_READINESS_MS});
+    await form.locator('input[name="source"]').fill('perf/cases.jl',{timeout:NATIVE_READINESS_MS});
+    await form.locator('input[name="factory"]').fill('make_sum_case',{timeout:NATIVE_READINESS_MS});
+    await form.locator('input[name="implementation"]').fill('ui',{timeout:NATIVE_READINESS_MS});
+    await form.locator('textarea').nth(0).fill(testCase.parameters,{timeout:NATIVE_READINESS_MS});
+    await form.locator('textarea').nth(1).fill(testCase.fixtures,{timeout:NATIVE_READINESS_MS});
+    await form.getByRole('button', {name: 'Add declaration', exact: true}).click({timeout:NATIVE_READINESS_MS});
+    await eventually(async () => testCase.error.test(await current.locator('#app .status').innerText({timeout:NATIVE_READINESS_MS})), `Invalid or duplicate declaration ${testCase.id} is rejected`);
     assert.deepEqual(await fs.readFile(catalog), before, 'Invalid input does not alter the actual catalogue');
   }
   context.proof('investigation-adoption-types-and-duplicate-rejected', {parametersArray: true, fixturesObject: true, duplicate: true, catalogUnchanged: true});
@@ -242,10 +243,10 @@ async function measure(context) {
   const current = await tab(context, 'Findings & advice');
   const chart = current.locator('svg.sample-chart');
   assert(await chart.count(), 'Actual measured observations produce a sample chart');
-  await chart.locator('circle').first().focus();
-  assert.match(await chart.locator('circle').first().getAttribute('aria-label'), /Displayed sample/);
-  await current.getByText('Qualification and measurement evidence', {exact: true}).click();
-  assert.match(await current.locator('#app').innerText(), /passed/);
+  await chart.locator('circle').first().focus({timeout:NATIVE_READINESS_MS});
+  assert.match(await chart.locator('circle').first().getAttribute('aria-label',{timeout:NATIVE_READINESS_MS}), /Displayed sample/);
+  await current.getByText('Qualification and measurement evidence', {exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.match(await current.locator('#app').innerText({timeout:NATIVE_READINESS_MS}), /passed/);
   context.proof('investigation-real-measurement', {scenario: run.scenario.id, collector: run.collector, correctness: run.qualification.correctness, samples: run.summaries[0]?.samples, report: result.location});
   context.investigationFirstRun ||= result;
   return result;
@@ -255,9 +256,9 @@ async function diagnose(context) {
   await selectScenario(context, 'ui_adopted', 'ui');
   const tools = ['jet', 'aqua', 'alloccheck', 'snoopcompile', 'latency', 'gc', 'memory', 'heap', 'locks'];
   await selectTools(context, tools);
-  // Nine real analyzers can outlive six minutes on a cold macOS CI host.
-  // This observation allowance leaves every execution limit and assertion intact.
-  const result = await action(context, 'Diagnose selected', 'diagnose', process.platform==='darwin'?900000:360000);
+  // Positive analyzer availability and execution use the requested one-hour
+  // fixture allowance; timeout/budget refusal fixtures remain separate.
+  const result = await action(context, 'Diagnose selected', 'diagnose', NATIVE_READINESS_MS);
   assert.equal(result.report.schema_version, 'perfchecker-diagnosis/1');
   context.log('investigation-diagnosis-record-statuses',{records:result.report.records.slice(0,16).map(record=>({
     tool:tools.includes(record.tool)?record.tool:'unlisted',
@@ -291,7 +292,7 @@ async function diagnose(context) {
     assert.equal(createHash('sha256').update(bytes).digest('hex'), artifact.sha256);
     const cardFor = frame => frame.locator('article.card').filter({has: frame.getByRole('heading', {name: `${artifactRecord.scenario} · ${artifactRecord.implementation} · ${artifactRecord.tool}`, exact: true})});
     const recordCard = cardFor(current);
-    await recordCard.getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click();
+    await recordCard.getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click({timeout:NATIVE_READINESS_MS});
     const artifactUri=context.vscode.Uri.file(artifact.path);
     await eventually(() => context.vscode.window.tabGroups.all.some(group=>group.tabs.some(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifactUri.fsPath)), 'Evidence artifact opens in the actual native text or custom editor');
     const opened=context.vscode.window.tabGroups.all.flatMap(group=>group.tabs).find(tab=>tab.isActive&&tab.input?.uri?.fsPath===artifactUri.fsPath);
@@ -300,8 +301,8 @@ async function diagnose(context) {
     try {
       // Opening a native editor hides and unloads this non-retained webview.
       const reopened = await tab(context, 'Findings & advice');
-      await cardFor(reopened).getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click();
-      await eventually(async () => /Artifact changed/.test(await reopened.locator('#app .status').innerText()), 'Changed artifact is rejected by digest');
+      await cardFor(reopened).getByRole('button', {name: `Open ${artifact.kind}`, exact: true}).first().click({timeout:NATIVE_READINESS_MS});
+      await eventually(async () => /Artifact changed/.test(await reopened.locator('#app .status').innerText({timeout:NATIVE_READINESS_MS})), 'Changed artifact is rejected by digest');
     } finally {await fs.writeFile(artifact.path, bytes);}
     context.proof('investigation-native-artifact-and-integrity', {kind: artifact.kind, sha256: artifact.sha256});
   } else context.log('investigation-artifact-prerequisite-gap', {reason: 'The real analyzers returned no evidence artifacts; artifact execution is not qualified by this run.'});
@@ -311,14 +312,14 @@ async function diagnose(context) {
 async function advise(context) {
   const current = await tab(context, 'Findings & advice');
   const before = await directories(reportRoot(context));
-  await current.getByRole('button', {name: 'Advise from saved evidence', exact: true}).click();
+  await current.getByRole('button', {name: 'Advise from saved evidence', exact: true}).click({timeout:NATIVE_READINESS_MS});
   await quickPick(context, 'Choose saved evidence', 0);
   const result = await reportAfter(context, before, 'advise');
   assert.equal(result.report.schema_version, 'perfchecker-advice/1');
   assert(Array.isArray(result.report.recommendations));
   assert(await (await view(context)).getByRole('heading', {name: 'Recommendations', exact: true}).isVisible());
-  await (await view(context)).getByRole('button', {name: 'Explain with configured model', exact: true}).click();
-  await eventually(async () => /Optional advisor is disabled/.test(await current.locator('#app .status').innerText()), 'Unconfigured model explains the prerequisite without making a generation request');
+  await (await view(context)).getByRole('button', {name: 'Explain with configured model', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async () => /Optional advisor is disabled/.test(await current.locator('#app .status').innerText({timeout:NATIVE_READINESS_MS})), 'Unconfigured model explains the prerequisite without making a generation request');
   context.proof('investigation-saved-advice-and-disabled-model', {recommendations: result.report.recommendations.length, modelPrerequisiteExplained: true});
 }
 
@@ -331,8 +332,8 @@ async function compare(context) {
   const timestamp = directory => path.basename(directory).slice(0, 24).replace(/T(\d{2})-(\d{2})-(\d{2})/, 'T$1:$2:$3');
   const pickMeasurement = async (title, directory) => {
     const widget = context.windowPage.locator('.quick-input-widget');
-    await widget.waitFor({state:'visible',timeout:30000});
-    await eventually(async()=>(await widget.innerText()).includes(title),`native quick pick ${title}`,30000);
+    await widget.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+    await eventually(async()=>(await widget.innerText({timeout:NATIVE_READINESS_MS})).includes(title),`native quick pick ${title}`,NATIVE_READINESS_MS);
     const target = Date.parse(timestamp(directory));
     const rows = widget.locator('.monaco-list-row[role="option"]');
     const labels = await rows.allTextContents();
@@ -340,17 +341,17 @@ async function compare(context) {
       .filter(item=>item.date&&Math.abs(Date.parse(item.date)-target)<10000);
     assert.equal(matches.length,1,`One actual saved measurement corresponds to ${timestamp(directory)}: ${JSON.stringify(labels)}`);
     context.log('investigation-native-measurement-picker',{title,directory:path.basename(directory),displayedTimestamp:matches[0].date});
-    await rows.nth(matches[0].index).click();
+    await rows.nth(matches[0].index).click({timeout:NATIVE_READINESS_MS});
   };
   const current = await tab(context, 'Before / after');
   const before = await directories(reportRoot(context));
-  await current.getByRole('button', {name: 'Choose baseline and candidate', exact: true}).click();
+  await current.getByRole('button', {name: 'Choose baseline and candidate', exact: true}).click({timeout:NATIVE_READINESS_MS});
   await pickMeasurement('Choose the baseline measurement', baseline.directory);
   await pickMeasurement('Choose the candidate measurement', candidate.directory);
   const result = await reportAfter(context, before, 'compare');
   assert.equal(result.report.schema_version, 'perfchecker-scenario-comparison/1');
   assert(result.report.configurations.some(item => item.scenario === 'ui_adopted' && item.implementation === 'ui'));
-  assert.match(await (await tab(context, 'Before / after')).locator('#app').innerText(), /ui_adopted/);
+  assert.match(await (await tab(context, 'Before / after')).locator('#app').innerText({timeout:NATIVE_READINESS_MS}), /ui_adopted/);
   context.proof('investigation-real-baseline-candidate', {configurations: result.report.configurations.length, report: result.location});
 }
 
@@ -363,10 +364,10 @@ async function bounded(context) {
   assert(Array.isArray(result.report.unexecuted));
   assert(Array.isArray(result.report.decisions));
   const current = await tab(context, 'Findings & advice');
-  assert.match(await current.locator('#app').innerText(), /Bounded investigation/);
-  await current.getByText('Limits', {exact: true}).click();
-  await current.getByText('Experiments not executed', {exact: true}).click();
-  await current.getByText('Optional model decisions', {exact: true}).click();
+  assert.match(await current.locator('#app').innerText({timeout:NATIVE_READINESS_MS}), /Bounded investigation/);
+  await current.getByText('Limits', {exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await current.getByText('Experiments not executed', {exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await current.getByText('Optional model decisions', {exact: true}).click({timeout:NATIVE_READINESS_MS});
   context.proof('investigation-real-bounded-work', {status: result.report.status, experiments: result.report.experiments.length, limits: result.report.limits});
 }
 
@@ -380,22 +381,22 @@ async function syncAndHistory(context) {
   assert.equal(catalog.report.schema_version, 'perfchecker-tool-catalog/1');
   const current = await tab(context, 'Findings & advice');
   const search = current.getByRole('searchbox', {name: 'Search tool catalogue'});
-  await search.fill('jet');
-  assert.match(await current.locator('#app').innerText(), /JET/i);
-  await search.fill('no-native-tool-matches');
+  await search.fill('jet',{timeout:NATIVE_READINESS_MS});
+  assert.match(await current.locator('#app').innerText({timeout:NATIVE_READINESS_MS}), /JET/i);
+  await search.fill('no-native-tool-matches',{timeout:NATIVE_READINESS_MS});
   assert.equal(await current.locator('article.card').count(), 0);
-  await search.fill('');
+  await search.fill('',{timeout:NATIVE_READINESS_MS});
   let history = await tab(context, 'Saved evidence');
   const cardFor = frame => frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^run ·/})}).first();
   for (const format of ['JSON', 'Markdown']) {
-    await cardFor(history).getByRole('button', {name: format, exact: true}).click();
+    await cardFor(history).getByRole('button', {name: format, exact: true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(() => context.vscode.window.activeTextEditor?.document.uri.fsPath.endsWith(format === 'JSON' ? 'run.json' : 'run.md'), `Native ${format} saved evidence export`);
     history = await tab(context, 'Saved evidence');
   }
-  await cardFor(history).getByRole('button', {name: 'Open evidence', exact: true}).click();
-  await eventually(async () => /Saved evidence/.test(await history.locator('#app .status').innerText()), 'History reloads actual evidence without starting a worker');
-  await (await view(context)).getByRole('button', {name: 'Worker log', exact: true}).click();
-  await eventually(async () => /PerfChecker investigations/.test(await context.windowPage.locator('body').innerText()), 'Investigation output channel is displayed');
+  await cardFor(history).getByRole('button', {name: 'Open evidence', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async () => /Saved evidence/.test(await history.locator('#app .status').innerText({timeout:NATIVE_READINESS_MS})), 'History reloads actual evidence without starting a worker');
+  await (await view(context)).getByRole('button', {name: 'Worker log', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async () => /PerfChecker investigations/.test(await context.windowPage.locator('body').innerText({timeout:NATIVE_READINESS_MS})), 'Investigation output channel is displayed');
   context.proof('investigation-sync-tools-history-native-exports', {coverage: sync.report.coverage.length, tools: catalog.report.tools.length, formats: ['JSON', 'Markdown'], historyReload: true});
 }
 
@@ -419,12 +420,12 @@ async function profiles(context) {
   }
   for (let index = 0; index < await profiles.count(); index++) {
     const profile = profiles.nth(index);
-    await profile.locator('summary').first().click();
+    await profile.locator('summary').first().click({timeout:NATIVE_READINESS_MS});
     const filter = profile.getByRole('searchbox', {name: 'Filter profile stacks'});
-    await filter.fill('no-stack-matches-native-test');
-    assert.match(await profile.innerText(), /0 \/ 0 matching|No samples were collected/);
-    await filter.fill('');
-    await profile.getByText('Raw profile', {exact: true}).click();
+    await filter.fill('no-stack-matches-native-test',{timeout:NATIVE_READINESS_MS});
+    assert.match(await profile.innerText({timeout:NATIVE_READINESS_MS}), /0 \/ 0 matching|No samples were collected/);
+    await filter.fill('',{timeout:NATIVE_READINESS_MS});
+    await profile.getByText('Raw profile', {exact: true}).click({timeout:NATIVE_READINESS_MS});
   }
   context.proof('investigation-real-collectors-and-profile-controls', {collectors: result.report.runs.map(item => item.collector), profileFilter: true, fullRawEvidence: true});
 }
@@ -434,14 +435,14 @@ async function cancel(context) {
   await fs.rm(marker, {force: true});
   await adopt(context, 'ui_cancel', 'make_cancel_case', {marker});
   const current = await selectScenario(context, 'ui_cancel', 'ui');
-  await current.getByRole('button', {name: 'Measure selected', exact: true}).click();
-  await eventually(async () => (await fs.readFile(marker, 'utf8')) === 'running', 'Actual isolated scenario operation starts before cancellation', 180000);
-  await (await view(context)).getByRole('button', {name: 'Cancel', exact: true}).click();
-  await eventually(async () => /Cancelled after controller cleanup/.test(await current.locator('#app .status').innerText()), 'Cancel waits for actual controller and worker cleanup', 120000);
+  await current.getByRole('button', {name: 'Measure selected', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async () => (await fs.readFile(marker, 'utf8')) === 'running', 'Actual isolated scenario operation starts before cancellation', NATIVE_READINESS_MS);
+  await (await view(context)).getByRole('button', {name: 'Cancel', exact: true}).click({timeout:30000});
+  await eventually(async () => /Cancelled after controller cleanup/.test(await current.locator('#app .status').innerText({timeout:30000})), 'Cancel waits for actual controller and worker cleanup', 120000);
   const history = await tab(context, 'Saved evidence');
   const first = history.locator('article.card').first();
-  assert.match(await first.innerText(), /cancelled/);
-  assert.equal(await first.getByRole('button', {name: 'Open evidence', exact: true}).isDisabled(), true);
+  assert.match(await first.innerText({timeout:NATIVE_READINESS_MS}), /cancelled/);
+  assert.equal(await first.getByRole('button', {name: 'Open evidence', exact: true}).isDisabled({timeout:NATIVE_READINESS_MS}), true);
   await fs.rm(marker, {force: true});
   context.proof('investigation-cancel-active-julia-worker', {workerStarted: true, cleanupCompleted: true, remainingConfigurationsQualified: false});
 }
@@ -463,32 +464,32 @@ async function savedImport(context) {
   const beforeDirectories=await directories(reportRoot(context));
   const beforeHistory=await (await tab(context,'Saved evidence')).locator('article.card').allTextContents();
   const choose=async file=>{
-    const picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:30000});
-    const input=picker.locator('input[type="text"]');await input.fill(file);await input.press('Enter');
-    await picker.waitFor({state:'hidden',timeout:30000});
+    const picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+    const input=picker.locator('input[type="text"]');await input.fill(file,{timeout:NATIVE_READINESS_MS});await input.press('Enter',{timeout:NATIVE_READINESS_MS});
+    await picker.waitFor({state:'hidden',timeout:NATIVE_READINESS_MS});
   };
   try{
     await files.update('simpleDialog.enable',true,context.vscode.ConfigurationTarget.Global);
     const pending=context.vscode.commands.executeCommand('perfchecker.openDiagnosticReport');await choose(filename);await pending;
     let current=await view(context);
-    const banner=current.locator('.imported-diagnostic');await banner.waitFor({state:'visible'});
-    assert.match(await banner.innerText(),/not measured or independently verified in this editor session/);
-    assert((await banner.innerText()).includes(sha256));assert((await banner.innerText()).includes(await fs.realpath(filename)));
+    const banner=current.locator('.imported-diagnostic');await banner.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+    assert.match(await banner.innerText({timeout:NATIVE_READINESS_MS}),/not measured or independently verified in this editor session/);
+    assert((await banner.innerText({timeout:NATIVE_READINESS_MS})).includes(sha256));assert((await banner.innerText({timeout:NATIVE_READINESS_MS})).includes(await fs.realpath(filename)));
     assert.deepEqual(await current.locator('.diagnostic-values dd').allTextContents(),['1.25 s','2.5 s','0.125 s']);
     assert.equal(await current.locator('.diagnostic-memory tbody tr').count(),5);
-    assert.match(await current.locator('article.card').last().innerText(),/Availability: unavailable/);
-    for(const name of ['Advise from saved evidence','Explain with configured model'])assert.equal(await current.getByRole('button',{name,exact:true}).isDisabled(),true);
-    await current.getByRole('button',{name:'Open imported JSON snapshot',exact:true}).click();
+    assert.match(await current.locator('article.card').last().innerText({timeout:NATIVE_READINESS_MS}),/Availability: unavailable/);
+    for(const name of ['Advise from saved evidence','Explain with configured model'])assert.equal(await current.getByRole('button',{name,exact:true}).isDisabled({timeout:NATIVE_READINESS_MS}),true);
+    await current.getByRole('button',{name:'Open imported JSON snapshot',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(()=>context.vscode.window.activeTextEditor?.document.isUntitled,'Imported JSON opens an unsaved snapshot');
     assert.equal(context.vscode.window.activeTextEditor.document.getText(),text);
     await context.vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
     current=await view(context);
-    await current.getByRole('button',{name:'Open saved diagnostic report',exact:true}).click();
-    const picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});await picker.locator('input[type="text"]').press('Escape');
-    await picker.waitFor({state:'hidden'});assert((await current.locator('.imported-diagnostic').innerText()).includes(sha256));
-    await current.getByRole('button',{name:'Open saved diagnostic report',exact:true}).click();await choose(invalid);
-    await eventually(async()=>/Invalid diagnostic record/.test(await current.locator('#app > .status').innerText()),'Invalid saved JSON is refused without replacing the snapshot');
-    assert((await current.locator('.imported-diagnostic').innerText()).includes(sha256));
+    await current.getByRole('button',{name:'Open saved diagnostic report',exact:true}).click({timeout:NATIVE_READINESS_MS});
+    const picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});await picker.locator('input[type="text"]').press('Escape',{timeout:NATIVE_READINESS_MS});
+    await picker.waitFor({state:'hidden',timeout:NATIVE_READINESS_MS});assert((await current.locator('.imported-diagnostic').innerText({timeout:NATIVE_READINESS_MS})).includes(sha256));
+    await current.getByRole('button',{name:'Open saved diagnostic report',exact:true}).click({timeout:NATIVE_READINESS_MS});await choose(invalid);
+    await eventually(async()=>/Invalid diagnostic record/.test(await current.locator('#app > .status').innerText({timeout:NATIVE_READINESS_MS})),'Invalid saved JSON is refused without replacing the snapshot');
+    assert((await current.locator('.imported-diagnostic').innerText({timeout:NATIVE_READINESS_MS})).includes(sha256));
     assert.deepEqual(await current.locator('.diagnostic-values dd').allTextContents(),['1.25 s','2.5 s','0.125 s']);
     assert.equal(await fs.readFile(filename,'utf8'),text);
     assert.deepEqual(await directories(reportRoot(context)),beforeDirectories);
@@ -509,7 +510,7 @@ exports.run = async (context,options={}) => {
   const settings = configuration(context);
   const keys = ['scenarioSamples', 'analysisTimeout', 'investigationMaxExperiments', 'investigationBudgetSeconds', 'advisorEnabled', 'advisorInvestigates'];
   const previous = Object.fromEntries(keys.map(key => [key, settings.inspect(key)?.workspaceFolderValue]));
-  const values = {scenarioSamples: 2, analysisTimeout: 180, investigationMaxExperiments: 1, investigationBudgetSeconds: 120, advisorEnabled: false, advisorInvestigates: false};
+  const values = {scenarioSamples: 2, analysisTimeout: NATIVE_READINESS_MS/1000, investigationMaxExperiments: 1, investigationBudgetSeconds: 120, advisorEnabled: false, advisorInvestigates: false};
   const catalog = path.resolve(context.workspace, settings.get('scenarioCatalog', 'perf/scenarios.toml'));
   const originalCatalog = await fs.readFile(catalog);
   const failures = [];
@@ -542,8 +543,8 @@ exports.run = async (context,options={}) => {
   } finally {
     await context.vscode.commands.executeCommand('perfchecker.cancelInvestigation').catch(() => {});
     try {
-      const current = await view(context);
-      await eventually(async () => !(await current.locator('#app .status').getAttribute('class')).includes('busy'), 'Investigation teardown waits for worker cleanup', 120000);
+      const current = await view(context,120000);
+      await eventually(async () => !(await current.locator('#app .status').getAttribute('class',{timeout:30000})).includes('busy'), 'Investigation teardown waits for worker cleanup', 120000);
     } catch (error) {failures.push(new Error(`investigation-teardown: ${error.message}`, {cause: error}));}
     await fs.writeFile(catalog, originalCatalog);
     await fs.rm(path.join(context.workspace, 'perf', 'native-investigation-running.marker'), {force: true});

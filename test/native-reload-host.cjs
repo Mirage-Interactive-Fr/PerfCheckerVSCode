@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS,waitForNativeAvailability}=require('./native-readiness.cjs');
 // A real single-folder -> saved multi-root conversion restarts the extension
 // host. The handoff is test evidence, not a fallback in the product.
 const assert=require('node:assert/strict');
@@ -6,7 +7,7 @@ const path=require('node:path');
 const os=require('node:os');
 const {createHash}=require('node:crypto');
 
-async function eventually(read,description,timeout=90000){
+async function eventually(read,description,timeout=NATIVE_READINESS_MS){
   const until=Date.now()+timeout;let last;
   while(Date.now()<until){
     try{const result=await read();if(result)return result;}catch(error){if(error.nativeTerminal)throw error;last=error;}
@@ -91,7 +92,7 @@ exports.run=async context=>{
   await fs.writeFile(preserved,'Existing allocation evidence owned by the fixture\n');
   const beforeMem=await allocationInventory(workspace);
   const beforeChecks=new Set(await privateChecks());
-  await vscode.commands.executeCommand('perfchecker.refresh');
+  await waitForNativeAvailability(vscode.commands.executeCommand('perfchecker.refresh'),"perfchecker.refresh");
   const running=vscode.commands.executeCommand('perfchecker.runAll').then(()=>({status:'finished'}),error=>({status:'rejected',error:String(error)}));
   let outcome;void running.then(result=>{outcome=result;});
   const info=await eventually(async()=>{
@@ -99,7 +100,7 @@ exports.run=async context=>{
     const text=await fs.readFile(marker,'utf8').catch(error=>{if(error.code==='ENOENT')return '';throw error;});
     const [pid,directory]=text.split('\n');
     return /^\d+$/.test(pid)&&directory&&path.isAbsolute(directory)?{pid:Number(pid),directory}:false;
-  },'A real allocation workload reaches its owned PID/directory marker',360000);
+  },'A real allocation workload reaches its owned PID/directory marker',NATIVE_READINESS_MS);
   assert(alive(info.pid));assert(await fs.stat(path.join(info.directory,'owned.tmp')));
   assert(path.basename(path.dirname(info.directory)).startsWith('perfchecker-check-'),'The workload marker must point inside this allocation worker\'s private Core environment');
   const privateCheckDirectories=[];

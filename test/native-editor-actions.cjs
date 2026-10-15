@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS,waitForNativeAvailability}=require('./native-readiness.cjs');
 // Actual CodeLens and quick-fix clicks in disposable native VS Code hosts.
 // Findings come from a real JET worker; no diagnostic or report is injected.
 const assert=require('node:assert/strict');
@@ -6,7 +7,7 @@ const path=require('node:path');
 const {createHash}=require('node:crypto');
 
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-async function eventually(read,description,timeout=180000){
+async function eventually(read,description,timeout=NATIVE_READINESS_MS){
   const deadline=Date.now()+timeout;let last;
   while(Date.now()<deadline){try{const value=await read();if(value)return value;}catch(error){last=error;}await delay(150);}
   throw new Error(`${description}${last?`: ${last.message}`:''}`);
@@ -149,11 +150,11 @@ async function reportAfter(root,before,name){
       catch(error){if(error.code!=='ENOENT'&&!(error instanceof SyntaxError))throw error;}
     }
     return false;
-  },`The actual ${name} worker writes its report`,360000);
+  },`The actual ${name} worker writes its report`,NATIVE_READINESS_MS);
 }
-async function view(context){
+async function view(context,timeout=NATIVE_READINESS_MS){
   await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
-  return context.findFrame('#app');
+  return context.findFrame('#app',{timeout});
 }
 
 async function resource(context,workspace,controller,threads,previousEditorAction){
@@ -184,7 +185,7 @@ async function resource(context,workspace,controller,threads,previousEditorActio
       await update(key,value,'prepare');
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',uri);
     let frame=await view(context),root=path.join(workspace,'perf','results','editor-actions'),before=await reports(root);
-    await frame.getByRole('button',{name:'Discover tests',exact:true}).click();
+    await frame.getByRole('button',{name:'Discover tests',exact:true}).click({timeout:NATIVE_READINESS_MS});
     const discovery=await reportAfter(root,before,'discovery');
     assert(discovery.payload.declared.some(item=>item.id==='native_editor_branch'));
     assert(discovery.payload.candidates.length,'The actual TestItem fixture exposes a proposal CodeLens');
@@ -201,7 +202,7 @@ async function resource(context,workspace,controller,threads,previousEditorActio
     const candidate=discovery.payload.candidates[0];
     await vscode.commands.executeCommand('perfchecker.openInvestigationSource',candidate.origin.file,candidate.origin.line);
     const prepareLens=windowPage.locator('.codelens-decoration a').filter({hasText:'Prepare shared performance case'}).first();
-    await prepareLens.waitFor({state:'visible',timeout:60000});await observeSurface(context,'proposal-codelens');await prepareLens.click();
+    await prepareLens.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});await observeSurface(context,'proposal-codelens');await prepareLens.click({timeout:NATIVE_READINESS_MS});
     await eventually(()=>vscode.window.activeTextEditor?.document.isUntitled,'The real proposal CodeLens opens an untitled shared-case draft');
     assert.match(vscode.window.activeTextEditor.document.getText(),/prepare/);
     assert.match(vscode.window.activeTextEditor.document.getText(),/verify/);
@@ -213,7 +214,7 @@ async function resource(context,workspace,controller,threads,previousEditorActio
     const actualLenses=await vscode.commands.executeCommand('vscode.executeCodeLensProvider',sourceUri);
     const editorAction=actualLenses.find(item=>item.command?.title==='Diagnose native_editor_branch · conditional')?.command;
     assert.equal(editorAction?.arguments[1],uri.toString(),'The registered native CodeLens contains its owning workspace URI');
-    await lens.waitFor({state:'visible',timeout:60000});await observeSurface(context,'diagnosis-codelens');before=await reports(root);await lens.click();
+    await lens.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});await observeSurface(context,'diagnosis-codelens');before=await reports(root);await lens.click({timeout:NATIVE_READINESS_MS});
     const diagnosis=await reportAfter(root,before,'diagnosis');
     const record=diagnosis.payload.records.find(item=>item.scenario==='native_editor_branch');
     assert(record,'The clicked CodeLens diagnoses its own selected scenario');
@@ -230,7 +231,7 @@ async function resource(context,workspace,controller,threads,previousEditorActio
       {preview:false,selection:diagnostic.range});
     await vscode.commands.executeCommand('editor.action.quickFix');
     const action=windowPage.getByText('Read evidence and verification steps',{exact:true});
-    await action.waitFor({state:'visible',timeout:30000});
+    await action.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
     if(context.editorQualification)context.log('native-editor-visible-quickfix',{entries:await action.count(),label:'Read evidence and verification steps',visible:await action.isVisible()});
     const menu=windowPage.locator('.action-widget:visible');assert.equal(await menu.count(),1);
     const entries=await menu.getByRole('option').count();assert(entries>0);
@@ -241,7 +242,7 @@ async function resource(context,workspace,controller,threads,previousEditorActio
     context.log('native-editor-quickfix-keyboard',{label:'Read evidence and verification steps',options:entries,arrowDown:next,exactRowFocused:true});
     await windowPage.keyboard.press('Enter');
     frame=await context.findFrame('#app');
-    await eventually(async()=>(await frame.locator('body').innerText()).includes('native_editor_branch'),
+    await eventually(async()=>(await frame.locator('body').innerText({timeout:NATIVE_READINESS_MS})).includes('native_editor_branch'),
       'The chosen native quick fix opens the evidence for the same workspace');
     assert.equal(await fs.readFile(factory,'utf8'),source,'Quick fix opens evidence without editing source');
     const currentSettings=vscode.workspace.getConfiguration('perfchecker',uri);
@@ -257,9 +258,9 @@ async function resource(context,workspace,controller,threads,previousEditorActio
   }finally{
     await vscode.commands.executeCommand('perfchecker.cancelInvestigation');
     {
-      const current=await view(context);
-      await eventually(async()=>!((await current.locator('#app .status').getAttribute('class'))||'').includes('busy'),
-        'Editor-action workers finish before restoring their fixture');
+      const current=await view(context,120000);
+      await eventually(async()=>!((await current.locator('#app .status').getAttribute('class',{timeout:30000}))||'').includes('busy'),
+        'Editor-action workers finish before restoring their fixture',180000);
     }
     for(const key of keys)await update(key,previous[key],'restore');
     if(original)await fs.writeFile(catalog,original);else await fs.rm(catalog,{force:true});
@@ -289,7 +290,7 @@ exports.run=async context=>{
     });
     try{
       added=vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length,0,{uri:secondUri,name:'Editor action second workspace'});
-      assert(added);await eventually(()=>acknowledged,'The workbench acknowledges the second workspace and its configuration model',30000);
+      assert(added);await eventually(()=>acknowledged,'The workbench acknowledges the second workspace and its configuration model',NATIVE_READINESS_MS);
     }finally{changed.dispose();}
     assert.equal(vscode.workspace.getWorkspaceFolder(secondUri)?.uri.toString(),secondUri.toString());
     context.log('native-editor-second-workspace-acknowledged',{resource:secondUri.toString(),actualWorkspaceEvent:true});
@@ -305,25 +306,25 @@ exports.run=async context=>{
 exports.runSuiteLog=async context=>{
   const {vscode,windowPage,workspace,controller}=context;
   await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',vscode.Uri.file(workspace));
-  await vscode.commands.executeCommand('perfchecker.refresh');
+  await waitForNativeAvailability(vscode.commands.executeCommand('perfchecker.refresh'),"perfchecker.refresh");
   await vscode.commands.executeCommand('workbench.action.closePanel');
   await vscode.commands.executeCommand('workbench.action.showCommands');
-  const picker=windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
-  await picker.locator('input[type="text"]').fill('>PerfChecker: Show worker output');
-  if(context.editorQualification){const action=picker.getByText('PerfChecker: Show worker output',{exact:true});await action.waitFor({state:'visible'});
+  const picker=windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+  await picker.locator('input[type="text"]').fill('>PerfChecker: Show worker output',{timeout:NATIVE_READINESS_MS});
+  if(context.editorQualification){const action=picker.getByText('PerfChecker: Show worker output',{exact:true});await action.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
     context.log('native-editor-visible-palette',{command:'perfchecker.showLog',entries:await action.count(),visible:await action.isVisible()});}
-  await picker.getByText('PerfChecker: Show worker output',{exact:true}).click();
-  await picker.waitFor({state:'hidden'});
+  await picker.getByText('PerfChecker: Show worker output',{exact:true}).click({timeout:NATIVE_READINESS_MS});
+  await picker.waitFor({state:'hidden',timeout:NATIVE_READINESS_MS});
   // OutputViewPane's official output-view class scopes the visible Monaco
   // editor; the native channel selector independently identifies the suite log.
-  const output=windowPage.locator('.output-view:visible');await output.waitFor({state:'visible'});
+  const output=windowPage.locator('.output-view:visible');await output.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
   const canonicalController=await fs.realpath(controller);
   // Monaco only renders the current viewport. Reveal the first physical log
   // line with a native editor gesture before asserting its visible contents.
   assert((await vscode.commands.getCommands(true)).includes('workbench.action.focusPanel'));
   await vscode.commands.executeCommand('workbench.action.focusPanel');
   await eventually(()=>output.evaluate(element=>element.contains(document.activeElement)),
-    'The native Focus into Panel command focuses the actual visible Output editor',30000);
+    'The native Focus into Panel command focuses the actual visible Output editor',NATIVE_READINESS_MS);
   await windowPage.keyboard.press(process.platform==='darwin'?'Meta+Home':'Control+Home');
   const file=`native-${process.platform}-vscode-${vscode.version}-suite-worker-output.png`;
   await windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,file)});
@@ -415,14 +416,14 @@ exports.runActiveSettings=async context=>{
       await settings().update(key,value,vscode.ConfigurationTarget.WorkspaceFolder);
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',uri);
     let frame=await view(context);const root=path.join(workspace,'perf','results','active-settings'),before=await reports(root);
-    await frame.getByRole('button',{name:'Discover tests',exact:true}).click();await reportAfter(root,before,'discovery');
-    await eventually(async()=>!((await frame.locator('#app .status').getAttribute('class'))||'').includes('busy'),'The actual declaration discovery finishes');
-    await frame.getByRole('button',{name:'Scenarios',exact:true}).click();await frame.getByRole('button',{name:'Clear selection',exact:true}).click();
-    await frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:'native_active_settings'})}).locator('.scenario-title input').check();
-    await frame.getByRole('button',{name:'Measure selected',exact:true}).click();
+    await frame.getByRole('button',{name:'Discover tests',exact:true}).click({timeout:NATIVE_READINESS_MS});await reportAfter(root,before,'discovery');
+    await eventually(async()=>!((await frame.locator('#app .status').getAttribute('class',{timeout:NATIVE_READINESS_MS}))||'').includes('busy'),'The actual declaration discovery finishes');
+    await frame.getByRole('button',{name:'Scenarios',exact:true}).click({timeout:NATIVE_READINESS_MS});await frame.getByRole('button',{name:'Clear selection',exact:true}).click({timeout:NATIVE_READINESS_MS});
+    await frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:'native_active_settings'})}).locator('.scenario-title input').check({timeout:NATIVE_READINESS_MS});
+    await frame.getByRole('button',{name:'Measure selected',exact:true}).click({timeout:NATIVE_READINESS_MS});
     const started=await eventually(async()=>{
       const values=(await fs.readFile(marker,'utf8')).split('\n');return values.length===3?values:false;
-    },'The real owned workload records its process and original target environment',240000);
+    },'The real owned workload records its process and original target environment',NATIVE_READINESS_MS);
     ownedPid=Number(started[0]);assert(ownedPid>0&&alive(ownedPid));
     assert.equal(vscode.Uri.file(started[1]).fsPath,vscode.Uri.file(controller).fsPath);
     assert.equal(started[2],process.env.PERFCHECKER_NATIVE_JULIA_VERSION);
@@ -434,8 +435,8 @@ exports.runActiveSettings=async context=>{
     const workerAliveAfterSettingsChanges=alive(ownedPid);
     context.log('native-active-settings-before-cancel',{pid:ownedPid,workerAlive:workerAliveAfterSettingsChanges,
       changedKeys:['runnerProject','scenarioProject','juliaExecutable']});
-    frame=await view(context);await observeSurface(context,'active-settings-before-cancel',frame);await frame.getByRole('button',{name:'Cancel',exact:true}).click();
-    await eventually(async()=>/Cancelled after controller cleanup/.test(await frame.locator('#app .status').innerText()),'Cancellation finishes despite changed controller/runtime settings',120000);
+    frame=await view(context);await observeSurface(context,'active-settings-before-cancel',frame);await frame.getByRole('button',{name:'Cancel',exact:true}).click({timeout:30000});
+    await eventually(async()=>/Cancelled after controller cleanup/.test(await frame.locator('#app .status').innerText({timeout:30000})),'Cancellation finishes despite changed controller/runtime settings',120000);
     await eventually(()=>!alive(ownedPid),'The original owned worker is dead before any fixture cleanup',30000);
     assert.equal(settings().get('runnerProject'),nextController);assert.equal(settings().get('scenarioProject'),nextController);assert.equal(settings().get('juliaExecutable'),missingJulia);
     await assert.rejects(vscode.commands.executeCommand('perfchecker.discoverScenarios'),/ENOENT|spawn.*unavailable/i,

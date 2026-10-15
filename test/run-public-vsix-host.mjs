@@ -8,6 +8,7 @@ import {promisify} from 'node:util';
 import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
+import readiness from './native-readiness.cjs';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
 import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
 import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
@@ -16,6 +17,8 @@ import {createCoalescingObserver,beforeDeadline} from './native-landscape-contro
 import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const {NATIVE_READINESS_MS,NATIVE_ACTIVITY_MINUTES,nativeReadinessPolicy,createNativeActivityBudget,waitForNativeAvailability}=readiness;
+const nativeActivity=createNativeActivityBudget({startedAt:Number(process.env.PERFCHECKER_NATIVE_ACTIVITY_STARTED_AT)||Date.now()});
 const output = path.join(repository, 'native-qualification-results');
 // Darwin's TMPDIR is long; per-phase profiles otherwise exceed its 103-byte
 // Unix-domain socket limit before VS Code can start. This remains a disposable
@@ -98,20 +101,51 @@ const publicSha = 'c4123271e71e4c4d148fe0e613ba260f4aeea6f28445338cab11d3fb9513d
 if (!['public', 'candidate'].includes(mode)) throw new Error('Choose public or candidate VSIX explicitly.');
 
 async function execute(executable, args, options = {}) {
+  const {technical=false,...spawnOptions}=options;
+  // Technical teardown retains its explicit old bound even after activity expires.
+  const timeout=technical?(options.timeout??30000):nativeActivity.timeout(options.timeout??NATIVE_READINESS_MS);
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, {windowsHide: true, env:runnerEnvironment,
-      ...(landscapeOnly?{signal:landscapeAbort.signal}:{}), ...options});
+      ...(landscapeOnly?{signal:landscapeAbort.signal}:{}), ...spawnOptions,timeout});
     let text = '';
+    const preserve=(reason,closed,error,signal)=>{
+      // Closing the preparation leader is not evidence that its compilation
+      // descendants are gone. Retention is conservative, never a leak claim.
+      sessionSafeToRemove=false;
+      try{console.error('NATIVE_PREPARATION_CLEANUP_INCONCLUSIVE '+JSON.stringify({reason,ownerPid:child.pid??null,
+        physicalCloseObserved:closed,treeCleanupQualified:false,errorClass:error?.name??null,signal:signal??null}));}catch{}
+    };
     child.stdout?.on('data', chunk => {text += chunk; process.stdout.write(chunk);});
     child.stderr?.on('data', chunk => {text += chunk; process.stderr.write(chunk);});
-    child.once('error', reject);
-    child.once('close', code => code === 0 ? resolve(text) : reject(Object.assign(new Error(`${path.basename(executable)} exited ${code}\n${text.slice(-5000)}`), {commandOutput: text, exitCode: code})));
+    child.once('error', error=>{preserve('spawn-error',false,error);reject(error);});
+    child.once('close', (code,signal) => {
+      if(code===0)return resolve(text);
+      preserve('nonzero-or-signal',true,undefined,signal);
+      reject(Object.assign(new Error(`${path.basename(executable)} exited ${code}\n${text.slice(-5000)}`), {commandOutput: text, exitCode: code}));
+    });
   });
+}
+
+async function downloadNativeVSCode(options){
+  const timeout=nativeActivity.timeout();
+  try{
+    // The library's timeout is idle-only. This separate absolute observation
+    // bound cannot be renewed by transport progress or extraction activity.
+    return await waitForNativeAvailability(downloadAndUnzipVSCode({...options,timeout}),
+      'VS Code download/extraction',{timeout});
+  }catch(error){
+    // The public API provides no proof that pending writes/extraction stopped.
+    sessionSafeToRemove=false;
+    try{console.error('NATIVE_PREPARATION_CLEANUP_INCONCLUSIVE '+JSON.stringify({reason:'download-or-extraction',
+      physicalCloseObserved:false,treeCleanupQualified:false,errorClass:error.name}));}catch{}
+    throw error;
+  }
 }
 
 // This preparation owns its compilation children independently of the import
 // timeout. No uncertain observation is accepted as proof of an empty tree.
-async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180000}={}){
+async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NATIVE_READINESS_MS}={}){
+  timeoutMs=nativeActivity.timeout(timeoutMs);
   assert(Number.isSafeInteger(timeoutMs)&&timeoutMs>0);
   const windows=process.platform==='win32',expected=await fs.realpath(executable);
   const launcher=path.join(repository,'resources','windows-owned-process.ps1');
@@ -120,7 +154,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
   const ownerArgs=windows?['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',launcher,
     '-Executable',expected,'-WorkingDirectory',receipt.project,'-ArgumentsBase64',Buffer.from(JSON.stringify(args)).toString('base64'),'-ParentPid',String(process.pid)]:args;
   const child=spawn(ownerExecutable,ownerArgs,{cwd:receipt.project,env:runnerEnvironment,windowsHide:true,detached:!windows,stdio:['pipe','pipe','pipe']});
-  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Date.now()+timeoutMs;
+  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Math.min(nativeActivity.deadlineAt,Date.now()+timeoutMs);
   receipt.deadlineAt=new Date(cleanupUntil).toISOString();
   const limit=maximum=>{const remaining=cleanupUntil-Date.now();if(remaining<=0)throw new Error('Owned preflight inspection exceeded its current preparation or cleanup deadline');return Math.min(maximum,remaining);};
   receipt.ownership={ownerPid:child.pid,identities:[],observations:[],errors,cleanupQualified:false};
@@ -375,12 +409,13 @@ async function prepareLandscapeFixture(runtime,artifactRecord){
     projects:await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,await fs.readFile(path.join(source,name)).then(hash).catch(error=>{if(error.code==='ENOENT')return null;throw error;})]))});
   const archiveInto=async(source,commit,destination)=>{
     await fs.mkdir(destination,{recursive:true});
+    const availability=nativeActivity.timeout();
     const archive=spawn('git',['-C',source,'archive','--format=tar',commit],{env:runnerEnvironment,signal:landscapeAbort.signal,stdio:['ignore','pipe','pipe']});
     // GNU tar must consume the entire producer stream, including trailing archive padding.
     const unpack=spawn('tar',['--ignore-zeros','-xf','-','-C',destination],{env:runnerEnvironment,signal:landscapeAbort.signal,stdio:['pipe','ignore','pipe']});
     let errors='';for(const child of [archive,unpack])child.stderr.on('data',data=>{errors=(errors+data.toString()).slice(-5000);});
     const exits=[archive,unpack].map(child=>new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',code=>code===0?resolve():reject(new Error(`Immutable source archive failed (${code}): ${errors}`)));}));
-    const timer=setTimeout(()=>{archive.kill('SIGKILL');unpack.kill('SIGKILL');},120000);
+    const timer=setTimeout(()=>{archive.kill('SIGKILL');unpack.kill('SIGKILL');},availability);
     try{await Promise.all([...exits,pipeline(archive.stdout,unpack.stdin)]);}
     finally{clearTimeout(timer);for(const child of [archive,unpack])if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');await Promise.allSettled(exits);}
   };
@@ -430,10 +465,10 @@ for (name,directory) in zip(names,ARGS[2:end]);@assert normpath(joinpath(root,so
 write(file,original)
 env=Pkg.Types.EnvCache(file);env.manifest.other["project_hash"]=Pkg.Types.workspace_resolve_hash(env)
 Pkg.Types.write_manifest(env.manifest,env.manifest_file)
-`,root,...sdk.map(item=>item.directory)],{timeout:900000});
+`,root,...sdk.map(item=>item.directory)],{timeout:NATIVE_READINESS_MS});
   assert.deepEqual(await fs.readFile(path.join(root,'Project.toml')),project,'Pkg preparation preserves the game tag Project.toml');
   for(const item of sdk)assert.equal(hash((await sourceDigest(item.directory)).join('')),item.sha256,'SDK runtime source remains identical to its archived tag');
-  // Install and compile this private SDK before the unchanged native 120-second
+  // Install and compile this private SDK before the one-hour native import
   // import observation. This qualifies prepared operation, never a cold launch.
   const preparedHashes=async()=>({
     project:hash(await fs.readFile(path.join(root,'Project.toml'))),
@@ -442,9 +477,9 @@ Pkg.Types.write_manifest(env.manifest,env.manifest_file)
   });
   assert.equal(runnerEnvironment.JULIA_NUM_PRECOMPILE_TASKS,'1');
   const preparation={status:'running',phase:'Landscape SDK cache preparation',startedAt:new Date().toISOString(),project:root,
-    packages:['EtenduBeautifulLandscape',...sdk.map(item=>item.name)],strict:true,timeoutMilliseconds:900000,
+    packages:['EtenduBeautifulLandscape',...sdk.map(item=>item.name)],strict:true,timeoutMilliseconds:NATIVE_READINESS_MS,
     precompileTasks:1,hashesBefore:await preparedHashes(),
-    scope:'Explicit private SDK cache preparation with owned compilation children; native import remains 120 seconds; no cold-launch qualification'};
+    scope:'Explicit private SDK cache preparation with owned compilation children; native import availability is one hour, clipped by shared activity; no cold-launch qualification'};
   artifactRecord.landscapeSdkCachePreparation=preparation;
   await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
   console.log('NATIVE_LANDSCAPE_SDK_PREPARATION_START '+JSON.stringify(preparation));
@@ -478,11 +513,12 @@ println("LANDSCAPE_SDK_PREPARATION_COMPLETE_V1 ",(time_ns()-started)/1e9)
   for(const [source,before]of snapshots)assert.deepEqual(await sourceSnapshot(source),before,'The human HEAD, status and project files remain unchanged');
   const executable=await fs.realpath(process.env.PERFCHECKER_TEST_XVFB||'/usr/bin/Xvfb');
   const tools=Object.fromEntries(await Promise.all(['xwd','xwininfo','vulkaninfo'].map(async name=>[name,await fs.realpath(`/usr/bin/${name}`)])));
+  const displayAvailability=nativeActivity.timeout();
   const displayChild=spawn(executable,['-displayfd','3','-screen','0','1920x1080x24','-nolisten','tcp','-ac'],{env:runnerEnvironment,stdio:['ignore','ignore','pipe','pipe']});
   const displayExit=new Promise(resolve=>{displayChild.once('close',resolve);displayChild.once('error',()=>resolve(-1));});
   landscapeFixture={root,displayChild,displayExit};displayChild.stderr.resume();
   const display=await new Promise((resolve,reject)=>{
-    let text='';const timer=setTimeout(()=>reject(new Error('The owned Xvfb did not reserve a private display')),15000);
+    let text='';const timer=setTimeout(()=>reject(new Error('The owned Xvfb did not reserve a private display')),displayAvailability);
     const finish=(error,value)=>{clearTimeout(timer);error?reject(error):resolve(value);};
     displayChild.once('error',error=>finish(error));displayChild.once('close',()=>finish(new Error('The owned Xvfb exited before native launch')));
     displayChild.stdio[3].on('data',bytes=>{text+=bytes;const match=text.match(/^(\d+)\s*$/);if(match)finish(undefined,`:${match[1]}`);});
@@ -544,7 +580,7 @@ try {
     "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
   assertNativeJuliaArchitecture(officialRuntime,architecture,'Official Julia runtime');
   const expectedVersion = mode === 'public' ? '1.0.0' : JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version;
-  const vscode = await downloadAndUnzipVSCode({version, cachePath: path.join(session, 'vscode')});
+  const vscode = await downloadNativeVSCode({version, cachePath: path.join(session, 'vscode')});
   const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscode, {reuseMachineInstall: true});
   const application=await nativeVSCodeApplication(vscode,cli,{expectedVersion:version});
   const hostVersion=application.version,cliSource=application.cliSource;
@@ -573,7 +609,7 @@ try {
   await fs.writeFile(path.join(workspace, 'test', 'performance.jl'), 'using TestItems\n@testitem "Vector reduction" tags=[:performance] begin\n data=collect(1:10_000)\n @test sum(data)==50_005_000\nend\n');
   const vsix = path.join(session, 'perfchecker.vsix');
   if (mode === 'public') {
-    const response = await fetch('https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode/releases/download/v1.0.0/perfchecker-vscode-1.0.0.vsix');
+    const response = await fetch('https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode/releases/download/v1.0.0/perfchecker-vscode-1.0.0.vsix',{signal:AbortSignal.timeout(nativeActivity.timeout())});
     if (!response.ok) throw new Error(`Public VSIX download failed: ${response.status}`);
     await fs.writeFile(vsix, Buffer.from(await response.arrayBuffer()));
   } else await fs.copyFile(path.join(repository, 'candidate.vsix'), vsix);
@@ -592,6 +628,7 @@ try {
     await fs.writeFile(path.join(output,'candidate.provenance.json'),JSON.stringify(packageProvenance,null,2));
   }
   let discoveryObservation;
+  assert(!discoveryDiagnostic,'Historical discovery diagnostics retain their original branch and explicit contract; this source qualifies the one-hour native campaign');
   if(discoveryDiagnostic){
     assertNativeDiscoveryDiagnostic({enabled:true,event:process.env.GITHUB_EVENT_NAME,artifact:mode,stage,
       scope:process.env.PERFCHECKER_NATIVE_SCOPE,core:coreMode,partition:fullCasePartition.name,platform:process.platform,arch:process.arch,
@@ -616,19 +653,20 @@ try {
   const cliProfile = await privateProfile(profile);
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
+    readinessPolicy:{...nativeReadinessPolicy,activityStartedAt:new Date(nativeActivity.startedAt).toISOString(),activityDeadlineAt:new Date(nativeActivity.deadlineAt).toISOString()},
     ...(discoveryDiagnostic?{discoveryObservation}:{}),
     fullCasePartition:stage==='full'?fullCasePartition:undefined,
     runner:{platform:process.platform,processArch:process.arch,runnerArch:process.env.RUNNER_ARCH||null},runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,
       actualCommit:application.commit,applicationName:application.applicationName,applicationRelativePath:path.relative(path.dirname(vscode),application.application),
       cliRelativePath:path.relative(path.dirname(vscode),cli),privateDirectoryFlags}};
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
-  const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
+  const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml',{signal:AbortSignal.timeout(nativeActivity.timeout())});
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
   const versionsText=await minimumResponse.text(),minimumSection=versionsText.split('["'+minimumVersion+'"]')[1]?.split(/^\[/m)[0];
   const minimumTree=/^git-tree-sha1\s*=\s*"([a-f0-9]{40})"/m.exec(minimumSection||'')?.[1];
   const minimumAvailable=Boolean(minimumTree);
   if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,CORE111_CANDIDATE.tree,'Published General 1.1.1 must match the independently pinned Core source tree');
-  const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml');
+  const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml',{signal:AbortSignal.timeout(nativeActivity.timeout())});
   if(!plutoTagResponse.ok&&plutoTagResponse.status!==404)throw new Error(`Cannot verify published Pluto companion tag: ${plutoTagResponse.status}`);
   const plutoTagAvailable=plutoTagResponse.ok&&/^version\s*=\s*"1\.0\.1"\s*$/m.test(await plutoTagResponse.text());
   await fs.writeFile(path.join(output,'production-bootstrap-gate.json'),JSON.stringify({minimum:minimumVersion,registry:'General',available:minimumAvailable,
@@ -692,7 +730,8 @@ try {
         PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         ...(phase==='pluto-start-stop'?{PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT:JSON.stringify(artifactRecord.plutoEnvironment)}:{}),
-        ...(phase==='editor'&&process.platform==='linux'?{PERFCHECKER_NATIVE_EDITOR_DEADLINE_AT:new Date(Date.now()+40*60*1000).toISOString()}:{}),
+        ...(phase==='editor'&&process.platform==='linux'?{PERFCHECKER_NATIVE_EDITOR_DEADLINE_AT:new Date(nativeActivity.deadlineAt).toISOString()}:{}),
+        PERFCHECKER_NATIVE_ACTIVITY_DEADLINE_AT:String(nativeActivity.deadlineAt),
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         ...(nativeNode?{PERFCHECKER_NATIVE_NODE:nativeNode,PERFCHECKER_NATIVE_NODE_PROVENANCE:JSON.stringify(nodeProvenance)}:{}),
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
@@ -708,6 +747,7 @@ try {
         UV_THREADPOOL_SIZE: '4'};
       const launchWorkspace=phase!=='fresh'&&(phase==='prepared'||stage==='focused')?workspaceFile:workspace;
       await fs.access(launchWorkspace);
+      const remainingActivityMs=nativeActivity.remaining(),activationWindowMs=Math.min(NATIVE_READINESS_MS,remainingActivityMs);
       await new Promise((resolve,reject)=>{
         // Actual interactive host: no --extensionTestsPath or smoke driver, and
         // no intercepted APIs. All dialogs are clicked through the real UI.
@@ -733,20 +773,21 @@ try {
         const stop=()=>{if(child.exitCode!==null)return;if(process.platform==='win32')spawn('taskkill',['/pid',String(child.pid),'/T','/F'],{windowsHide:true});else try{process.kill(-child.pid,'SIGTERM');}catch{}};
         const activationTimer=setTimeout(()=>{if(activated)return;void(async()=>{
           await retainHostLogs().catch(error=>console.error(`NATIVE_STARTUP_LOGS ${error.message}`));stop();
-          reject(new Error(`The ${phase} helper did not activate within 3 minutes. Retained Electron/extension-host logs distinguish startup failure from campaign duration.`));
-        })();},180000);
-        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?130:phase==='landscape'?45:40;
+          reject(new Error(`The ${phase} helper exceeded its one-hour availability or remaining shared infrastructure activity budget. Retained logs distinguish startup failure from campaign duration.`));
+        })();},activationWindowMs);
+        const minutes=NATIVE_ACTIVITY_MINUTES;
         const deadlineStartedAt=new Date().toISOString();
         let globalDeadlineExpired=false;
         const timer=setTimeout(()=>{globalDeadlineExpired=true;void(async()=>{
-          const failure=new Error(`The ${phase} native phase exceeded its explicit ${minutes}-minute bound`);
+          const failure=Object.assign(new Error(`The shared ${minutes}-minute native infrastructure activity budget was exhausted during ${phase}`),{code:'NATIVE_INFRASTRUCTURE_ACTIVITY_LIMIT'});
           try{await fs.writeFile(path.join(output,`${phase}-global-limit.json`),JSON.stringify({status:'failed',phase,
             stage:environment.PERFCHECKER_NATIVE_STAGE,limitMinutes:minutes,startedAt:deadlineStartedAt,
+            limitKind:'infrastructure-shared-activity',activityStartedAt:new Date(nativeActivity.startedAt).toISOString(),activityDeadlineAt:new Date(nativeActivity.deadlineAt).toISOString(),
             expiredAt:new Date().toISOString(),lastObservedCase:activeCase||null,
             hostStopRequested:true,productCleanupQualified:false,error:failure.message},null,2));}
           catch(error){console.error(`NATIVE_GLOBAL_LIMIT_REPORT ${error.message}`);}
           stop();reject(failure);
-        })();},minutes*60*1000);
+        })();},remainingActivityMs);
         const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
         const clean=()=>{clearTimeout(timer);clearTimeout(activationTimer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
         child.once('error',error=>{clean();if(!globalDeadlineExpired)reject(error);});
@@ -766,7 +807,7 @@ try {
         const code=await recorded;clearTimeout(timeout);
         if(code!==0)phaseFailures.push({phase,kind:'recording',error:`Real Xvfb recording failed (${code}): ${recordingError}`});
         else{
-          const probe=JSON.parse(await execute('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_name,width,height,avg_frame_rate','-of','json',video]));
+          const probe=JSON.parse(await execute('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_name,width,height,avg_frame_rate','-of','json',video],{technical:true,timeout:30000}));
           await fs.writeFile(video.replace(/\.mp4$/,'.json'),JSON.stringify({file:path.basename(video),source:'actual-Xvfb-screen',phase,
             startedAt:videoStartedAt,timeline:`${phase}.json`,timestampPrecision:'Wall-clock offsets from recorder launch; correlate with native UI events and review frames before editing.',
             vscodeRequested:version,extension:expectedVersion,core:coreProvenance,fixtures:'Disposable deterministic qualification data; no human model authentication',
@@ -781,7 +822,7 @@ try {
   const installationStartedAt=new Date().toISOString();
   if(documentedMcpInstall){artifactRecord.documentedMcpInstallation={status:'running',startedAt:installationStartedAt};
     await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));}
-  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]=="documented-mcp";Pkg.add("HTTP");elseif ARGS[6]=="standard";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();if ARGS[6]=="documented-mcp";httpinfo=only(p for p in values(Pkg.dependencies()) if p.name=="HTTP");@assert httpinfo.is_tracking_registry;print("QUALIFIED_DOCUMENTED_HTTP ");PerfChecker.JSON.print(Dict("version"=>string(httpinfo.version),"tree"=>string(httpinfo.tree_hash),"registered"=>httpinfo.is_tracking_registry,"source"=>realpath(httpinfo.source),"autoPrecompile"=>ENV["JULIA_PKG_PRECOMPILE_AUTO"]));println();end;println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':savedReportOnly?'saved-report':documentedMcpInstall?'documented-mcp':'standard'],{timeout:landscapeOnly?900000:undefined}).catch(async error=>{
+  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]=="documented-mcp";Pkg.add("HTTP");elseif ARGS[6]=="standard";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();if ARGS[6]=="documented-mcp";httpinfo=only(p for p in values(Pkg.dependencies()) if p.name=="HTTP");@assert httpinfo.is_tracking_registry;print("QUALIFIED_DOCUMENTED_HTTP ");PerfChecker.JSON.print(Dict("version"=>string(httpinfo.version),"tree"=>string(httpinfo.tree_hash),"registered"=>httpinfo.is_tracking_registry,"source"=>realpath(httpinfo.source),"autoPrecompile"=>ENV["JULIA_PKG_PRECOMPILE_AUTO"]));println();end;println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':savedReportOnly?'saved-report':documentedMcpInstall?'documented-mcp':'standard'],{timeout:NATIVE_READINESS_MS}).catch(async error=>{
     if(documentedMcpInstall){Object.assign(artifactRecord.documentedMcpInstallation,{status:'failed',finishedAt:new Date().toISOString(),
       elapsedSeconds:(Date.now()-Date.parse(installationStartedAt))/1000,error:String(error).slice(0,5000)});
       await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
@@ -816,10 +857,10 @@ try {
   if(prepareTestItemDiscovery||stage==='targeted'||stage==='full'||stage==='focused'&&(['general100','mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
     // This is installation/cache preparation, not first-Send or a cold-start
     // measurement. Keep its explicit compilation cost and physical ownership
-    // separate from the unchanged 180-second prepared-import qualification.
+    // separate from the prepared-import availability check (one hour, clipped by shared activity).
     const preparationBefore=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
     const preparation={status:'running',phase:'cache preparation',startedAt:new Date().toISOString(),project:controller,
-      packages:['PerfChecker','HTTP',...(prepareTestItemDiscovery?['TestItemRunner']:[])],strict:true,timeoutMilliseconds:900000,hashesBefore:preparationBefore,
+      packages:['PerfChecker','HTTP',...(prepareTestItemDiscovery?['TestItemRunner']:[])],strict:true,timeoutMilliseconds:NATIVE_READINESS_MS,hashesBefore:preparationBefore,
       automaticPrecompile:runnerEnvironment.JULIA_PKG_PRECOMPILE_AUTO,
       scope:'Explicit selected-package cache preparation with owned compilation children; no cold-start or native first-Send claim'};
     artifactRecord.controllerCachePreparation=preparation;await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));

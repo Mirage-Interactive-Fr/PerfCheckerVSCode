@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS,waitForNativeAvailability}=require('./native-readiness.cjs');
 // Exercise the installed public VSIX through its real VS Code webviews in disposable CI profiles.
 // No intercepted VS Code API, replaced process, fabricated plan message or model credential is used.
 const assert = require('node:assert/strict');
@@ -24,7 +25,7 @@ const studioActions = {
 const checkTypes = ['BenchmarkTools', 'Chairmarks', 'Line allocations', 'Allocation profile',
   'CPU profile', 'Wall-time profile', 'Network workload', 'Network interface', 'Isolated network'];
 
-async function eventually(read, description, timeout = 60000) {
+async function eventually(read, description, timeout = NATIVE_READINESS_MS) {
   const deadline = Date.now() + timeout;
   let last;
   while (Date.now() < deadline) {
@@ -44,7 +45,7 @@ function assertDisposable(context) {
 async function frame(context, selector) {
   return eventually(async () => {
     const result = await context.findFrame(selector);
-    await result.locator(selector).first().waitFor({state: 'visible', timeout: 1000});
+    await result.locator(selector).first().waitFor({state: 'visible', timeout: NATIVE_READINESS_MS});
     return result;
   }, `Reacquire the current native webview ${selector}`);
 }
@@ -55,7 +56,7 @@ async function studio(context) {
   if(!context.openStudioCommandVerified){
     await context.vscode.commands.executeCommand('perfchecker.openStudio',context.vscode.Uri.file(context.workspace));
     const opened=await frame(context,'#studio-root');
-    await eventually(async()=>(await opened.locator('.workspace strong').innerText())===context.vscode.workspace.getWorkspaceFolder(context.vscode.Uri.file(context.workspace)).name,'The generic Studio command displays the explicit workspace');
+    await eventually(async()=>(await opened.locator('.workspace strong').innerText({timeout:NATIVE_READINESS_MS}))===context.vscode.workspace.getWorkspaceFolder(context.vscode.Uri.file(context.workspace)).name,'The generic Studio command displays the explicit workspace');
     context.proof('native-open-studio-command',{command:'perfchecker.openStudio',explicitWorkspace:true,currentPanelVisible:true});
     context.openStudioCommandVerified=true;
   }
@@ -69,12 +70,12 @@ async function clickStudioAction(context, action) {
     ? view.getByRole('button', {name: studioActions[action], exact: true})
     : view.locator(`[data-action="${action}"]`);
   context.log('native-ui-action',{surface:'Studio',action:studioActions[action]});
-  await selector.click();
+  await selector.click({timeout:NATIVE_READINESS_MS});
 }
 exports.clickStudioAction = clickStudioAction;
 
 async function selectionCount(view) {
-  const match = (await view.locator('#count').innerText()).match(/^(\d+) selected/);
+  const match = (await view.locator('#count').innerText({timeout:NATIVE_READINESS_MS})).match(/^(\d+) selected/);
   assert(match, 'The selection counter describes the exact selection');
   return Number(match[1]);
 }
@@ -85,7 +86,7 @@ async function options(view, selector) {
 }
 
 async function designer(context) {
-  return context.observeOperation?context.observeOperation('plan',()=>openDesigner(context),Date.now()+600000):openDesigner(context);
+  return context.observeOperation?context.observeOperation('plan',()=>openDesigner(context),Date.now()+NATIVE_READINESS_MS):openDesigner(context);
 }
 
 async function openDesigner(context) {
@@ -105,12 +106,12 @@ async function openDesigner(context) {
       plan});
   };
   await observe('attached');
-  try{await eventually(async()=>await view.locator('#check-types label').count()>0,'The controller supplies real check types before any filter gesture',360000);}
+  try{await eventually(async()=>await view.locator('#check-types label').count()>0,'The controller supplies real check types before any filter gesture',NATIVE_READINESS_MS);}
   catch(error){try{await observe('failed');}catch(secondary){context.log('native-designer-readiness-diagnostic-error',{message:String(secondary),primary:String(error)});}throw error;}
   await observe('plan-ready');
-  await view.locator('#reset-filters').click();
+  await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});
   await eventually(async () => (await view.locator('#cards .card').count()) > 0,
-    'General-backed suite plan renders workload cards', 120000);
+    'General-backed suite plan renders workload cards', NATIVE_READINESS_MS);
   return view;
 }
 
@@ -119,7 +120,7 @@ async function savedConfiguration(context, view) {
     context.vscode.Uri.file(context.workspace));
   const destination = path.resolve(context.workspace, settings.get('uiConfiguration', 'perf/perfchecker-ui.json'));
   const previous = await fs.stat(destination,{bigint:true}).catch(() => undefined);
-  await view.locator('#save').click();
+  await view.locator('#save').click({timeout:NATIVE_READINESS_MS});
   const config = await eventually(async () => {
     const stat = await fs.stat(destination,{bigint:true});
     if (previous && stat.mtimeNs === previous.mtimeNs) return false;
@@ -212,7 +213,7 @@ async function output(context) {
   // report read and HTML replacement, so visibility alone can still select its old frame.
   const previous=new Set((await resultDocuments(context)).map(document=>document.nonce));
   await clickStudioAction(context, 'results');
-  const deadline=Date.now()+60000;
+  const deadline=Date.now()+NATIVE_READINESS_MS;
   while(Date.now()<deadline){
     const current=(await resultDocuments(context)).filter(document=>document.visible&&!previous.has(document.nonce));
     assert(current.length<=1,'Only one new results document belongs to this request');
@@ -227,8 +228,8 @@ async function output(context) {
 }
 
 async function resetDesigner(view) {
-  await view.locator('#reset-filters').click();
-  await view.locator('#select-visible').click();
+  await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});
+  await view.locator('#select-visible').click({timeout:NATIVE_READINESS_MS});
   await eventually(async () => (await selectionCount(view)) > 0, 'Restore all suite selections');
 }
 
@@ -245,7 +246,7 @@ async function testSuiteSelection(context) {
     const ids=new Set(expected.map(run=>run.id)),keys=[...new Set(expected.map(groupKey))].sort();
     assert(keys.length<=120,'This filter fixture fits entirely within the native page');
     await eventually(async()=>{
-      const counter=await view.locator('#count').innerText(),match=/· (\d+)\/(\d+) visible/.exec(counter);
+      const counter=await view.locator('#count').innerText({timeout:NATIVE_READINESS_MS}),match=/· (\d+)\/(\d+) visible/.exec(counter);
       const groups=await renderedGroups();
       return match&&Number(match[1])===expected.length&&Number(match[2])===plan.runs.length&&
         groups.every(group=>ids.has(group.id))&&groups.length===keys.length&&
@@ -260,69 +261,69 @@ async function testSuiteSelection(context) {
   for (const type of checkTypes) {
     assert(labels.some(label => label.startsWith(`${type} ·`)), `Native suite includes ${type}`);
     const input = view.locator('#check-types label').filter({hasText: `${type} ·`}).locator('input');
-    await input.uncheck();
+    await input.uncheck({timeout:NATIVE_READINESS_MS});
     assert((await selectionCount(view)) < all, `${type} removes matching runs, including hidden runs`);
-    await input.check();
+    await input.check({timeout:NATIVE_READINESS_MS});
     assert.equal(await selectionCount(view), all, `${type} re-includes every matching run`);
   }
   for (const unavailable of await view.locator('.check-option.unavailable .check-status').all()) {
-    assert((await unavailable.getAttribute('title'))?.trim(), 'An unavailable check explains its prerequisite');
+    assert((await unavailable.getAttribute('title',{timeout:NATIVE_READINESS_MS}))?.trim(), 'An unavailable check explains its prerequisite');
   }
   context.proof('suite-check-types', {types: checkTypes, runs: all, unavailableReasonsChecked: true});
 
   const targets = await options(view, '#target-filter');
   assert(targets.length >= 2, 'At least two real targets are needed to qualify hidden selections and versions');
   for (const target of targets) {
-    await view.locator('#target-filter').selectOption(target.value);
+    await view.locator('#target-filter').selectOption(target.value,{timeout:NATIVE_READINESS_MS});
     await assertFiltered(plan.runs.filter(run=>run.version===target.value),`target=${target.value}`);
     assert.equal(await selectionCount(view), all, 'Target filtering preserves hidden selected runs');
   }
-  await view.locator('#clear-visible').click();
+  await view.locator('#clear-visible').click({timeout:NATIVE_READINESS_MS});
   const hidden = await selectionCount(view);
   assert(hidden > 0 && hidden < all, 'Clear visible preserves selected runs belonging to other targets');
-  assert.match(await view.locator('#count').innerText(), /selected outside filters/);
-  await view.locator('#reset-filters').click();
+  assert.match(await view.locator('#count').innerText({timeout:NATIVE_READINESS_MS}), /selected outside filters/);
+  await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});
   assert.equal(await selectionCount(view), hidden, 'Reset filters does not secretly replace the selection');
-  await view.locator('#select-visible').click();
+  await view.locator('#select-visible').click({timeout:NATIVE_READINESS_MS});
   assert.equal(await selectionCount(view), all);
-  await view.locator('#clear-all').click();
+  await view.locator('#clear-all').click({timeout:NATIVE_READINESS_MS});
   assert.equal(await selectionCount(view), 0);
-  assert(await view.locator('#run').isDisabled(), 'No selection cannot launch a run');
-  await view.locator('#select-visible').click();
+  assert(await view.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS}), 'No selection cannot launch a run');
+  await view.locator('#select-visible').click({timeout:NATIVE_READINESS_MS});
 
-  await view.locator('#search').fill('a-query-that-matches-no-fixture');
+  await view.locator('#search').fill('a-query-that-matches-no-fixture',{timeout:NATIVE_READINESS_MS});
   await eventually(async () => (await view.locator('#cards .card').count()) === 0, 'Empty workload filter');
-  assert.match(await view.locator('#cards').innerText(), /No workloads match/);
+  assert.match(await view.locator('#cards').innerText({timeout:NATIVE_READINESS_MS}), /No workloads match/);
   assert.equal(await selectionCount(view), all);
-  await view.locator('#clear-visible').click();
+  await view.locator('#clear-visible').click({timeout:NATIVE_READINESS_MS});
   assert.equal(await selectionCount(view), all, 'Clearing an empty visible set preserves all hidden selections');
-  await view.locator('#reset-filters').click();
+  await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});
 
   for (const selector of ['#package', '#target-kind']) {
     for (const option of await options(view, selector)) {
-      await view.locator(selector).selectOption(option.value);
+      await view.locator(selector).selectOption(option.value,{timeout:NATIVE_READINESS_MS});
       const key=selector==='#package'?'package':'target_kind';
       await assertFiltered(plan.runs.filter(run=>run[key]===option.value),`${key}=${option.value}`);
       assert.equal(await selectionCount(view), all);
     }
-    await view.locator(selector).selectOption('');
+    await view.locator(selector).selectOption('',{timeout:NATIVE_READINESS_MS});
   }
   const releaseTargets = targets.filter(item => /^v?\d+\.\d+\.\d+/.test(item.value));
   if (releaseTargets.length) {
-    await view.locator('#from').fill(releaseTargets[0].value);
-    await view.locator('#to').fill(releaseTargets.at(-1).value);
+    await view.locator('#from').fill(releaseTargets[0].value,{timeout:NATIVE_READINESS_MS});
+    await view.locator('#to').fill(releaseTargets.at(-1).value,{timeout:NATIVE_READINESS_MS});
     const version=value=>value.replace(/^v/,'').split('.').slice(0,3).map(Number);
     const comparison=(a,b)=>{const x=version(a),y=version(b);return x[0]-y[0]||x[1]-y[1]||x[2]-y[2];};
     await assertFiltered(plan.runs.filter(run=>run.target_kind!=='release'||
       comparison(run.version,releaseTargets[0].value)>=0&&comparison(run.version,releaseTargets.at(-1).value)<=0),'inclusive release bounds');
     assert.equal(await selectionCount(view), all, 'Release bounds preserve selected Git targets');
-    await view.locator('#from').fill('999.0.0');
-    await view.locator('#to').fill('0.0.0');
+    await view.locator('#from').fill('999.0.0',{timeout:NATIVE_READINESS_MS});
+    await view.locator('#to').fill('0.0.0',{timeout:NATIVE_READINESS_MS});
     await assertFiltered(plan.runs.filter(run=>run.target_kind!=='release'),'inverted release bounds');
     assert.equal(await selectionCount(view), all, 'Inverted release bounds do not discard hidden selections');
   } else context.log('release-range-prerequisite', 'Fixture has only Git/dev targets; a registered-release fixture is still required');
-  await view.locator('#reset-filters').click();
-  await view.locator('#sort').selectOption('suite');
+  await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});
+  await view.locator('#sort').selectOption('suite',{timeout:NATIVE_READINESS_MS});
   const {config:orderConfiguration}=await savedConfiguration(context,view);
   assert.equal(orderConfiguration.selection.run_ids.length,plan.runs.length,'The real saved order includes every selected fixture run');
   const byId=new Map(plan.runs.map(run=>[run.id,run]));
@@ -336,7 +337,7 @@ async function testSuiteSelection(context) {
   const versionRank=new Map(versionOrder.map((value,index)=>[value,index]));
   let previousOrder=(await renderedGroups()).map(group=>group.key),observedSortChange=false;
   for (const sort of ['package', 'feature', 'version', 'suite']) {
-    await view.locator('#sort').selectOption(sort);
+    await view.locator('#sort').selectOption(sort,{timeout:NATIVE_READINESS_MS});
     let observed=[];
     try{
     await eventually(async()=>{
@@ -359,23 +360,23 @@ async function testSuiteSelection(context) {
   }
   assert(observedSortChange,'At least one discriminating native sort gesture changes the displayed group order');
   const group = view.locator('#cards .card').first();
-  await group.locator('.pick').uncheck();
+  await group.locator('.pick').uncheck({timeout:NATIVE_READINESS_MS});
   assert((await selectionCount(view)) < all);
-  await group.locator('.pick').check();
-  await group.locator('.check-option input').first().uncheck();
+  await group.locator('.pick').check({timeout:NATIVE_READINESS_MS});
+  await group.locator('.check-option input').first().uncheck({timeout:NATIVE_READINESS_MS});
   assert.equal(await view.locator('.card.partial').count(), 1);
-  if(await view.locator('#selection-preview').locator('..').getAttribute('open')===null)
-    await view.locator('#selection-summary').click();
+  if(await view.locator('#selection-preview').locator('..').getAttribute('open',{timeout:NATIVE_READINESS_MS})===null)
+    await view.locator('#selection-summary').click({timeout:NATIVE_READINESS_MS});
   await eventually(async()=>await view.locator('#selection-preview li').count()===Math.min(all-1,80),
     'The native details toggle renders the exact selected runs before their count is read');
-  await view.locator('#open-after-run').uncheck();
+  await view.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});
   await group.locator('.label').evaluate(input => {
     input.value = '#1266aa'; input.dispatchEvent(new Event('input', {bubbles: true}));
   });
-  await view.locator('#doc-id').fill('native-checks');
-  await view.locator('#doc-title').fill('Native control qualification');
-  await view.locator('#doc-url').fill('https://example.invalid/qualified-report');
-  for (const checkbox of await view.locator('input[name="view"]').all()) await checkbox.check();
+  await view.locator('#doc-id').fill('native-checks',{timeout:NATIVE_READINESS_MS});
+  await view.locator('#doc-title').fill('Native control qualification',{timeout:NATIVE_READINESS_MS});
+  await view.locator('#doc-url').fill('https://example.invalid/qualified-report',{timeout:NATIVE_READINESS_MS});
+  for (const checkbox of await view.locator('input[name="view"]').all()) await checkbox.check({timeout:NATIVE_READINESS_MS});
   const {config} = await savedConfiguration(context, view);
   assert.equal(config.selection.run_ids.length, all - 1);
   assert.equal(new Set(config.selection.run_ids).size, all - 1);
@@ -384,15 +385,15 @@ async function testSuiteSelection(context) {
   assert.deepEqual(config.documentation.blocks[0].views,
     ['summary', 'comparison', 'plots', 'observations', 'diagnostics', 'artifacts']);
   assert.equal(config.documentation.blocks[0].interactive_url, 'https://example.invalid/qualified-report');
-  await view.locator('#refresh').click();
-  await eventually(async () => !(await view.locator('#refresh').isDisabled()), 'Refresh native Julia plan', 120000);
+  await view.locator('#refresh').click({timeout:NATIVE_READINESS_MS});
+  await eventually(async () => !(await view.locator('#refresh').isDisabled({timeout:NATIVE_READINESS_MS})), 'Refresh native Julia plan', NATIVE_READINESS_MS);
   assert.equal(await selectionCount(view), all - 1, 'Native refresh preserves the saved and current selection');
   context.proof('suite-selection-and-save', {runs: all, selected: all - 1, hiddenSelectionsPreserved: true, views: 6});
-  await view.locator('h1').first().scrollIntoViewIfNeeded();
+  await view.locator('h1').first().scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
   await capture(context,'suite-designer');
 
   // Exercise the script button and assert its real editor document, then return to the retained view.
-  await view.locator('#cards .card .check-option .open').first().click();
+  await view.locator('#cards .card .check-option .open').first().click({timeout:NATIVE_READINESS_MS});
   await eventually(() => context.vscode.window.activeTextEditor?.document.languageId === 'julia', 'Open workload Julia source');
   assert(path.isAbsolute(context.vscode.window.activeTextEditor.document.uri.fsPath));
   await studio(context);
@@ -415,7 +416,7 @@ async function testGitTargetsAndComparisons(context) {
     await eventually(async()=>{
       const state=await idleState();
       return state.progressHidden&&Object.values(state.controls).every(disabled=>!disabled);
-    },'The preceding actual plan finishes before Git target gestures',120000);
+    },'The preceding actual plan finishes before Git target gestures',NATIVE_READINESS_MS);
   }catch(error){
     try{context.log('git-target-idle-timeout',{state:await idleState(),primary:String(error)});}
     catch(secondary){context.log('git-target-idle-diagnostic-error',{message:String(secondary),primary:String(error)});}
@@ -425,13 +426,13 @@ async function testGitTargetsAndComparisons(context) {
   const previousTargets = settings().inspect('gitTargets')?.workspaceFolderValue;
   const previousPolicies = settings().inspect('comparisonPolicies')?.workspaceFolderValue;
   try {
-    await view.locator('#target-package').selectOption('PerfCheckerNativeFixture');
-    await eventually(async () => !(await view.locator('#target-reference').isDisabled()), 'Discover real local Git references');
+    await view.locator('#target-package').selectOption('PerfCheckerNativeFixture',{timeout:NATIVE_READINESS_MS});
+    await eventually(async () => !(await view.locator('#target-reference').isDisabled({timeout:NATIVE_READINESS_MS})), 'Discover real local Git references');
     const groups = await view.locator('#target-reference optgroup').evaluateAll(items => items.map(item => item.label));
     assert(groups.includes('Branches') && groups.includes('Tags') && groups.includes('Recent commits'),
       'Disposable Git fixture contains branch, tag and commit references');
     await context.vscode.commands.executeCommand('workbench.action.closePanel');
-    await view.locator('#target-reference').scrollIntoViewIfNeeded();
+    await view.locator('#target-reference').scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
     await view.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
     const geometry=()=>view.evaluate(()=>{
       const rect=node=>{const value=node.getBoundingClientRect();return {left:value.left,right:value.right,width:value.width,
@@ -472,54 +473,54 @@ async function testGitTargetsAndComparisons(context) {
     for (const kind of ['branch', 'tag', 'commit']) {
       const candidate = refs.find(item => item.kind === kind);
       assert(candidate?.commit?.match(/^[a-f0-9]{40}$/), `Pinned ${kind} SHA supplied by actual Git discovery`);
-      await view.locator('#target-reference').selectOption(candidate.ref);
-      assert(await view.locator('#target-label').inputValue(), 'Automatic display label follows selected reference');
+      await view.locator('#target-reference').selectOption(candidate.ref,{timeout:NATIVE_READINESS_MS});
+      assert(await view.locator('#target-label').inputValue({timeout:NATIVE_READINESS_MS}), 'Automatic display label follows selected reference');
     }
     const chosen = refs.find(item => item.kind === 'branch');
-    await view.locator('#target-reference').selectOption(chosen.ref);
-    await view.locator('#target-label').fill('native-click-target');
-    await view.locator('#add-target').click();
+    await view.locator('#target-reference').selectOption(chosen.ref,{timeout:NATIVE_READINESS_MS});
+    await view.locator('#target-label').fill('native-click-target',{timeout:NATIVE_READINESS_MS});
+    await view.locator('#add-target').click({timeout:NATIVE_READINESS_MS});
     await eventually(() => settings().get('gitTargets', []).some(item => item.label === 'native-click-target'), 'Persist target from button');
     assert.equal(settings().get('gitTargets', []).find(item => item.label === 'native-click-target').revision, chosen.commit);
-    await eventually(async () => !(await view.locator('#add-target').isDisabled()), 'Replan with new Git target', 120000);
-    await view.locator('#target-list .target').filter({hasText: 'native-click-target'}).getByRole('button', {name: 'Remove comparison target'}).click();
+    await eventually(async () => !(await view.locator('#add-target').isDisabled({timeout:NATIVE_READINESS_MS})), 'Replan with new Git target', NATIVE_READINESS_MS);
+    await view.locator('#target-list .target').filter({hasText: 'native-click-target'}).getByRole('button', {name: 'Remove comparison target'}).click({timeout:NATIVE_READINESS_MS});
     await eventually(() => !settings().get('gitTargets', []).some(item => item.label === 'native-click-target'), 'Remove target via native button');
-    await eventually(async () => !(await view.locator('#add-target').isDisabled()), 'Replan after target removal', 120000);
-    await view.locator('#target-revision').fill('refs/heads/nonexistent-native-fixture');
-    await view.locator('#target-label').fill('invalid-native-target');
-    await view.locator('#add-target').click();
-    await view.locator('#target-error').waitFor({state: 'visible'});
-    assert((await view.locator('#target-error').innerText()).trim());
+    await eventually(async () => !(await view.locator('#add-target').isDisabled({timeout:NATIVE_READINESS_MS})), 'Replan after target removal', NATIVE_READINESS_MS);
+    await view.locator('#target-revision').fill('refs/heads/nonexistent-native-fixture',{timeout:NATIVE_READINESS_MS});
+    await view.locator('#target-label').fill('invalid-native-target',{timeout:NATIVE_READINESS_MS});
+    await view.locator('#add-target').click({timeout:NATIVE_READINESS_MS});
+    await view.locator('#target-error').waitFor({state: 'visible',timeout:NATIVE_READINESS_MS});
+    assert((await view.locator('#target-error').innerText({timeout:NATIVE_READINESS_MS})).trim());
     assert(!settings().get('gitTargets', []).some(item => item.label === 'invalid-native-target'));
-    await view.locator('#refresh-targets').click();
-    await eventually(async () => !(await view.locator('#target-reference').isDisabled()), 'Refresh actual Git inventory');
+    await view.locator('#refresh-targets').click({timeout:NATIVE_READINESS_MS});
+    await eventually(async () => !(await view.locator('#target-reference').isDisabled({timeout:NATIVE_READINESS_MS})), 'Refresh actual Git inventory');
     context.proof('git-reference-controls', {groups, pinnedBranch: chosen.commit, addRemove: true, invalidReferenceRejected: true});
 
-    await view.locator('#add-comparison').click();
-    await view.locator('#comparison-error').waitFor({state: 'visible'});
+    await view.locator('#add-comparison').click({timeout:NATIVE_READINESS_MS});
+    await view.locator('#comparison-error').waitFor({state: 'visible',timeout:NATIVE_READINESS_MS});
     const candidates = await view.locator('#candidate-targets input').evaluateAll(items => items.map(item => item.value));
     assert(candidates.length >= 2, 'Comparison fixture supplies two targets');
-    for (const input of await view.locator('#baseline-targets input, #candidate-targets input').all()) await input.uncheck();
-    await view.locator('#baseline-targets input').first().check();
-    await view.locator('#candidate-targets input').first().check();
-    await view.locator('#add-comparison').click();
-    assert.match(await view.locator('#comparison-error').innerText(), /different targets/);
-    await view.locator('#candidate-targets input').first().uncheck();
-    await view.locator('#candidate-targets input').nth(1).check();
-    for (const value of ['median', 'mean', 'minimum', 'maximum']) await view.locator('#comparison-aggregation').selectOption(value);
-    await view.locator('#comparison-aggregation').selectOption('median');
+    for (const input of await view.locator('#baseline-targets input, #candidate-targets input').all()) await input.uncheck({timeout:NATIVE_READINESS_MS});
+    await view.locator('#baseline-targets input').first().check({timeout:NATIVE_READINESS_MS});
+    await view.locator('#candidate-targets input').first().check({timeout:NATIVE_READINESS_MS});
+    await view.locator('#add-comparison').click({timeout:NATIVE_READINESS_MS});
+    assert.match(await view.locator('#comparison-error').innerText({timeout:NATIVE_READINESS_MS}), /different targets/);
+    await view.locator('#candidate-targets input').first().uncheck({timeout:NATIVE_READINESS_MS});
+    await view.locator('#candidate-targets input').nth(1).check({timeout:NATIVE_READINESS_MS});
+    for (const value of ['median', 'mean', 'minimum', 'maximum']) await view.locator('#comparison-aggregation').selectOption(value,{timeout:NATIVE_READINESS_MS});
+    await view.locator('#comparison-aggregation').selectOption('median',{timeout:NATIVE_READINESS_MS});
     await context.vscode.commands.executeCommand('workbench.action.closePanel');
     const matrix=view.locator('.aside-panel').filter({has:view.getByRole('heading',{name:'Comparison matrix',exact:true})});
-    await matrix.scrollIntoViewIfNeeded();
+    await matrix.scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
     await capture(context,'comparison-matrix');
     const before = settings().get('comparisonPolicies', []).length;
-    await view.locator('#add-comparison').click();
+    await view.locator('#add-comparison').click({timeout:NATIVE_READINESS_MS});
     await eventually(() => settings().get('comparisonPolicies', []).length === before + 1, 'Persist comparison from actual button');
-    await eventually(async () => !(await view.locator('#add-comparison').isDisabled()), 'Replan after comparison', 120000);
+    await eventually(async () => !(await view.locator('#add-comparison').isDisabled({timeout:NATIVE_READINESS_MS})), 'Replan after comparison', NATIVE_READINESS_MS);
     const policy = settings().get('comparisonPolicies', []).at(-1);
     assert.equal(policy.aggregation, 'median');
     assert.equal(policy.baselines.length, 1); assert.equal(policy.candidates.length, 1);
-    await view.locator('#comparison-list .target').last().getByRole('button', {name: 'Remove comparison', exact: true}).click();
+    await view.locator('#comparison-list .target').last().getByRole('button', {name: 'Remove comparison', exact: true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(() => settings().get('comparisonPolicies', []).length === before, 'Remove comparison via actual button');
     context.proof('comparison-controls', {invalidEmpty: true, overlapRejected: true, aggregationSelections: 4, aggregationsComputed: false, addRemove: true});
   } finally {
@@ -536,22 +537,22 @@ async function testCancelGitDiscovery(context){
   let view;
   try{
     view=await designer(context);
-    await view.locator('#target-package').selectOption('PerfCheckerNativeFixture');
-    await eventually(async()=>!(await view.locator('#target-reference').isDisabled()),'Initial local Git inventory finishes');
+    await view.locator('#target-package').selectOption('PerfCheckerNativeFixture',{timeout:NATIVE_READINESS_MS});
+    await eventually(async()=>!(await view.locator('#target-reference').isDisabled({timeout:NATIVE_READINESS_MS})),'Initial local Git inventory finishes');
     const advanced=view.locator('details').filter({hasText:'Advanced target options'});
-    if(await advanced.getAttribute('open')===null)await advanced.locator('summary').click();
-    await view.locator('#target-source').fill(`http://127.0.0.1:${server.address().port}/qualification.git`);
-    await view.locator('#refresh-targets').click();
-    await eventually(()=>requested&&sockets.size>0,'The actual Git process reaches its pending HTTP discovery request',30000);
-    await view.locator('#cancel-targets').click();
+    if(await advanced.getAttribute('open',{timeout:NATIVE_READINESS_MS})===null)await advanced.locator('summary').click({timeout:NATIVE_READINESS_MS});
+    await view.locator('#target-source').fill(`http://127.0.0.1:${server.address().port}/qualification.git`,{timeout:NATIVE_READINESS_MS});
+    await view.locator('#refresh-targets').click({timeout:NATIVE_READINESS_MS});
+    await eventually(()=>requested&&sockets.size>0,'The actual Git process reaches its pending HTTP discovery request',NATIVE_READINESS_MS);
+    await view.locator('#cancel-targets').click({timeout:30000});
     await eventually(()=>sockets.size===0,'The native Cancel discovery button terminates Git and closes its real connection',30000);
-    await eventually(async()=>!(await view.locator('#cancel-targets').isVisible()),'The cancelled Git scan returns to idle');
-    assert.match(await view.locator('#target-error').innerText(),/cancel/i);
-    await view.locator('#target-source').fill('');await view.locator('#refresh-targets').click();
+    await eventually(async()=>!(await view.locator('#cancel-targets').isVisible()),'The cancelled Git scan returns to idle',60000);
+    assert.match(await view.locator('#target-error').innerText({timeout:NATIVE_READINESS_MS}),/cancel/i);
+    await view.locator('#target-source').fill('',{timeout:NATIVE_READINESS_MS});await view.locator('#refresh-targets').click({timeout:NATIVE_READINESS_MS});
     await eventually(async()=>await view.locator('#target-reference optgroup[label="Branches"]').count()>0,'A fresh real local Git discovery works after cancellation');
     context.proof('git-cancel-discovery',{nativeClick:true,actualRemoteGitRequest:true,connectionClosedBeforeHarnessCleanup:true,freshScanSucceeded:true});
   }finally{
-    if(view){await view.locator('#cancel-targets').click({timeout:1000}).catch(()=>{});await view.locator('#target-source').fill('').catch(()=>{});}
+    if(view){await view.locator('#cancel-targets').click({timeout:1000}).catch(()=>{});await view.locator('#target-source').fill('',{timeout:30000}).catch(()=>{});}
     server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
   }
 }
@@ -559,11 +560,11 @@ async function testCancelGitDiscovery(context){
 async function testFlameControls(context,view) {
   const graphs=view.locator('.flame-view');assert((await graphs.count())>0);
   for(let index=0;index<await graphs.count();index++){
-    const graph=graphs.nth(index),model=JSON.parse(await graph.getAttribute('data-flame'));
+    const graph=graphs.nth(index),model=JSON.parse(await graph.getAttribute('data-flame',{timeout:NATIVE_READINESS_MS}));
     assert.equal(await graph.locator('.flame-node').count(),model.frames.length,
       'Every frame from the actual measured profile model remains in the native SVG');
   }
-  const graph=graphs.first(),payload=await graph.getAttribute('data-flame'),model=JSON.parse(payload);
+  const graph=graphs.first(),payload=await graph.getAttribute('data-flame',{timeout:NATIVE_READINESS_MS}),model=JSON.parse(payload);
   const svg=graph.locator('svg.flame'),indexInput=graph.getByRole('spinbutton',{name:'Inspect frame',exact:true});
   const expectedGeometry=async()=>{
     const actual=await svg.evaluate(svg=>({width:svg.viewBox.baseVal.width,
@@ -579,25 +580,25 @@ async function testFlameControls(context,view) {
   };
   const original=await expectedGeometry();
   const narrow=model.frames.reduce((best,frame)=>frame.x1-frame.x0<best.x1-best.x0?frame:best);
-  await indexInput.fill(String(narrow.index));await indexInput.press('Tab');
-  const detailId=await graph.getAttribute('data-detail-target'),detail=view.locator(`[id="${detailId}"]`);
-  await eventually(async()=>(await detail.innerText()).startsWith(`Frame ${narrow.index} /`),'Native frame index updates the real readout');
+  await indexInput.fill(String(narrow.index),{timeout:NATIVE_READINESS_MS});await indexInput.press('Tab',{timeout:NATIVE_READINESS_MS});
+  const detailId=await graph.getAttribute('data-detail-target',{timeout:NATIVE_READINESS_MS}),detail=view.locator(`[id="${detailId}"]`);
+  await eventually(async()=>(await detail.innerText({timeout:NATIVE_READINESS_MS})).startsWith(`Frame ${narrow.index} /`),'Native frame index updates the real readout');
   const callPath=[];for(let frame=narrow;frame;frame=frame.parent===null?undefined:model.frames[frame.parent-1])callPath.push(frame.name);
-  const text=await detail.innerText();assert(text.includes(callPath.reverse().join(' → ')));
+  const text=await detail.innerText({timeout:NATIVE_READINESS_MS});assert(text.includes(callPath.reverse().join(' → ')));
   assert(text.includes(`Inclusive weight: ${narrow.value} ${model.unit}`));
   const colorMode=graph.getByRole('combobox',{name:'Color by',exact:true}),labelMode=graph.getByRole('combobox',{name:'Labels',exact:true});
-  assert.equal(await colorMode.inputValue(),'function');assert.equal(await labelMode.inputValue(),'function');
+  assert.equal(await colorMode.inputValue({timeout:NATIVE_READINESS_MS}),'function');assert.equal(await labelMode.inputValue({timeout:NATIVE_READINESS_MS}),'function');
   const functionLabels=model.frames.map(frame=>frame.name.replace(/ \([^()\r\n]+\.jl:[1-9]\d*\)$/u,''));
   const labelsText=()=>svg.locator('.flame-node text').allTextContents();
   assert.deepEqual(await labelsText(),functionLabels);
   const functionColors=await svg.locator('.flame-node rect').evaluateAll(nodes=>nodes.map(node=>getComputedStyle(node).fill));
   for(const [mode,expected]of [['full',model.frames.map(frame=>frame.name)],['function',functionLabels]]){
-    await labelMode.selectOption(mode);assert.deepEqual(await labelsText(),expected);
-    assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame'),payload);
-    assert.equal(await detail.innerText(),text,'Changing labels retains the selected full call path and measured weight');
+    await labelMode.selectOption(mode,{timeout:NATIVE_READINESS_MS});assert.deepEqual(await labelsText(),expected);
+    assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame',{timeout:NATIVE_READINESS_MS}),payload);
+    assert.equal(await detail.innerText({timeout:NATIVE_READINESS_MS}),text,'Changing labels retains the selected full call path and measured weight');
   }
-  await colorMode.selectOption('diagnostics');
-  assert.match(await graph.locator('.flame-legend').innerText(),/Unknown or missing inference information is not a warning/);
+  await colorMode.selectOption('diagnostics',{timeout:NATIVE_READINESS_MS});
+  assert.match(await graph.locator('.flame-legend').innerText({timeout:NATIVE_READINESS_MS}),/Unknown or missing inference information is not a warning/);
   const diagnostics=await svg.locator('.flame-node').evaluateAll(nodes=>nodes.map(node=>({index:Number(node.dataset.frameIndex),
     dynamic:node.classList.contains('dynamic'),unstable:node.classList.contains('unstable'),gc:node.classList.contains('gc')})));
   for(const actual of diagnostics){
@@ -607,42 +608,42 @@ async function testFlameControls(context,view) {
     assert.deepEqual(actual,{index:saved.index,dynamic:!saved.gc&&saved.dynamic,
       unstable:!saved.gc&&!saved.dynamic&&saved.unstable,gc:saved.gc});
   }
-  assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame'),payload);
-  await colorMode.selectOption('function');
+  assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame',{timeout:NATIVE_READINESS_MS}),payload);
+  await colorMode.selectOption('function',{timeout:NATIVE_READINESS_MS});
   assert.deepEqual(await svg.locator('.flame-node rect').evaluateAll(nodes=>nodes.map(node=>getComputedStyle(node).fill)),functionColors);
-  assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame'),payload);
-  assert.equal(await detail.innerText(),text);
+  assert.deepEqual(await expectedGeometry(),original);assert.equal(await graph.getAttribute('data-flame',{timeout:NATIVE_READINESS_MS}),payload);
+  assert.equal(await detail.innerText({timeout:NATIVE_READINESS_MS}),text);
   context.proof('native-flame-presentation-modes',{source:'actual-installed-VSIX',colorModes:['function','diagnostics'],
     labelModes:['function','full'],nativeSelectChanges:4,frames:model.frames.length,diagnosticFlagsChecked:diagnostics.length,
     unknownInferenceFramesChecked:model.frames.filter(frame=>frame.inferenceStatuses.includes('unknown')&&!frame.unstable).length,
     fullCallPathPreserved:true,modelByteExact:true,geometryExact:true});
-  await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click();
-  await eventually(async()=>Number(await svg.getAttribute('data-current-max'))-Number(await svg.getAttribute('data-current-min'))<1,'Native flame Zoom narrows only the viewport');
+  await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async()=>Number(await svg.getAttribute('data-current-max',{timeout:NATIVE_READINESS_MS}))-Number(await svg.getAttribute('data-current-min',{timeout:NATIVE_READINESS_MS}))<1,'Native flame Zoom narrows only the viewport');
   await expectedGeometry();
   const pan=graph.getByRole('button',{name:'Pan flame graph left',exact:true});
   const otherPan=graph.getByRole('button',{name:'Pan flame graph right',exact:true});
-  if(await pan.isEnabled())await pan.click();else await otherPan.click();
-  await expectedGeometry();await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
-  await eventually(async()=>await svg.getAttribute('data-current-min')==='0'&&await svg.getAttribute('data-current-max')==='1','Native flame Fit restores the complete original range');
+  if(await pan.isEnabled({timeout:NATIVE_READINESS_MS}))await pan.click({timeout:NATIVE_READINESS_MS});else await otherPan.click({timeout:NATIVE_READINESS_MS});
+  await expectedGeometry();await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async()=>await svg.getAttribute('data-current-min',{timeout:NATIVE_READINESS_MS})==='0'&&await svg.getAttribute('data-current-max',{timeout:NATIVE_READINESS_MS})==='1','Native flame Fit restores the complete original range');
   const restored=await expectedGeometry();assert.deepEqual(restored,original);
-  await graph.locator('.flame-range summary').click();
+  await graph.locator('.flame-range summary').click({timeout:NATIVE_READINESS_MS});
   const start=graph.locator('[data-flame-bound="min"]'),end=graph.locator('[data-flame-bound="max"]');
   for(const [input,value]of [[start,'-1'],[end,'101'],[start,'100'],[start,'']]){
-    await input.fill(value);await input.press('Tab');
-    assert.match(await graph.locator('[role="alert"]').innerText(),/from 0 to 100/);
+    await input.fill(value,{timeout:NATIVE_READINESS_MS});await input.press('Tab',{timeout:NATIVE_READINESS_MS});
+    assert.match(await graph.locator('[role="alert"]').innerText({timeout:NATIVE_READINESS_MS}),/from 0 to 100/);
     assert.deepEqual(await expectedGeometry(),original,'Invalid percentage input must not silently move the viewport');
   }
-  await start.fill('90');await start.press('Tab');const beforeReversed=await expectedGeometry();
-  await end.fill('10');await end.press('Tab');
-  assert.match(await graph.locator('[role="alert"]').innerText(),/from 0 to 100/);
+  await start.fill('90',{timeout:NATIVE_READINESS_MS});await start.press('Tab',{timeout:NATIVE_READINESS_MS});const beforeReversed=await expectedGeometry();
+  await end.fill('10',{timeout:NATIVE_READINESS_MS});await end.press('Tab',{timeout:NATIVE_READINESS_MS});
+  assert.match(await graph.locator('[role="alert"]').innerText({timeout:NATIVE_READINESS_MS}),/from 0 to 100/);
   assert.deepEqual(await expectedGeometry(),beforeReversed,'Reversed user bounds leave the previous valid viewport unchanged');
-  await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
-  await start.fill('10');await end.fill('90');await end.press('Tab');
+  await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click({timeout:NATIVE_READINESS_MS});
+  await start.fill('10',{timeout:NATIVE_READINESS_MS});await end.fill('90',{timeout:NATIVE_READINESS_MS});await end.press('Tab',{timeout:NATIVE_READINESS_MS});
   // Normalized bounds may differ by a few floating-point ULPs, never by a displayed percentage.
   const rangeTolerance=Number.EPSILON*8;
   const explicitRange=await eventually(async()=>{
-    const actual={from:Number(await svg.getAttribute('data-current-min')),to:Number(await svg.getAttribute('data-current-max')),
-      start:await start.inputValue(),end:await end.inputValue()};
+    const actual={from:Number(await svg.getAttribute('data-current-min',{timeout:NATIVE_READINESS_MS})),to:Number(await svg.getAttribute('data-current-max',{timeout:NATIVE_READINESS_MS})),
+      start:await start.inputValue({timeout:NATIVE_READINESS_MS}),end:await end.inputValue({timeout:NATIVE_READINESS_MS})};
     assert(Math.abs(actual.from-.1)<=rangeTolerance&&Math.abs(actual.to-.9)<=rangeTolerance,
       `Expected normalized bounds 0.1–0.9 within ${rangeTolerance}; received ${JSON.stringify(actual)}`);
     assert.equal(actual.start,'10',`Start must be readable: ${JSON.stringify(actual)}`);
@@ -650,9 +651,9 @@ async function testFlameControls(context,view) {
     return actual;
   },
     'A valid explicit percentage range changes only the viewport');
-  await expectedGeometry();await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
-  await graph.locator('.flame-range summary').click();
-  assert.equal(await graph.getAttribute('data-flame'),payload,'Flame interaction leaves the measured model byte-exact');
+  await expectedGeometry();await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click({timeout:NATIVE_READINESS_MS});
+  await graph.locator('.flame-range summary').click({timeout:NATIVE_READINESS_MS});
+  assert.equal(await graph.getAttribute('data-flame',{timeout:NATIVE_READINESS_MS}),payload,'Flame interaction leaves the measured model byte-exact');
   const labels=await svg.evaluate(svg=>[...svg.querySelectorAll('.flame-node text')].filter(text=>text.style.display!=='none').map(text=>{
     const rect=text.parentElement.querySelector('rect'),left=Number(rect.getAttribute('x')),width=Number(rect.getAttribute('width'));
     return {length:text.getComputedTextLength(),available:Math.min(svg.viewBox.baseVal.width,left+width)-Math.max(0,left)-8};
@@ -671,7 +672,7 @@ async function testFlamePresentation(context,view,graph){
   const workbench=context.vscode.workspace.getConfiguration('workbench');
   const previousTheme=workbench.inspect('colorTheme')?.globalValue;
   const previousViewport=await context.windowPage.evaluate(()=>({width:innerWidth,height:innerHeight}));
-  const colorMode=graph.getByRole('combobox',{name:'Color by',exact:true}),previousColor=await colorMode.inputValue();
+  const colorMode=graph.getByRole('combobox',{name:'Color by',exact:true}),previousColor=await colorMode.inputValue({timeout:NATIVE_READINESS_MS});
   const audits=[];
   const audit=async()=>{
     const presentation=await graph.locator('svg.flame').evaluate(svg=>({
@@ -720,11 +721,11 @@ async function testFlamePresentation(context,view,graph){
         if(commands.includes(command))await context.vscode.commands.executeCommand(command);
       }
       for(const mode of ['function','diagnostics']){
-        await colorMode.selectOption(mode);
+        await colorMode.selectOption(mode,{timeout:NATIVE_READINESS_MS});
         await eventually(audit,'The rendered flame labels update their actual contrast after the theme and color mode change');
         const desktop=await audit();
-        await graph.locator('.flame-node').first().focus();const focused=await audit();
-        await graph.locator('.flame-node').first().hover();const hovered=await audit();
+        await graph.locator('.flame-node').first().focus({timeout:NATIVE_READINESS_MS});const focused=await audit();
+        await graph.locator('.flame-node').first().hover({timeout:NATIVE_READINESS_MS});const hovered=await audit();
         await context.windowPage.setViewportSize({width:390,height:844});
         await eventually(async()=>await view.evaluate(()=>innerWidth)<=390,'The actual webview adopts the narrow workbench viewport');
         const geometry=await graph.evaluate(node=>({viewport:innerWidth,width:node.getBoundingClientRect().width,
@@ -733,11 +734,11 @@ async function testFlamePresentation(context,view,graph){
         assert(geometry.width>=230&&geometry.width<=390,'The narrow qualification uses a readable editor after hiding disposable side panels');assert(geometry.scrollWidth<=geometry.clientWidth);
         assert(geometry.buttons.every(control=>control.height>=44),'The narrow native flame buttons and selects retain touch-sized targets');
         const mobile=await audit();
-        await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click();
-        await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click();
-        await graph.locator('.flame-presentation').scrollIntoViewIfNeeded();
+        await graph.getByRole('button',{name:'Zoom in flame graph',exact:true}).click({timeout:NATIVE_READINESS_MS});
+        await graph.getByRole('button',{name:'Fit all flame frames',exact:true}).click({timeout:NATIVE_READINESS_MS});
+        await graph.locator('.flame-presentation').scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
         await capture(context,`flame-mobile-${uiTheme}-${mode}-controls`);
-        await graph.locator('.flame-detail').scrollIntoViewIfNeeded();
+        await graph.locator('.flame-detail').scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
         await capture(context,`flame-mobile-${uiTheme}-${mode}-readout`);
         audits.push({theme:theme.id,colorMode:mode,desktop,focused,hovered,mobile,geometry});
         await context.windowPage.setViewportSize(previousViewport);
@@ -746,7 +747,7 @@ async function testFlamePresentation(context,view,graph){
     context.proof('native-flame-theme-and-mobile-presentation',{source:'actual-installed-VSIX-and-built-in-VSCode-themes',audits});
   }finally{
     await context.windowPage.setViewportSize(previousViewport);
-    await colorMode.selectOption(previousColor);
+    await colorMode.selectOption(previousColor,{timeout:30000});
     await workbench.update('colorTheme',previousTheme,context.vscode.ConfigurationTarget.Global);
   }
 }
@@ -755,18 +756,18 @@ async function testResults(context) {
   const commands=await context.vscode.commands.getCommands(true);
   if(commands.includes('workbench.action.closePanel'))await context.vscode.commands.executeCommand('workbench.action.closePanel');
   let view = await output(context);
-  assert.match(await view.locator('body').innerText(), /PERFCHECKER OUTPUT/);
+  assert.match(await view.locator('body').innerText({timeout:NATIVE_READINESS_MS}), /PERFCHECKER OUTPUT/);
   assert.equal(await view.locator('.empty').count(), 0, 'Real suite measurements were supplied to the installed VSIX');
   const total = await view.locator('[data-result-item]').count(); assert(total > 0);
   for (const id of ['package', 'workload', 'backend', 'kind', 'status']) {
     for (const option of await options(view, `#result-${id}`)) {
       const expected=await view.locator('[data-result-item]').evaluateAll((items,{id,value})=>items.filter(item=>item.dataset[id]===value).length,{id,value:option.value});
-      await view.locator(`#result-${id}`).selectOption(option.value);
+      await view.locator(`#result-${id}`).selectOption(option.value,{timeout:NATIVE_READINESS_MS});
       const visible = view.locator('[data-result-item]:visible');
       assert.equal(await visible.count(),expected,`The ${id}=${option.value} filter shows exactly the matching real results, including an empty status`);
       assert(await visible.evaluateAll((items, {id, value}) => items.every(item => item.dataset[id] === value), {id, value: option.value}));
     }
-    await view.locator(`#result-${id}`).selectOption('');
+    await view.locator(`#result-${id}`).selectOption('',{timeout:NATIVE_READINESS_MS});
   }
   const resultGroups=()=>view.locator('.result-list,.chart-grid,.flame-grid,tbody').evaluateAll(containers=>containers.map(container=>
     [...container.children].filter(item=>item.matches('[data-result-item]')).map(item=>({kind:item.dataset.kind,package:item.dataset.package,
@@ -775,7 +776,7 @@ async function testResults(context) {
   assert(originalGroups.some(items=>items.length>=2),'The real Results fixture contains a group with multiple sortable entries');
   let previousResults=originalGroups,observedResultSortChange=false;
   for (const sort of await options(view, '#result-sort')) {
-    await view.locator('#result-sort').selectOption(sort.value);
+    await view.locator('#result-sort').selectOption(sort.value,{timeout:NATIVE_READINESS_MS});
     const key=sort.value==='name'?'search':sort.value;
     await eventually(async()=>{
       const groups=await resultGroups();
@@ -790,31 +791,31 @@ async function testResults(context) {
     previousResults=groups;
   }
   assert(observedResultSortChange,'At least one discriminating Results sort gesture changes a rendered group order');
-  await view.locator('#result-search').fill('there-is-no-matching-native-result');
+  await view.locator('#result-search').fill('there-is-no-matching-native-result',{timeout:NATIVE_READINESS_MS});
   assert.equal(await view.locator('[data-result-item]:visible').count(), 0);
-  await view.locator('#result-search').fill(''); assert.equal(await view.locator('[data-result-item]').count(), total);
+  await view.locator('#result-search').fill('',{timeout:NATIVE_READINESS_MS}); assert.equal(await view.locator('[data-result-item]').count(), total);
   const chartFamilies = {};
   for (const [name, selector] of Object.entries({distribution: '.distribution .sample', allocation: '.pie-slice', normalized: '.normalized-chart .hover-value', flame: '.flame-node', series: '.spark .hover-value'})) {
     const points = view.locator(selector); const count = await points.count(); chartFamilies[name] = count;
     if (!count) {context.log(`plot-prerequisite-${name}`, 'No corresponding observations in this real run; collector fixture must qualify this family separately'); continue;}
-    const point = points.first(); await point.focus();
-    const target = await point.getAttribute('data-target');
-    if (target) assert((await view.locator(`[id="${target}"]`).innerText()).trim(), `${name} keyboard focus shows its evidence`);
+    const point = points.first(); await point.focus({timeout:NATIVE_READINESS_MS});
+    const target = await point.getAttribute('data-target',{timeout:NATIVE_READINESS_MS});
+    if (target) assert((await view.locator(`[id="${target}"]`).innerText({timeout:NATIVE_READINESS_MS})).trim(), `${name} keyboard focus shows its evidence`);
   }
   assert(chartFamilies.flame>0,'The actual profile reports render nonempty, focusable flame frames');
   await testFlameControls(context,view);
   const overlay=view.locator('.normalized-plot').first();
   assert.equal(await overlay.count(),1,'Measured version series supplies the real comparison controls');
   const seriesFile=path.join(context.results,'version-series.json'),seriesBytes=await fs.readFile(seriesFile);
-  const payload=await overlay.getAttribute('data-normalized'),data=JSON.parse(payload);
+  const payload=await overlay.getAttribute('data-normalized',{timeout:NATIVE_READINESS_MS}),data=JSON.parse(payload);
   const inspected=overlay.locator('.normalized-chart .hover-value').first();
-  const metric=await inspected.getAttribute('data-metric'),detailTarget=await inspected.getAttribute('data-target');
+  const metric=await inspected.getAttribute('data-metric',{timeout:NATIVE_READINESS_MS}),detailTarget=await inspected.getAttribute('data-target',{timeout:NATIVE_READINESS_MS});
   const beforeCount=await overlay.locator('.normalized-chart .hover-value').count();assert(beforeCount>0);
-  await inspected.focus();assert.match(await view.locator(`[id="${detailTarget}"]`).innerText(),/ratio/);
-  await overlay.locator(`[data-normalized-metric="${metric}"]`).uncheck();
+  await inspected.focus({timeout:NATIVE_READINESS_MS});assert.match(await view.locator(`[id="${detailTarget}"]`).innerText({timeout:NATIVE_READINESS_MS}),/ratio/);
+  await overlay.locator(`[data-normalized-metric="${metric}"]`).uncheck({timeout:NATIVE_READINESS_MS});
   assert.equal(await overlay.locator(`[data-metric="${metric}"]`).count(),0);
-  assert.match(await view.locator(`[id="${detailTarget}"]`).innerText(),/^Hover or focus/);
-  await overlay.getByRole('button',{name:'Reset chart',exact:true}).click();
+  assert.match(await view.locator(`[id="${detailTarget}"]`).innerText({timeout:NATIVE_READINESS_MS}),/^Hover or focus/);
+  await overlay.getByRole('button',{name:'Reset chart',exact:true}).click({timeout:NATIVE_READINESS_MS});
   assert.equal(await overlay.locator('.normalized-chart .hover-value').count(),beforeCount);
   const retained=await overlay.locator('.normalized-chart .hover-value').evaluateAll((points,versions)=>{
     const point=points.find(point=>versions.indexOf(point.dataset.version)>0);
@@ -822,34 +823,34 @@ async function testResults(context) {
   },data.versions);
   assert(retained,'The actual measured series has a finite point beyond its first version');
   const index=String(data.versions.indexOf(retained.version));
-  await overlay.locator('[data-normalized-from]').selectOption(index);await overlay.locator('[data-normalized-to]').selectOption(index);
+  await overlay.locator('[data-normalized-from]').selectOption(index,{timeout:NATIVE_READINESS_MS});await overlay.locator('[data-normalized-to]').selectOption(index,{timeout:NATIVE_READINESS_MS});
   const filtered=await overlay.locator('.normalized-chart .hover-value').evaluateAll(points=>points.map(point=>({
     version:point.dataset.version,metric:point.dataset.metric,y:point.getAttribute('cy'),detail:point.dataset.detail,
   })));
   assert(filtered.length>0&&filtered.every(point=>point.version===retained.version));
   assert.deepEqual(filtered.find(point=>point.metric===retained.metric),retained,'View filtering preserves the original ratio, raw value and Y');
-  assert.equal(await overlay.getAttribute('data-normalized'),payload);
-  await overlay.getByRole('button',{name:'Reset chart',exact:true}).click();
-  assert.equal(await overlay.locator('[data-normalized-from]').inputValue(),'0');
-  assert.equal(await overlay.locator('[data-normalized-to]').inputValue(),String(data.versions.length-1));
+  assert.equal(await overlay.getAttribute('data-normalized',{timeout:NATIVE_READINESS_MS}),payload);
+  await overlay.getByRole('button',{name:'Reset chart',exact:true}).click({timeout:NATIVE_READINESS_MS});
+  assert.equal(await overlay.locator('[data-normalized-from]').inputValue({timeout:NATIVE_READINESS_MS}),'0');
+  assert.equal(await overlay.locator('[data-normalized-to]').inputValue({timeout:NATIVE_READINESS_MS}),String(data.versions.length-1));
   assert.equal(await overlay.locator('.normalized-chart .hover-value').count(),beforeCount);
-  assert.match(await view.locator(`[id="${detailTarget}"]`).innerText(),/^Hover or focus/);
+  assert.match(await view.locator(`[id="${detailTarget}"]`).innerText({timeout:NATIVE_READINESS_MS}),/^Hover or focus/);
   assert.deepEqual(await fs.readFile(seriesFile),seriesBytes,'Comparison gestures do not rewrite measured reports');
   context.proof('native-results-comparison-controls',{actualMeasuredVersions:data.versions.length,visibleMetrics:data.metrics.length,
     metricCheckbox:true,measuredVersionRange:true,reset:true,staleReadoutCleared:true,
     fixedYAndOriginalRatioPreserved:true,measurementFileUnchanged:true});
   context.proof('result-controls', {items: total, filters: 7, chartFamilies});
   const chart=view.locator('.normalized-chart,.distribution,.spark').first();
-  if(await chart.count())await chart.scrollIntoViewIfNeeded();
+  if(await chart.count())await chart.scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
   await capture(context,'measured-results');
   for (const [name, report] of [['Summary', 'suite-report.md'], ['JSON', 'suite-result.json'], ['Comparisons', 'version-comparison.md'], ['Series JSON', 'version-series.json']]) {
     view = await output(context);
-    await view.getByRole('button', {name, exact: true}).click();
+    await view.getByRole('button', {name, exact: true}).click({timeout:NATIVE_READINESS_MS});
     const file = path.join(context.results, report);
     const exists = await fs.access(file).then(() => true, () => false);
     if (exists) await eventually(() => context.vscode.window.tabGroups.all.some(group => group.tabs.some(tab =>
       tab.input?.uri?.fsPath === context.vscode.Uri.file(file).fsPath || (report.endsWith('.md') && tab.label.includes(report)))), `Open actual ${report}`);
-    else await eventually(async () => (await context.windowPage.locator('body').innerText()).includes(`PerfChecker has not produced ${report} yet.`), `Missing ${report} explains its prerequisite`);
+    else await eventually(async () => (await context.windowPage.locator('body').innerText({timeout:NATIVE_READINESS_MS})).includes(`PerfChecker has not produced ${report} yet.`), `Missing ${report} explains its prerequisite`);
     context.log(`result-report-${name}`, {exists, openedOrExplained: true});
   }
 }
@@ -867,26 +868,26 @@ async function testComputedAggregations(context){
       const reports=path.join(context.workspace,'perf','results','aggregations',aggregation);
       await settings().update('reports',reports,context.vscode.ConfigurationTarget.WorkspaceFolder);
       let view=await designer(context);
-      await view.locator('#comparison-package').selectOption('Example');
-      await view.locator('#comparison-feature').selectOption('hello');
-      for(const input of await view.locator('#baseline-targets input,#candidate-targets input').all())await input.uncheck();
-      for(const version of baselines)await view.locator(`#baseline-targets input[value="${version}"]`).check();
-      await view.locator(`#candidate-targets input[value="${candidate}"]`).check();
-      await view.locator('#comparison-aggregation').selectOption(aggregation);
-      await view.locator('#add-comparison').click();
+      await view.locator('#comparison-package').selectOption('Example',{timeout:NATIVE_READINESS_MS});
+      await view.locator('#comparison-feature').selectOption('hello',{timeout:NATIVE_READINESS_MS});
+      for(const input of await view.locator('#baseline-targets input,#candidate-targets input').all())await input.uncheck({timeout:NATIVE_READINESS_MS});
+      for(const version of baselines)await view.locator(`#baseline-targets input[value="${version}"]`).check({timeout:NATIVE_READINESS_MS});
+      await view.locator(`#candidate-targets input[value="${candidate}"]`).check({timeout:NATIVE_READINESS_MS});
+      await view.locator('#comparison-aggregation').selectOption(aggregation,{timeout:NATIVE_READINESS_MS});
+      await view.locator('#add-comparison').click({timeout:NATIVE_READINESS_MS});
       await eventually(()=>settings().get('comparisonPolicies',[]).length===1,`The native ${aggregation} comparison policy is persisted`);
-      await eventually(async()=>!(await view.locator('#run').isDisabled()),'The policy replan finishes',120000);
-      await view.locator('#reset-filters').click();await view.locator('#clear-all').click();
-      await view.locator('#package').selectOption('Example');await view.locator('#select-visible').click();
+      await eventually(async()=>!(await view.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS})),'The policy replan finishes',NATIVE_READINESS_MS);
+      await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});await view.locator('#clear-all').click({timeout:NATIVE_READINESS_MS});
+      await view.locator('#package').selectOption('Example',{timeout:NATIVE_READINESS_MS});await view.locator('#select-visible').click({timeout:NATIVE_READINESS_MS});
       assert.equal(await selectionCount(view),4,'Three registered references and a registered candidate are really measured');
-      await view.locator('#open-after-run').uncheck();context.log('native-ui-action',{surface:'Suite designer',action:'Run comparison',aggregation});await view.locator('#run').click();
+      await view.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});context.log('native-ui-action',{surface:'Suite designer',action:'Run comparison',aggregation});await view.locator('#run').click({timeout:NATIVE_READINESS_MS});
       const comparison=await eventually(async()=>{
         const suite=JSON.parse(await fs.readFile(path.join(reports,'suite-result.json'),'utf8'));
         if(suite.runs.length!==4)return false;
         assert(suite.runs.every(run=>run.status==='pass'&&run.qualification.correctness.status==='passed'));
         return JSON.parse(await fs.readFile(path.join(reports,'version-comparison.json'),'utf8'));
-      },`Actual benchmark reports complete for ${aggregation}`,360000);
-      await eventually(async()=>!(await view.locator('#run').isDisabled()),'The measured comparison returns to idle');
+      },`Actual benchmark reports complete for ${aggregation}`,NATIVE_READINESS_MS);
+      await eventually(async()=>!(await view.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS})),'The measured comparison returns to idle');
       const records=comparison.records.filter(record=>record.package==='Example'&&record.candidate_version===candidate);
       assert(records.length>0,'The measured policy produces comparisons, rather than merely saving an option');
       for(const record of records){
@@ -907,7 +908,7 @@ async function testComputedAggregations(context){
     if(saved)await fs.writeFile(configFile,saved);else await fs.rm(configFile,{force:true});
     await settings().update('reports',previous.reports,context.vscode.ConfigurationTarget.WorkspaceFolder);
     await settings().update('comparisonPolicies',previous.policies,context.vscode.ConfigurationTarget.WorkspaceFolder);
-    await context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
+    await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri),"perfchecker.openDesignerForWorkspace");
   }
 }
 
@@ -915,37 +916,37 @@ async function testAdvisorAndTools(context) {
   await clickStudioAction(context, 'advisor');
   let view = await frame(context, '#advisor-root');
   for (const mode of ['none', 'ollama', 'chat_completions', 'chat_completions_schema', 'mcp_http']) {
-    await view.locator('#advisor-protocol').selectOption(mode);
-    assert.equal(await view.getByRole('button', {name: 'Test connection / discover', exact: true}).isDisabled(), mode === 'none');
+    await view.locator('#advisor-protocol').selectOption(mode,{timeout:NATIVE_READINESS_MS});
+    assert.equal(await view.getByRole('button', {name: 'Test connection / discover', exact: true}).isDisabled({timeout:NATIVE_READINESS_MS}), mode === 'none');
     assert.equal(await view.locator('#advisor-mcp_tool').isVisible(), mode === 'mcp_http');
     assert.equal(await view.locator('#advisor-download-model').isVisible(), mode === 'ollama');
   }
-  await view.locator('#advisor-mcp_arguments').fill('{ invalid JSON');
-  await view.getByRole('button', {name: 'Save configuration', exact: true}).click();
-  assert.match(await view.locator('[role="status"]').innerText(), /JSON|property|Unexpected/i);
-  await view.locator('#advisor-mcp_arguments').fill('{}');
-  await view.locator('#advisor-investigates').check();
+  await view.locator('#advisor-mcp_arguments').fill('{ invalid JSON',{timeout:NATIVE_READINESS_MS});
+  await view.getByRole('button', {name: 'Save configuration', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.match(await view.locator('[role="status"]').innerText({timeout:NATIVE_READINESS_MS}), /JSON|property|Unexpected/i);
+  await view.locator('#advisor-mcp_arguments').fill('{}',{timeout:NATIVE_READINESS_MS});
+  await view.locator('#advisor-investigates').check({timeout:NATIVE_READINESS_MS});
   assert(await view.locator('#advisor-max_experiments').isVisible());
-  await view.getByRole('button', {name: 'Save configuration', exact: true}).click();
-  assert.match(await view.locator('[role="status"]').innerText(), /structured response/);
-  await view.locator('#advisor-investigates').uncheck();
-  assert(await view.getByRole('button', {name: 'Cancel operation', exact: true}).isDisabled());
+  await view.getByRole('button', {name: 'Save configuration', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.match(await view.locator('[role="status"]').innerText({timeout:NATIVE_READINESS_MS}), /structured response/);
+  await view.locator('#advisor-investigates').uncheck({timeout:NATIVE_READINESS_MS});
+  assert(await view.getByRole('button', {name: 'Cancel operation', exact: true}).isDisabled({timeout:NATIVE_READINESS_MS}));
   context.proof('provider-controls', {modes: 5, malformedArgumentsRejected: true, textInvestigationRejected: true, noNetworkRequest: true});
 
   await clickStudioAction(context, 'tools');
   view = await frame(context, '#app');
-  await view.getByRole('button', {name: 'Findings & advice', exact: true}).click();
-  await view.getByRole('heading', {name: 'Tool catalogue', exact: true}).waitFor({timeout: 120000});
+  await view.getByRole('button', {name: 'Findings & advice', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await view.getByRole('heading', {name: 'Tool catalogue', exact: true}).waitFor({timeout: NATIVE_READINESS_MS});
   const search = view.getByRole('searchbox', {name: 'Search tool catalogue'});
-  await search.fill('nonexistent-native-catalogue-tool');
+  await search.fill('nonexistent-native-catalogue-tool',{timeout:NATIVE_READINESS_MS});
   const catalogueContainer = search.locator('..');
   assert.equal(await catalogueContainer.locator('article.card').count(), 0);
-  await search.fill(''); assert((await catalogueContainer.locator('article.card').count()) > 0);
+  await search.fill('',{timeout:NATIVE_READINESS_MS}); assert((await catalogueContainer.locator('article.card').count()) > 0);
   for (const tab of ['Scenarios', 'Findings & advice', 'Before / after', 'Saved evidence']) {
-    await view.getByRole('button', {name: tab, exact: true}).click();
-    assert.equal(await view.getByRole('button', {name: tab, exact: true}).getAttribute('aria-current'), 'page');
+    await view.getByRole('button', {name: tab, exact: true}).click({timeout:NATIVE_READINESS_MS});
+    assert.equal(await view.getByRole('button', {name: tab, exact: true}).getAttribute('aria-current',{timeout:NATIVE_READINESS_MS}), 'page');
   }
-  await view.getByRole('button', {name: 'Worker log', exact: true}).click();
+  await view.getByRole('button', {name: 'Worker log', exact: true}).click({timeout:NATIVE_READINESS_MS});
   context.proof('native-tool-catalogue', {backend: context.core, filter: true, investigationTabs: 4, workerLog: true});
 }
 
@@ -954,8 +955,8 @@ async function testSavePalette(context) {
   const {destination} = await savedConfiguration(context, view);
   assert((await fs.stat(destination)).size > 0, 'Editor Save works before testing the independent palette command');
   const title = `Unsaved palette qualification ${Date.now()}`;
-  await view.locator('#doc-title').fill(title);
-  await view.locator('#cards .card .check-option input').first().uncheck();
+  await view.locator('#doc-title').fill(title,{timeout:NATIVE_READINESS_MS});
+  await view.locator('#cards .card .check-option input').first().uncheck({timeout:NATIVE_READINESS_MS});
   const count = await selectionCount(view);
   await view.locator('#cards .card .label').first().evaluate(input => {
     input.value = '#a12655'; input.dispatchEvent(new Event('input', {bubbles: true}));
@@ -978,18 +979,18 @@ async function testLargePlanAndOrdering(context) {
   try{
     await fs.rm(configFile,{force:true});
     await settings().update('suite','perf/large-suite.jl',context.vscode.ConfigurationTarget.WorkspaceFolder);
-    await context.vscode.commands.executeCommand('perfchecker.refresh');
-    await context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
+    await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.refresh'),"perfchecker.refresh");
+    await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri),"perfchecker.openDesignerForWorkspace");
     let view=await frame(context,'#cards');
-    await eventually(async()=>/Showing 120 of 125 workload groups/.test(await view.locator('#rendered-count').innerText()),'The real large plan paginates 125 workload groups',120000);
+    await eventually(async()=>/Showing 120 of 125 workload groups/.test(await view.locator('#rendered-count').innerText({timeout:NATIVE_READINESS_MS})),'The real large plan paginates 125 workload groups',NATIVE_READINESS_MS);
     assert.equal(await view.locator('#cards .card').count(),120);
-    await view.locator('#reset-filters').click();
-    await view.locator('#select-visible').click();
+    await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});
+    await view.locator('#select-visible').click({timeout:NATIVE_READINESS_MS});
     assert.equal(await selectionCount(view),125,'Bulk selection includes the five groups not rendered yet');
-    await view.locator('#show-more').click();
+    await view.locator('#show-more').click({timeout:NATIVE_READINESS_MS});
     assert.equal(await view.locator('#cards .card').count(),125);
     assert(!await view.locator('#show-more').isVisible());
-    await view.locator('#sort').selectOption('suite');
+    await view.locator('#sort').selectOption('suite',{timeout:NATIVE_READINESS_MS});
     const before=await savedConfiguration(context,view);
     const first=before.config.selection.run_ids[0];
     // Start on the workload title rather than a checkbox/color input in the card's
@@ -1029,9 +1030,9 @@ async function testLargePlanAndOrdering(context) {
     assert(events.some(event=>event.type==='dragstart')&&events.some(event=>event.type==='drop'),'The real webview receives native dragstart and drop before checking order');
     assert.notEqual(after.config.selection.run_ids[0],first,'Native drag changes the persisted execution order');
     assert.deepEqual(new Set(after.config.selection.run_ids),new Set(before.config.selection.run_ids));
-    await view.locator('#search').fill('workload_125');
+    await view.locator('#search').fill('workload_125',{timeout:NATIVE_READINESS_MS});
     await eventually(async()=>await view.locator('#cards .card').count()===1,'The debounced workload search has rendered the one matching group');
-    await view.locator('#clear-visible').click();
+    await view.locator('#clear-visible').click({timeout:NATIVE_READINESS_MS});
     await eventually(async()=>await selectionCount(view)===124,'Clearing the one filtered group preserves all124hidden selections');
     context.proof('large-plan-pagination-and-drag',{groups:125,initiallyRendered:120,bulkIncludesHidden:true,nativeDrag:true,executionsRequested:0});
   }catch(error){
@@ -1043,10 +1044,10 @@ async function testLargePlanAndOrdering(context) {
   }finally{
     if(saved)await fs.writeFile(configFile,saved);else await fs.rm(configFile,{force:true});
     await settings().update('suite',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);
-    await context.vscode.commands.executeCommand('perfchecker.refresh');
-    await context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
+    await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.refresh'),"perfchecker.refresh");
+    await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri),"perfchecker.openDesignerForWorkspace");
     const view=await frame(context,'#cards');
-    await eventually(async()=>!(await view.locator('#show-more').isVisible())&&!/workload_125/.test(await view.locator('#cards').innerText()),'Restore the real measurement suite after plan-only pagination',120000);
+    await eventually(async()=>!(await view.locator('#show-more').isVisible())&&!/workload_125/.test(await view.locator('#cards').innerText({timeout:30000})),'Restore the real measurement suite after plan-only pagination',NATIVE_READINESS_MS);
   }
 }
 
@@ -1076,7 +1077,7 @@ exports.runColour = async context => {
   const planFile=path.join(process.env.PERFCHECKER_NATIVE_PROFILE,'User','globalStorage',
     'mirage-interactive-fr.perfchecker-vscode','suite-plan.json');
   const planBytes=await fs.readFile(planFile),plan=JSON.parse(planBytes);
-  const group=view.locator('#cards .card').first(),leader=await group.getAttribute('data-id');
+  const group=view.locator('#cards .card').first(),leader=await group.getAttribute('data-id',{timeout:NATIVE_READINESS_MS});
   const first=plan.runs.find(run=>run.id===leader);assert(first,'The visible group belongs to the real controller plan');
   const ids=plan.runs.filter(run=>run.package===first.package&&run.workload===first.workload&&run.version===first.version).map(run=>run.id);
   assert(ids.length>1,'The picker labels a real group of multiple checks');
@@ -1087,11 +1088,11 @@ exports.runColour = async context => {
     cards:[...document.querySelectorAll('#cards .card')].map(card=>card.dataset.id),checkTypes:document.querySelectorAll('#check-types label').length}));
   const captureGroup=async name=>{
     await context.vscode.commands.executeCommand('workbench.action.closePanel');
-    await view.locator(`#cards .card[data-id="${leader}"]`).scrollIntoViewIfNeeded();
+    await view.locator(`#cards .card[data-id="${leader}"]`).scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
     await capture(context,name);
   };
   await context.vscode.commands.executeCommand('workbench.action.closePanel');
-  await group.locator('input.label').scrollIntoViewIfNeeded();
+  await group.locator('input.label').scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
   const previous=await eventually(async()=>{
     const cards=await colours();assert(cards.length>0,'The real plan has visible groups');
     for(const card of cards){
@@ -1104,11 +1105,11 @@ exports.runColour = async context => {
   context.log('native-colour-initial-borders',{cards:previous});
   const windowIds=new Set((await windows()).map(window=>window.id));
   context.log('native-ui-action',{surface:'Suite designer',action:'Open real colour picker'});
-  await group.locator('input.label').click();
+  await group.locator('input.label').click({timeout:NATIVE_READINESS_MS});
   const popup=await eventually(async()=>{
     const opened=(await windows()).filter(window=>!windowIds.has(window.id)&&window.width>=220&&window.width<=260&&window.height>=240&&window.height<=280);
     return opened.length===1&&opened[0];
-  },'The trusted colour click creates its actual X11 picker popup',10000);
+  },'The trusted colour click creates its actual X11 picker popup',NATIVE_READINESS_MS);
   const output=process.env.PERFCHECKER_NATIVE_OUTPUT,temporary=path.join(output,'native-colour-popup.xwd');
   const image=path.join(output,`native-${process.platform}-vscode-${context.vscode.version}-colour-picker.png`);
   let painted;
@@ -1117,7 +1118,7 @@ exports.runColour = async context => {
       await execute('convert',[temporary,image],{timeout:10000});
       painted=Number((await execute('identify',['-format','%k',image],{timeout:10000})).stdout.trim());
       return painted>20;
-    },'The actual OS picker is painted before its review capture',10000);}
+    },'The actual OS picker is painted before its review capture',NATIVE_READINESS_MS);}
   finally{await fs.rm(temporary,{force:true});}
   context.log('native-colour-picker-before-input',{popup,paintedColors:painted,file:path.basename(image),
     sha256:createHash('sha256').update(await fs.readFile(image)).digest('hex')});
@@ -1131,7 +1132,7 @@ exports.runColour = async context => {
     await native(['type','--clearmodifiers',value]);
   }
   await native(['key','--clearmodifiers','Return']);
-  await eventually(async()=>!(await windows()).some(window=>window.id===popup.id),'Return dismisses the real colour picker',10000);
+  await eventually(async()=>!(await windows()).some(window=>window.id===popup.id),'Return dismisses the real colour picker',NATIVE_READINESS_MS);
   const verify=async()=>{
     const current=await colours(),changed=current.find(card=>card.id===leader);
     assert.equal(changed.colour,'#1266aa');assert.equal(changed.border,'rgb(18, 102, 170)');
@@ -1174,18 +1175,18 @@ exports.runColour = async context => {
 exports.runSelection = async context => {
   assertDisposable(context);
   let view = await designer(context);
-  await view.locator('#results').click();
+  await view.locator('#results').click({timeout:NATIVE_READINESS_MS});
   const empty = await frame(context, 'button[data-report="suite-result.json"]');
-  assert.match(await empty.locator('.empty').innerText(), /No persisted output yet/);
+  assert.match(await empty.locator('.empty').innerText({timeout:NATIVE_READINESS_MS}), /No persisted output yet/);
   context.log('empty-result-controls', {native: true, noFabricatedEvidence: true});
   view = await designer(context);
-  await view.locator('#reset-filters').click();
-  await view.locator('#clear-all').click();
+  await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});
+  await view.locator('#clear-all').click({timeout:NATIVE_READINESS_MS});
   const ready = view.locator('.check-option.ready').filter({hasText: 'BenchmarkTools'}).first();
   assert.equal(await ready.count(), 1, 'A real runnable benchmark is in the fixture');
-  await ready.locator('input').check();
+  await ready.locator('input').check({timeout:NATIVE_READINESS_MS});
   assert.equal(await selectionCount(view), 1, 'The Run button receives exactly one selected run');
-  await view.locator('#open-after-run').uncheck();
+  await view.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});
   const settings = context.vscode.workspace.getConfiguration('perfchecker', context.vscode.Uri.file(context.workspace));
   const reports = path.resolve(context.workspace, settings.get('reports', 'perf/results/vscode'));
   const reportPath = path.join(reports, 'suite-result.json');
@@ -1202,7 +1203,7 @@ exports.runSelection = async context => {
   const idleState=await state(),beforeLaunches=await controllerLaunches();
   const launchCount=entries=>entries.reduce((sum,item)=>sum+item.commands.length,0);
   context.log('native-ui-action',{surface:'Suite designer',action:'Run selected check'});
-  await view.locator('#run').click();
+  await view.locator('#run').click({timeout:NATIVE_READINESS_MS});
   const freshReport=async()=>{
     try{const text=await fs.readFile(reportPath,'utf8');if(text===old)return false;const value=JSON.parse(text);
       return value.schema_version==='perfchecker-suite-result/1'&&value.runs.length===1&&value.runs[0].status==='pass'&&value;
@@ -1212,7 +1213,7 @@ exports.runSelection = async context => {
     const worker=await nativeSuiteWorker(context),snapshot=await state();
     if(worker&&Object.values(snapshot.controls).every(Boolean))return {worker,snapshot};
     if(await freshReport())return {finished:true};return false;
-  },'The existing selected suite has an owned active controller and busy controls, or completes with fresh real evidence',30000);
+  },'The existing selected suite has an owned active controller and busy controls, or completes with fresh real evidence',NATIVE_READINESS_MS);
   const runningLaunches=await eventually(async()=>{
     const value=await controllerLaunches();return launchCount(value)===launchCount(beforeLaunches)+1&&value;
   },'The real output log witnesses exactly the intended suite launch');
@@ -1252,9 +1253,9 @@ exports.runSelection = async context => {
     const value = JSON.parse(text);
     if (value.schema_version !== 'perfchecker-suite-result/1' || value.runs.length !== 1) return false;
     return value;
-  }, 'The native Run button completes the registered Julia backend and writes current evidence', 240000);
+  }, 'The native Run button completes the registered Julia backend and writes current evidence', NATIVE_READINESS_MS);
   assert.equal(report.runs[0].status, 'pass', 'Actual correctness-checked benchmark succeeds');
-  await eventually(async () => !(await view.locator('#run').isDisabled()), 'Run control returns to idle');
+  await eventually(async () => !(await view.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS})), 'Run control returns to idle');
   assert.deepEqual(await state(),idleState,'The same reloaded run finishes with the original exact idle controls and inventory');
   assert.deepEqual(await controllerLaunches(),runningLaunches,'No additional controller launches occur through completion of the same selected run');
   assert.deepEqual(await fs.readFile(planFile),planBytes,'Active reload preserves the exact canonical real plan');
@@ -1262,7 +1263,7 @@ exports.runSelection = async context => {
   context.proof('native-designer-active-reload-completed',{workerPid:active.worker?.pid,sameRunCompleted:true,activeBusyHydrationQualified,
     planSha256:createHash('sha256').update(planBytes).digest('hex'),planUnchanged:true,idleControlsRestored:true,
     inventorySelectionOrderPreserved:true,additionalControllerLaunches:0});
-  await view.locator('#results').click();
+  await view.locator('#results').click({timeout:NATIVE_READINESS_MS});
   const result = await frame(context, 'button[data-report="suite-result.json"]');
   assert.equal(await result.locator('.empty').count(), 0);
   assert((await result.locator('[data-result-item]').count()) > 0);
@@ -1277,8 +1278,8 @@ exports.run = async context => {
   assert.equal(await view.locator('.lab button').count(), 5);
   assert(await view.locator('.hero img').evaluate(image => image.complete && image.naturalWidth > 0));
   const environment=view.locator('details.environment');
-  if(await environment.getAttribute('open')===null)await environment.locator('summary').click();
-  await eventually(async()=>(await environment.locator('p').innerText()).includes(context.controller),'Studio displays the selected controller after its state arrives');
+  if(await environment.getAttribute('open',{timeout:NATIVE_READINESS_MS})===null)await environment.locator('summary').click({timeout:NATIVE_READINESS_MS});
+  await eventually(async()=>(await environment.locator('p').innerText({timeout:NATIVE_READINESS_MS})).includes(context.controller),'Studio displays the selected controller after its state arrives');
   context.proof('studio-inventory', {cards: 9, workbenchButtons: 5, controllerShown: true});
   const failures = [];
   for (const [name, run] of [['suite-selection', testSuiteSelection], ['git-and-comparisons', testGitTargetsAndComparisons],['git-cancel-discovery',testCancelGitDiscovery],
@@ -1300,20 +1301,20 @@ exports.runFresh = async context => {
   assertDisposable(context);
   const view = await studio(context);
   assert.equal(await view.locator('.card').count(), 9);
-  assert.match(await view.locator('.status').innerText(), /Install the Julia extension/);
+  assert.match(await view.locator('.status').innerText({timeout:NATIVE_READINESS_MS}), /Install the Julia extension/);
   await clickStudioAction(context, 'suite');
   const missingSetup = /suite file not found.*perfchecker\.suite|controller Project\.toml not found.*perfchecker\.runnerProject/i;
-  await eventually(async () => missingSetup.test(await (await frame(context, '#studio-root')).locator('.status').innerText()) ||
-    missingSetup.test(await context.windowPage.locator('body').innerText()),
+  await eventually(async () => missingSetup.test(await (await frame(context, '#studio-root')).locator('.status').innerText({timeout:NATIVE_READINESS_MS})) ||
+    missingSetup.test(await context.windowPage.locator('body').innerText({timeout:NATIVE_READINESS_MS})),
     'Fresh install explains the missing controller or suite file');
   await clickStudioAction(context, 'results');
-  await eventually(async () => missingSetup.test(await (await frame(context, '#studio-root')).locator('.status').innerText()) ||
-    missingSetup.test(await context.windowPage.locator('body').innerText()),
+  await eventually(async () => missingSetup.test(await (await frame(context, '#studio-root')).locator('.status').innerText({timeout:NATIVE_READINESS_MS})) ||
+    missingSetup.test(await context.windowPage.locator('body').innerText({timeout:NATIVE_READINESS_MS})),
     'Fresh results explain the missing controller or suite file');
   await clickStudioAction(context, 'advisor');
   const advisor = await frame(context, '#advisor-root');
   assert(await advisor.locator('#advisor-protocol').isVisible());
-  await advisor.locator('#advisor-protocol').selectOption('none');
-  assert(await advisor.getByRole('button', {name: 'Test connection / discover', exact: true}).isDisabled());
+  await advisor.locator('#advisor-protocol').selectOption('none',{timeout:NATIVE_READINESS_MS});
+  assert(await advisor.getByRole('button', {name: 'Test connection / discover', exact: true}).isDisabled({timeout:NATIVE_READINESS_MS}));
   context.proof('fresh-studio-and-advisor', {visibleControls: 14, exercisedActions:['suite','results','advisor'], missingSuiteExplained: true, noJuliaExplained: true, ruleBasedAvailable: true});
 };

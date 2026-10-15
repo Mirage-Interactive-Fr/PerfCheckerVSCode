@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS}=require('./native-readiness.cjs');
 // Disposable Linux default-browser fixture. env.openExternal is never mocked:
 // Electron launches xdg-open, which invokes this fixture's temporary handler.
 const fs=require('node:fs/promises');
@@ -32,12 +33,12 @@ exports.create=async(directory,{chromium,executablePath}={})=>{
       assert(url.searchParams.get('secret'));
       if(origin){assert.equal(url.origin,origin);assert.equal(url.searchParams.get('secret'),secret);}
       else{origin=url.origin;secret=url.searchParams.get('secret');}
-      browser||=await chromium.launch({...(executablePath?{executablePath}:{}),headless:true,args:['--no-sandbox']});
+      browser||=await chromium.launch({...(executablePath?{executablePath}:{}),headless:true,timeout:NATIVE_READINESS_MS,args:['--no-sandbox']});
       const page=await browser.newPage();
       const route=url.pathname;let proof;
       if(route==='/notebookexport'){
-        const downloadPromise=page.waitForEvent('download');
-        await page.goto(url.href).catch(error=>{if(!/ERR_ABORTED|Download is starting/i.test(error.message))throw error;});
+        const downloadPromise=page.waitForEvent('download',{timeout:NATIVE_READINESS_MS});
+        await page.goto(url.href,{timeout:NATIVE_READINESS_MS}).catch(error=>{if(!/ERR_ABORTED|Download is starting/i.test(error.message))throw error;});
         const download=await downloadPromise,stream=await download.createReadStream(),chunks=[];
         for await(const chunk of stream)chunks.push(chunk);
         const bytes=Buffer.concat(chunks),html=bytes.toString();
@@ -49,14 +50,14 @@ exports.create=async(directory,{chromium,executablePath}={})=>{
         assert(!html.includes(secret)&&!source.includes(secret),'Exports never contain the session credential');
         proof={route,kind:'html-download',bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),embeddedJulia:true,editedExpression:true,credentialAbsent:true};
       }else if(route==='/notebookfile'){
-        const result=await page.goto(url.href);assert.equal(result.status(),200);
-        const source=await page.locator('body').innerText();
+        const result=await page.goto(url.href,{timeout:NATIVE_READINESS_MS});assert.equal(result.status(),200);
+        const source=await page.locator('body').innerText({timeout:NATIVE_READINESS_MS});
         assert(source.startsWith('### A Pluto.jl notebook ###'));assert.match(source,/4 \+ 5/);assert(!source.includes(secret));
         proof={route,kind:'julia-source-browser',bytes:Buffer.byteLength(source),sha256:createHash('sha256').update(source).digest('hex'),editedExpression:true,credentialAbsent:true};
       }else{
         let authenticatedWebSocket=false;
         page.on('websocket',socket=>{const ws=new URL(socket.url());if(ws.host===url.host&&ws.searchParams.get('secret')===secret)authenticatedWebSocket=true;});
-        await page.goto(url.href);await page.locator('pluto-notebook').waitFor({timeout:90000});
+        await page.goto(url.href,{timeout:NATIVE_READINESS_MS});await page.locator('pluto-notebook').waitFor({timeout:NATIVE_READINESS_MS});
         const final=new URL(page.url());assert.equal(final.origin,origin);assert.equal(final.pathname,'/edit');assert.equal(final.searchParams.get('secret'),secret);
         assert(authenticatedWebSocket,'The actual new browser notebook connects its authenticated WebSocket');
         proof={route,kind:'new-context-editor',authenticatedWebSocket:true,notebookId:final.searchParams.get('id')};

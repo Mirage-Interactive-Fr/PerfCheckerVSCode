@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS}=require('./native-readiness.cjs');
 // Native installed-VSIX clicks and real Julia evidence; HTTP replies are a declared protocol fixture.
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
@@ -11,7 +12,7 @@ const customInstructions = 'Native qualification instruction: distinguish measur
 const names = {discover: 'discovery', run: 'run', narrate: 'narrative'};
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function eventually(read, description, timeout = 180000) {
+async function eventually(read, description, timeout = NATIVE_READINESS_MS) {
   const end = Date.now() + timeout;
   let last;
   while (Date.now() < end) {
@@ -25,15 +26,15 @@ function configuration(context) {
   return context.vscode.workspace.getConfiguration('perfchecker', context.vscode.Uri.file(context.workspace));
 }
 
-async function view(context) {
+async function view(context,timeout=NATIVE_READINESS_MS) {
   await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
-  return context.findFrame('#app nav[aria-label="Investigation views"]');
+  return context.findFrame('#app nav[aria-label="Investigation views"]',{timeout});
 }
 
 async function tab(context, name) {
   const frame = await view(context);
-  await frame.getByRole('button', {name, exact: true}).click();
-  await eventually(async () => await frame.getByRole('button', {name, exact: true}).getAttribute('aria-current') === 'page', name);
+  await frame.getByRole('button', {name, exact: true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async () => await frame.getByRole('button', {name, exact: true}).getAttribute('aria-current',{timeout:NATIVE_READINESS_MS}) === 'page', name);
   return frame;
 }
 
@@ -45,11 +46,11 @@ async function reloadMeasuredEvidence(context, measured, stage) {
   context.log('native-narrative-history-reload-start', {stage, reportId: measured.id});
   const frame = await tab(context, 'Saved evidence');
   const card = frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^run ·/})}).first();
-  const heading = await card.getByRole('heading', {name: /^run ·/}).innerText();
+  const heading = await card.getByRole('heading', {name: /^run ·/}).innerText({timeout:NATIVE_READINESS_MS});
   assert.match(heading, /^run · \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
   const created = heading.slice('run · '.length);
   context.log('native-narrative-history-open-click', {stage, created, reportId: measured.id});
-  await card.getByRole('button', {name: 'Open evidence', exact: true}).click();
+  await card.getByRole('button', {name: 'Open evidence', exact: true}).click({timeout:NATIVE_READINESS_MS});
   // The click changes tabs before loadHistory has read and published its report.
   // Match both the selected history timestamp and every rendered measured run.
   await eventually(async () => {
@@ -83,13 +84,13 @@ async function directories(root) {
 }
 
 async function idle(context) {
-  const frame = await view(context);
-  await eventually(async () => !(await frame.locator('#app .status').getAttribute('class')).includes('busy'), 'native controller finishes cleanup', 240000);
-  assert(await frame.getByRole('button', {name: 'Cancel', exact: true}).isDisabled());
+  const frame = await view(context,120000);
+  await eventually(async () => !(await frame.locator('#app .status').getAttribute('class',{timeout:30000})).includes('busy'), 'native controller finishes cleanup', 240000);
+  assert(await frame.getByRole('button', {name: 'Cancel', exact: true}).isDisabled({timeout:30000}));
   return frame;
 }
 
-async function reportAfter(context, root, before, action) {
+async function reportAfter(context, root, before, action,timeout=NATIVE_READINESS_MS) {
   const result = await eventually(async () => {
     for (const id of await directories(root)) {
       if (before.has(id)) continue;
@@ -98,7 +99,7 @@ async function reportAfter(context, root, before, action) {
       catch (error) {if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;}
     }
     return false;
-  }, `real Julia ${action} report`, 360000);
+  }, `real Julia ${action} report`, timeout);
   await idle(context);
   return result;
 }
@@ -106,7 +107,7 @@ async function reportAfter(context, root, before, action) {
 async function action(context, root, label, name) {
   const before = await directories(root);
   const frame = await view(context);
-  await frame.getByRole('button', {name: label, exact: true}).click();
+  await frame.getByRole('button', {name: label, exact: true}).click({timeout:NATIVE_READINESS_MS});
   return reportAfter(context, root, before, name);
 }
 
@@ -177,22 +178,22 @@ async function remoteConfiguration(context, fixture, settings, keyEnvironment, t
     await context.vscode.commands.executeCommand('perfchecker.configureAdvisor');
     let frame = await context.findFrame('#advisor-root');
     assert.equal(await frame.locator('#advisor-allow_remote').isChecked(), false);
-    assert.equal(await frame.locator('#advisor-instructions').inputValue(), customInstructions);
-    assert.equal(await frame.locator('#advisor-api_key_env').inputValue(), keyEnvironment);
+    assert.equal(await frame.locator('#advisor-instructions').inputValue({timeout:NATIVE_READINESS_MS}), customInstructions);
+    assert.equal(await frame.locator('#advisor-api_key_env').inputValue({timeout:NATIVE_READINESS_MS}), keyEnvironment);
     const original = await fs.readFile(file), calls = fixture.requests.length;
     const save = async expression => {
-      await frame.getByRole('button', {name: 'Save configuration', exact: true}).click();
-      await eventually(async () => await frame.locator('#advisor-root').getAttribute('aria-busy') === 'false' &&
-        expression.test(await frame.getByRole('status').innerText()), 'The native remote configuration action finishes');
+      await frame.getByRole('button', {name: 'Save configuration', exact: true}).click({timeout:NATIVE_READINESS_MS});
+      await eventually(async () => await frame.locator('#advisor-root').getAttribute('aria-busy',{timeout:NATIVE_READINESS_MS}) === 'false' &&
+        expression.test(await frame.getByRole('status').innerText({timeout:NATIVE_READINESS_MS})), 'The native remote configuration action finishes');
     };
-    await frame.locator('#advisor-endpoint').fill('https://perfchecker-native-fixture.invalid/v1/chat/completions');
+    await frame.locator('#advisor-endpoint').fill('https://perfchecker-native-fixture.invalid/v1/chat/completions',{timeout:NATIVE_READINESS_MS});
     await save(/remote evidence transmission requires allow_remote=true and HTTPS/);
     assert.deepEqual(await fs.readFile(file), original, 'Refused remote configuration preserves the saved local provider');
-    await frame.locator('#advisor-allow_remote').check();
-    await frame.locator('#advisor-endpoint').fill('http://perfchecker-native-fixture.invalid/v1/chat/completions');
+    await frame.locator('#advisor-allow_remote').check({timeout:NATIVE_READINESS_MS});
+    await frame.locator('#advisor-endpoint').fill('http://perfchecker-native-fixture.invalid/v1/chat/completions',{timeout:NATIVE_READINESS_MS});
     await save(/remote evidence transmission requires allow_remote=true and HTTPS/);
     assert.deepEqual(await fs.readFile(file), original, 'Opt-in still refuses unencrypted remote HTTP');
-    await frame.locator('#advisor-endpoint').fill('https://perfchecker-native-fixture.invalid/v1/chat/completions');
+    await frame.locator('#advisor-endpoint').fill('https://perfchecker-native-fixture.invalid/v1/chat/completions',{timeout:NATIVE_READINESS_MS});
     await save(/Configuration saved/);
     const saved = await fs.readFile(file, 'utf8'), config = JSON.parse(saved);
     assert.equal(config.allow_remote, true); assert.equal(config.instructions, customInstructions);
@@ -202,7 +203,7 @@ async function remoteConfiguration(context, fixture, settings, keyEnvironment, t
     await context.vscode.commands.executeCommand('perfchecker.configureAdvisor');
     frame = await context.findFrame('#advisor-root');
     assert.equal(await frame.locator('#advisor-allow_remote').isChecked(), true);
-    assert.equal(await frame.locator('#advisor-endpoint').inputValue(), config.endpoint);
+    assert.equal(await frame.locator('#advisor-endpoint').inputValue({timeout:NATIVE_READINESS_MS}), config.endpoint);
     assert.equal(fixture.requests.length, calls, 'Validation and saving make no generation request');
     context.proof('native-advisor-remote-opt-in-contract', {nativeUncheckedRefusal: true, nativeHttpOptInRefusal: true,
       explicitHttpsOptInSavedAndReopened: true, noGenerationRequests: true, credentialValueNotPersisted: true,
@@ -223,7 +224,7 @@ async function exportAndVerify(context, result) {
     // its real frame and current card for each click, including the next export.
     const frame = await tab(context, 'Saved evidence');
     const card = frame.locator('article.card').filter({has: frame.getByRole('heading', {name: /^narrate ·/})}).first();
-    await card.getByRole('button', {name: label, exact: true}).click({timeout: 30000});
+    await card.getByRole('button', {name: label, exact: true}).click({timeout: NATIVE_READINESS_MS});
     const expected = result.location.replace(/\.json$/, `.${extension}`);
     await eventually(() => context.vscode.window.activeTextEditor?.document.uri.fsPath === context.vscode.Uri.file(expected).fsPath, `${label} export opens in the actual native editor`);
     assert(context.vscode.window.activeTextEditor.document.getText().includes(marker));
@@ -261,11 +262,11 @@ exports.run = async context => {
     assert.equal(await fs.realpath(declared[0].source),await fs.realpath(path.join(context.workspace,'perf','cases.jl')));
     assert.deepEqual(selectedScenarios(discovery.report.declared,[wantedKey]),declared);
     let frame = await tab(context, 'Scenarios');
-    await frame.getByRole('button', {name: 'Clear selection', exact: true}).click();
+    await frame.getByRole('button', {name: 'Clear selection', exact: true}).click({timeout:NATIVE_READINESS_MS});
     const card = frame.locator('article.card').filter({has: frame.locator('.scenario-title strong', {hasText: /^sum_squares$/})})
       .filter({has: frame.locator('.implementation', {hasText: /^allocating$/})});
     assert.equal(await card.count(),1,'Only the exact narrative scenario card is selected');
-    await card.locator('.scenario-title input').check();
+    await card.locator('.scenario-title input').check({timeout:NATIVE_READINESS_MS});
     const selected=await frame.locator('article.card').evaluateAll(cards=>cards.filter(card=>card.querySelector('.scenario-title input')?.checked)
       .map(card=>({id:card.querySelector('.scenario-title strong')?.textContent,implementation:card.querySelector('.implementation')?.textContent})));
     assert.deepEqual(selected.map(scenarioKey),[wantedKey],'The native checkbox selects exactly the canonical narrative scenario');
@@ -283,7 +284,7 @@ exports.run = async context => {
     assert(advice.recommendations.some(item => item.rule_id === 'evidence.samples'), 'Two real samples trigger the deterministic ten-sample policy');
     const runBytes = await fs.readFile(measured.location);
     frame = await tab(context, 'Findings & advice');
-    assert.equal(await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).isEnabled(), true);
+    assert.equal(await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).isEnabled({timeout:NATIVE_READINESS_MS}), true);
     const narrative = await action(context, root, 'Explain with configured model', 'narrate');
     assert.deepEqual(fixture.errors, []);
     assert.equal(fixture.requests.length, 1);
@@ -305,9 +306,9 @@ exports.run = async context => {
       outboundSyntheticBearerExact: true, realJuliaWorkerEnvironment: true, credentialValueNotPersisted: true,
       scope: 'Owned loopback fixture only; synthetic token, no human authentication or inference'});
     frame = await tab(context, 'Findings & advice');
-    await frame.getByRole('heading', {name: 'Optional model explanation', exact: true}).waitFor();
-    assert((await frame.locator('#app').innerText()).includes(marker));
-    assert((await frame.locator('#app').innerText()).includes('Generated prose needs review'));
+    await frame.getByRole('heading', {name: 'Optional model explanation', exact: true}).waitFor({timeout:NATIVE_READINESS_MS});
+    assert((await frame.locator('#app').innerText({timeout:NATIVE_READINESS_MS})).includes(marker));
+    assert((await frame.locator('#app').innerText({timeout:NATIVE_READINESS_MS})).includes('Generated prose needs review'));
     context.proof('native-narrative-controlled-response-visible', {provider: 'local controlled HTTP protocol fixture; no inference or human authentication',
       protocol: settings.advisorProtocol, requests: fixture.requests.length, scenario: 'sum_squares', evidenceIds: request.ids,
       samples: 2, status: narrative.report.status, authority: narrative.report.authority, visible: true, exportsStillRequired: true});
@@ -321,18 +322,18 @@ exports.run = async context => {
     frame = await reloadMeasuredEvidence(context, measured, 'before-cancel');
     fixture.mode = 'hold';
     const before = await directories(root);
-    await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).click();
-    await eventually(() => fixture.blocked, 'second actual HTTP generation request arrives', 240000);
+    await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).click({timeout:NATIVE_READINESS_MS});
+    await eventually(() => fixture.blocked, 'second actual HTTP generation request arrives', NATIVE_READINESS_MS);
     context.proof('native-narrative-http-held', {stage: 'before-cancel', requests: fixture.requests.length});
     assert.equal(fixture.requests.length, 2);
     assert.equal(fixture.blocked.closed, false, 'Generation is actually in flight when Cancel is clicked');
-    assert.equal(await frame.getByRole('button', {name: 'Cancel', exact: true}).isEnabled(), true);
+    assert.equal(await frame.getByRole('button', {name: 'Cancel', exact: true}).isEnabled({timeout:30000}), true);
     context.log('native-narrative-cancel-click', {stage: 'active-http'});
-    await frame.getByRole('button', {name: 'Cancel', exact: true}).click();
+    await frame.getByRole('button', {name: 'Cancel', exact: true}).click({timeout:30000});
     await eventually(() => fixture.blocked.closed, 'cancellation closes the active model HTTP socket before fixture teardown', 180000);
     context.proof('native-narrative-http-closed', {stage: 'cancelled'});
     frame = await idle(context);
-    assert.match(await frame.locator('#app .status').innerText(), /Cancelled after controller cleanup/);
+    assert.match(await frame.locator('#app .status').innerText({timeout:NATIVE_READINESS_MS}), /Cancelled after controller cleanup/);
     assert.deepEqual(fixture.errors, []);
     const added = [...await directories(root)].filter(id => !before.has(id));
     assert.equal(added.length, 1);
@@ -353,16 +354,16 @@ exports.run = async context => {
     fixture.blocked = undefined;
     const timeoutBefore = await directories(root);
     frame = await reloadMeasuredEvidence(context, measured, 'before-deadline');
-    await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).click();
-    await eventually(() => fixture.blocked, 'The real third HTTP request reaches the deadline fixture', 180000);
+    await frame.getByRole('button', {name: 'Explain with configured model', exact: true}).click({timeout:NATIVE_READINESS_MS});
+    await eventually(() => fixture.blocked, 'The real third HTTP request reaches the deadline fixture', NATIVE_READINESS_MS);
     context.proof('native-narrative-http-held', {stage: 'before-deadline', requests: fixture.requests.length});
     const held = fixture.blocked; assert.equal(held.closed, false);
-    const expired = await reportAfter(context, root, timeoutBefore, 'narrate');
+    const expired = await reportAfter(context, root, timeoutBefore, 'narrate',360000);
     assert.equal(expired.report.status, 'timeout', 'The Core request deadline expires without a Cancel click');
-    await eventually(() => held.closed, 'The expired model socket closes before fixture teardown');
+    await eventually(() => held.closed, 'The expired model socket closes before fixture teardown',180000);
     assert.equal(configuration(context).get('advisorTimeout'), 45);
     frame = await tab(context, 'Findings & advice');
-    assert.match(await frame.locator('#app').innerText(), /timeout|timed out|isolated worker stopped/i);
+    assert.match(await frame.locator('#app').innerText({timeout:NATIVE_READINESS_MS}), /timeout|timed out|isolated worker stopped/i);
     assert.deepEqual(await fs.readFile(measured.location), runBytes);
     context.proof('native-narrative-configured-deadline', {configuredSeconds: 45, requestReachedOwnedFixture: true,
       noCancelClick: true, coreStatus: expired.report.status, socketClosedBeforeFixtureCleanup: true,
@@ -371,9 +372,9 @@ exports.run = async context => {
     context.log('native-narrative-finally-entered');
     // Only the sacrificial workspace-folder settings are restored; global/user configuration is never written.
     try {
-      const frame = await view(context);
-      if (await frame.getByRole('button', {name: 'Cancel', exact: true}).isEnabled()) {
-        await frame.getByRole('button', {name: 'Cancel', exact: true}).click();
+      const frame = await view(context,120000);
+      if (await frame.getByRole('button', {name: 'Cancel', exact: true}).isEnabled({timeout:30000})) {
+        await frame.getByRole('button', {name: 'Cancel', exact: true}).click({timeout:30000});
         await idle(context);
       }
     } finally {

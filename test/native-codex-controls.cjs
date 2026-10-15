@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS}=require('./native-readiness.cjs');
 // Explicit local opt-in: existing authentication is read-only, no model is called.
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
@@ -66,7 +67,7 @@ exports.run=async context=>{
   assert.equal(process.env.PERFCHECKER_NATIVE_CODEX_NO_MODEL,'1');
   const externalDeadline=Date.parse(process.env.PERFCHECKER_NATIVE_CODEX_DEADLINE);
   assert(Number.isFinite(externalDeadline)&&externalDeadline>Date.now(),'The external native-case deadline must be finite and future');
-  const deadline=Math.min(Date.now()+120000,externalDeadline);
+  const deadline=Math.min(Date.now()+NATIVE_READINESS_MS,externalDeadline);
   assert.equal(await fs.realpath(workspace),path.join(await fs.realpath(session),'workspace'));
   const cli=await fs.realpath(process.env.PERFCHECKER_NATIVE_CODEX_EXECUTABLE);
   assert.equal(cli,'/usr/lib/chatgpt/resources/codex','Only the explicitly reviewed installed native CLI is selected');
@@ -130,13 +131,13 @@ exports.run=async context=>{
     assert.equal(settings().inspect('codexExecutable')[level],cli);
     stage='open-chat';
     await vscode.commands.executeCommand('perfchecker.openChat');const frame=await findFrame('#chat-root');
-    await frame.locator('summary').filter({hasText:'Optional Codex CLI connector'}).click();
+    await frame.locator('summary').filter({hasText:'Optional Codex CLI connector'}).click({timeout:NATIVE_READINESS_MS});
     stage='native-connect-click';
-    await frame.getByRole('button',{name:'Connect Codex CLI',exact:true}).click();
+    await frame.getByRole('button',{name:'Connect Codex CLI',exact:true}).click({timeout:NATIVE_READINESS_MS});
     stage='wait-connected-state';
     await eventually(async()=>{
       if(observerErrors.length)throw observerErrors[0];return (await state()).connected;
-    },'The selected authenticated native CLI connects without a model request',60000,deadline);
+    },'The selected authenticated native CLI connects without a model request',NATIVE_READINESS_MS,deadline);
     connected=true;
     const active=connection();assert.equal(active.kind,'codex');
     assert.match(active.label,/^codex-cli 0\.162\.0-alpha\.17\.2/);
@@ -156,7 +157,7 @@ exports.run=async context=>{
       preflightKindsObserved:[...new Set([...records.values()].map(value=>value.kind))],preflightIdentities:[...records.values()],
       observedPreflightsAbsentBeforeTeardown:true,unobservedPreflightCountNotClaimed:true,savedProviderBytesPreserved:true,modelRequestsSent:0,implementationRequestsSent:0});
     stage='native-disconnect-click';
-    await frame.getByRole('button',{name:'Disconnect Codex',exact:true}).click();
+    await frame.getByRole('button',{name:'Disconnect Codex',exact:true}).click({timeout:30000});
     stage='wait-disconnected-state';
     await eventually(async()=>!(await state()).connected,'Actual Disconnect clears the authenticated temporary connection',10000,deadline);
     connected=false;assert.equal(connection(),undefined);
