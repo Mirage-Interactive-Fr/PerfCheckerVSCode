@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS}=require('./native-readiness.cjs');
 // A real untrusted workspace in the runner's private VS Code profile.
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
@@ -39,15 +40,15 @@ exports.run=async({vscode,windowPage,workspace,log,proof,eventually})=>{
   const project=await fs.readFile(path.join(workspace,'Project.toml'));
   const settings=await fs.readFile(path.join(workspace,'.vscode','settings.json'));
   const prompt=windowPage.getByRole('button',{name:"No, I don't trust the authors",exact:true});
-  await prompt.waitFor({state:'visible',timeout:180000});
+  await prompt.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
   await windowPage.screenshot({path:path.join(output,'native-restricted-trust-prompt.png')});
   log('native-ui-action',{surface:'Workspace Trust',action:"No, I don't trust the authors"});
-  await prompt.click();
-  await prompt.waitFor({state:'hidden'});
+  await prompt.click({timeout:NATIVE_READINESS_MS});
+  await prompt.waitFor({state:'hidden',timeout:NATIVE_READINESS_MS});
   await eventually(()=>vscode.workspace.isTrusted===false,'The real workspace remains untrusted');
   const indicator=windowPage.locator('[id="status.workspaceTrust"]');
-  await indicator.waitFor({state:'visible'});
-  assert.match(await indicator.innerText(),/Restricted Mode/);
+  await indicator.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+  assert.match(await indicator.innerText({timeout:NATIVE_READINESS_MS}),/Restricted Mode/);
   assert(inactive(),'VS Code has not activated the installed product');
   assert.equal(manifest.capabilities.untrustedWorkspaces.supported,false);
   const commands=await vscode.commands.getCommands(true);
@@ -56,10 +57,10 @@ exports.run=async({vscode,windowPage,workspace,log,proof,eventually})=>{
     scope:'VS Code may retain contribution placeholders while the product is inactive'});
   await vscode.commands.executeCommand('workbench.extensions.action.showExtensionsWithIds',[id]);
   const row=windowPage.locator('.monaco-list-row').filter({has:windowPage.locator('.name').filter({hasText:/^PerfChecker$/})});
-  await row.first().click();
+  await row.first().click({timeout:NATIVE_READINESS_MS});
   const status=windowPage.locator('.extension-editor .actions-status-container .status');
-  await status.waitFor({state:'visible'});
-  await eventually(async()=>(await status.innerText()).trim()===manifest.capabilities.untrustedWorkspaces.description,
+  await status.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+  await eventually(async()=>(await status.innerText({timeout:NATIVE_READINESS_MS})).trim()===manifest.capabilities.untrustedWorkspaces.description,
     'The actual installed-extension UI explains its Workspace Trust requirement');
   assert(await status.locator('.codicon-extension-workspace-trust').count()>0,
     'The official extension status displays the Workspace Trust restriction icon');

@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {nativeCoreContract,GENERAL100_TREE,CORE110_CANDIDATE} from './native-core-contract.mjs';
+import {nativeCoreContract,GENERAL100_TREE,CORE111_CANDIDATE} from './native-core-contract.mjs';
 const legacy={core:'general100',artifact:'candidate',stage:'focused',group:'general100'};
-test('the 1.0.2 campaign qualifies guided setup with Core 1.1.0 without claiming registration',()=>{
-  assert.deepEqual(nativeCoreContract({artifact:'candidate'}),{mode:'general',version:'1.1.0',registry:'General',tree:CORE110_CANDIDATE.tree});
+test('the 1.0.3 campaign qualifies corrected setup with Core 1.1.1 without claiming registration',()=>{
+  assert.deepEqual(nativeCoreContract({artifact:'candidate'}),{mode:'general',version:'1.1.1',registry:'General',tree:CORE111_CANDIDATE.tree});
   assert.equal(nativeCoreContract({artifact:'public'}).version,'1.0.0');
-  for(const override of [{commit:'a'.repeat(40)},{tree:CORE110_CANDIDATE.tree}])
+  for(const override of [{commit:'a'.repeat(40)},{tree:CORE111_CANDIDATE.tree}])
     assert.throws(()=>nativeCoreContract({artifact:'candidate',...override}),/without Git source overrides/);
 });
 test('legacy declares an exact registered tree without Git fallback',()=>{

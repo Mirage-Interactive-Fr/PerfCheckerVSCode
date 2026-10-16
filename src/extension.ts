@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
 import {registerInvestigations} from './investigation';
-import {registerNativeTestItems} from './testitems';
+import {registerNativeTestItems, shutdownNativeTestItems} from './testitems';
 import {registerStudio} from './studio';
 import {executeLiveProvider, prepareLiveProvider} from './live-provider';
 import {cancellableJulia, controllerCancellation, shutdownControllerProcesses} from './controllerCancellation';
@@ -1165,5 +1165,6 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
+  shutdownNativeTestItems();
   await Promise.all([shutdownCodexConnections(),shutdownMcpStdioConnections(),shutdownPlutoSessions(),shutdownWorkspaceSetup(),shutdownControllerProcesses()]);
 }

@@ -8,13 +8,17 @@ import {promisify} from 'node:util';
 import {pipeline} from 'node:stream/promises';
 import {fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
+import readiness from './native-readiness.cjs';
 import {downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath} from '@vscode/test-electron';
-import {nativeCoreContract,CORE110_CANDIDATE} from './native-core-contract.mjs';
+import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
+import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const {NATIVE_READINESS_MS,NATIVE_ACTIVITY_MINUTES,nativeReadinessPolicy,createNativeActivityBudget,waitForNativeAvailability}=readiness;
+const nativeActivity=createNativeActivityBudget({startedAt:Number(process.env.PERFCHECKER_NATIVE_ACTIVITY_STARTED_AT)||Date.now()});
 const output = path.join(repository, 'native-qualification-results');
 // Darwin's TMPDIR is long; per-phase profiles otherwise exceed its 103-byte
 // Unix-domain socket limit before VS Code can start. This remains a disposable
@@ -30,7 +34,7 @@ const coreTree=coreMode==='candidate'?(process.env.PERFCHECKER_NATIVE_CORE_TREE 
 const coreProvenance=nativeCoreContract({core:coreMode,artifact:mode,stage:process.env.PERFCHECKER_NATIVE_STAGE||'smoke',
   group:process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative',commit:process.env.PERFCHECKER_NATIVE_CORE_COMMIT||'',tree:process.env.PERFCHECKER_NATIVE_CORE_TREE||''});
 const expectedCoreVersion=coreProvenance.version;
-const minimumVersion=mode==='public'?'1.0.0':'1.1.0';
+const minimumVersion=mode==='public'?'1.0.0':'1.1.1';
 const installCore=coreMode==='candidate'?`${candidateGitSetupScript};Pkg.add(Pkg.PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",rev=ARGS[2]));${candidateCheckoutPermissionsScript}`:`Pkg.add(Pkg.PackageSpec(name="PerfChecker",version="${expectedCoreVersion}"))${coreMode==='general100'?'; Pkg.pin(Pkg.PackageSpec(name="PerfChecker",version="1.0.0"))':''}`;
 // Read the actual dependency and Manifest route, not the declared fixture pin.
 const companionProvenance=String.raw`function native_provider_provenance(m)
@@ -52,6 +56,8 @@ async function assertCompanionRoute(info,name,revision){
 }
 const version = process.env.PERFCHECKER_VSCODE_VERSION || 'stable';
 const stage=process.env.PERFCHECKER_NATIVE_STAGE||'smoke';
+const discoveryDiagnostic=process.env.PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC==='1';
+const fullCasePartition=nativeFullCasePartition({partition:process.env.PERFCHECKER_NATIVE_FULL_PARTITION||'all',stage,artifact:mode});
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
 if(stage==='focused'&&!['bootstrap','general100','narrative','mcp','mcp-stdio','mcp-documented-install','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','saved-report','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
@@ -95,20 +101,51 @@ const publicSha = 'c4123271e71e4c4d148fe0e613ba260f4aeea6f28445338cab11d3fb9513d
 if (!['public', 'candidate'].includes(mode)) throw new Error('Choose public or candidate VSIX explicitly.');
 
 async function execute(executable, args, options = {}) {
+  const {technical=false,...spawnOptions}=options;
+  // Technical teardown retains its explicit old bound even after activity expires.
+  const timeout=technical?(options.timeout??30000):nativeActivity.timeout(options.timeout??NATIVE_READINESS_MS);
   return await new Promise((resolve, reject) => {
     const child = spawn(executable, args, {windowsHide: true, env:runnerEnvironment,
-      ...(landscapeOnly?{signal:landscapeAbort.signal}:{}), ...options});
+      ...(landscapeOnly?{signal:landscapeAbort.signal}:{}), ...spawnOptions,timeout});
     let text = '';
+    const preserve=(reason,closed,error,signal)=>{
+      // Closing the preparation leader is not evidence that its compilation
+      // descendants are gone. Retention is conservative, never a leak claim.
+      sessionSafeToRemove=false;
+      try{console.error('NATIVE_PREPARATION_CLEANUP_INCONCLUSIVE '+JSON.stringify({reason,ownerPid:child.pid??null,
+        physicalCloseObserved:closed,treeCleanupQualified:false,errorClass:error?.name??null,signal:signal??null}));}catch{}
+    };
     child.stdout?.on('data', chunk => {text += chunk; process.stdout.write(chunk);});
     child.stderr?.on('data', chunk => {text += chunk; process.stderr.write(chunk);});
-    child.once('error', reject);
-    child.once('close', code => code === 0 ? resolve(text) : reject(Object.assign(new Error(`${path.basename(executable)} exited ${code}\n${text.slice(-5000)}`), {commandOutput: text, exitCode: code})));
+    child.once('error', error=>{preserve('spawn-error',false,error);reject(error);});
+    child.once('close', (code,signal) => {
+      if(code===0)return resolve(text);
+      preserve('nonzero-or-signal',true,undefined,signal);
+      reject(Object.assign(new Error(`${path.basename(executable)} exited ${code}\n${text.slice(-5000)}`), {commandOutput: text, exitCode: code}));
+    });
   });
+}
+
+async function downloadNativeVSCode(options){
+  const timeout=nativeActivity.timeout();
+  try{
+    // The library's timeout is idle-only. This separate absolute observation
+    // bound cannot be renewed by transport progress or extraction activity.
+    return await waitForNativeAvailability(downloadAndUnzipVSCode({...options,timeout}),
+      'VS Code download/extraction',{timeout});
+  }catch(error){
+    // The public API provides no proof that pending writes/extraction stopped.
+    sessionSafeToRemove=false;
+    try{console.error('NATIVE_PREPARATION_CLEANUP_INCONCLUSIVE '+JSON.stringify({reason:'download-or-extraction',
+      physicalCloseObserved:false,treeCleanupQualified:false,errorClass:error.name}));}catch{}
+    throw error;
+  }
 }
 
 // This preparation owns its compilation children independently of the import
 // timeout. No uncertain observation is accepted as proof of an empty tree.
-async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180000}={}){
+async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NATIVE_READINESS_MS}={}){
+  timeoutMs=nativeActivity.timeout(timeoutMs);
   assert(Number.isSafeInteger(timeoutMs)&&timeoutMs>0);
   const windows=process.platform==='win32',expected=await fs.realpath(executable);
   const launcher=path.join(repository,'resources','windows-owned-process.ps1');
@@ -117,7 +154,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
   const ownerArgs=windows?['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',launcher,
     '-Executable',expected,'-WorkingDirectory',receipt.project,'-ArgumentsBase64',Buffer.from(JSON.stringify(args)).toString('base64'),'-ParentPid',String(process.pid)]:args;
   const child=spawn(ownerExecutable,ownerArgs,{cwd:receipt.project,env:runnerEnvironment,windowsHide:true,detached:!windows,stdio:['pipe','pipe','pipe']});
-  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Date.now()+timeoutMs;
+  const records=new Map(),errors=[];let text='',readyPid,started=false,expired=false,spawnError,lastRows=[],cleanupUntil=Math.min(nativeActivity.deadlineAt,Date.now()+timeoutMs);
   receipt.deadlineAt=new Date(cleanupUntil).toISOString();
   const limit=maximum=>{const remaining=cleanupUntil-Date.now();if(remaining<=0)throw new Error('Owned preflight inspection exceeded its current preparation or cleanup deadline');return Math.min(maximum,remaining);};
   receipt.ownership={ownerPid:child.pid,identities:[],observations:[],errors,cleanupQualified:false};
@@ -153,7 +190,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
     assert(typeof current.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(current.started)&&Number.isFinite(Date.parse(current.started)));
     return current;
   };
-  const inspect=async row=>{
+  const inspect=async(row,imageFailures)=>{
     if(windows){
       assert(typeof row.started==='string'&&/^\d{4}-\d{2}-\d{2}T.*Z$/.test(row.started)&&Number.isFinite(Date.parse(row.started)));
       if(typeof row.executable==='string'&&row.executable)return {...row,executable:await fs.realpath(row.executable)};
@@ -181,7 +218,8 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
         if(qualified)return revalidateQualifiedLinuxExecutable({identity:qualified,error,deadlineAt:cleanupUntil,readCurrent:linuxCurrent,
           readExecutable:pid=>fs.realpath(`/proc/${pid}/exe`),record:observation=>(receipt.ownership.revalidations??=[]).push(observation)});
         const current=await linuxCurrent(row.pid);
-        if(!current)return undefined;same(current);if(['Z','X'].includes(current.state))return undefined;throw error;}
+        if(!current)return undefined;same(current);if(['Z','X'].includes(current.state))return undefined;
+        imageFailures.markLinuxImageFailure(error,{row,before,current,qualified:Boolean(qualified),ownerPid:child.pid});throw error;}
       const after=await linuxCurrent(row.pid);if(!after)return undefined;same(after);if(['Z','X'].includes(after.state))return undefined;
       if(after.parent!==before.parent||after.state!==before.state)(receipt.ownership.revalidations??=[]).push({stage:'mutable-process-fields',pid:row.pid,
         started:after.started,group:after.group,beforeParent:before.parent,currentParent:after.parent,beforeState:before.state,currentState:after.state,stillAlive:true,observedAt:new Date().toISOString()});
@@ -234,12 +272,18 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
     return {...after,executable:mappings.includes(expected)?expected:mappings[0],executableMappings:mappings};
   };
   const survey=async()=>{
+    const imageFailures=createControllerImageInspectionSurvey({platform:process.platform,errors,
+      diagnostics:receipt.ownership.imageInspectionFailures??=[]});let completed=false;
+    try{
+    const {readyPid:observedReadyPid,rows}=await captureControllerInventory(()=>readyPid,async()=>{
     let rows;
     if(windows){const value=await inspectCommand(ownerExecutable,['-NoProfile','-Command',"$ErrorActionPreference='Stop'; @((Get-CimInstance Win32_Process -ErrorAction Stop) | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;started=$(if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}else{$null});executable=$_.ExecutablePath} }) | ConvertTo-Json -Compress"],{timeout:limit(10000),maxBuffer:4*1024*1024});rows=JSON.parse(value.stdout);assert(Array.isArray(rows));}
     else{const value=await inspectCommand('ps',['-eo','pid=,ppid=,pgid=,lstart=,stat='],{timeout:limit(3000),maxBuffer:4*1024*1024});rows=value.stdout.split('\n').flatMap(line=>{
       const match=/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s+(\S+)\s*$/.exec(line);return match?[{pid:Number(match[1]),parent:Number(match[2]),group:Number(match[3]),started:match[4],state:match[5]}]:[];});}
+    return rows;
+    });
     lastRows=rows;const inspected=new Map();
-    const read=async row=>{if(inspected.has(row.pid))return inspected.get(row.pid);try{const current=await inspect(row);inspected.set(row.pid,current);return current;}catch(error){errors.push(controllerInspectionFailure(error,{stage:'inspect',pid:row.pid,ownerPid:child.pid}));inspected.set(row.pid,undefined);return undefined;}};
+    const read=async row=>{if(inspected.has(row.pid))return inspected.get(row.pid);try{const current=await inspect(row,imageFailures);inspected.set(row.pid,current);return current;}catch(error){imageFailures.capture(error,controllerInspectionFailure(error,{stage:'inspect',pid:row.pid,ownerPid:child.pid}));inspected.set(row.pid,undefined);return undefined;}};
     const original=rows.find(row=>row.pid===child.pid),owner=original&&await read(original);
     if(owner&&!records.size){assert.equal(owner.parent,process.pid);assert.equal(canonical(owner.executable),canonical(await fs.realpath(ownerExecutable)));records.set(owner.pid,owner);}
     const live=new Set();for(const prior of records.values()){
@@ -266,6 +310,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
         try{
           const current=await linuxCurrent(row.pid);observation.current=current??null;
           observation.resolution=!current?'proved-absent':['Z','X'].includes(current.state)?'proved-zombie-or-exited':'live-unqualified';
+          imageFailures.resolveAbsent(row,observation,{qualified:records.has(row.pid),live:live.has(row.pid)});
           if(!current||['Z','X'].includes(current.state))continue;
           // The ps member has no qualified incarnation yet. Even a reparented
           // or reused PID that is now alive remains unknown, never a gone proof.
@@ -279,8 +324,9 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=180
     const observation={observedAt:new Date().toISOString(),alive:[...live],unknown:unknown.map(row=>row.pid)};
     const signature=JSON.stringify({alive:observation.alive,unknown:observation.unknown});
     if(receipt.ownership.observations.at(-1)?.signature!==signature)receipt.ownership.observations.push({...observation,signature});
-    if(readyPid&&!started){const leader=inspected.get(readyPid);assert(leader&&live.has(readyPid));assert.equal(leader.parent,windows?child.pid:process.pid);assert.equal(canonical(leader.executable),canonical(expected));started=true;child.stdin.write('OBSERVED\n');}
-    return [...live].map(pid=>records.get(pid));
+    if(controllerReadinessObserved({readyPid:observedReadyPid,started,identities:inspected,live,parent:windows?child.pid:process.pid,expected,canonical})){started=true;child.stdin.write('OBSERVED\n');}
+    const result=[...live].map(pid=>records.get(pid));completed=true;return result;
+    }finally{imageFailures.finish(completed);}
   };
   let observation=Promise.resolve(),sampling=false;
   const sample=()=>{if(sampling)return observation;sampling=true;observation=survey().catch(error=>errors.push(controllerInspectionFailure(error,{stage:'survey',pid:readyPid??child.pid,ownerPid:child.pid}))).finally(()=>{sampling=false;});return observation;};
@@ -369,12 +415,13 @@ async function prepareLandscapeFixture(runtime,artifactRecord){
     projects:await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,await fs.readFile(path.join(source,name)).then(hash).catch(error=>{if(error.code==='ENOENT')return null;throw error;})]))});
   const archiveInto=async(source,commit,destination)=>{
     await fs.mkdir(destination,{recursive:true});
+    const availability=nativeActivity.timeout();
     const archive=spawn('git',['-C',source,'archive','--format=tar',commit],{env:runnerEnvironment,signal:landscapeAbort.signal,stdio:['ignore','pipe','pipe']});
     // GNU tar must consume the entire producer stream, including trailing archive padding.
     const unpack=spawn('tar',['--ignore-zeros','-xf','-','-C',destination],{env:runnerEnvironment,signal:landscapeAbort.signal,stdio:['pipe','ignore','pipe']});
     let errors='';for(const child of [archive,unpack])child.stderr.on('data',data=>{errors=(errors+data.toString()).slice(-5000);});
     const exits=[archive,unpack].map(child=>new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',code=>code===0?resolve():reject(new Error(`Immutable source archive failed (${code}): ${errors}`)));}));
-    const timer=setTimeout(()=>{archive.kill('SIGKILL');unpack.kill('SIGKILL');},120000);
+    const timer=setTimeout(()=>{archive.kill('SIGKILL');unpack.kill('SIGKILL');},availability);
     try{await Promise.all([...exits,pipeline(archive.stdout,unpack.stdin)]);}
     finally{clearTimeout(timer);for(const child of [archive,unpack])if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');await Promise.allSettled(exits);}
   };
@@ -424,10 +471,10 @@ for (name,directory) in zip(names,ARGS[2:end]);@assert normpath(joinpath(root,so
 write(file,original)
 env=Pkg.Types.EnvCache(file);env.manifest.other["project_hash"]=Pkg.Types.workspace_resolve_hash(env)
 Pkg.Types.write_manifest(env.manifest,env.manifest_file)
-`,root,...sdk.map(item=>item.directory)],{timeout:900000});
+`,root,...sdk.map(item=>item.directory)],{timeout:NATIVE_READINESS_MS});
   assert.deepEqual(await fs.readFile(path.join(root,'Project.toml')),project,'Pkg preparation preserves the game tag Project.toml');
   for(const item of sdk)assert.equal(hash((await sourceDigest(item.directory)).join('')),item.sha256,'SDK runtime source remains identical to its archived tag');
-  // Install and compile this private SDK before the unchanged native 120-second
+  // Install and compile this private SDK before the one-hour native import
   // import observation. This qualifies prepared operation, never a cold launch.
   const preparedHashes=async()=>({
     project:hash(await fs.readFile(path.join(root,'Project.toml'))),
@@ -436,9 +483,9 @@ Pkg.Types.write_manifest(env.manifest,env.manifest_file)
   });
   assert.equal(runnerEnvironment.JULIA_NUM_PRECOMPILE_TASKS,'1');
   const preparation={status:'running',phase:'Landscape SDK cache preparation',startedAt:new Date().toISOString(),project:root,
-    packages:['EtenduBeautifulLandscape',...sdk.map(item=>item.name)],strict:true,timeoutMilliseconds:900000,
+    packages:['EtenduBeautifulLandscape',...sdk.map(item=>item.name)],strict:true,timeoutMilliseconds:NATIVE_READINESS_MS,
     precompileTasks:1,hashesBefore:await preparedHashes(),
-    scope:'Explicit private SDK cache preparation with owned compilation children; native import remains 120 seconds; no cold-launch qualification'};
+    scope:'Explicit private SDK cache preparation with owned compilation children; native import availability is one hour, clipped by shared activity; no cold-launch qualification'};
   artifactRecord.landscapeSdkCachePreparation=preparation;
   await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
   console.log('NATIVE_LANDSCAPE_SDK_PREPARATION_START '+JSON.stringify(preparation));
@@ -472,11 +519,12 @@ println("LANDSCAPE_SDK_PREPARATION_COMPLETE_V1 ",(time_ns()-started)/1e9)
   for(const [source,before]of snapshots)assert.deepEqual(await sourceSnapshot(source),before,'The human HEAD, status and project files remain unchanged');
   const executable=await fs.realpath(process.env.PERFCHECKER_TEST_XVFB||'/usr/bin/Xvfb');
   const tools=Object.fromEntries(await Promise.all(['xwd','xwininfo','vulkaninfo'].map(async name=>[name,await fs.realpath(`/usr/bin/${name}`)])));
+  const displayAvailability=nativeActivity.timeout();
   const displayChild=spawn(executable,['-displayfd','3','-screen','0','1920x1080x24','-nolisten','tcp','-ac'],{env:runnerEnvironment,stdio:['ignore','ignore','pipe','pipe']});
   const displayExit=new Promise(resolve=>{displayChild.once('close',resolve);displayChild.once('error',()=>resolve(-1));});
   landscapeFixture={root,displayChild,displayExit};displayChild.stderr.resume();
   const display=await new Promise((resolve,reject)=>{
-    let text='';const timer=setTimeout(()=>reject(new Error('The owned Xvfb did not reserve a private display')),15000);
+    let text='';const timer=setTimeout(()=>reject(new Error('The owned Xvfb did not reserve a private display')),displayAvailability);
     const finish=(error,value)=>{clearTimeout(timer);error?reject(error):resolve(value);};
     displayChild.once('error',error=>finish(error));displayChild.once('close',()=>finish(new Error('The owned Xvfb exited before native launch')));
     displayChild.stdio[3].on('data',bytes=>{text+=bytes;const match=text.match(/^(\d+)\s*$/);if(match)finish(undefined,`:${match[1]}`);});
@@ -499,7 +547,7 @@ println("LANDSCAPE_SDK_PREPARATION_COMPLETE_V1 ",(time_ns()-started)/1e9)
 
 try {
   await fs.mkdir(output, {recursive: true});
-  assertCI();
+  const architecture=assertCI();
   if(landscapeOnly){
     assert.equal(process.platform,'linux');await fs.mkdir(runnerEnvironment.XDG_RUNTIME_DIR,{mode:0o700});
     process.on('SIGINT',abortLandscape);process.on('SIGTERM',abortLandscape);
@@ -524,6 +572,7 @@ try {
   }else{
   const runtime = JSON.parse((await execute(julia, ['--startup-file=no', '-e',
     "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
+  assertNativeJuliaArchitecture(runtime,architecture,'PerfChecker runtime');
   julia = runtime.executable;
   let nativeNode,nodeProvenance;
   if(stage==='focused'&&caseGroup==='mcp-stdio'){
@@ -535,8 +584,9 @@ try {
   }
   const officialRuntime=JSON.parse((await execute(process.env.PERFCHECKER_NATIVE_OFFICIAL_JULIA||julia,['--startup-file=no','-e',
     "print(\"{\\\"executable\\\":\", repr(joinpath(Sys.BINDIR, Base.julia_exename())), \",\\\"version\\\":\", repr(string(VERSION)), \",\\\"arch\\\":\", repr(string(Sys.ARCH)), \",\\\"cpuName\\\":\", repr(Sys.CPU_NAME), \",\\\"threads\\\":\", Threads.nthreads(), \",\\\"hardwareThreads\\\":\", length(Sys.cpu_info()), \"}\")"])).trim());
+  assertNativeJuliaArchitecture(officialRuntime,architecture,'Official Julia runtime');
   const expectedVersion = mode === 'public' ? '1.0.0' : JSON.parse(await fs.readFile(path.join(repository, 'package.json'), 'utf8')).version;
-  const vscode = await downloadAndUnzipVSCode({version, cachePath: path.join(session, 'vscode')});
+  const vscode = await downloadNativeVSCode({version, cachePath: path.join(session, 'vscode')});
   const [cli, ...cliArgs] = resolveCliArgsFromVSCodeExecutablePath(vscode, {reuseMachineInstall: true});
   const application=await nativeVSCodeApplication(vscode,cli,{expectedVersion:version});
   const hostVersion=application.version,cliSource=application.cliSource;
@@ -561,11 +611,11 @@ try {
   await fs.writeFile(path.join(workspace, 'Project.toml'), 'name = "PerfCheckerNativeFixture"\nuuid = "6af56806-e0b1-4f34-88bf-fde69d8a8679"\nversion = "0.1.0"\n');
   // Keep actual workload frames in the target package, rather than inlining them
   // into an external perf script. Both workloads allocate inside their own source.
-  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nBase.@noinline wait_task(x) = (values=fill(x,1_000_000); sleep(0.005); values[1])\nend\n');
+  await fs.writeFile(path.join(workspace, 'src', 'PerfCheckerNativeFixture.jl'), 'module PerfCheckerNativeFixture\nBase.@noinline sum_squares(xs) = sum(xs .^ 2)\nBase.@noinline function profile_sum_squares(xs)\n total=0.0\n for _ in 1:64\n  total+=sum_squares(xs)\n end\n total\nend\nBase.@noinline wait_task(x) = (values=fill(x,1_000_000); sleep(0.005); values[1])\nend\n');
   await fs.writeFile(path.join(workspace, 'test', 'performance.jl'), 'using TestItems\n@testitem "Vector reduction" tags=[:performance] begin\n data=collect(1:10_000)\n @test sum(data)==50_005_000\nend\n');
   const vsix = path.join(session, 'perfchecker.vsix');
   if (mode === 'public') {
-    const response = await fetch('https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode/releases/download/v1.0.0/perfchecker-vscode-1.0.0.vsix');
+    const response = await fetch('https://github.com/Mirage-Interactive-Fr/PerfCheckerVSCode/releases/download/v1.0.0/perfchecker-vscode-1.0.0.vsix',{signal:AbortSignal.timeout(nativeActivity.timeout())});
     if (!response.ok) throw new Error(`Public VSIX download failed: ${response.status}`);
     await fs.writeFile(vsix, Buffer.from(await response.arrayBuffer()));
   } else await fs.copyFile(path.join(repository, 'candidate.vsix'), vsix);
@@ -583,6 +633,24 @@ try {
     if(packageProvenance.sha256!==sha||packageProvenance.version!==expectedVersion)throw new Error('The candidate package provenance differs from the installed archive.');
     await fs.writeFile(path.join(output,'candidate.provenance.json'),JSON.stringify(packageProvenance,null,2));
   }
+  let discoveryObservation;
+  assert(!discoveryDiagnostic,'Historical discovery diagnostics retain their original branch and explicit contract; this source qualifies the one-hour native campaign');
+  if(discoveryDiagnostic){
+    assertNativeDiscoveryDiagnostic({enabled:true,event:process.env.GITHUB_EVENT_NAME,artifact:mode,stage,
+      scope:process.env.PERFCHECKER_NATIVE_SCOPE,core:coreMode,partition:fullCasePartition.name,platform:process.platform,arch:process.arch,
+      backendJulia:process.env.PERFCHECKER_NATIVE_BACKEND_JULIA,originRun:packageProvenance?.run,
+      originName:`native-candidate-${packageProvenance?.commit}`,originSha:sha,coreCommit,coreTree,newOrigin:false});
+    assert.equal(packageProvenance.commit,'73b99deb87efaf45bd5e96036f755e42c748bdab');
+    assert.equal(packageProvenance.tree,'3722727a870402497078e63da78be90d606f5ed5');
+    assert.equal(packageProvenance.packagedOnceOn,'Linux');assert.equal(packageProvenance.version,'1.0.3');
+    let sampleSyntax;try{sampleSyntax=await verifyNativeSampleSyntax();}
+    catch(error){sampleSyntax={supported:false,reason:'installed-manual-inspection-unknown',
+      errorClass:/^[A-Za-z]+$/.test(error.name)?error.name:null,code:/^[A-Z0-9_]+$/.test(error.code||'')?error.code:null};}
+    discoveryObservation={diagnosticOnly:true,perturbing:true,qualifiesCanonicalProduct:false,sampleSyntax,
+      prelude:'Exact full fresh/configured preparation, then prepared prefix through native-testitem-measurement',
+      skippedAfter:['native-complete-suite-measurements','native-all-studio-controls','native-workbench-controls'],
+      origin:packageProvenance,uiOracleMs:120000,workerOracleMs:180000};
+  }
   const privateProfile=async root=>{
     const directories=privateDirectoryFlags.map(flag=>[flag,path.join(root,flag)]);
     await Promise.all(directories.map(([,directory])=>fs.mkdir(directory,{recursive:true})));
@@ -591,17 +659,20 @@ try {
   const cliProfile = await privateProfile(profile);
   await execute(cli, [...cliArgs, ...cliProfile, '--install-extension', vsix, '--force'], {shell: process.platform === 'win32' && cli.endsWith('.cmd')});
   const artifactRecord={mode,retainedVsix,sha256: sha,vscodeRequested: version,core:coreProvenance,packageProvenance,
+    readinessPolicy:{...nativeReadinessPolicy,activityStartedAt:new Date(nativeActivity.startedAt).toISOString(),activityDeadlineAt:new Date(nativeActivity.deadlineAt).toISOString()},
+    ...(discoveryDiagnostic?{discoveryObservation}:{}),
+    fullCasePartition:stage==='full'?fullCasePartition:undefined,
     runner:{platform:process.platform,processArch:process.arch,runnerArch:process.env.RUNNER_ARCH||null},runtimes:{perfchecker:runtime,officialJulia:officialRuntime},hostPreferences:{scope:'disposable-application-profile',dialogStyle:'custom',dialogAPI:'real-VS-Code-no-interception',actualVersion:hostVersion,
       actualCommit:application.commit,applicationName:application.applicationName,applicationRelativePath:path.relative(path.dirname(vscode),application.application),
       cliRelativePath:path.relative(path.dirname(vscode),cli),privateDirectoryFlags}};
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
-  const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml');
+  const minimumResponse=await fetch('https://raw.githubusercontent.com/JuliaRegistries/General/master/P/PerfChecker/Versions.toml',{signal:AbortSignal.timeout(nativeActivity.timeout())});
   if(!minimumResponse.ok)throw new Error(`Cannot verify the production minimum in General: ${minimumResponse.status}`);
   const versionsText=await minimumResponse.text(),minimumSection=versionsText.split('["'+minimumVersion+'"]')[1]?.split(/^\[/m)[0];
   const minimumTree=/^git-tree-sha1\s*=\s*"([a-f0-9]{40})"/m.exec(minimumSection||'')?.[1];
   const minimumAvailable=Boolean(minimumTree);
-  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,CORE110_CANDIDATE.tree,'Published General 1.1.0 must match the independently pinned Core source tree');
-  const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml');
+  if(minimumAvailable&&mode==='candidate')assert.equal(minimumTree,CORE111_CANDIDATE.tree,'Published General 1.1.1 must match the independently pinned Core source tree');
+  const plutoTagResponse=await fetch('https://raw.githubusercontent.com/Mirage-Interactive-Fr/PerfChecker.jl/v1.0.1/packages/PerfCheckerPluto/Project.toml',{signal:AbortSignal.timeout(nativeActivity.timeout())});
   if(!plutoTagResponse.ok&&plutoTagResponse.status!==404)throw new Error(`Cannot verify published Pluto companion tag: ${plutoTagResponse.status}`);
   const plutoTagAvailable=plutoTagResponse.ok&&/^version\s*=\s*"1\.0\.1"\s*$/m.test(await plutoTagResponse.text());
   await fs.writeFile(path.join(output,'production-bootstrap-gate.json'),JSON.stringify({minimum:minimumVersion,registry:'General',available:minimumAvailable,
@@ -659,11 +730,14 @@ try {
         assert(coreProvenance.diagnosticWorker,'The qualified Core preparation supplies its exact diagnostic worker');
       }
       const environment={...runnerEnvironment,...externalBrowser?.environment,...(phase==='landscape'?landscapeFixture.environment:{}),
+        ...(discoveryDiagnostic?{PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC:'1',
+          PERFCHECKER_NATIVE_DISCOVERY_OBSERVATION:JSON.stringify(discoveryObservation)}:{}),
         ...(diagnosticTemporaryRoot?{TMPDIR:diagnosticTemporaryRoot,PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP:diagnosticTemporaryRoot}:{}),
         PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
         ...(phase==='pluto-start-stop'?{PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT:JSON.stringify(artifactRecord.plutoEnvironment)}:{}),
-        ...(phase==='editor'&&process.platform==='linux'?{PERFCHECKER_NATIVE_EDITOR_DEADLINE_AT:new Date(Date.now()+40*60*1000).toISOString()}:{}),
+        ...(phase==='editor'&&process.platform==='linux'?{PERFCHECKER_NATIVE_EDITOR_DEADLINE_AT:new Date(nativeActivity.deadlineAt).toISOString()}:{}),
+        PERFCHECKER_NATIVE_ACTIVITY_DEADLINE_AT:String(nativeActivity.deadlineAt),
         PERFCHECKER_NATIVE_TARGET: target, PERFCHECKER_NATIVE_JULIA: julia,
         ...(nativeNode?{PERFCHECKER_NATIVE_NODE:nativeNode,PERFCHECKER_NATIVE_NODE_PROVENANCE:JSON.stringify(nodeProvenance)}:{}),
         PERFCHECKER_NATIVE_OFFICIAL_JULIA:officialRuntime.executable,PERFCHECKER_NATIVE_OFFICIAL_JULIA_VERSION:officialRuntime.version,
@@ -679,6 +753,7 @@ try {
         UV_THREADPOOL_SIZE: '4'};
       const launchWorkspace=phase!=='fresh'&&(phase==='prepared'||stage==='focused')?workspaceFile:workspace;
       await fs.access(launchWorkspace);
+      const remainingActivityMs=nativeActivity.remaining(),activationWindowMs=Math.min(NATIVE_READINESS_MS,remainingActivityMs);
       await new Promise((resolve,reject)=>{
         // Actual interactive host: no --extensionTestsPath or smoke driver, and
         // no intercepted APIs. All dialogs are clicked through the real UI.
@@ -704,20 +779,21 @@ try {
         const stop=()=>{if(child.exitCode!==null)return;if(process.platform==='win32')spawn('taskkill',['/pid',String(child.pid),'/T','/F'],{windowsHide:true});else try{process.kill(-child.pid,'SIGTERM');}catch{}};
         const activationTimer=setTimeout(()=>{if(activated)return;void(async()=>{
           await retainHostLogs().catch(error=>console.error(`NATIVE_STARTUP_LOGS ${error.message}`));stop();
-          reject(new Error(`The ${phase} helper did not activate within 3 minutes. Retained Electron/extension-host logs distinguish startup failure from campaign duration.`));
-        })();},180000);
-        const minutes=phase==='prepared'&&environment.PERFCHECKER_NATIVE_STAGE==='full'?130:phase==='landscape'?45:40;
+          reject(new Error(`The ${phase} helper exceeded its one-hour availability or remaining shared infrastructure activity budget. Retained logs distinguish startup failure from campaign duration.`));
+        })();},activationWindowMs);
+        const minutes=NATIVE_ACTIVITY_MINUTES;
         const deadlineStartedAt=new Date().toISOString();
         let globalDeadlineExpired=false;
         const timer=setTimeout(()=>{globalDeadlineExpired=true;void(async()=>{
-          const failure=new Error(`The ${phase} native phase exceeded its explicit ${minutes}-minute bound`);
+          const failure=Object.assign(new Error(`The shared ${minutes}-minute native infrastructure activity budget was exhausted during ${phase}`),{code:'NATIVE_INFRASTRUCTURE_ACTIVITY_LIMIT'});
           try{await fs.writeFile(path.join(output,`${phase}-global-limit.json`),JSON.stringify({status:'failed',phase,
             stage:environment.PERFCHECKER_NATIVE_STAGE,limitMinutes:minutes,startedAt:deadlineStartedAt,
+            limitKind:'infrastructure-shared-activity',activityStartedAt:new Date(nativeActivity.startedAt).toISOString(),activityDeadlineAt:new Date(nativeActivity.deadlineAt).toISOString(),
             expiredAt:new Date().toISOString(),lastObservedCase:activeCase||null,
             hostStopRequested:true,productCleanupQualified:false,error:failure.message},null,2));}
           catch(error){console.error(`NATIVE_GLOBAL_LIMIT_REPORT ${error.message}`);}
           stop();reject(failure);
-        })();},minutes*60*1000);
+        })();},remainingActivityMs);
         const onInterrupt=()=>stop();process.once('SIGINT',onInterrupt);process.once('SIGTERM',onInterrupt);
         const clean=()=>{clearTimeout(timer);clearTimeout(activationTimer);clearInterval(progress);process.off('SIGINT',onInterrupt);process.off('SIGTERM',onInterrupt);};
         child.once('error',error=>{clean();if(!globalDeadlineExpired)reject(error);});
@@ -737,7 +813,7 @@ try {
         const code=await recorded;clearTimeout(timeout);
         if(code!==0)phaseFailures.push({phase,kind:'recording',error:`Real Xvfb recording failed (${code}): ${recordingError}`});
         else{
-          const probe=JSON.parse(await execute('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_name,width,height,avg_frame_rate','-of','json',video]));
+          const probe=JSON.parse(await execute('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_name,width,height,avg_frame_rate','-of','json',video],{technical:true,timeout:30000}));
           await fs.writeFile(video.replace(/\.mp4$/,'.json'),JSON.stringify({file:path.basename(video),source:'actual-Xvfb-screen',phase,
             startedAt:videoStartedAt,timeline:`${phase}.json`,timestampPrecision:'Wall-clock offsets from recorder launch; correlate with native UI events and review frames before editing.',
             vscodeRequested:version,extension:expectedVersion,core:coreProvenance,fixtures:'Disposable deterministic qualification data; no human model authentication',
@@ -752,7 +828,7 @@ try {
   const installationStartedAt=new Date().toISOString();
   if(documentedMcpInstall){artifactRecord.documentedMcpInstallation={status:'running',startedAt:installationStartedAt};
     await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));}
-  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]=="documented-mcp";Pkg.add("HTTP");elseif ARGS[6]=="standard";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();if ARGS[6]=="documented-mcp";httpinfo=only(p for p in values(Pkg.dependencies()) if p.name=="HTTP");@assert httpinfo.is_tracking_registry;print("QUALIFIED_DOCUMENTED_HTTP ");PerfChecker.JSON.print(Dict("version"=>string(httpinfo.version),"tree"=>string(httpinfo.tree_hash),"registered"=>httpinfo.is_tracking_registry,"source"=>realpath(httpinfo.source),"autoPrecompile"=>ENV["JULIA_PKG_PRECOMPILE_AUTO"]));println();end;println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':savedReportOnly?'saved-report':documentedMcpInstall?'documented-mcp':'standard'],{timeout:landscapeOnly?900000:undefined}).catch(async error=>{
+  const installation=await execute(julia, ['--startup-file=no', '-e', `using Pkg; Pkg.activate(ARGS[1]); ${installCore}; if ARGS[6]=="documented-mcp";Pkg.add("HTTP");elseif ARGS[6]=="standard";Pkg.add(["TestItemRunner","HTTP","BenchmarkTools","Chairmarks","JET","AllocCheck"]);end; using PerfChecker; @assert Base.pkgversion(PerfChecker)==VersionNumber(ARGS[4]); info=Pkg.dependencies()[Base.PkgId(PerfChecker).uuid]; if !isempty(ARGS[3]); @assert string(info.tree_hash)==ARGS[3]; else; @assert info.is_tracking_registry; end; print("QUALIFIED_CORE_PROVENANCE ");PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"tree"=>string(info.tree_hash),"registered"=>info.is_tracking_registry));println();if ARGS[6]=="documented-mcp";httpinfo=only(p for p in values(Pkg.dependencies()) if p.name=="HTTP");@assert httpinfo.is_tracking_registry;print("QUALIFIED_DOCUMENTED_HTTP ");PerfChecker.JSON.print(Dict("version"=>string(httpinfo.version),"tree"=>string(httpinfo.tree_hash),"registered"=>httpinfo.is_tracking_registry,"source"=>realpath(httpinfo.source),"autoPrecompile"=>ENV["JULIA_PKG_PRECOMPILE_AUTO"]));println();end;println("QUALIFIED_CORE_MODE=", ARGS[5], " VERSION=", Base.pkgversion(PerfChecker), " TREE=",info.tree_hash," SOURCE=", pathof(PerfChecker))`, controller,coreCommit,coreTree,expectedCoreVersion,coreMode,landscapeOnly?'landscape':savedReportOnly?'saved-report':documentedMcpInstall?'documented-mcp':'standard'],{timeout:NATIVE_READINESS_MS}).catch(async error=>{
     if(documentedMcpInstall){Object.assign(artifactRecord.documentedMcpInstallation,{status:'failed',finishedAt:new Date().toISOString(),
       elapsedSeconds:(Date.now()-Date.parse(installationStartedAt))/1000,error:String(error).slice(0,5000)});
       await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
@@ -783,19 +859,30 @@ try {
     coreProvenance.diagnosticWorker={file:worker,sha256:createHash('sha256').update(await fs.readFile(worker)).digest('hex')};
   }
   await fs.writeFile(path.join(output, 'artifact.json'), JSON.stringify(artifactRecord, null, 2));
-  if(stage==='targeted'||stage==='full'||stage==='focused'&&(['general100','mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
+  const prepareTestItemDiscovery=mode==='candidate'&&(stage==='full'||stage==='focused'&&['testitems','testitems-ready'].includes(caseGroup));
+  if(prepareTestItemDiscovery||stage==='targeted'||stage==='full'||stage==='focused'&&(['general100','mcp','mcp-stdio','mcp-pluto','advisor','narrative'].includes(caseGroup)||caseGroup==='editor'&&process.platform==='linux')){
     // This is installation/cache preparation, not first-Send or a cold-start
     // measurement. Keep its explicit compilation cost and physical ownership
-    // separate from the unchanged 180-second prepared-import qualification.
+    // separate from the prepared-import availability check (one hour, clipped by shared activity).
     const preparationBefore=Object.fromEntries(await Promise.all(['Project.toml','Manifest.toml'].map(async name=>[name,createHash('sha256').update(await fs.readFile(path.join(controller,name))).digest('hex')])));
     const preparation={status:'running',phase:'cache preparation',startedAt:new Date().toISOString(),project:controller,
-      packages:['PerfChecker','HTTP'],strict:true,timeoutMilliseconds:900000,hashesBefore:preparationBefore,
+      packages:['PerfChecker','HTTP',...(prepareTestItemDiscovery?['TestItemRunner']:[])],strict:true,timeoutMilliseconds:NATIVE_READINESS_MS,hashesBefore:preparationBefore,
       automaticPrecompile:runnerEnvironment.JULIA_PKG_PRECOMPILE_AUTO,
       scope:'Explicit selected-package cache preparation with owned compilation children; no cold-start or native first-Send claim'};
     artifactRecord.controllerCachePreparation=preparation;await fs.writeFile(path.join(output,'artifact.json'),JSON.stringify(artifactRecord,null,2));
     try{
-      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',controllerCachePreparationScript,controller],preparation,{timeoutMs:preparation.timeoutMilliseconds});
+      const discoveryFile=path.join(output,'controller-testitem-discovery.json');
+      const text=await executeControllerPreflight(julia,['--startup-file=no',`--project=${controller}`,'-e',controllerCachePreparationScript,controller,
+        ...(prepareTestItemDiscovery?[workspace,discoveryFile]:[])],preparation,{timeoutMs:preparation.timeoutMilliseconds});
       await fs.writeFile(path.join(output,'controller-cache-preparation.log'),text);
+      if(prepareTestItemDiscovery){
+        preparation.testItemDiscovery=parseControllerTestItemDiscoveryReceipt(text,{project:await fs.realpath(path.join(controller,'Project.toml')),root:await fs.realpath(workspace)});
+        const listing=JSON.parse(await fs.readFile(discoveryFile,'utf8'));
+        assert.equal(listing.schema_version,preparation.testItemDiscovery.listingSchema);
+        assert.equal(listing.executed,false);assert.equal(await fs.realpath(listing.root),preparation.testItemDiscovery.root);
+        assert.deepEqual(listing.items.filter(item=>item.name==='Vector reduction'&&item.file.replaceAll('\\','/')==='test/performance.jl'),[preparation.testItemDiscovery.item]);
+        preparation.testItemDiscovery.listingSha256=createHash('sha256').update(await fs.readFile(discoveryFile)).digest('hex');
+      }
       const complete=text.split(/\r?\n/).filter(line=>line.startsWith('CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 '));
       assert.equal(complete.length,1,'Exactly one completed explicit cache-preparation receipt is required');
       preparation.precompileSeconds=Number(complete[0].slice('CONTROLLER_CACHE_PREPARATION_COMPLETE_V1 '.length));
@@ -833,7 +920,9 @@ try {
   await fs.rm(path.join(workspace,'perf','results'),{recursive:true,force:true});
   await fs.rm(path.join(workspace,'perf','perfchecker-ui.json'),{force:true});
   await fs.writeFile(path.join(workspace, 'perf', 'sum.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs) = perf_workload(xs) == 333833500.0\n');
-  await fs.writeFile(path.join(workspace,'perf','profile-sum.jl'),'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1_000_000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.sum_squares(xs)\nperf_oracle(xs,result) = isapprox(result,1_000_000.0*1_000_001.0*2_000_001.0/6;rtol=1e-12)\n');
+  // Keep a sustained, checked batch inside the target module while each fresh
+  // profile operation owns its own sampling window; ordinary collectors stay small.
+  await fs.writeFile(path.join(workspace,'perf','profile-sum.jl'),'using PerfCheckerNativeFixture\nperf_setup() = collect(1.0:1_000_000.0)\nperf_workload(xs) = PerfCheckerNativeFixture.profile_sum_squares(xs)\nperf_oracle(xs,result) = isapprox(result,64*(1_000_000.0*1_000_001.0*2_000_001.0/6);rtol=1e-12)\n');
   await fs.writeFile(path.join(workspace, 'perf', 'wait.jl'), 'using PerfCheckerNativeFixture\nperf_setup() = 42\nperf_workload(x) = PerfCheckerNativeFixture.wait_task(x)\nperf_oracle(x) = perf_workload(x) == 42\n');
   await fs.writeFile(path.join(workspace, 'perf', 'cases.jl'), 'make_sum_case(p) = (prepare=()->collect(1.0:1000.0), operation=xs->sum(xs.^2), verify=(xs,result)->result==333833500.0)\nmake_wait_case(p) = (prepare=()->42, operation=x->(sleep(0.005);x), verify=(x,result)->result==42)\nmake_cancel_case(p) = (prepare=()->42, operation=x->(write(p["marker"],"running");sleep(30);x), verify=(x,result)->result==42)\n');
   // A distinct bounded workload gives CPU sampling actual operation time;
@@ -895,6 +984,8 @@ function build_suite()
  features=FeatureSpec[]
  for (workload,file) in [(:sum_squares,"sum.jl"),(:wait_task,"wait.jl")], backend in [:benchmark,:chairmark,:profile,:wall_profile,:profile_alloc,:alloc]
   options=Dict{Symbol,Any}(:samples=>3,:seconds=>0.03,:evals=>1,:repeat=>false,:targets=>["PerfCheckerNativeFixture"],:profile_seconds=>0.5,:profile_delay=>0.0005,:profile_repetitions=>3,:sample_rate=>1.0)
+  # wait_task only reads its immutable input; reuse keeps one continuous wall-profiling window.
+  workload===:wait_task && backend===:wall_profile && (options[:state_policy]=:reuse)
   entrypoint=workload===:sum_squares && backend in (:profile,:wall_profile) ? "profile-sum.jl" : file
   push!(features,FeatureSpec(Symbol(workload,"_",backend);workload,backend,entrypoint=joinpath(@__DIR__,entrypoint),options,oracle=OracleSpec()))
  end
@@ -1039,5 +1130,7 @@ finally {
 
 function assertCI() {
   if (process.env.CI !== 'true') throw new Error('Native VS Code installation is restricted to disposable remote CI.');
-  if (process.arch !== 'x64') throw new Error(`The registered core hardware dependency requires the explicitly tested x64 host, got ${process.arch}`);
+  return nativePlatformContract({scope:process.env.PERFCHECKER_NATIVE_SCOPE||'all',event:process.env.GITHUB_EVENT_NAME,
+    artifact:mode,stage,group:caseGroup,core:coreMode,runnerArch:process.env.RUNNER_ARCH||'',
+    expectedArch:process.env.PERFCHECKER_NATIVE_EXPECTED_ARCH||'x64'});
 }

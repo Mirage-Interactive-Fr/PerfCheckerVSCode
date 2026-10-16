@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.3 — ARM-compatible setup
+
+- Install PerfChecker.jl 1.1.1 or newer in the 1.x series when creating a controller
+  or installing/upgrading the separate Pluto environment. This excludes Core
+  1.1.0's ARM import failure while allowing compatible updates.
+- Resolve Core and the requested packages together before precompilation, then
+  verify the installed Core version. Existing prepared environments still accept
+  Core 1.1.0 in 1.x; installation and upgrades require an explicit choice.
+- Share simultaneous test-item discovery requests and prevent outdated results
+  from replacing the current workspace selection.
+
 ## 1.0.2 — Narrow chat and process lifecycle fixes
 
 - Keep MCP chat controls usable in narrow VS Code editor panels with the host's

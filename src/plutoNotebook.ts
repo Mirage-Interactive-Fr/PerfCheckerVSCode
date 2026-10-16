@@ -16,12 +16,13 @@ export async function shutdownPlutoSessions(): Promise<void> {
 
 const installCode = `
 using Pkg
-Pkg.add(PackageSpec(name="PerfChecker", version="1.1.0"))
-Pkg.add([PackageSpec(name="Pluto", version="1.0.4"), PackageSpec(name="PlutoUI"),
-    PackageSpec(name="BenchmarkTools"), PackageSpec(name="Chairmarks")])
-Pkg.add(PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",
-    subdir="packages/PerfCheckerPluto", rev="v1.0.1"))
+Pkg.add([PackageSpec(name="PerfChecker", version="1.1.1 - 1"),
+    PackageSpec(name="Pluto", version="1.0.4"), PackageSpec(name="PlutoUI"),
+    PackageSpec(name="BenchmarkTools"), PackageSpec(name="Chairmarks"),
+    PackageSpec(url="https://github.com/Mirage-Interactive-Fr/PerfChecker.jl",
+        subdir="packages/PerfCheckerPluto", rev="v1.0.1")])
 using PerfChecker, PerfCheckerPluto, Pluto, PlutoUI
+v"1.1.1" <= Base.pkgversion(PerfChecker) < v"2.0.0" || error("Pluto installation requires registered PerfChecker 1.1.1 or newer in the 1.x series.")
 `;
 const generateCode = `
 using PerfChecker, PerfCheckerPluto, Base64
@@ -397,7 +398,7 @@ export class PlutoNotebooks implements vscode.Disposable {
     }
     const action = exists ? 'Upgrade Pluto environment' : 'Install Pluto environment';
     const choice = await vscode.window.showWarningMessage(
-      `${exists ? 'This existing separate Pluto environment needs an explicit upgrade' : 'Pluto needs its own Julia environment'} at ${project}. Install registered PerfChecker 1.1.0, PerfCheckerPluto 1.0.1, Pluto 1.0.4 and PlutoUI there? This downloads packages and updates that environment. Your MCP controller stays separate.`,
+      `${exists ? 'This existing separate Pluto environment needs an explicit upgrade' : 'Pluto needs its own Julia environment'} at ${project}. Install registered PerfChecker 1.1.1 or newer in the 1.x series, PerfCheckerPluto 1.0.1, Pluto 1.0.4 and PlutoUI there? This downloads packages and updates that environment. Your MCP controller stays separate.`,
       {modal: true}, action, 'Open setup guide');
     if (choice === 'Open setup guide') {
       await vscode.env.openExternal(vscode.Uri.parse('https://perfchecker.mirageinteractive.fr/interfaces/repl-pluto.html')); return;

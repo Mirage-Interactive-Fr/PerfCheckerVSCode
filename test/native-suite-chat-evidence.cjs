@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS,waitForNativeAvailability}=require('./native-readiness.cjs');
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
 const path=require('node:path');
@@ -6,7 +7,7 @@ const {execFile}=require('node:child_process');
 const {promisify}=require('node:util');
 const execute=promisify(execFile),hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 const documents=['manifest.json','measurement-definitions.json','observations.jsonl','diagnostics.jsonl','artifacts.json','integrity.json'];
-async function eventually(callback,label,timeout=180000){
+async function eventually(callback,label,timeout=NATIVE_READINESS_MS){
   const until=Date.now()+timeout;
   do {const result=await callback();if(result)return result;await new Promise(resolve=>setTimeout(resolve,100));}while(Date.now()<until);
   throw new Error(label);
@@ -22,26 +23,26 @@ exports.run=async(context,{calls,receipts,providerErrors,state,setAttached})=>{
   const reports=path.resolve(workspace,settings.get('reports','perf/results/vscode'));
   assert(!path.relative(workspace,reports).startsWith('..')&&!path.isAbsolute(path.relative(workspace,reports)));
   const previous=await fs.readFile(path.join(reports,'suite-result.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
-  await vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri);
+  await waitForNativeAvailability(vscode.commands.executeCommand('perfchecker.openDesignerForWorkspace',uri),"perfchecker.openDesignerForWorkspace");
   const designer=await findFrame('#cards',{allowAttached:true});
   await eventually(async()=>await designer.locator('#check-types label').count()>0&&await designer.locator('#cards .card').count()>0,
-    'The real controller supplies the suite plan before Run selection',360000);
-  await designer.locator('#reset-filters').click();await designer.locator('#clear-all').click();
+    'The real controller supplies the suite plan before Run selection',NATIVE_READINESS_MS);
+  await designer.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});await designer.locator('#clear-all').click({timeout:NATIVE_READINESS_MS});
   const card=designer.locator('#cards .card')
     .filter({has:designer.locator('.package',{hasText:/^PerfCheckerNativeFixture$/})})
     .filter({has:designer.locator('strong',{hasText:/^sum_squares$/})}).first();
   assert.equal(await card.count(),1);
   const check=card.locator('.check-option.ready').filter({hasText:'BenchmarkTools'});
-  assert.equal(await check.count(),1);await check.locator('input').check();
-  assert.match(await designer.locator('#count').innerText(),/^1 selected/);
-  await designer.locator('#open-after-run').uncheck();await designer.locator('#run').click();
+  assert.equal(await check.count(),1);await check.locator('input').check({timeout:NATIVE_READINESS_MS});
+  assert.match(await designer.locator('#count').innerText({timeout:NATIVE_READINESS_MS}),/^1 selected/);
+  await designer.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});await designer.locator('#run').click({timeout:NATIVE_READINESS_MS});
   let suite;
   await eventually(async()=>{
     const bytes=await fs.readFile(path.join(reports,'suite-result.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
     if(!bytes||bytes.equals(previous??Buffer.alloc(0)))return false;
     try{suite=JSON.parse(bytes);}catch(error){if(error instanceof SyntaxError)return false;throw error;}
-    return suite.schema_version==='perfchecker-suite-result/1'&&suite.runs.length===1&&suite.runs[0].status==='pass'&&!(await designer.locator('#run').isDisabled());
-  },'The one selected real BenchmarkTools suite check generates its saved report',360000);
+    return suite.schema_version==='perfchecker-suite-result/1'&&suite.runs.length===1&&suite.runs[0].status==='pass'&&!(await designer.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS}));
+  },'The one selected real BenchmarkTools suite check generates its saved report',NATIVE_READINESS_MS);
   assert.equal(suite.runs[0].package,'PerfCheckerNativeFixture');
   assert.equal(suite.runs[0].feature,'sum_squares_benchmark');
   const series=JSON.parse(await fs.readFile(path.join(reports,'version-series.json')));
@@ -63,7 +64,7 @@ exports.run=async(context,{calls,receipts,providerErrors,state,setAttached})=>{
   // measurement row is manufactured by the host qualification.
   const projected=await execute(process.env.PERFCHECKER_NATIVE_JULIA,['--startup-file=no',`--project=${context.controller}`,'-e',
     'using PerfChecker; bundle=read_run_bundle(ARGS[1];require_integrity=true); advice=advise(bundle); @assert haskey(advice,"measurement_summaries"); config=PerfChecker.AdvisorConfig(protocol=:mcp_http,mcp_tool="ask_perfchecker",mcp_response=:text); evidence=PerfChecker._advisor_evidence(advice,config); serialized=PerfChecker.JSON.json(evidence); PerfChecker.JSON.print(Dict("version"=>string(Base.pkgversion(PerfChecker)),"advice"=>advice,"evidence"=>evidence,"characters"=>length(serialized),"budget"=>config.max_evidence_chars))',directory],
-    {windowsHide:true,timeout:180000,env:{...process.env,JULIA_LOAD_PATH:'@'+path.delimiter+'@stdlib'}});
+    {windowsHide:true,timeout:NATIVE_READINESS_MS,env:{...process.env,JULIA_LOAD_PATH:'@'+path.delimiter+'@stdlib'}});
   const expected=JSON.parse(projected.stdout);assert.equal(expected.version,context.core.version);
   assert.equal(expected.budget,12000);assert(expected.characters<=expected.budget);
   const measured=expected.evidence.filter(row=>row.kind==='measurement');assert(measured.length>0);
@@ -104,19 +105,19 @@ exports.run=async(context,{calls,receipts,providerErrors,state,setAttached})=>{
   let chat,originalObservations,corrupted=false,primaryError;
   try{
     await vscode.commands.executeCommand('perfchecker.openChat');chat=await findFrame('#chat-root');
-    await chat.getByRole('tab',{name:'01 · Advice',exact:true}).click();
+    await chat.getByRole('tab',{name:'01 · Advice',exact:true}).click({timeout:NATIVE_READINESS_MS});
     const entry=await eventually(async()=>(await state()).evidence.find(item=>item.id.startsWith('suite:')&&item.id.includes(series.run_id)&&!item.unavailable),
       'Chat refresh exposes the exact generated Suite run before its selection');
     assert(entry&&!entry.unavailable,'The real picker exposes the generated bundle by explicit workspace/run identity');
     assert(entry.id.includes(uri.toString()));
     assert.equal(receipts.length,beforeOpenReceipts,'Open Chat contacts no provider');
-    await chat.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(entry.id);
+    await chat.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(entry.id,{timeout:NATIVE_READINESS_MS});
     await eventually(async()=>{const value=await state();return value.evidenceId===entry.id&&!value.busy&&value.messages.length===0;},'Native Suite selection stays idle');
     assert.equal(calls.length,beforeCalls);assert.equal(receipts.length,beforeOpenReceipts);
     assert.deepEqual(await sourceHashes(),before);
     setAttached({evidence:expected.evidence,evidenceBudget:expected.budget,inspectPayload});
-    await chat.locator('#chat-question').fill(question);
-    await chat.getByRole('button',{name:'Send question',exact:true}).click();
+    await chat.locator('#chat-question').fill(question,{timeout:NATIVE_READINESS_MS});
+    await chat.getByRole('button',{name:'Send question',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async()=>{assert.deepEqual(providerErrors,[]);const value=await state();return !value.busy&&value.messages.length===2;},'Actual Suite projection and the real MCP request complete');
     assert.equal(calls.length,beforeCalls+1);assert.deepEqual(calls.at(-1).evidenceIds,expected.evidence.map(row=>row.id));
     assert.equal(inspectedPayloads,1,'The complete real request was inspected before its controlled reply');
@@ -130,7 +131,7 @@ exports.run=async(context,{calls,receipts,providerErrors,state,setAttached})=>{
       completePayloadSha256:payloadSha256,completePayloadNoPathsOrRawSource:true,uniqueEvidenceIds:true,
       originalProtocolBytesPreserved:true,originalIdentityReportBytesPreserved:true,
       provider:'Controlled actual MCP transport; no agent inference or performance gain claimed'});
-    await chat.getByRole('button',{name:'New conversation',exact:true}).click();
+    await chat.getByRole('button',{name:'New conversation',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async()=>!(await state()).busy&&(await state()).messages.length===0,'Clear Suite conversation before integrity refusal');
     originalObservations=await fs.readFile(path.join(directory,'observations.jsonl'));
     const changedObservations=Buffer.concat([originalObservations,Buffer.from('\n')]);
@@ -138,8 +139,8 @@ exports.run=async(context,{calls,receipts,providerErrors,state,setAttached})=>{
     const refusedHashes={...before,'bundle/observations.jsonl':hash(changedObservations)};
     assert.deepEqual(await sourceHashes(),refusedHashes,'Only the deliberate disposable observation corruption changes any source or identity report');
     const beforeRejectedCalls=calls.length,beforeRejectedReceipts=receipts.length;
-    await chat.locator('#chat-question').fill('Do not send this modified bundle.');
-    await chat.getByRole('button',{name:'Send question',exact:true}).click();
+    await chat.locator('#chat-question').fill('Do not send this modified bundle.',{timeout:NATIVE_READINESS_MS});
+    await chat.getByRole('button',{name:'Send question',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async()=>{const value=await state();return !value.busy&&/byte integrity check.*No measurements were sent/.test(value.status);},'A modified real bundle is refused before contacting MCP');
     assert.equal(calls.length,beforeRejectedCalls);assert.equal(receipts.length,beforeRejectedReceipts);
     assert.deepEqual((await state()).messages,[]);
@@ -152,8 +153,8 @@ exports.run=async(context,{calls,receipts,providerErrors,state,setAttached})=>{
     const errors=[];
     try{if(corrupted)await fs.writeFile(path.join(directory,'observations.jsonl'),originalObservations);}catch(error){errors.push(error);}
     setAttached(undefined);
-    try{if(chat){await chat.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption('');
-      await eventually(async()=>!(await state()).busy&&(await state()).evidenceId===''&&(await state()).messages.length===0,'Restore configuration-only conversation after the Suite test');}}
+    try{if(chat){await chat.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption('',{timeout:30000});
+      await eventually(async()=>!(await state()).busy&&(await state()).evidenceId===''&&(await state()).messages.length===0,'Restore configuration-only conversation after the Suite test',180000);}}
     catch(error){errors.push(error);}
     if(errors.length)throw new AggregateError([...(primaryError?[primaryError]:[]),...errors],'Native Suite evidence failed or could not restore its disposable fixture');
   }

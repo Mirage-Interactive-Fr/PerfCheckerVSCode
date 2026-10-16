@@ -1,7 +1,329 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import {controllerPreflightScript,parseControllerImportReceipt,controllerInspectionFailure,revalidateQualifiedLinuxExecutable} from './native-controller-preflight.mjs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import {EventEmitter} from 'node:events';
+import {writeSync} from 'node:fs';
+import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,nativeOperationSnapshot,observeNativeOperation,captureQualifiedNativeProgress,assertNativeDiscoveryDiagnostic,nativeDiscoverySpawnOutput,installNativeDiscoveryObserver,readBoundedNativeFile,nativeSampleProjection,nativeSampleManualContract,createNativeDiscoveryReaders,discoveryOwnedCommand} from './native-controller-preflight.mjs';
+
+const nextObservationTurn=()=>new Promise(resolve=>setImmediate(resolve));
+const discoveryExpected={executable:'/private/Julia/bin/julia',project:'/private/controller',root:'/private/workspace',
+  expression:'immutable installed cancellation wrapper',outputRoot:'/private/profile/native-testitems'};
+const discoveryArgs=()=>['--startup-file=no','--project=/private/controller','-e',discoveryExpected.expression,'--','testitems',
+  '--root=/private/workspace','--project=/private/controller','--output=/private/profile/native-testitems/12345678-1234-1234-1234-123456789abc/result.json',
+  '--list','--tags=','--exclude-tags='];
+function observationChild(pid=123){const child=new EventEmitter();child.pid=pid;child.exitCode=null;child.signalCode=null;
+  child.stdout=new EventEmitter();child.stderr=new EventEmitter();child.kill=()=>true;return child;}
+const diagnosticSelection=()=>({enabled:true,event:'workflow_dispatch',artifact:'candidate',stage:'full',scope:'macos-stable',
+  core:'candidate',partition:'measure',platform:'darwin',arch:'x64',backendJulia:'1',originRun:'38653410110',
+  originName:'native-candidate-73b99deb87efaf45bd5e96036f755e42c748bdab',
+  originSha:'bc61f9fa172069c61722e0691900d3ddf8a39ce143fd9d553b252304dbc55850',
+  coreCommit:'d079efd5c24c3dcac5b7550781822038e0ff780f',coreTree:'749f8eac351ed2a1f0bc110456f2eb37a3bc08ee',newOrigin:false});
+
+test('discovery diagnostic refuses another host, phase, product, Core or origin and is inert when off',()=>{
+  assert.doesNotThrow(()=>assertNativeDiscoveryDiagnostic({enabled:false,stage:'irrelevant'}));
+  assert.doesNotThrow(()=>assertNativeDiscoveryDiagnostic(diagnosticSelection()));
+  for(const [key,value]of Object.entries({event:'pull_request',artifact:'public',stage:'focused',scope:'all',core:'general',
+    partition:'agentic',platform:'linux',arch:'arm64',backendJulia:'1.10',originRun:'other',originName:'other',originSha:'other',
+    coreCommit:'other',coreTree:'other',newOrigin:true}))assert.throws(()=>assertNativeDiscoveryDiagnostic({...diagnosticSelection(),[key]:value}),key);
+});
+
+test('discovery matcher uses the exact known private invocation and never inspects a running argv',()=>{
+  const args=discoveryArgs(),options={cwd:discoveryExpected.root,env:{token:'PRIVATE'}};
+  assert.equal(nativeDiscoverySpawnOutput(discoveryExpected.executable,args,options,discoveryExpected),args[8].slice(9));
+  for(const index of [0,1,3,6,7,8,9,10,11]){const other=[...args];other[index]+='changed';
+    assert.equal(nativeDiscoverySpawnOutput(discoveryExpected.executable,other,options,discoveryExpected),undefined);}
+  assert.equal(nativeDiscoverySpawnOutput('/other/julia',args,options,discoveryExpected),undefined);
+});
+
+test('discovery hook delegates once with identical arguments, this and ChildProcess before observers run',async()=>{
+  const records=[],calls=[],child=observationChild();let reads=0;
+  const cp={spawn:function(){calls.push({self:this,args:[...arguments]});return child;}},original=cp.spawn;
+  const observer=installNativeDiscoveryObserver({childProcess:cp,expected:discoveryExpected,delays:[0],record:row=>records.push(row),
+    readListing:async()=>{reads++;return{status:'not-observed'};},observe:async()=>({qualified:true})});
+  const args=discoveryArgs(),options={cwd:discoveryExpected.root};
+  try{assert.equal(cp.spawn(discoveryExpected.executable,args,options),child);assert.equal(reads,0);assert.equal(calls.length,1);
+    assert.equal(calls[0].self,cp);assert.equal(calls[0].args[1],args);assert.equal(calls[0].args[2],options);
+    await new Promise(resolve=>setTimeout(resolve,5));assert.equal(reads,1);
+    child.exitCode=0;child.emit('exit',0,null);child.emit('close',0,null);await nextObservationTurn();
+  }finally{await observer.retire();}
+  assert.equal(cp.spawn,original);assert(records.some(row=>row.stage==='product-close'));
+  assert(!JSON.stringify(records).includes('/private/'));assert.equal(records.at(-1).drained,true);
+});
+
+test('diagnostic matcher and sink failures cannot lose an already spawned product or replace its synchronous error',async()=>{
+  const child=observationChild(),calls=[],cp={spawn:function(){calls.push([...arguments]);return child;}};
+  const observer=installNativeDiscoveryObserver({childProcess:cp,expected:discoveryExpected,delays:[],
+    record:()=>{},observe:async()=>({}),readListing:async()=>({})});
+  const args=discoveryArgs();Object.defineProperty(args,8,{get(){throw new Error('PRIVATE matcher failure');}});
+  assert.equal(cp.spawn(discoveryExpected.executable,args,{cwd:discoveryExpected.root}),child);assert.equal(calls.length,1);
+  await assert.rejects(observer.retire(),error=>error instanceof AggregateError&&!String(error).includes('PRIVATE'));
+  const primary=new Error('original spawn refusal'),failing={spawn(){throw primary;}};
+  const other=installNativeDiscoveryObserver({childProcess:failing,expected:discoveryExpected,record:()=>{throw new Error('PRIVATE sink');},
+    observe:async()=>{assert.fail('No observer after refused spawn');},readListing:async()=>({})});
+  assert.throws(()=>failing.spawn('anything',[]),error=>error===primary);
+  await assert.rejects(other.retire());
+  const short={spawn:function(){assert.equal(arguments.length,2);return child;}};
+  const exact=installNativeDiscoveryObserver({childProcess:short,expected:discoveryExpected,record:()=>{},observe:async()=>({}),readListing:async()=>({})});
+  assert.equal(short.spawn('other',[]),child);await exact.retire();
+});
+
+test('discovery observation keeps a valid listing when process inspection fails without leaking tool messages',async()=>{
+  const records=[],child=observationChild(),cp={spawn:()=>child};let started;
+  const entered=new Promise(resolve=>{started=resolve;});
+  const observer=installNativeDiscoveryObserver({childProcess:cp,expected:discoveryExpected,delays:[0],record:row=>records.push(row),
+    readListing:async()=>({status:'valid-listing',sha256:'safe'}),observe:async()=>{started();throw Object.assign(new Error('PRIVATE argv'),{diagnosticStage:'image-after',code:'EACCES'});}});
+  try{cp.spawn(discoveryExpected.executable,discoveryArgs(),{cwd:discoveryExpected.root});await entered;await nextObservationTurn();}
+  finally{await observer.retire();}
+  assert(records.some(row=>row.stage==='listing-observed'&&row.listing.status==='valid-listing'));
+  assert(records.some(row=>row.stage==='snapshot-unknown'&&row.step==='image-after'&&row.code==='EACCES'));
+  assert(!JSON.stringify(records).includes('PRIVATE'));
+});
+
+test('discovery observer coalesces readers, aborts and physically drains them, and refuses a replaced hook',async()=>{
+  const child=observationChild(),cp={spawn:()=>child},records=[];let calls=0,aborted=false,entered;
+  const started=new Promise(resolve=>{entered=resolve;});
+  const observer=installNativeDiscoveryObserver({childProcess:cp,expected:discoveryExpected,delays:[0,0,0],record:row=>records.push(row),
+    readListing:async()=>({status:'not-observed'}),observe:(capture,{signal})=>new Promise(resolve=>{calls++;entered();
+      signal.addEventListener('abort',()=>{aborted=true;resolve({qualified:true});},{once:true});})});
+  cp.spawn(discoveryExpected.executable,discoveryArgs(),{cwd:discoveryExpected.root});await started;await nextObservationTurn();
+  assert.equal(calls,1);await observer.retire();assert(aborted);assert.equal(records.at(-1).drained,true);
+  const other=installNativeDiscoveryObserver({childProcess:cp,expected:discoveryExpected,delays:[],record:()=>{},observe:async()=>({}),readListing:async()=>({})});
+  const foreign=()=>child;cp.spawn=foreign;await assert.rejects(other.retire(),/retirement failed/);assert.equal(cp.spawn,foreign);
+});
+
+test('discovery listing delayed beyond abort and retirement is unknown and never published as active',async()=>{
+  const child=observationChild(),cp={spawn:()=>child},records=[];let resolveRead,entered;
+  const started=new Promise(resolve=>{entered=resolve;});
+  const observer=installNativeDiscoveryObserver({childProcess:cp,expected:discoveryExpected,delays:[0],record:row=>records.push(row),
+    readListing:()=>new Promise(resolve=>{resolveRead=resolve;entered();}),observe:async()=>assert.fail('Late listing cannot inspect a process')});
+  cp.spawn(discoveryExpected.executable,discoveryArgs(),{cwd:discoveryExpected.root});await started;
+  const retired=observer.retire();resolveRead({status:'valid-listing',sha256:'late'});await retired;
+  assert(!records.some(row=>row.stage==='listing-observed'));
+  assert(records.some(row=>row.stage==='listing-unknown'));assert.equal(records.at(-1).drained,true);
+});
+
+test('bounded reads refuse growth and short data and accumulate partial physical reads exactly',async()=>{
+  const fake=bytes=>({async read(out,offset,length,position){const n=Math.min(2,length,Math.max(0,bytes.length-position));bytes.copy(out,offset,position,position+n);return{bytesRead:n};}});
+  assert.equal(String(await readBoundedNativeFile(fake(Buffer.from('abc')),3,4)),'abc');
+  await assert.rejects(readBoundedNativeFile(fake(Buffer.from('ab')),3,4),/short read/);
+  await assert.rejects(readBoundedNativeFile(fake(Buffer.from('abcd')),3,4),/growth/);
+  await assert.rejects(readBoundedNativeFile(fake(Buffer.from('a')),5,4));
+});
+
+test('listing reader records current schema and hashed target and refuses links and stale live identity',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'pc-discovery-test-'));
+  const output=path.join(root,'result.json'),records=[];
+  const readers=createNativeDiscoveryReaders({...discoveryExpected,root,canonicalExecutable:process.execPath},{record:row=>records.push(row)});
+  const options={signal:new AbortController().signal,deadlineAt:Date.now()+1000};
+  const capture={output,pid:123,parent:process.pid,exited:false,closed:false};
+  try{assert.deepEqual(await readers.readListing(capture,options),{status:'not-observed'});
+    await fs.writeFile(output,JSON.stringify({schema_version:'perfchecker-testitems/1',root,executed:false,
+      items:[{id:'PRIVATE target',name:'Vector reduction',file:'test/performance.jl'}]}));
+    const value=await readers.readListing(capture,options);assert.equal(value.targetMatches,1);assert.equal(value.targetIds[0].length,64);
+    assert(!JSON.stringify(value).includes('PRIVATE'));await fs.unlink(output);await fs.symlink('missing',output);
+    await assert.rejects(readers.readListing(capture,options));
+    await assert.rejects(readers.observe({...capture,exited:true},{...options,originalSpawn:()=>assert.fail('Exited product cannot start an observer')}));
+  }finally{await readers.retire();await fs.rm(root,{recursive:true,force:true});}
+});
+
+test('sample projection accepts only finite known symbols and hashes unknown or overlong names',()=>{
+  const value=nativeSampleProjection(Buffer.from(' 12 jl_compile_method_internal (in Julia)\n 3 read\n 9 llvm::PRIVATE_TOKEN\n 8 jl_compilePRIVATE_TOKEN\n'+
+    ' 999999999999999999999999 jl_load\n 1 '+ 'jl_compile'+ 'X'.repeat(3000)));
+  assert.equal(value.categories.jit,12);assert.equal(value.categories.io,3);assert.equal(value.unclassified.weight,17);
+  assert.equal(value.unclassified.lines,2);assert.equal(value.rejectedLines,1);
+  assert(!JSON.stringify(value).includes('PRIVATE'));assert(Object.values(value.categories).every(Number.isSafeInteger));
+  assert.throws(()=>nativeSampleProjection(Buffer.alloc(2000001)));
+});
+
+test('sample temporary directories retire after chmod or open fails without launching a sample writer',async()=>{
+  const realChmod=fs.chmod,realOpen=fs.open,realMkdtemp=fs.mkdtemp;
+  for(const failingMethod of ['chmod','open']){
+    const records=[],directoryNames=[],toolNames=[],created=Date.now(),image=await fs.realpath(process.execPath);
+    const expected={...discoveryExpected,canonicalExecutable:image};
+    const readers=createNativeDiscoveryReaders(expected,{sampleSyntax:{supported:true},record:row=>records.push(row)});
+    const fakeSpawn=(file,args)=>{toolNames.push(path.basename(file));const child=observationChild(456);
+      queueMicrotask(()=>{const text=file.endsWith('lsof')?'p123\nn'+image+'\n':args.includes('lstart=')?
+        process.pid+' '+new Date(created).toString()+'\n':'R 00:01 0:00.01 1.0\n';
+        child.stdout.emit('data',Buffer.from(text));child.emit('exit',0,null);child.emit('close',0,null);});return child;};
+    const primary=new Error('controlled setup failure');
+    fs.mkdtemp=async(...args)=>{const directory=await realMkdtemp(...args);directoryNames.push(directory);return directory;};
+    fs.chmod=failingMethod==='chmod'?async()=>{throw primary;}:realChmod;
+    fs.open=failingMethod==='open'?async()=>{throw primary;}:realOpen;
+    try{await assert.rejects(readers.observe({pid:123,parent:process.pid,startedAt:created,spawnedAt:created,exited:false,closed:false},
+      {signal:new AbortController().signal,deadlineAt:Date.now()+1000,originalSpawn:fakeSpawn,sample:true}),error=>error===primary);
+    }finally{fs.chmod=realChmod;fs.open=realOpen;fs.mkdtemp=realMkdtemp;await readers.retire();}
+    assert.equal(directoryNames.length,1);assert(!toolNames.includes('sample'));
+    await assert.rejects(fs.lstat(directoryNames[0]),error=>error.code==='ENOENT');assert.equal(records.at(-1).physicalClose,true);
+  }
+});
+
+test('reader retirement preserves a sink error after closing and removing safe sample output',async()=>{
+  const primary=new Error('original diagnostic sink failure'),created=Date.now(),image=await fs.realpath(process.execPath);
+  const realMkdtemp=fs.mkdtemp,directories=[];
+  const readers=createNativeDiscoveryReaders({...discoveryExpected,canonicalExecutable:image},{sampleSyntax:{supported:true},
+    record:row=>{if(row.stage==='owned-observers-retired')throw primary;}});
+  const fakeSpawn=(file,args,options)=>{const child=observationChild(456);
+    queueMicrotask(()=>{
+      if(file.endsWith('sample')){assert.equal(args.at(-1),'/dev/fd/3');writeSync(options.stdio[3],' 4 jl_compile_method_internal\n');}
+      else{const text=file.endsWith('lsof')?'p123\nn'+image+'\n':args.includes('lstart=')?
+        process.pid+' '+new Date(created).toString()+'\n':'R 00:01 0:00.01 1.0\n';child.stdout.emit('data',Buffer.from(text));}
+      child.emit('exit',0,null);child.emit('close',0,null);
+    });return child;};
+  fs.mkdtemp=async(...args)=>{const directory=await realMkdtemp(...args);directories.push(directory);return directory;};
+  try{
+    const result=await readers.observe({pid:123,parent:process.pid,startedAt:created,spawnedAt:created,exited:false,closed:false},
+      {signal:new AbortController().signal,deadlineAt:Date.now()+1000,originalSpawn:fakeSpawn,sample:true});
+    assert.equal(result.stack.categories.jit,4);
+    await assert.rejects(readers.retire(),error=>error===primary);
+    assert.equal(directories.length,1);await assert.rejects(fs.lstat(directories[0]),error=>error.code==='ENOENT');
+  }finally{fs.mkdtemp=realMkdtemp;for(const directory of directories)await fs.rm(directory,{recursive:true,force:true});}
+});
+
+test('sample command syntax is supported only by explicit installed man or mdoc options',()=>{
+  assert(nativeSampleManualContract(Buffer.from('sample pid duration interval [-mayDie] [-file output]')).supported);
+  assert(nativeSampleManualContract(Buffer.from('.Dt SAMPLE 1\n.Nm sample\n.Ar pid\n.Ar duration\n.Ar interval\n.Fl mayDie\n.Fl file')).supported);
+  for(const text of ['sample pid duration interval mayDie file','sample pid duration interval -mayDied -filename',
+    'sample pid -file output -mayDie'])assert.equal(nativeSampleManualContract(Buffer.from(text)).supported,false);
+});
+
+test('owned inspection stops once and preserves the first error until real close with safe tool metadata',async()=>{
+  const child=observationChild(),controller=new AbortController(),records=[],primary=new Error('PRIVATE original command error');let kills=0;
+  child.kill=()=>{kills++;return true;};
+  const pending=discoveryOwnedCommand(()=>child,'/bin/ps',[],{signal:controller.signal,deadlineAt:Date.now()+1000,states:[],
+    record:row=>records.push(row),stage:'cpu',targetPid:456,sequence:1});
+  child.emit('error',primary);child.stdout.emit('data',Buffer.alloc(131073));controller.abort();child.stderr.emit('data',Buffer.alloc(16385));
+  assert.equal(kills,1);let finished=false;void pending.catch(()=>{finished=true;});await nextObservationTurn();assert.equal(finished,false);
+  child.emit('exit',null,'SIGTERM');child.emit('close',null,'SIGTERM');await assert.rejects(pending,error=>error===primary);
+  assert.equal(kills,1);assert.equal(records.length,1);assert.equal(records[0].physicalClose,true);
+  assert.equal(records[0].tool,'ps');assert.equal(records[0].stdoutBytes,131073);assert(!JSON.stringify(records).includes('PRIVATE'));
+});
+
+const observationDelay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const operationSnapshot=()=>({hostPid:10,expectedExecutable:process.execPath,
+  rows:[{pid:11,parent:10,createdAt:'2026-10-14T10:00:00.000Z',canonicalExecutable:process.execPath,
+    progress:{state:'R',elapsed:'00:12',cpuTime:'0:03.10',cpuPercent:'25.0'},argv:'private source',token:'private token'}],
+  files:[{name:'suite',present:false,contents:'private source'}],environment:'private environment'});
+
+test('native state observations revalidate the executable after reading progress',async()=>{
+  const order=[],progress={state:'R'};
+  assert.equal(await captureQualifiedNativeProgress(process.execPath,[process.execPath],async()=>{order.push('states');return progress;},
+    async()=>{order.push('image-after');return[process.execPath];}),progress);
+  assert.deepEqual(order,['states','image-after']);
+  await assert.rejects(captureQualifiedNativeProgress(process.execPath,[process.execPath],async()=>progress,async()=>['/other/executable']),/changed or uncertain executable/);
+  const unknown=Object.assign(new Error('canonical executable unavailable'),{code:'ENOENT'});
+  await assert.rejects(captureQualifiedNativeProgress(process.execPath,[process.execPath],async()=>progress,async()=>{throw unknown;}),error=>error===unknown);
+  let read=false;
+  await assert.rejects(captureQualifiedNativeProgress(process.execPath,[],async()=>{read=true;return progress;},async()=>[process.execPath]),/canonical executable before/);
+  assert.equal(read,false);
+});
+
+test('native operation evidence refuses foreign or ambiguous ownership and strips private payloads',()=>{
+  const value=operationSnapshot(),safe=nativeOperationSnapshot(value);
+  assert(!JSON.stringify(safe).includes('private'));
+  assert.deepEqual(safe.files,[{name:'suite',present:false}]);
+  for(const rows of [[{...value.rows[0],parent:999}],[...value.rows,...value.rows],
+    [{...value.rows[0],identityOnly:true}],[{...value.rows[0],createdAt:'unverified'}]])
+    assert.throws(()=>nativeOperationSnapshot({...value,rows}));
+  assert.throws(()=>nativeOperationSnapshot({...value,files:[{name:'user-source',present:true,bytes:1,modifiedAt:'2026-10-14T10:00:00Z'}]}));
+});
+
+test('native operation invokes the real action first and preserves its exact result',async()=>{
+  const order=[],records=[],result={actual:'result'};
+  const actual=await observeNativeOperation('plan',async()=>{order.push('action');await observationDelay(15);return result;},{
+    deadlineAt:Date.now()+1000,intervalMs:2,sampleTimeoutMs:100,maxSamples:2,
+    sample:async()=>{order.push('sample');return operationSnapshot();},record:row=>records.push(row)});
+  assert.equal(actual,result);assert.equal(order[0],'action');assert(order.includes('sample'));
+  assert(records.filter(row=>row.stage==='sample').length<=2);assert.equal(records.at(-1).stage,'observer-stopped');
+  assert.equal(records.at(-1).drained,true);
+});
+
+test('observation failure neither replaces a real rejection nor records its private contents',async()=>{
+  const primary=new Error('original operation rejection'),records=[];
+  await assert.rejects(observeNativeOperation('initialize',async()=>{await observationDelay(10);throw primary;},{
+    deadlineAt:Date.now()+1000,intervalMs:1,sampleTimeoutMs:100,maxSamples:1,
+    sample:async()=>{throw Object.assign(new Error('private token and argv'),{code:'EACCES'});},record:row=>records.push(row)}),error=>error===primary);
+  assert(records.some(row=>row.stage==='inspection-error'&&row.code==='EACCES'));
+  assert(!JSON.stringify(records).includes('private'));assert.equal(records.at(-1).drained,true);
+});
+
+test('native observer coalesces pending reads and aborts and drains them before returning',async()=>{
+  let active=0,maximum=0,calls=0,aborted=0;const records=[];
+  await observeNativeOperation('diagnose',async()=>{await observationDelay(20);return 'unchanged';},{
+    deadlineAt:Date.now()+1000,intervalMs:1,sampleTimeoutMs:100,maxSamples:10,
+    sample:({signal})=>new Promise(resolve=>{calls++;maximum=Math.max(maximum,++active);
+      signal.addEventListener('abort',()=>{aborted++;active--;resolve(operationSnapshot());},{once:true});}),record:row=>records.push(row)});
+  assert.equal(maximum,1);assert.equal(calls,1);assert.equal(active,0);assert.equal(aborted,1);
+  assert.equal(records.at(-1).drained,true);const count=records.length;
+  await observationDelay(10);assert.equal(calls,1);assert.equal(records.length,count);
+});
+
+test('late observations cannot qualify a snapshot or extend an expired operation oracle',async()=>{
+  const records=[],primary=new Error('original deadline');let finishSample,rejectOperation,started;
+  const entered=new Promise(resolve=>{started=resolve;});
+  const pending=observeNativeOperation('plan',()=>new Promise((resolve,reject)=>{rejectOperation=reject;}),{
+    deadlineAt:Date.now()+1000,intervalMs:1,sampleTimeoutMs:2,maxSamples:1,
+    sample:()=>new Promise(resolve=>{finishSample=()=>resolve(operationSnapshot());started();}),record:row=>records.push(row)});
+  await entered;rejectOperation(primary);
+  await assert.rejects(pending,error=>error===primary);assert.equal(records.at(-1).drained,false);
+  finishSample();await new Promise(resolve=>setImmediate(resolve));
+  assert(!records.some(row=>row.stage==='sample'));
+});
+
+test('a diagnostic sink failure preserves synchronous operation refusal and schedules no observer',async()=>{
+  const primary=new Error('original refusal');let sampled=false;
+  await assert.rejects(observeNativeOperation('initialize',()=>{throw primary;},{deadlineAt:Date.now()+100,
+    sample:async()=>{sampled=true;return operationSnapshot();},record:()=>{throw new Error('sink failed');}}),error=>error===primary);
+  assert.equal(sampled,false);
+});
+
+const readyLeader={pid:4924,parent:6176,executable:'C:\\Julia\\bin\\julia.exe'};
+const readiness={parent:6176,expected:readyLeader.executable,canonical:value=>value.toLowerCase()};
+
+test('READY received during an inventory waits for the next coherent snapshot',async()=>{
+  let readyPid,finishInventory,started=false;
+  const handshakes=[];
+  const observe=snapshot=>{
+    if(controllerReadinessObserved({...readiness,readyPid:snapshot.readyPid,started,
+      identities:new Map(snapshot.rows.map(row=>[row.pid,row])),live:new Set(snapshot.rows.map(row=>row.pid))})){
+      started=true;handshakes.push('OBSERVED\n');
+    }
+  };
+  const first=captureControllerInventory(()=>readyPid,()=>new Promise(resolve=>{finishInventory=resolve;}));
+  readyPid=4924;
+  const earlierRows=[{pid:6176,parent:6592}];
+  finishInventory(earlierRows);
+  const initial=await first;
+  assert.deepEqual(initial,{readyPid:undefined,rows:earlierRows},'Later stdout cannot qualify an earlier inventory');
+  observe(initial);assert.deepEqual(handshakes,[],'The previous inventory cannot send a handshake');
+  const currentRows=[...earlierRows,readyLeader];
+  const next=await captureControllerInventory(()=>readyPid,async()=>currentRows);
+  assert.deepEqual(next,{readyPid:4924,rows:currentRows},'The next inventory binds the received READY to its own rows');
+  observe(next);assert.deepEqual(handshakes,['OBSERVED\n']);
+  observe(next);assert.equal(handshakes.length,1,'The observed leader starts only once');
+});
+
+test('an inventory keeps its initial READY identity and propagates read failures',async()=>{
+  let readyPid=4924,finishInventory;
+  const pending=captureControllerInventory(()=>readyPid,()=>new Promise(resolve=>{finishInventory=resolve;}));
+  readyPid=9000;
+  const rows=[{pid:4924,parent:6176}];finishInventory(rows);
+  assert.deepEqual(await pending,{readyPid:4924,rows});
+  const failure=new Error('CIM inventory failed');
+  await assert.rejects(captureControllerInventory(()=>readyPid,async()=>{throw failure;}),error=>error===failure);
+});
+
+test('known READY still requires the live PID, original parent and executable',()=>{
+  const qualified={...readiness,readyPid:4924,started:false,identities:new Map([[4924,readyLeader]]),live:new Set([4924])};
+  assert.equal(controllerReadinessObserved(qualified),true);
+  for(const change of [
+    {identities:new Map()},
+    {live:new Set()},
+    ...[{parent:undefined},{parent:9000},{executable:undefined},{executable:'C:\\Other\\julia.exe'}]
+      .map(change=>({identities:new Map([[4924,{...readyLeader,...change}]])})),
+  ])assert.throws(()=>controllerReadinessObserved({...qualified,...change}),'Missing or changed ownership evidence is still a failure');
+});
 
 const project=path.resolve('controller','Project.toml'),coreRoot=path.resolve('packages','PerfChecker','Δ'),httpRoot=path.resolve('packages','HTTP','abc');
 const hex=value=>Buffer.from(value).toString('hex'),tree='a'.repeat(40),httpTree='b'.repeat(40);
@@ -9,6 +331,22 @@ const fields=['CONTROLLER_IMPORT_RECEIPT_V1','175.935475','HTTPAdvisorExt',hex(p
   'PerfChecker','1.0.1',hex(coreRoot),hex(path.join(coreRoot,'src','PerfChecker.jl')),tree,tree,
   'HTTP','2.9.0',hex(httpRoot),hex(path.join(httpRoot,'src','HTTP.jl')),httpTree,httpTree];
 const parse=value=>parseControllerImportReceipt(value,{project,version:'1.0.1',tree});
+const discoveryRoot=path.resolve('fixture'),discovery={schema_version:'perfchecker-native-testitem-discovery/1',
+  project,root:discoveryRoot,startedAt:'2026-10-14T07:00:00.000Z',finishedAt:'2026-10-14T07:00:04.000Z',
+  elapsedSeconds:4,listingSchema:'perfchecker-testitems/1',listingRoot:discoveryRoot,executed:false,targetPrepared:false,
+  item:{name:'Vector reduction',file:'test/performance.jl'},TestItemRunner:{version:'1.3.2',source:path.resolve('packages','TestItemRunner','src','TestItemRunner.jl')}};
+const parseDiscovery=value=>parseControllerTestItemDiscoveryReceipt(value,{project,root:discoveryRoot});
+const discoveryLine=receipt=>'CONTROLLER_TESTITEM_DISCOVERY_V1 '+JSON.stringify(receipt);
+test('actual discovery preparation keeps timestamps, dependency identity and the missing target',()=>{
+  assert.deepEqual(parseDiscovery(discoveryLine(discovery)),discovery);
+  for(const change of [{project:path.resolve('other','Project.toml')},{root:path.resolve('other')},
+    {startedAt:'unknown'},{finishedAt:'2026-10-14T06:59:59.000Z'},{elapsedSeconds:-1},
+    {listingSchema:'other'},{listingRoot:'relative'},{executed:true},{targetPrepared:true},{item:{name:'Other',file:'test/performance.jl'}},
+    {item:{name:'Vector reduction',file:'different.jl'}},{TestItemRunner:{version:'unknown',source:'relative'}}])
+    assert.throws(()=>parseDiscovery(discoveryLine({...discovery,...change})));
+  assert.throws(()=>parseDiscovery(''));
+  assert.throws(()=>parseDiscovery(discoveryLine(discovery)+'\n'+discoveryLine(discovery)));
+});
 test('primitive preflight receipt preserves real import time, Unicode paths and both pinned source trees',()=>{
   const value=parse(`CONTROLLER_IMPORT_AFTER HTTP elapsed=175.935475\n${fields.join('\t')}\n`);
   assert.equal(value.elapsedSeconds,175.935475);assert.equal(value.packages[0].root,coreRoot);
@@ -34,6 +372,63 @@ test('failed inspection preserves target, timing and subprocess cause without we
 });
 
 const incarnation={pid:5280,parent:4607,group:4607,started:'26774',state:'R',executable:path.resolve('julia','bin','julia')};
+function newLinuxImageSurvey(changes={}){
+  const row={pid:4890,parent:4398,group:4398,started:'Thu Oct 15 19:31:06 2026',state:'Sl'};
+  const before={pid:4890,parent:4398,group:4398,started:'26774',state:'S'};
+  const error=Object.assign(new Error('The initial image read failed'),{code:'ENOENT',syscall:'realpath',path:'/proc/4890/exe'},changes.error);
+  const errors=[],diagnostics=[],survey=createControllerImageInspectionSurvey({platform:changes.platform??'linux',errors,diagnostics});
+  const failure=controllerInspectionFailure(error,{stage:'inspect',pid:4890,ownerPid:4398});
+  const context={row,before,current:{...before},qualified:false,ownerPid:4398,...changes.context};
+  const absent={stage:'unqualified-private-group-revalidation',pid:4890,initial:{...row},current:null,resolution:'proved-absent'};
+  const capture=()=>{survey.markLinuxImageFailure(error,context);survey.capture(error,failure);};
+  return {row,error,failure,errors,diagnostics,survey,absent,capture};
+}
+test('a new Linux image ENOENT resolves only through the existing absence proof in the same completed survey',()=>{
+  const f=newLinuxImageSurvey();f.capture();assert.deepEqual(f.errors,[]);
+  assert.equal(f.diagnostics[0].initialFailure,f.failure);assert.equal(f.diagnostics[0].resolution,'pending');
+  assert.equal(f.survey.resolveAbsent(f.row,f.absent,{qualified:false,live:false}),undefined);
+  f.survey.finish(true);assert.deepEqual(f.errors,[]);
+  assert.equal(f.diagnostics[0].resolution,'proved-absent-in-same-survey');assert.equal(f.diagnostics[0].revalidation,f.absent);
+  assert(!('executable'in f.diagnostics[0]));assert(!('identity'in f.diagnostics[0]));
+});
+test('only the exact realpath failure of a new private Linux image can be provisional',()=>{
+  for(const changes of [{platform:'darwin'},{error:{code:'ESRCH'}},{error:{code:'EACCES'}},{error:{syscall:'stat'}},
+    {error:{path:'/proc/4890/stat'}},{error:{path:'/proc/4891/exe'}},{context:{qualified:true}},{context:{ownerPid:9999}},
+    {context:{current:{pid:4890,parent:4398,group:4398,started:'26775',state:'S'}}},
+    {context:{current:{pid:4890,parent:1,group:4398,started:'26774',state:'S'}}},
+    {context:{current:{pid:4890,parent:4398,group:9999,started:'26774',state:'S'}}}]){
+    const f=newLinuxImageSurvey(changes);f.capture();f.survey.resolveAbsent(f.row,f.absent,{qualified:false,live:false});f.survey.finish(true);
+    assert.deepEqual(f.errors,[f.failure]);assert.deepEqual(f.diagnostics,[]);
+  }
+});
+test('live, zombie, changed, missing and unrelated absence evidence retain the original image failure',()=>{
+  for(const change of [{current:{pid:4890,state:'S'},resolution:'live-unqualified'},
+    {current:{pid:4890,state:'Z'},resolution:'proved-zombie-or-exited'},{current:undefined},{pid:4891},
+    {stage:'qualified-executable-revalidation'},{resolution:'inspection-failed'},{initial:undefined},
+    {initial:{parent:1,group:4398,started:'Thu Oct 15 19:31:06 2026',state:'Sl'}},
+    {initial:{parent:4398,group:9999,started:'Thu Oct 15 19:31:06 2026',state:'Sl'}},
+    {initial:{parent:4398,group:4398,started:'Thu Oct 15 19:31:07 2026',state:'Sl'}}]){
+    const f=newLinuxImageSurvey();f.capture();f.survey.resolveAbsent(f.row,{...f.absent,...change},{qualified:false,live:false});f.survey.finish(true);
+    assert.deepEqual(f.errors,[f.failure]);assert.equal(f.diagnostics[0].resolution,'fatal-absence-unproved');
+  }
+  for(const state of [{qualified:true,live:false},{qualified:false,live:true}]){
+    const f=newLinuxImageSurvey();f.capture();f.survey.resolveAbsent(f.row,f.absent,state);f.survey.finish(true);assert.deepEqual(f.errors,[f.failure]);
+  }
+  const unrelated=newLinuxImageSurvey();unrelated.capture();
+  unrelated.survey.resolveAbsent({...unrelated.row},unrelated.absent,{qualified:false,live:false});unrelated.survey.finish(true);
+  assert.deepEqual(unrelated.errors,[unrelated.failure]);
+  const missingProof=newLinuxImageSurvey();missingProof.capture();missingProof.survey.finish(true);
+  assert.deepEqual(missingProof.errors,[missingProof.failure]);
+});
+test('a survey exception or later survey cannot clear an original provisional image failure',()=>{
+  const f=newLinuxImageSurvey();f.capture();f.survey.resolveAbsent(f.row,f.absent,{qualified:false,live:false});f.survey.finish(false);
+  assert.deepEqual(f.errors,[f.failure]);assert.equal(f.diagnostics[0].resolution,'fatal-survey-incomplete');
+  const other=createControllerImageInspectionSurvey({platform:'linux',errors:f.errors,diagnostics:f.diagnostics});
+  other.resolveAbsent(f.row,f.absent,{qualified:false,live:false});other.finish(true);f.survey.finish(true);assert.deepEqual(f.errors,[f.failure]);
+  const unmarked=newLinuxImageSurvey();unmarked.survey.capture(unmarked.error,unmarked.failure);
+  unmarked.survey.resolveAbsent(unmarked.row,unmarked.absent,{qualified:false,live:false});unmarked.survey.finish(true);
+  assert.deepEqual(unmarked.errors,[unmarked.failure]);
+});
 const missing=code=>Object.assign(new Error('The qualified executable is temporarily unavailable'),{code});
 function executableRevalidation({states=[incarnation],images=[incarnation.executable],code='ENOENT',deadlineAt=5000,identity=incarnation}={}){
   let clock=0,stateReads=0,imageReads=0;const history=[];

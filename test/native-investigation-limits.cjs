@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS}=require('./native-readiness.cjs');
 // Installed VSIX callbacks, actual Julia workers and an owned MCP protocol fixture.
 const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
@@ -5,7 +6,7 @@ const path=require('node:path');
 const http=require('node:http');
 const {randomUUID}=require('node:crypto');
 
-async function eventually(read,label,timeout=180000){
+async function eventually(read,label,timeout=NATIVE_READINESS_MS){
   const until=Date.now()+timeout;let last;
   while(Date.now()<until){try{const value=await read();if(value)return value;}catch(error){last=error;}
     await new Promise(resolve=>setTimeout(resolve,100));}
@@ -19,10 +20,10 @@ async function alive(pid){
   }
   return true;
 }
-async function panel(context,tab){
+async function panel(context,tab,timeout=NATIVE_READINESS_MS){
   await context.vscode.commands.executeCommand('perfchecker.openInvestigations');
-  const frame=await context.findFrame('#app nav[aria-label="Investigation views"]');
-  if(tab)await frame.getByRole('button',{name:tab,exact:true}).click();
+  const frame=await context.findFrame('#app nav[aria-label="Investigation views"]',{timeout});
+  if(tab)await frame.getByRole('button',{name:tab,exact:true}).click({timeout:NATIVE_READINESS_MS});
   return frame;
 }
 async function entries(root){return new Set(await fs.readdir(root).catch(error=>{if(error.code==='ENOENT')return [];throw error;}));}
@@ -35,8 +36,8 @@ async function completed(context,root,before,name){
     }
   },`The real ${name} report is written`,240000);
   const frame=await panel(context);
-  await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class')).includes('busy'),'The actual controller completes cleanup');
-  assert(await frame.getByRole('button',{name:'Cancel',exact:true}).isDisabled());
+  await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class',{timeout:30000})).includes('busy'),'The actual controller completes cleanup',180000);
+  assert(await frame.getByRole('button',{name:'Cancel',exact:true}).isDisabled({timeout:30000}));
   return result;
 }
 async function decisionFixture(){
@@ -96,26 +97,26 @@ exports.run=async context=>{
   await fs.writeFile(path.join(directory,'scenarios.toml'),`schema_version = "perfchecker-scenario-catalog/1"\nroot = "."\n[[scenarios]]\nid = "native_limits"\nimplementation = "sleeping"\nsource = "case.jl"\nfactory = "make_native_limit_case"\ncollectors = ["benchmark"]\nparameters = { marker = ${JSON.stringify(marker)} }\n`);
   try{
     for(const [key,value]of Object.entries(values))await settings().update(key,value,context.vscode.ConfigurationTarget.WorkspaceFolder);
-    let frame=await panel(context,'Scenarios');await frame.getByRole('button',{name:'Discover tests',exact:true}).click();
+    let frame=await panel(context,'Scenarios');await frame.getByRole('button',{name:'Discover tests',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await completed(context,root,new Set(),'discovery');
-    frame=await panel(context,'Scenarios');await frame.getByRole('button',{name:'Clear selection',exact:true}).click();
+    frame=await panel(context,'Scenarios');await frame.getByRole('button',{name:'Clear selection',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:'native_limits'})}).first()
-      .locator('.scenario-title input').check();
+      .locator('.scenario-title input').check({timeout:NATIVE_READINESS_MS});
     const fieldset=frame.locator('fieldset').filter({has:frame.getByText('Diagnostic tools',{exact:true})});
     for(const label of await fieldset.locator('label span').allTextContents()){
       const input=fieldset.locator('label').filter({hasText:label}).locator('input');
-      if(label.split(' · ')[0]==='latency')await input.check();else await input.uncheck();
+      if(label.split(' · ')[0]==='latency')await input.check({timeout:NATIVE_READINESS_MS});else await input.uncheck({timeout:NATIVE_READINESS_MS});
     }
-    let before=await entries(root);await frame.getByRole('button',{name:'Investigate selected',exact:true}).click();
+    let before=await entries(root);await frame.getByRole('button',{name:'Investigate selected',exact:true}).click({timeout:NATIVE_READINESS_MS});
     const enabled=await completed(context,root,before,'investigation');
     assert.equal(enabled.report.status,'advisor_stopped');assert.equal(enabled.report.experiments.length,0);
     assert.equal(enabled.report.decisions.length,1);assert.equal(enabled.report.decisions[0].status,'complete');
     assert.equal(enabled.report.decisions[0].experiment_id,'stop');assert(enabled.report.unexecuted.length>=2);
     assert.equal(fixture.calls.length,1);assert.deepEqual(fixture.errors,[]);
     await assert.rejects(fs.stat(marker),{code:'ENOENT'},'A stop decision executes no sleeping scenario');
-    frame=await panel(context,'Findings & advice');assert.match(await frame.locator('#app').innerText(),/advisor_stopped/);
-    await frame.getByText('Optional model decisions',{exact:true}).click();
-    assert.match(await frame.locator('#app').innerText(),/"experiment_id": "stop"/);
+    frame=await panel(context,'Findings & advice');assert.match(await frame.locator('#app').innerText({timeout:NATIVE_READINESS_MS}),/advisor_stopped/);
+    await frame.getByText('Optional model decisions',{exact:true}).click({timeout:NATIVE_READINESS_MS});
+    assert.match(await frame.locator('#app').innerText({timeout:NATIVE_READINESS_MS}),/"experiment_id": "stop"/);
     context.proof('native-investigation-enabled-model-decision',{nativeClick:true,core:context.core,customMcpFieldsAndInstructionsPreserved:true,
       structuredResponse:true,declaredMenu:fixture.calls[0].menu,status:enabled.report.status,noScenarioExecution:true,nativeDecisionVisible:true});
 
@@ -124,7 +125,7 @@ exports.run=async context=>{
     for(const [name,label,budget]of [['run','Measure selected',180],['investigation','Investigate selected',45]]){
       await fs.rm(marker,{force:true});await settings().update('investigationBudgetSeconds',budget,context.vscode.ConfigurationTarget.WorkspaceFolder);
       if(name==='investigation')await settings().update('analysisTimeout',180,context.vscode.ConfigurationTarget.WorkspaceFolder);
-      before=await entries(root);frame=await panel(context,'Scenarios');await frame.getByRole('button',{name:label,exact:true}).click();
+      before=await entries(root);frame=await panel(context,'Scenarios');await frame.getByRole('button',{name:label,exact:true}).click({timeout:NATIVE_READINESS_MS});
       const pid=await eventually(async()=>{const value=Number(await fs.readFile(marker,'utf8'));return value>0?value:false;},'The actual sleeping scenario publishes its worker PID');
       assert(await alive(pid),'The real operation is active before its configured limit expires');
       context.log('native-limit-worker-active',{limit:name,pid,budgetSeconds:budget,analysisTimeout:settings().get('analysisTimeout')});
@@ -135,8 +136,8 @@ exports.run=async context=>{
       if(name==='investigation'){
         assert.equal(result.report.status,'budget_exhausted');assert.equal(result.report.limits.budget_seconds,45);
         assert.equal(result.report.experiments.length,1);assert(result.report.unexecuted.length>0);
-        assert.match(await frame.locator('#app').innerText(),/budget_exhausted/);
-      }else assert.match(await frame.locator('#app').innerText(),/timeout/);
+        assert.match(await frame.locator('#app').innerText({timeout:NATIVE_READINESS_MS}),/budget_exhausted/);
+      }else assert.match(await frame.locator('#app').innerText({timeout:NATIVE_READINESS_MS}),/timeout/);
       assert.equal(await fs.readFile(factory,'utf8'),source);assert.equal(fixture.calls.length,1);
       context.proof(name==='run'?'native-analysis-configured-deadline':'native-investigation-elapsed-budget',{
         nativeClick:true,pid,operationActuallyStarted:true,configuredSeconds:45,noCancelClick:true,
@@ -145,8 +146,8 @@ exports.run=async context=>{
     }
   }finally{
     await context.vscode.commands.executeCommand('perfchecker.cancelInvestigation');
-    const frame=await panel(context);
-    await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class')).includes('busy'),'Limits teardown waits for owned controller cleanup');
+    const frame=await panel(context,undefined,120000);
+    await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class',{timeout:30000})).includes('busy'),'Limits teardown waits for owned controller cleanup',180000);
     await fixture.close();
     for(const [key,value]of Object.entries(previous))await settings().update(key,value,context.vscode.ConfigurationTarget.WorkspaceFolder);
     await fs.rm(directory,{recursive:true,force:true});

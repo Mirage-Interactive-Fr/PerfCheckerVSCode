@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS}=require('./native-readiness.cjs');
 // Actual VS Code controls and Julia HTTP workers. This local protocol fixture
 // stores tiny test payloads; it is not an Ollama runtime or an inference model.
 const assert = require('node:assert/strict');
@@ -7,7 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {createHash, randomUUID} = require('node:crypto');
 
-async function eventually(read, label, timeout = 180000) {
+async function eventually(read, label, timeout = NATIVE_READINESS_MS) {
   const deadline = Date.now() + timeout;
   let last;
   while (Date.now() < deadline) {
@@ -110,34 +111,35 @@ async function panel(context) {
   return context.findFrame('#advisor-root');
 }
 const row = (frame, name) => frame.locator('section[aria-label="Available models and tools"] article').filter({has: frame.getByRole('heading', {name, exact: true})});
-async function finished(frame, message) {
+async function finished(frame, message,timeout=NATIVE_READINESS_MS) {
+  const readTimeout=timeout===NATIVE_READINESS_MS?timeout:Math.min(timeout,30000);
   try{
-    await eventually(async () => await frame.locator('#advisor-root').getAttribute('aria-busy') === 'false' &&
-      message.test(await frame.getByRole('status').innerText()), `Advisor action finishes: ${message}`);
+    await eventually(async () => await frame.locator('#advisor-root').getAttribute('aria-busy',{timeout:readTimeout}) === 'false' &&
+      message.test(await frame.getByRole('status').innerText({timeout:readTimeout})), `Advisor action finishes: ${message}`,timeout);
   }catch(error){
-    const actual={busy:await frame.locator('#advisor-root').getAttribute('aria-busy'),status:await frame.getByRole('status').innerText(),
-      mode:await frame.locator('#advisor-protocol').inputValue(),model:await frame.locator('#advisor-model').inputValue()};
+    const actual={busy:await frame.locator('#advisor-root').getAttribute('aria-busy',{timeout:30000}),status:await frame.getByRole('status').innerText({timeout:30000}),
+      mode:await frame.locator('#advisor-protocol').inputValue({timeout:30000}),model:await frame.locator('#advisor-model').inputValue({timeout:30000})};
     throw new Error(`${error.message}; actual declared fixture UI: ${JSON.stringify(actual)}`);
   }
 }
-async function click(frame, label) {await frame.getByRole('button', {name: label, exact: true}).click();}
+async function click(frame, label,timeout=NATIVE_READINESS_MS) {await frame.getByRole('button', {name: label, exact: true}).click({timeout});}
 async function confirm(frame, label) {await click(frame, label); await click(frame, 'Confirm');}
 
 async function ollama(context, fixture, configFile) {
   const frame = await panel(context), initialRequests = fixture.calls.length;
-  assert.equal(await frame.getByRole('button', {name: 'Cancel operation', exact: true}).isDisabled(), true);
+  assert.equal(await frame.getByRole('button', {name: 'Cancel operation', exact: true}).isDisabled({timeout:NATIVE_READINESS_MS}), true);
   assert.equal(fixture.calls.length, initialRequests, 'Opening Advisor performs no provider request');
-  await frame.locator('#advisor-protocol').selectOption('ollama');
-  await frame.locator('#advisor-endpoint').fill(`${fixture.base}/api/chat`);
-  await frame.locator('#advisor-model').fill('missing:fixture');
-  await frame.locator('#advisor-timeout').fill('120');
-  await frame.locator('#advisor-instructions').fill('Protocol fixture only; preserve the public API.');
+  await frame.locator('#advisor-protocol').selectOption('ollama',{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-endpoint').fill(`${fixture.base}/api/chat`,{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-model').fill('missing:fixture',{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-timeout').fill('120',{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-instructions').fill('Protocol fixture only; preserve the public API.',{timeout:NATIVE_READINESS_MS});
   await click(frame, 'Test connection / discover');
   await finished(frame, /configured model \/ tool is missing/);
   assert(fixture.calls.some(call => call.method === 'GET' && call.url === '/api/tags'));
   assert.equal(await row(frame, 'seed:fixture').count(), 1);
-  await row(frame, 'seed:fixture').getByRole('button', {name: 'Use', exact: true}).click();
-  assert.equal(await frame.locator('#advisor-model').inputValue(), 'seed:fixture');
+  await row(frame, 'seed:fixture').getByRole('button', {name: 'Use', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.equal(await frame.locator('#advisor-model').inputValue({timeout:NATIVE_READINESS_MS}), 'seed:fixture');
   const beforeSave = fixture.calls.length;
   await click(frame, 'Save configuration'); await finished(frame, /Configuration saved/);
   const saved = JSON.parse(await fs.readFile(configFile, 'utf8'));
@@ -148,14 +150,14 @@ async function ollama(context, fixture, configFile) {
   await click(frame, 'Refresh models'); await finished(frame, /Ollama connected/);
   const original = await fs.readFile(fixture.modelFile('seed:fixture'));
   const beforeUnload = fixture.calls.length;
-  await row(frame, 'seed:fixture').getByRole('button', {name: 'Unload from memory…', exact: true}).click();
+  await row(frame, 'seed:fixture').getByRole('button', {name: 'Unload from memory…', exact: true}).click({timeout:NATIVE_READINESS_MS});
   assert.equal(fixture.calls.length, beforeUnload, 'Mutation waits for the explicit confirmation');
   await click(frame, 'Back'); assert.equal(fixture.calls.length, beforeUnload);
-  await row(frame, 'seed:fixture').getByRole('button', {name: 'Unload from memory…', exact: true}).click();
+  await row(frame, 'seed:fixture').getByRole('button', {name: 'Unload from memory…', exact: true}).click({timeout:NATIVE_READINESS_MS});
   await click(frame, 'Confirm'); await finished(frame, /unloaded from memory/);
   assert.equal(fixture.models.get('seed:fixture').loaded, false);
   assert.deepEqual(await fs.readFile(fixture.modelFile('seed:fixture')), original);
-  await frame.locator('#advisor-download-model').fill('downloaded:fixture');
+  await frame.locator('#advisor-download-model').fill('downloaded:fixture',{timeout:NATIVE_READINESS_MS});
   const beforePull = fixture.calls.length;
   await click(frame, 'Download this model…');
   assert.equal(fixture.calls.length, beforePull); assert.equal(fixture.models.has('downloaded:fixture'), false);
@@ -164,7 +166,7 @@ async function ollama(context, fixture, configFile) {
   assert(fixture.calls.some(call => call.method === 'POST' && call.url === '/api/pull' && call.body.model === 'downloaded:fixture' && call.body.stream === false));
   await click(frame, 'Refresh models'); await finished(frame, /Ollama connected/);
   assert.equal(await row(frame, 'downloaded:fixture').count(), 1);
-  await row(frame, 'downloaded:fixture').getByRole('button', {name: 'Delete from disk…', exact: true}).click();
+  await row(frame, 'downloaded:fixture').getByRole('button', {name: 'Delete from disk…', exact: true}).click({timeout:NATIVE_READINESS_MS});
   const beforeDelete = fixture.calls.length;
   await click(frame, 'Confirm'); await finished(frame, /Model removed/);
   assert.equal(fixture.models.has('downloaded:fixture'), false);
@@ -172,20 +174,20 @@ async function ollama(context, fixture, configFile) {
   assert.equal(fixture.calls[beforeDelete].method, 'DELETE');
   await click(frame, 'Refresh models'); await finished(frame, /Ollama connected/);
   assert.equal(await row(frame, 'downloaded:fixture').count(), 0);
-  await frame.locator('#advisor-download-model').fill('cancelled:fixture');
+  await frame.locator('#advisor-download-model').fill('cancelled:fixture',{timeout:NATIVE_READINESS_MS});
   await confirm(frame, 'Download this model…');
   await eventually(() => fs.stat(fixture.partialFile('cancelled:fixture')).then(() => true).catch(() => false), 'The real fixture receives the active download');
-  assert.equal(await frame.getByRole('button', {name: 'Cancel operation', exact: true}).isEnabled(), true);
-  await click(frame, 'Cancel operation'); await finished(frame, /Operation cancelled/);
-  await eventually(() => fixture.cancelled.has('cancelled:fixture'), 'Cancellation closes the real Julia HTTP connection');
+  assert.equal(await frame.getByRole('button', {name: 'Cancel operation', exact: true}).isEnabled({timeout:NATIVE_READINESS_MS}), true);
+  await click(frame, 'Cancel operation',30000); await finished(frame, /Operation cancelled/,180000);
+  await eventually(() => fixture.cancelled.has('cancelled:fixture'), 'Cancellation closes the real Julia HTTP connection',180000);
   assert.equal(fixture.models.has('cancelled:fixture'), false);
   assert.equal(await fs.readFile(fixture.partialFile('cancelled:fixture'), 'utf8'), 'partial test payload\n');
   assert.deepEqual(await fs.readFile(configFile), savedBytes, 'Cancelled download does not modify the saved provider');
   await click(frame, 'Refresh models'); await finished(frame, /Ollama connected/);
   assert.equal(await row(frame, 'cancelled:fixture').count(), 0);
-  await frame.locator('#advisor-endpoint').fill(`${fixture.base}/unavailable/api/chat`);
+  await frame.locator('#advisor-endpoint').fill(`${fixture.base}/unavailable/api/chat`,{timeout:NATIVE_READINESS_MS});
   await click(frame, 'Test connection / discover'); await finished(frame, /HTTP 503/);
-  assert.equal(await frame.getByRole('button', {name: 'Test connection / discover', exact: true}).isEnabled(), true);
+  assert.equal(await frame.getByRole('button', {name: 'Test connection / discover', exact: true}).isEnabled({timeout:NATIVE_READINESS_MS}), true);
   assert.deepEqual(await fs.readFile(configFile), savedBytes, 'Provider errors preserve the saved configuration');
   context.proof('advisor-native-model-management', {protocolFixture: true, inferenceModelDownloaded: false,
     payloadBytes: fixture.payload.length, selectionSaved: true, confirmedPullDeleteUnload: true,
@@ -194,27 +196,27 @@ async function ollama(context, fixture, configFile) {
 
 async function inventories(context, fixture, configFile) {
   const frame = await panel(context);
-  await frame.locator('#advisor-protocol').selectOption('chat_completions');
-  await frame.locator('#advisor-endpoint').fill(`${fixture.base}/v1/chat/completions`);
-  await frame.locator('#advisor-model').fill('chat:fixture');
+  await frame.locator('#advisor-protocol').selectOption('chat_completions',{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-endpoint').fill(`${fixture.base}/v1/chat/completions`,{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-model').fill('chat:fixture',{timeout:NATIVE_READINESS_MS});
   await click(frame, 'Test connection / discover'); await finished(frame, /Model inventory connected/);
-  await row(frame, 'chat:fixture').getByRole('button', {name: 'Use', exact: true}).click();
-  assert.equal(await frame.locator('#advisor-model').inputValue(), 'chat:fixture');
-  await frame.locator('#advisor-protocol').selectOption('mcp_http');
-  await frame.locator('#advisor-endpoint').fill(`${fixture.base}/mcp`);
-  await frame.locator('#advisor-mcp_version').selectOption('2025-11-25');
-  await frame.locator('#advisor-mcp_tool').fill('');
+  await row(frame, 'chat:fixture').getByRole('button', {name: 'Use', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.equal(await frame.locator('#advisor-model').inputValue({timeout:NATIVE_READINESS_MS}), 'chat:fixture');
+  await frame.locator('#advisor-protocol').selectOption('mcp_http',{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-endpoint').fill(`${fixture.base}/mcp`,{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-mcp_version').selectOption('2025-11-25',{timeout:NATIVE_READINESS_MS});
+  await frame.locator('#advisor-mcp_tool').fill('',{timeout:NATIVE_READINESS_MS});
   await click(frame, 'Test connection / discover'); await finished(frame, /MCP connected/);
   assert.equal(await row(frame, 'ask_fixture').count(), 1); assert.equal(await row(frame, 'simple_advice').count(), 1);
   assert.equal(await frame.locator('#advisor-root b').count(), 0, 'Tool descriptions remain literal text');
-  await row(frame, 'ask_fixture').getByText('Required arguments and tool schema', {exact: true}).click();
-  assert.match(await row(frame, 'ask_fixture').locator('pre').innerText(), /"context"/);
-  await row(frame,'ask_fixture').scrollIntoViewIfNeeded();
+  await row(frame, 'ask_fixture').getByText('Required arguments and tool schema', {exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.match(await row(frame, 'ask_fixture').locator('pre').innerText({timeout:NATIVE_READINESS_MS}), /"context"/);
+  await row(frame,'ask_fixture').scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
   if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await new Promise(resolve=>setTimeout(resolve,2500));
-  await row(frame, 'ask_fixture').getByRole('button', {name: 'Use', exact: true}).click();
-  assert.equal(await frame.locator('#advisor-mcp_tool').inputValue(), 'ask_fixture');
-  assert.equal(await frame.locator('#advisor-mcp_prompt_argument').inputValue(), 'question');
-  await frame.locator('#advisor-mcp_arguments').fill('{"context":{"fixture":true}}');
+  await row(frame, 'ask_fixture').getByRole('button', {name: 'Use', exact: true}).click({timeout:NATIVE_READINESS_MS});
+  assert.equal(await frame.locator('#advisor-mcp_tool').inputValue({timeout:NATIVE_READINESS_MS}), 'ask_fixture');
+  assert.equal(await frame.locator('#advisor-mcp_prompt_argument').inputValue({timeout:NATIVE_READINESS_MS}), 'question');
+  await frame.locator('#advisor-mcp_arguments').fill('{"context":{"fixture":true}}',{timeout:NATIVE_READINESS_MS});
   await click(frame, 'Save configuration'); await finished(frame, /Configuration saved/);
   const saved = JSON.parse(await fs.readFile(configFile, 'utf8'));
   assert.equal(saved.mcp_tool, 'ask_fixture'); assert.equal(saved.mcp_prompt_argument, 'question');
@@ -227,7 +229,7 @@ async function inventories(context, fixture, configFile) {
   assert(calls.some(call => call.method === 'DELETE'));
   assert.equal(fixture.calls.filter(call => call.body.method === 'tools/call').length, 0);
   assert.equal(fixture.calls.filter(call => /chat\/completions|api\/chat/.test(call.url)).length, 0);
-  await frame.locator('#advisor-protocol').selectOption('none');
+  await frame.locator('#advisor-protocol').selectOption('none',{timeout:NATIVE_READINESS_MS});
   await click(frame, 'Save configuration'); await finished(frame, /Rule-based advice only/);
   assert.equal(context.vscode.workspace.getConfiguration('perfchecker', context.vscode.Uri.file(context.workspace)).get('advisorEnabled'), false);
   assert.deepEqual(await fs.readFile(fixture.modelFile('seed:fixture')), fixture.payload);
@@ -267,7 +269,7 @@ exports.run = async context => {
     throw error;
   } finally {
     await context.vscode.commands.executeCommand('perfchecker.cancelAdvisorSetup').catch(() => {});
-    const frame = await context.findFrame('#advisor-root').catch(() => undefined);
+    const frame = await context.findFrame('#advisor-root',{timeout:120000}).catch(() => undefined);
     if (frame) await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor').catch(() => {});
     for (const key of keys) await settings.update(key, previous[key], context.vscode.ConfigurationTarget.WorkspaceFolder);
     await fixture.close(); await fs.rm(path.dirname(configFile), {recursive: true, force: true});

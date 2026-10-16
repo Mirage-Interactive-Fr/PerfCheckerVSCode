@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS,waitForNativeAvailability}=require('./native-readiness.cjs');
 // Actual VS Code webviews and Pluto workers in disposable CI workspaces only.
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
@@ -9,7 +10,7 @@ const execute=require('node:util').promisify(execFile);
 const {inflateSync}=require('node:zlib');
 const {clickStudioAction}=require('./native-studio-controls.cjs');
 
-async function eventually(read, name, timeout = 180000) {
+async function eventually(read, name, timeout = NATIVE_READINESS_MS) {
   const until = Date.now() + timeout;
   let last;
   while (Date.now() < until) {
@@ -48,10 +49,10 @@ async function fingerprint(directory) {
 
 async function view(context) {
   const parent = await context.findFrame('iframe.perfchecker-pluto-frame');
-  const element = await parent.locator('iframe.perfchecker-pluto-frame').elementHandle();
+  const element = await parent.locator('iframe.perfchecker-pluto-frame').elementHandle({timeout:NATIVE_READINESS_MS});
   const frame = await element.contentFrame();
   assert(frame, 'The notebook must be an interactive Pluto iframe');
-  await frame.locator('pluto-notebook').waitFor({state: 'visible', timeout: 180000});
+  await frame.locator('pluto-notebook').waitFor({state: 'visible', timeout: NATIVE_READINESS_MS});
   return {parent, frame};
 }
 
@@ -73,16 +74,16 @@ async function interactiveEditor(context,state,cell,label){
   const observe=async stage=>context.log('pluto-editor-readiness',{label,stage,state:await geometry(),frontendErrors:[...errors]});
   page.on('pageerror',onError);
   try{
-    await cell.scrollIntoViewIfNeeded();await observe('before-gesture');
+    await cell.scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});await observe('before-gesture');
     const shown=cell.locator('pluto-input .cm-editor');
-    if(!await shown.isVisible())await cell.locator('.foldcode').click();
+    if(!await shown.isVisible())await cell.locator('.foldcode').click({timeout:NATIVE_READINESS_MS});
     await observe('after-fold-gesture');
-    await shown.waitFor({state:'visible'});
+    await shown.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
     // Pluto replaces the static placeholder with CodeMirror when its input
     // intersects the viewport. Scrolling the cell can leave that input clipped.
-    await shown.scrollIntoViewIfNeeded();
+    await shown.scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
     const editor=cell.locator('pluto-input .cm-editor:not(.cm-ssr-fake) .cm-content[contenteditable="true"]');
-    await eventually(async()=>await editor.isVisible()&&await editor.isEditable(),'The real UI exposes an interactive CodeMirror input');
+    await eventually(async()=>await editor.isVisible()&&await editor.isEditable({timeout:NATIVE_READINESS_MS}),'The real UI exposes an interactive CodeMirror input');
     await observe('interactive');return editor;
   }catch(error){
     try{await observe('failed');}catch(diagnosticError){
@@ -93,9 +94,9 @@ async function interactiveEditor(context,state,cell,label){
   finally{page.off('pageerror',onError);}
 }
 
-async function idle(frame) {
+async function idle(frame,timeout=NATIVE_READINESS_MS) {
   await eventually(async () => await frame.locator('pluto-cell.running, pluto-cell.queued').count() === 0,
-    'Pluto reactive cells finish');
+    'Pluto reactive cells finish',timeout);
 }
 
 async function ready(frame, button) {
@@ -106,16 +107,17 @@ async function ready(frame, button) {
     if (errors.length) throw Object.assign(new Error(`Pluto reactive errors: ${errors.join('\n').slice(0, 4000)}`),{name:'PlutoReactiveError'});
     return await frame.getByRole('button', {name: button, exact: true}).isVisible() &&
       await frame.locator('pluto-editor.loading, pluto-editor.disconnected, pluto-cell.running, pluto-cell.queued').count() === 0;
-  }, `The connected notebook finishes evaluation and renders ${button}`, 240000);
+  }, `The connected notebook finishes evaluation and renders ${button}`, NATIVE_READINESS_MS);
 }
 
-async function refresh(frame, button, selector, expected, timeout = 360000) {
+async function refresh(frame, button, selector, expected, timeout = NATIVE_READINESS_MS) {
   const until = Date.now() + timeout;
   let last = '';
   while (Date.now() < until) {
-    await frame.getByRole('button', {name: button, exact: true}).click();
-    await idle(frame);
-    last = await frame.locator(selector).innerText();
+    const remaining=()=>{const value=until-Date.now();assert(value>0,'The existing reactive-result window remains available');return value;};
+    await frame.getByRole('button', {name: button, exact: true}).click({timeout:remaining()});
+    await idle(frame,remaining());
+    last = await frame.locator(selector).innerText({timeout:remaining()});
     if (expected.test(last)) return last;
     if (/"status"\s+"(?:error|failed|timeout)"|Status:\s*(?:failed|timeout)/.test(last)) {
       throw new Error(`Pluto worker failed: ${last.slice(0, 1500)}`);
@@ -138,18 +140,18 @@ async function stop(context, state, closePanel = false,deadline) {
   assert(port > 0, 'This disposable desktop test has a real loopback Pluto server');
   context.log('native-ui-action',{surface:'Pluto session',action:closePanel?'Close notebook view':'Stop session'});
   if (closePanel) await context.vscode.commands.executeCommand('workbench.action.closeActiveEditor');
-  else await state.parent.locator('#pluto-stop').click();
+  else await state.parent.locator('#pluto-stop').click({timeout:30000});
   const remaining=deadline===undefined?45000:deadline-Date.now();assert(remaining>0,'The existing 45 second Close budget remains available');
   await eventually(async () => !await portOpen(port), 'Closing Pluto also closes its server and workers', remaining);
   if(!closePanel)await eventually(async()=>{
-    const parent=await context.findFrame('#pluto-restart');
+    const parent=await context.findFrame('#pluto-restart',{timeout:120000});
     return await parent.locator('iframe.perfchecker-pluto-frame').count()===0&&
-      /session stopped/i.test(await parent.locator('[role="status"]').innerText());
-  },'The explicit Stop transition finishes before another session action');
+      /session stopped/i.test(await parent.locator('[role="status"]').innerText({timeout:30000}));
+  },'The explicit Stop transition finishes before another session action',180000);
 }
 
 async function create(context, file, kind) {
-  const uri = await context.vscode.commands.executeCommand('perfchecker.newNotebook', context.vscode.Uri.file(file), {kind});
+  const uri = await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.newNotebook', context.vscode.Uri.file(file), {kind}),"perfchecker.newNotebook");
   assert.equal(uri.fsPath, context.vscode.Uri.file(file).fsPath);
   const source = await fs.readFile(file, 'utf8');
   assert(source.startsWith('### A Pluto.jl notebook ###'));
@@ -268,21 +270,21 @@ async function studioNotebookButtons(context,directory){
     // VS Code declares this as application scope. Only the disposable profile is changed.
     await settings.update('simpleDialog.enable',true,context.vscode.ConfigurationTarget.Global);
     await clickStudioAction(context,'notebook');
-    let picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
-    let input=picker.locator('input[type="text"]');await input.fill(file);await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter');
+    let picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+    let input=picker.locator('input[type="text"]');await input.fill(file,{timeout:NATIVE_READINESS_MS});await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter',{timeout:NATIVE_READINESS_MS});
     // Filter the real QuickPick, then accept its active option with the native keyboard.
     // A pointer target may disappear while the file dialog transitions on macOS.
     picker=context.windowPage.locator('.quick-input-widget').filter({has:context.windowPage.locator('.quick-input-title').filter({hasText:/^PerfChecker · Pluto dashboard$/})});
-    await picker.waitFor({state:'visible'});
-    const kindInput=picker.locator('input[type="text"]');await kindInput.fill('Investigation');
-    await picker.locator('.monaco-list-row').filter({hasText:'Investigation'}).first().waitFor({state:'visible'});
-    await kindInput.press('Enter');
+    await picker.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+    const kindInput=picker.locator('input[type="text"]');await kindInput.fill('Investigation',{timeout:NATIVE_READINESS_MS});
+    await picker.locator('.monaco-list-row').filter({hasText:'Investigation'}).first().waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+    await kindInput.press('Enter',{timeout:NATIVE_READINESS_MS});
     const state=await view(context);await idle(state.frame);
     assert((await fs.readFile(file,'utf8')).startsWith('### A Pluto.jl notebook ###'));
     await stop(context,state,true);
     await clickStudioAction(context,'openNotebook');
-    picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible'});
-    input=picker.locator('input[type="text"]');await input.fill(file);await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter');
+    picker=context.windowPage.locator('.quick-input-widget');await picker.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+    input=picker.locator('input[type="text"]');await input.fill(file,{timeout:NATIVE_READINESS_MS});await new Promise(resolve=>setTimeout(resolve,300));await input.press('Enter',{timeout:NATIVE_READINESS_MS});
     await stop(context,await view(context),true);
     context.proof('pluto-studio-file-dialog-buttons',{nativeNewClick:true,nativeOpenClick:true,realFileDialog:true,file:path.basename(file),jupyter:false});
   }finally{await settings.update('simpleDialog.enable',previous,context.vscode.ConfigurationTarget.Global);}
@@ -296,7 +298,7 @@ async function restartFailureCleanup(context,directory){
   if(initialOwner)await eventually(async()=>{
     const actual=await sessionInventory(context,'after-initial-stop',undefined,initialOwner.descendants);
     return actual.direct.length===0&&initialOwner.descendants.every(prior=>identityGone(actual,prior));
-  },'Initial Stop leaves no selected-Julia child or observed session descendant before the failed startup');
+  },'Initial Stop leaves no selected-Julia child or observed session descendant before the failed startup',180000);
   const settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
   const previous=settings.get('plutoProject','perf/pluto'),before=await serverPids(context);let startingPids=[];
   const startingIdentities=new Map();
@@ -305,7 +307,7 @@ async function restartFailureCleanup(context,directory){
       startingIdentities.set(`${row.pid}:${row.createdAt}`,row);
   };
   try{
-    const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
+    const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click({timeout:NATIVE_READINESS_MS});
     if(['win32','darwin'].includes(process.platform)){
       assert.equal(before.size,0,'The failed-startup baseline contains no direct selected-Julia child');
       const inventory=await eventually(async()=>{
@@ -317,12 +319,12 @@ async function restartFailureCleanup(context,directory){
       startingPids=[leader.pid];startingIdentities.set(`${leader.pid}:${leader.createdAt}`,leader);remember(inventory);
       const status=await eventually(async()=>{
         const current=await context.findFrame('#pluto-restart');
-        const value=await current.locator('[role="status"]').innerText();
+        const value=await current.locator('[role="status"]').innerText({timeout:NATIVE_READINESS_MS});
         assert.match(value,/Starting Pluto/);
         assert.equal(await current.locator('iframe.perfchecker-pluto-frame').count(),0,
           'The configuration change must occur during actual nonREADY startup');
         return value;
-      },'The current re-rendered parent witnesses actual nonREADY startup before the configuration change',10000);
+      },'The current re-rendered parent witnesses actual nonREADY startup before the configuration change',NATIVE_READINESS_MS);
       context.log('pluto-failed-startup-physical-owner',{leader,descendants:[...startingIdentities.values()],
         status,iframePublished:false,aliveBeforeConfigurationChange:true,
         observedListeners:inventory.listeners.filter(row=>startingPids.includes(row.pid)),listenerScope:'diagnostic only'});
@@ -330,8 +332,8 @@ async function restartFailureCleanup(context,directory){
     await settings.update('plutoProject','perf/changed-pluto-environment',context.vscode.ConfigurationTarget.WorkspaceFolder);
     await eventually(async()=>{
       if(['win32','darwin'].includes(process.platform))remember(await sessionInventory(context,'startup-configuration-change',undefined,[...startingIdentities.values()]));
-      return /environment changed|Start the action again/.test(await (await context.findFrame('#pluto-restart')).locator('[role="status"]').innerText());
-    },'Restart reports a changed environment after starting',240000);
+      return /environment changed|Start the action again/.test(await (await context.findFrame('#pluto-restart')).locator('[role="status"]').innerText({timeout:NATIVE_READINESS_MS}));
+    },'Restart reports a changed environment after starting',NATIVE_READINESS_MS);
     if(['win32','darwin'].includes(process.platform))await eventually(async()=>{
       const actual=await sessionInventory(context,'failed-startup-cleanup',undefined,[...startingIdentities.values()]);remember(actual);
       return [...startingIdentities.values()].every(prior=>identityGone(actual,prior));
@@ -341,10 +343,10 @@ async function restartFailureCleanup(context,directory){
   }catch(error){
     try{
       const current=await eventually(async()=>{
-        const parent=await context.findFrame('#pluto-restart'),status=await parent.locator('[role="status"]').innerText();
+        const parent=await context.findFrame('#pluto-restart'),status=await parent.locator('[role="status"]').innerText({timeout:NATIVE_READINESS_MS});
         const iframe=parent.locator('iframe.perfchecker-pluto-frame');
-        return {status,src:await iframe.count()?await iframe.getAttribute('src'):undefined};
-      },'Read the actual current failed-startup parent before teardown',10000);
+        return {status,src:await iframe.count()?await iframe.getAttribute('src',{timeout:NATIVE_READINESS_MS}):undefined};
+      },'Read the actual current failed-startup parent before teardown',NATIVE_READINESS_MS);
       const port=current.src?Number(new URL(current.src).port):undefined;
       let listeners;
       if(process.platform==='win32'&&port)listeners=JSON.parse((await execute('powershell.exe',['-NoProfile','-Command',
@@ -356,7 +358,7 @@ async function restartFailureCleanup(context,directory){
     }catch(secondary){context.log('pluto-restart-diagnostic-error',{primary:String(error),secondary:String(secondary)});}
     throw error;
   }finally{await settings.update('plutoProject',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);}
-  const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click();
+  const parent=await context.findFrame('#pluto-restart');await parent.locator('#pluto-restart').click({timeout:NATIVE_READINESS_MS});
   state=await view(context);await idle(state.frame);
   assert(await portOpen(Number(new URL(state.frame.url()).port)),'A later successful Restart remains alive');
   const finalOwner=['win32','darwin'].includes(process.platform)?await sessionOwner(context,state):undefined;
@@ -364,7 +366,7 @@ async function restartFailureCleanup(context,directory){
   if(finalOwner)await eventually(async()=>{
     const actual=await sessionInventory(context,'after-final-close',undefined,finalOwner.descendants);
     return finalOwner.descendants.every(prior=>identityGone(actual,prior));
-  },'Final Close stops the exact listening session owner and observed descendants before teardown');
+  },'Final Close stops the exact listening session owner and observed descendants before teardown',180000);
   context.proof('pluto-failed-restart-real-worker-cleanup',{failedPids:startingPids.length,
     failedIdentities:[...startingIdentities.values()].map(row=>({pid:row.pid,createdAt:row.createdAt})),
     nonReadyPhysicalOwnerVerified:['win32','darwin'].includes(process.platform),exactSuccessfulListenerOwnerVerified:!!finalOwner,
@@ -382,18 +384,18 @@ async function investigation(context, directory) {
     'Execute selected setup action', 'Cancel advisor setup', 'Refresh advisor setup / model inventory', 'Compare saved measurements']) {
     assert(await state.frame.getByRole('button', {name, exact: true}).isVisible(), `Real Pluto control: ${name}`);
   }
-  await state.frame.locator('bond[def="action"] select').selectOption('run');
-  await state.frame.locator('bond[def="selected"] select').selectOption({label:'sampled_sum_squares / sampled'});
+  await state.frame.locator('bond[def="action"] select').selectOption('run',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="selected"] select').selectOption({label:'sampled_sum_squares / sampled'},{timeout:NATIVE_READINESS_MS});
   await idle(state.frame);
   assert.deepEqual(await fingerprint(reportRoot), before, 'Opening and selecting cannot execute measurements');
   context.log('native-ui-action',{surface:'Pluto investigation',action:'Launch selected action'});
-  await state.frame.getByRole('button', {name: 'Launch selected action', exact: true}).click();
+  await state.frame.getByRole('button', {name: 'Launch selected action', exact: true}).click({timeout:NATIVE_READINESS_MS});
   const report = await eventually(async () => {
     for (const name of await files(reportRoot)) {
       if (!name.endsWith(`${path.sep}run.json`) || before[path.relative(reportRoot, name)]) continue;
       return JSON.parse(await fs.readFile(name, 'utf8'));
     }
-  }, 'Launch writes a real scenario report', 360000);
+  }, 'Launch writes a real scenario report', NATIVE_READINESS_MS);
   assert.equal(report.schema_version, 'perfchecker-scenario-run/1');
   assert.deepEqual(new Set(report.runs.map(run => run.collector)), new Set(['benchmark', 'chairmark', 'profile', 'profile_alloc']));
   for (const run of report.runs) {
@@ -407,7 +409,7 @@ async function investigation(context, directory) {
   await refresh(state.frame, 'Refresh status and evidence', snapshot, /\bcomplete\b/);
   await capture(context,'pluto-investigation');
   const completed = await fingerprint(reportRoot);
-  await state.frame.locator('bond[def="action"] select').selectOption('tools');
+  await state.frame.locator('bond[def="action"] select').selectOption('tools',{timeout:NATIVE_READINESS_MS});
   await idle(state.frame);
   assert.deepEqual(await fingerprint(reportRoot), completed, 'Changing selectors after completion cannot rerun the check');
   context.proof('pluto-investigation-real-run', {collectors: [...new Set(report.runs.map(run => run.collector))], core: context.core});
@@ -417,43 +419,43 @@ async function investigation(context, directory) {
   const cell = state.frame.locator(`pluto-cell[id="${id}"]`);
   const title = 'PerfChecker native reactive qualification';
   const editor = await interactiveEditor(context,state,cell,'investigation reactive title');
-  await editor.click(); await editor.press('ControlOrMeta+A');
+  await editor.click({timeout:NATIVE_READINESS_MS}); await editor.press('ControlOrMeta+A',{timeout:NATIVE_READINESS_MS});
   context.log('native-ui-action',{surface:'Pluto investigation',action:'Edit reactive cell and evaluate'});
-  await editor.pressSequentially(`md"# ${title}: $(4 + 5)"`); await editor.press('ControlOrMeta+Enter');
+  await editor.pressSequentially(`md"# ${title}: $(4 + 5)"`,{timeout:NATIVE_READINESS_MS}); await editor.press('ControlOrMeta+Enter',{timeout:NATIVE_READINESS_MS});
   await eventually(async () => (await fs.readFile(file, 'utf8')).includes(`md"# ${title}: $(4 + 5)"`), 'Reactive cell is saved as real Julia code');
-  await eventually(async () => (await cell.locator('pluto-output').innerText()).includes(title), 'Reactive output changes');
-  await state.frame.goto(state.frame.url());
+  await eventually(async () => (await cell.locator('pluto-output').innerText({timeout:NATIVE_READINESS_MS})).includes(title), 'Reactive output changes');
+  await state.frame.goto(state.frame.url(),{timeout:NATIVE_READINESS_MS});
   state = await view(context);
-  await eventually(async () => (await state.frame.locator(`pluto-cell[id="${id}"] pluto-output`).innerText()).includes(title), 'Saved cell survives a real iframe reload');
-  await state.parent.locator('#pluto-source').click();
+  await eventually(async () => (await state.frame.locator(`pluto-cell[id="${id}"] pluto-output`).innerText({timeout:NATIVE_READINESS_MS})).includes(title), 'Saved cell survives a real iframe reload');
+  await state.parent.locator('#pluto-source').click({timeout:NATIVE_READINESS_MS});
   await eventually(() => context.vscode.window.activeTextEditor?.document.uri.fsPath === context.vscode.Uri.file(file).fsPath, 'Open source opens the actual generated .jl');
   const saved = await fs.readFile(file);
-  await context.vscode.commands.executeCommand('perfchecker.openNotebook', context.vscode.Uri.file(file));
+  await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.openNotebook', context.vscode.Uri.file(file)),"perfchecker.openNotebook");
   state = await view(context);
   assert.deepEqual(await fs.readFile(file), saved, 'Open reuses the saved notebook without regeneration');
   const port = Number(new URL(state.frame.url()).port);
-  await context.vscode.commands.executeCommand('perfchecker.openNotebook', context.vscode.Uri.file(file));
+  await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.openNotebook', context.vscode.Uri.file(file)),"perfchecker.openNotebook");
   assert.equal(Number(new URL((await view(context)).frame.url()).port), port, 'Reopening reuses the same server');
   if(process.env.PERFCHECKER_NATIVE_BROWSER_ORACLE){
     const endpoint=process.env.PERFCHECKER_NATIVE_BROWSER_ORACLE,token=process.env.PERFCHECKER_NATIVE_BROWSER_TOKEN;
     const events=async()=>{const response=await fetch(`${endpoint}/events`,{headers:{authorization:`Bearer ${token}`}});assert.equal(response.status,200);return response.json();};
     const expect=async(kind)=>eventually(async()=>{const values=await events();assert(!values.some(value=>value.failed),JSON.stringify(values));return values.find(value=>value.kind===kind);},`Real default browser completes ${kind}`);
     const editorUrl=state.frame.url();
-    await state.frame.locator('#at_the_top button.toggle_export').click();
-    await state.frame.locator('#export a[href*="notebookfile?"]').click();
+    await state.frame.locator('#at_the_top button.toggle_export').click({timeout:NATIVE_READINESS_MS});
+    await state.frame.locator('#export a[href*="notebookfile?"]').click({timeout:NATIVE_READINESS_MS});
     const julia=await expect('julia-source-browser');assert(julia.editedExpression&&julia.credentialAbsent);
     assert.equal(state.frame.url(),editorUrl,'Julia export leaves the original VS Code editor in place');
-    if(!((await state.frame.locator('#pluto-nav').getAttribute('class'))||'').includes('show_export'))await state.frame.locator('#at_the_top button.toggle_export').click();
-    await state.frame.locator('#pluto-nav.show_export #export a[href*="notebookexport?"]').click();
-    await state.frame.locator('.export-html-dialog .ple-download a[download]').click();
+    if(!((await state.frame.locator('#pluto-nav').getAttribute('class',{timeout:NATIVE_READINESS_MS}))||'').includes('show_export'))await state.frame.locator('#at_the_top button.toggle_export').click({timeout:NATIVE_READINESS_MS});
+    await state.frame.locator('#pluto-nav.show_export #export a[href*="notebookexport?"]').click({timeout:NATIVE_READINESS_MS});
+    await state.frame.locator('.export-html-dialog .ple-download a[download]').click({timeout:NATIVE_READINESS_MS});
     const html=await expect('html-download');assert(html.embeddedJulia&&html.editedExpression&&html.credentialAbsent);
     assert.equal(state.frame.url(),editorUrl,'HTML export leaves the original VS Code editor in place');
-    await state.frame.locator('img#logo-big').locator('..').click();await state.frame.locator('#recent').waitFor();
-    await state.frame.locator('#recent li.new a').click({modifiers:['Control']});
+    await state.frame.locator('img#logo-big').locator('..').click({timeout:NATIVE_READINESS_MS});await state.frame.locator('#recent').waitFor({timeout:NATIVE_READINESS_MS});
+    await state.frame.locator('#recent li.new a').click({modifiers:['Control'],timeout:NATIVE_READINESS_MS});
     const modified=await expect('new-context-editor');assert.equal(modified.route,'/new');assert(modified.authenticatedWebSocket);
     assert.equal(new URL(state.frame.url()).pathname,'/','Modified New opens a separate real browser editor');
     const originalId=new URL(editorUrl).searchParams.get('id');
-    await state.frame.locator(`#recent a[href*="id=${originalId}"]`).click();await state.frame.locator('pluto-notebook').waitFor();
+    await state.frame.locator(`#recent a[href*="id=${originalId}"]`).click({timeout:NATIVE_READINESS_MS});await state.frame.locator('pluto-notebook').waitFor({timeout:NATIVE_READINESS_MS});
     assert.equal(new URL(state.frame.url()).searchParams.get('id'),originalId,'Normal Recent navigation remains inside VS Code');
     await capture(context,'pluto-browser-exports-completed');
     context.proof('pluto-default-browser-exports',{source:'actual-installed-VSIX-env.openExternal-and-disposable-xdg-default-browser',
@@ -461,9 +463,9 @@ async function investigation(context, directory) {
   }else context.log('pluto-default-browser-exports',{status:'skipped',reason:'Representative actual OS default-browser fixture requires disposable Linux stable; no human browser profile changes.'});
   await stop(context, state);
   const stopped = await context.findFrame('#pluto-restart');
-  await stopped.locator('#pluto-restart').click();
+  await stopped.locator('#pluto-restart').click({timeout:NATIVE_READINESS_MS});
   state = await view(context);
-  await eventually(async () => (await state.frame.locator(`pluto-cell[id="${id}"] pluto-output`).innerText()).includes(title), 'Restart retains saved cells');
+  await eventually(async () => (await state.frame.locator(`pluto-cell[id="${id}"] pluto-output`).innerText({timeout:NATIVE_READINESS_MS})).includes(title), 'Restart retains saved cells');
   assert.deepEqual(await fingerprint(reportRoot), completed, 'Restart is not a measurement request');
   await stop(context, state, true);
   context.proof('pluto-reactive-save-reload-close', {source: path.basename(file), workersClosed: true});
@@ -477,12 +479,12 @@ async function cancellation(context, directory) {
   try {
     await settings.update('scenarioCatalog', catalog, context.vscode.ConfigurationTarget.WorkspaceFolder);
     const state = await create(context, path.join(directory, 'NativeCancellation.jl'), 'investigation');
-    await state.frame.locator('bond[def="action"] select').selectOption('run');
+    await state.frame.locator('bond[def="action"] select').selectOption('run',{timeout:NATIVE_READINESS_MS});
     await idle(state.frame);
     assert.equal(await fs.stat(marker).then(() => true).catch(() => false), false);
-    await state.frame.getByRole('button', {name: 'Launch selected action', exact: true}).click();
-    await eventually(() => fs.readFile(marker, 'utf8').then(value => value === 'running'), 'An actual measured workload reaches its active-worker marker', 360000);
-    await state.frame.getByRole('button', {name: 'Cancel active investigation', exact: true}).click();
+    await state.frame.getByRole('button', {name: 'Launch selected action', exact: true}).click({timeout:NATIVE_READINESS_MS});
+    await eventually(() => fs.readFile(marker, 'utf8').then(value => value === 'running'), 'An actual measured workload reaches its active-worker marker', NATIVE_READINESS_MS);
+    await state.frame.getByRole('button', {name: 'Cancel active investigation', exact: true}).click({timeout:30000});
     const snapshot = `pluto-cell[id="${cellId(state.source, 'snapshot = (refresh_click;')}"] pluto-output`;
     await refresh(state.frame, 'Refresh status and evidence', snapshot, /\bcancelled\b/, 90000);
     await stop(context, state, true);
@@ -527,9 +529,9 @@ async function ownedWorkerClose(context,directory){
   try{
     await settings.update('scenarioCatalog',catalog,context.vscode.ConfigurationTarget.WorkspaceFolder);
     let state=await create(context,path.join(directory,'StopActiveInvestigation.jl'),'investigation');
-    await state.frame.locator('bond[def="action"] select').selectOption('run');await idle(state.frame);
-    await state.frame.getByRole('button',{name:'Launch selected action',exact:true}).click();
-    const info=await eventually(async()=>{const lines=(await fs.readFile(marker,'utf8')).split('\n');return lines.length===3?lines:false;},'The detached investigation reaches its real PID and private controller-directory marker',360000);
+    await state.frame.locator('bond[def="action"] select').selectOption('run',{timeout:NATIVE_READINESS_MS});await idle(state.frame);
+    await state.frame.getByRole('button',{name:'Launch selected action',exact:true}).click({timeout:NATIVE_READINESS_MS});
+    const info=await eventually(async()=>{const lines=(await fs.readFile(marker,'utf8')).split('\n');return lines.length===3?lines:false;},'The detached investigation reaches its real PID and private controller-directory marker',NATIVE_READINESS_MS);
     const [pid,userDirectory,controllerDirectory]=info;
     fixtureWorkerPid=Number(pid);fixtureUserDirectory=userDirectory;
     for(const name of ['request.toml','worker.log'])assert(await fs.stat(path.join(controllerDirectory,name)).then(stat=>stat.isFile()),
@@ -554,16 +556,16 @@ async function ownedWorkerClose(context,directory){
     const suiteMarker=path.join(context.workspace,'perf','owned-suite-worker.marker');
     await fs.rm(suiteMarker,{force:true});
     state=await create(context,path.join(directory,'CancelActiveAllocation.jl'),'suite');
-    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
-    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
-    const cancelInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Suite Cancel test reaches its active allocation worker',360000);
+    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc',{timeout:NATIVE_READINESS_MS});await idle(state.frame);
+    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click({timeout:NATIVE_READINESS_MS});
+    const cancelInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Suite Cancel test reaches its active allocation worker',NATIVE_READINESS_MS);
     const cancelOwned=await allocationOwned(cancelInfo);
-    await state.frame.getByRole('button',{name:'Cancel active job',exact:true}).click();
+    await state.frame.getByRole('button',{name:'Cancel active job',exact:true}).click({timeout:30000});
     let workerAliveBeforeSecondClick;
     try{process.kill(Number(cancelInfo[0]),0);workerAliveBeforeSecondClick=true;}catch(error){if(error.code!=='ESRCH')throw error;workerAliveBeforeSecondClick=false;}
-    await state.frame.getByRole('button',{name:'Cancel active job',exact:true}).click();
+    await state.frame.getByRole('button',{name:'Cancel active job',exact:true}).click({timeout:30000});
     await refresh(state.frame,'Refresh status','[data-suite-state]',/\bcancelled\b/,90000);
-    await eventually(()=>{try{process.kill(Number(cancelInfo[0]),0);return false;}catch(error){if(error.code==='ESRCH')return true;throw error;}},'The actual Suite Cancel button terminates the detached allocation worker');
+    await eventually(()=>{try{process.kill(Number(cancelInfo[0]),0);return false;}catch(error){if(error.code==='ESRCH')return true;throw error;}},'The actual Suite Cancel button terminates the detached allocation worker',180000);
     await eventually(()=>fs.stat(cancelOwned).then(()=>false).catch(error=>{if(error.code==='ENOENT')return true;throw error;}),'Suite Cancel cleans the actual private allocation environment and its journal',45000);
     assert.deepEqual(await fs.readFile(preserved),sentinel);
     assert.deepEqual(new Set((await files(context.workspace)).filter(file=>file.endsWith('.mem'))),beforeMem);
@@ -571,37 +573,37 @@ async function ownedWorkerClose(context,directory){
     context.proof('pluto-suite-cancel-active-allocation',{nativeClick:true,nativeCancelClicks:2,workerAliveBeforeSecondClick,secondNativeCancelDuringCleanup:'not-observed; the Core regression separately forces cancellation during cleanup',workerTerminated:true,ownedDirectoryRemoved:true,noNewMem:true,preExistingMemPreserved:true});
     await fs.rm(suiteMarker,{force:true});
     state=await create(context,path.join(directory,'CloseActiveAllocation.jl'),'suite');
-    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
-    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
-    const suiteInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The allocation worker reaches its real PID marker',360000);
+    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc',{timeout:NATIVE_READINESS_MS});await idle(state.frame);
+    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click({timeout:NATIVE_READINESS_MS});
+    const suiteInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The allocation worker reaches its real PID marker',NATIVE_READINESS_MS);
     const suiteOwned=await allocationOwned(suiteInfo);
     const suiteElapsed=await assertStopped(state,Number(suiteInfo[0]),suiteOwned,true);
     context.proof('pluto-close-active-allocation-worker',{kind:'SuiteJob',cleanupMilliseconds:suiteElapsed,pidTerminated:true,ownedFilesRemoved:true,preExistingMemPreserved:true,noNewMem:true});
 
     await fs.rm(suiteMarker,{force:true});
     state=await create(context,path.join(directory,'ShutdownActiveAllocation.jl'),'suite');
-    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc');await idle(state.frame);
-    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click();
-    const shutdownInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Pluto homepage Shutdown test reaches its active allocation worker',360000);
+    await state.frame.locator('bond[def="selected_collector"] select').selectOption('alloc',{timeout:NATIVE_READINESS_MS});await idle(state.frame);
+    await state.frame.getByRole('button',{name:'Launch selected checks',exact:true}).click({timeout:NATIVE_READINESS_MS});
+    const shutdownInfo=await eventually(async()=>{const lines=(await fs.readFile(suiteMarker,'utf8')).split('\n');return lines.length===2?lines:false;},'The Pluto homepage Shutdown test reaches its active allocation worker',NATIVE_READINESS_MS);
     const shutdownOwned=await allocationOwned(shutdownInfo);
     let confirmed=false;
     const shutdownElapsed=await assertStopped(state,Number(shutdownInfo[0]),shutdownOwned,false,async()=>{
-        await state.frame.locator('img#logo-big').locator('..').click();
+        await state.frame.locator('img#logo-big').locator('..').click({timeout:NATIVE_READINESS_MS});
         await eventually(()=>new URL(state.frame.url()).pathname==='/'&&state.frame.locator('#recent').isVisible(),'The real Pluto logo opens its authenticated homepage');
         const running=state.frame.locator('#recent li.running').filter({hasText:'ShutdownActiveAllocation.jl'});
-        await running.locator('button').first().click();
+        await running.locator('button').first().click({timeout:NATIVE_READINESS_MS});
         const confirmation=state.frame.getByRole('dialog',{name:'Pluto confirmation'});
-        await confirmation.waitFor({state:'visible'});
-        assert.equal(await confirmation.locator('p').innerText(),'Shut down notebook process?',
+        await confirmation.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+        assert.equal(await confirmation.locator('p').innerText({timeout:NATIVE_READINESS_MS}),'Shut down notebook process?',
           'The real confirmation preserves Pluto 1.0.4\'s exact current translation');
         await capture(context,'pluto-homepage-shutdown-confirmation');
-        await confirmation.getByRole('button',{name:'Cancel',exact:true}).click();
+        await confirmation.getByRole('button',{name:'Cancel',exact:true}).click({timeout:30000});
         assert.equal(await running.count(),1,'Cancelling the actual confirmation preserves the notebook');
         assert.doesNotThrow(()=>process.kill(Number(shutdownInfo[0]),0),'Cancelling preserves the active allocation worker');
         assert(await fs.stat(shutdownOwned).then(stat=>stat.isDirectory()),'Cancelling preserves the active owned allocation directory');
-        await running.locator('button').first().click();await confirmation.waitFor({state:'visible'});
-        await confirmation.getByRole('button',{name:'Confirm',exact:true}).click();confirmed=true;
-        await eventually(async()=>await running.count()===0,'The native Pluto homepage removes the stopped notebook');
+        await running.locator('button').first().click({timeout:NATIVE_READINESS_MS});await confirmation.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+        await confirmation.getByRole('button',{name:'Confirm',exact:true}).click({timeout:NATIVE_READINESS_MS});confirmed=true;
+        await eventually(async()=>await running.count()===0,'The native Pluto homepage removes the stopped notebook',180000);
     });
     assert(confirmed,'The actual visible confirmation was accepted through its native button');
     assert(await portOpen(Number(new URL(state.frame.url()).port)),'The homepage shuts down its notebook without stopping the shared Pluto server');
@@ -692,15 +694,15 @@ async function drawnCanvas(context,canvas,label,movedFrom){
     assertDrawnFigure(pixels);
     if(movedFrom)assertMovedHighlight(movedFrom,pixels);
     return pixels;
-  },`The native ${label} WebGL figure draws measured evidence`,180000);
+  },`The native ${label} WebGL figure draws measured evidence`,NATIVE_READINESS_MS);
 }
 
 async function plotDocument(state,previous){
   const element=await eventually(async()=>{
     const frames=state.frame.locator('pluto-output iframe[data-perfchecker-plot-frame]');
     if(await frames.count()!==1)return false;
-    const handle=await frames.elementHandle();
-    const token=await handle.getAttribute('data-perfchecker-plot-frame');
+    const handle=await frames.elementHandle({timeout:NATIVE_READINESS_MS});
+    const token=await handle.getAttribute('data-perfchecker-plot-frame',{timeout:NATIVE_READINESS_MS});
     if(previous&&token===previous.token){await handle.dispose();return false;}
     return handle;
   },'The actual generator displays one fresh SuitePlotFrame document');
@@ -717,7 +719,7 @@ async function plotDocument(state,previous){
     await eventually(()=>previous.frame.isDetached(),'Pluto removes the previous plot document');
   }
   const canvas=frame.locator('#offline-figure canvas');
-  await canvas.waitFor({state:'visible',timeout:360000});await canvas.scrollIntoViewIfNeeded();
+  await canvas.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});await canvas.scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
   return {frame,canvas,token:attributes.token,title:attributes.title,
     htmlSha256:createHash('sha256').update(attributes.srcdoc).digest('hex')};
 }
@@ -739,7 +741,7 @@ function observePlotFrontend(context,state){
       try{
       const detail=await Promise.race([(async()=>{
       const inspect=()=>{
-        const ids=[...document.querySelectorAll('[data-jscall-id]')].map(node=>node.getAttribute('data-jscall-id'));
+        const ids=[...document.querySelectorAll('[data-jscall-id]')].map(node=>node.getAttribute('data-jscall-id',{timeout:NATIVE_READINESS_MS}));
         const counts=new Map();for(const id of ids)counts.set(id,(counts.get(id)||0)+1);
         const sessions=window.Bonito?.Sessions,queue=window.Bonito?.OBJECT_FREEING_LOCK;
         return {readyState:document.readyState,viewport:{width:innerWidth,height:innerHeight},bonitoLoaded:!!window.Bonito,queue:queue?{size:queue.size,pending:queue.pending,isPaused:queue.isPaused}:null,
@@ -756,7 +758,7 @@ function observePlotFrontend(context,state){
       };
       const notebook=await state.frame.evaluate(inspect),documents=[];
       for(const element of await state.frame.locator('iframe[data-perfchecker-plot-frame]').elementHandles()){
-        const token=await element.getAttribute('data-perfchecker-plot-frame'),frame=await element.contentFrame();
+        const token=await element.getAttribute('data-perfchecker-plot-frame',{timeout:NATIVE_READINESS_MS}),frame=await element.contentFrame();
         if(frame&&!frame.isDetached())documents.push({token,...await frame.evaluate(inspect)});
       }
       return {notebook,documents};
@@ -783,7 +785,7 @@ async function renderedPlots(context,state,selector,completedRoot){
   const distribution=options.find(option=>option.label.endsWith(' · Sample distribution'));
   const trajectory=options.find(option=>option.label.endsWith(' · Version trajectory'));
   assert(distribution&&trajectory,'Real measured samples provide distribution and version-series entries');
-  await selector.selectOption(distribution.value);await idle(state.frame);
+  await selector.selectOption(distribution.value,{timeout:NATIVE_READINESS_MS});await idle(state.frame);
   // Inspect the actual running notebook through a user-edited diagnostic cell.
   // The generated rendering cell and measured bundle remain untouched.
   const cell=state.frame.locator(`pluto-cell[id="${cellId(state.source,'## Performance curves')}"]`);
@@ -806,15 +808,15 @@ end`;
   const clipboard=await context.vscode.env.clipboard.readText();
   try{
     await context.vscode.env.clipboard.writeText(diagnostic);
-    await editor.click();await editor.press('ControlOrMeta+A');await editor.press('ControlOrMeta+V');
+    await editor.click({timeout:NATIVE_READINESS_MS});await editor.press('ControlOrMeta+A',{timeout:NATIVE_READINESS_MS});await editor.press('ControlOrMeta+V',{timeout:NATIVE_READINESS_MS});
     await eventually(async()=>await editor.evaluate(node=>[...node.querySelectorAll('.cm-line')].map(line=>line.textContent).join('\n'))===diagnostic,
-      'Native clipboard paste inserts the complete diagnostic into the real editor',30000);
+      'Native clipboard paste inserts the complete diagnostic into the real editor',NATIVE_READINESS_MS);
   }finally{await context.vscode.env.clipboard.writeText(clipboard);}
-  await editor.press('ControlOrMeta+Enter');
+  await editor.press('ControlOrMeta+Enter',{timeout:NATIVE_READINESS_MS});
   await ready(state.frame,'Launch selected checks');
   await eventually(async()=>(await fs.readFile(path.join(context.workspace,'perf','notebooks','NativeSuite.jl'),'utf8')).includes(diagnostic),
-    'The submitted diagnostic is present in the actual Pluto-saved notebook',30000);
-  const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent();return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',360000);
+    'The submitted diagnostic is present in the actual Pluto-saved notebook',NATIVE_READINESS_MS);
+  const evidence=async()=>eventually(async()=>{const raw=await cell.locator('#native-plot-evidence').textContent({timeout:NATIVE_READINESS_MS});return raw&&JSON.parse(raw);},'The real Pluto worker exposes loaded providers and measured plot data',NATIVE_READINESS_MS);
   const data=await evidence();assert.equal(data.kind,'distribution');assert(data.selected.startsWith('distribution-'));assert.equal(data.selectedLabel,distribution.label);assert(data.values.length>=2);
   const providerProvenance=JSON.parse(await fs.readFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'pluto-plot-provider-provenance.json'),'utf8'));
   assert.equal(providerProvenance.pins.makieCommit,'ffbf33f0bda61dfc84adfb8e8e6dfd8a404d0642');
@@ -845,9 +847,9 @@ end`;
   context.log('pluto-plot-diagnostic-viewport',await diagnosticViewport('before-native-fold'));
   // Pluto follows its focused CodeMirror caret and compensates output height changes.
   // Fold the completed diagnostic through its real control before viewing the plot.
-  await cell.locator('.foldcode').click();
+  await cell.locator('.foldcode').click({timeout:NATIVE_READINESS_MS});
   await eventually(async()=>await cell.locator('.cm-content:visible').count()===0,'The native fold control hides the completed diagnostic input');
-  await selector.focus();
+  await selector.focus({timeout:NATIVE_READINESS_MS});
   await eventually(async()=>!(await diagnosticViewport('focus-check')).focusedWithin,'Plot selection owns focus before its separate canvas is scrolled');
   context.log('pluto-plot-diagnostic-viewport',await diagnosticViewport('after-native-fold'));
   const firstDocument=await plotDocument(state),canvas=firstDocument.canvas;
@@ -864,29 +866,29 @@ end`;
   };
   const distinct=distinctMeasuredPoint(data);
   const selectedIndex=distinct<0?1:distinct;
-  await pointInput.focus();for(let step=0;step<selectedIndex;step++)await pointInput.press('ArrowUp');
-  await eventually(async()=>recordedPoint(await firstDocument.frame.locator('#point-readout').innerText(),selectedIndex,data),
+  await pointInput.focus({timeout:NATIVE_READINESS_MS});for(let step=0;step<selectedIndex;step++)await pointInput.press('ArrowUp',{timeout:NATIVE_READINESS_MS});
+  await eventually(async()=>recordedPoint(await firstDocument.frame.locator('#point-readout').innerText({timeout:NATIVE_READINESS_MS}),selectedIndex,data),
     'A real native number-input gesture inspects the exact chosen version, value and unit');
-  const expected=await firstDocument.frame.locator('#point-readout').innerText();
+  const expected=await firstDocument.frame.locator('#point-readout').innerText({timeout:NATIVE_READINESS_MS});
   const after=await drawnCanvas(context,canvas,'highlight',distinct<0?undefined:before);
   await frontend.snapshot('distribution-point-inspected');
   await capture(context,'pluto-rendered-distribution');
-  await selector.selectOption(trajectory.value);await ready(state.frame,'Launch selected checks');
+  await selector.selectOption(trajectory.value,{timeout:NATIVE_READINESS_MS});await ready(state.frame,'Launch selected checks');
   const second=await eventually(async()=>{const current=await evidence();return current.selectedLabel===trajectory.label&&current;},'The real plot selector regenerates the version-series figure');
   assert.equal(second.kind,'version_series');assert(second.selected.startsWith('version-series-'));
   const secondDocument=await plotDocument(state,firstDocument);
-  await eventually(async()=>recordedPoint(await secondDocument.frame.locator('#point-readout').innerText(),0,second),
+  await eventually(async()=>recordedPoint(await secondDocument.frame.locator('#point-readout').innerText({timeout:NATIVE_READINESS_MS}),0,second),
     'The newly rendered trajectory inspector identifies its exact version, measured value and unit');
   await frontend.snapshot('trajectory-readout-ready');
   const trajectoryPixels=await drawnCanvas(context,secondDocument.canvas,'trajectory');
   await capture(context,'pluto-rendered-version-series');
-  await selector.selectOption(distribution.value);await ready(state.frame,'Launch selected checks');
+  await selector.selectOption(distribution.value,{timeout:NATIVE_READINESS_MS});await ready(state.frame,'Launch selected checks');
   const returned=await eventually(async()=>{const current=await evidence();return current.selectedLabel===distribution.label&&current;},'The real selector returns to the original measured distribution');
   assert.deepEqual(returned.values,data.values);assert.deepEqual(returned.versions,data.versions);
   const returnedDocument=await plotDocument(state,secondDocument);
   assert.notEqual(returnedDocument.token,firstDocument.token,'Even a cached plot creates a new document identity');
   assert.equal(returnedDocument.htmlSha256,firstDocument.htmlSha256,'The unchanged cached HTML is reused without patching queues or providers');
-  await eventually(async()=>recordedPoint(await returnedDocument.frame.locator('#point-readout').innerText(),0,data),
+  await eventually(async()=>recordedPoint(await returnedDocument.frame.locator('#point-readout').innerText({timeout:NATIVE_READINESS_MS}),0,data),
     'The returned document starts with its own exact version, measured value and unit');
   const returnedPixels=await drawnCanvas(context,returnedDocument.canvas,'distribution-returned');
   await frontend.snapshot('distribution-returned');
@@ -896,7 +898,7 @@ end`;
   assert(timing,'Interactive plot qualification requires the real measured wall-time distribution');
   let temporalInteraction;
   {
-    await selector.selectOption(timing.value);await ready(state.frame,'Launch selected checks');
+    await selector.selectOption(timing.value,{timeout:NATIVE_READINESS_MS});await ready(state.frame,'Launch selected checks');
     const temporal=await eventually(async()=>{const current=await evidence();return current.selectedLabel===timing.label&&current;},'The actual measured wall-time distribution is selected');
     assert.equal(temporal.kind,'distribution');assert(temporal.selected.startsWith('distribution-'));assert(temporal.values.length>=2);
     const temporalDocument=await plotDocument(state,returnedDocument),temporalCanvas=temporalDocument.canvas;
@@ -905,10 +907,10 @@ end`;
     assert(point>=0,'The measured wall-time coordinates coincide; required pixel movement cannot be qualified');
     const index=point;
     const temporalInput=temporalDocument.frame.getByRole('spinbutton',{name:'Recorded point index'});
-    await temporalInput.focus();for(let step=0;step<index;step++)await temporalInput.press('ArrowUp');
-    await eventually(async()=>recordedPoint(await temporalDocument.frame.locator('#point-readout').innerText(),index,temporal),
+    await temporalInput.focus({timeout:NATIVE_READINESS_MS});for(let step=0;step<index;step++)await temporalInput.press('ArrowUp',{timeout:NATIVE_READINESS_MS});
+    await eventually(async()=>recordedPoint(await temporalDocument.frame.locator('#point-readout').innerText({timeout:NATIVE_READINESS_MS}),index,temporal),
       'A native number-input gesture inspects the exact wall-time version, measured value and unit');
-    const readout=await temporalDocument.frame.locator('#point-readout').innerText();
+    const readout=await temporalDocument.frame.locator('#point-readout').innerText({timeout:NATIVE_READINESS_MS});
     const moved=await drawnCanvas(context,temporalCanvas,'wall-time-highlight',initial);
     await capture(context,'pluto-rendered-wall-time-highlight');
     temporalInteraction={available:true,selected:temporal.selected,measuredSamples:temporal.values.length,nativeKeyboard:true,
@@ -933,22 +935,22 @@ async function suite(context, directory, requirePlots=false,observation) {
   for (const name of ['Launch selected checks', 'Cancel active job', 'Refresh status', 'Save completed reports']) {
     assert(await state.frame.getByRole('button', {name, exact: true}).isVisible(), `Real suite control: ${name}`);
   }
-  await state.frame.locator('bond[def="selected_collector"] select').selectOption('benchmark');
-  await state.frame.locator('bond[def="selected_package"] select').selectOption('PerfCheckerNativeFixture');
-  await state.frame.locator('bond[def="selected_workload"] select').selectOption('sum_squares');
-  await state.frame.locator('bond[def="selected_target"] select').selectOption('baseline');
-  await state.frame.locator('bond[def="samples"] input').fill('2');
-  await state.frame.locator('bond[def="samples"] input').press('Tab');
-  await state.frame.locator('bond[def="seconds"] input').fill('0.1');
-  await state.frame.locator('bond[def="seconds"] input').press('Tab');
+  await state.frame.locator('bond[def="selected_collector"] select').selectOption('benchmark',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="selected_package"] select').selectOption('PerfCheckerNativeFixture',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="selected_workload"] select').selectOption('sum_squares',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="selected_target"] select').selectOption('baseline',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="samples"] input').fill('2',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="samples"] input').press('Tab',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="seconds"] input').fill('0.1',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="seconds"] input').press('Tab',{timeout:NATIVE_READINESS_MS});
   await idle(state.frame);
   assert.deepEqual(await fingerprint(root), before, 'Suite selectors and sample inputs do not execute workers');
   context.log('native-ui-action',{surface:'Pluto suite',action:'Launch selected checks'});
-  await state.frame.getByRole('button', {name: 'Launch selected checks', exact: true}).click();
+  await state.frame.getByRole('button', {name: 'Launch selected checks', exact: true}).click({timeout:NATIVE_READINESS_MS});
   await refresh(state.frame, 'Refresh status', '[data-suite-state]', /\bcomplete\b/);
   assert.deepEqual(await fingerprint(root), before, 'Reports are saved only on the explicit Save action');
   context.log('native-ui-action',{surface:'Pluto suite',action:'Save completed reports'});
-  await state.frame.getByRole('button', {name: 'Save completed reports', exact: true}).click();
+  await state.frame.getByRole('button', {name: 'Save completed reports', exact: true}).click({timeout:NATIVE_READINESS_MS});
   const saved = await eventually(async () => {
     for (const name of await files(root)) {
       if (!name.endsWith(`${path.sep}suite-result.json`) || before[path.relative(root, name)]) continue;
@@ -956,7 +958,7 @@ async function suite(context, directory, requirePlots=false,observation) {
     }
   }, 'Save completed reports writes an actual measured bundle');
   const savedOutput=state.frame.locator(`pluto-cell[id="${cellId(state.source,'saved_reports = begin')}"] pluto-output`);
-  await eventually(async()=>/Last saved reports:/.test(await savedOutput.innerText()),
+  await eventually(async()=>/Last saved reports:/.test(await savedOutput.innerText({timeout:NATIVE_READINESS_MS})),
     'The Save cell finishes writing every report format');
   await idle(state.frame);
   for(const name of ['version-series.json','version-comparison.json','version-comparison.md'])
@@ -981,8 +983,8 @@ async function suite(context, directory, requirePlots=false,observation) {
     context.log('pluto-rendered-plot', {available: true, canvas: true,documentToken:document.token});
   }
   const completed = await fingerprint(root);
-  await state.frame.locator('bond[def="samples"] input').fill('3');
-  await state.frame.locator('bond[def="samples"] input').press('Tab');
+  await state.frame.locator('bond[def="samples"] input').fill('3',{timeout:NATIVE_READINESS_MS});
+  await state.frame.locator('bond[def="samples"] input').press('Tab',{timeout:NATIVE_READINESS_MS});
   await idle(state.frame);
   assert.deepEqual(await fingerprint(root), completed, 'Changing a completed suite does not rerun or resave results');
   const closeDeadline=observation?Date.now()+45000:undefined;
@@ -1014,7 +1016,7 @@ exports.run = async context => {
         context.log('pluto-failure-before-stop', {case:name,reactiveErrors:reactive.map(value=>value.slice(0,3000)),
           renderedLaunch:await state.frame.getByRole('button',{name:/Launch selected/}).count(),
           cellCount:await state.frame.locator('pluto-cell').count(),
-          editorStatus:await state.frame.locator('pluto-editor').getAttribute('class')});
+          editorStatus:await state.frame.locator('pluto-editor').getAttribute('class',{timeout:NATIVE_READINESS_MS})});
       } catch (diagnostic) {context.log('pluto-failure-view-unavailable',{case:name,message:String(diagnostic).replace(/([?&]secret=)[^&\s"<>]+/g,'$1[redacted]')});}
       await capture(context,`pluto-${name}-failed-before-stop`).catch(()=>{});
     }
@@ -1043,21 +1045,23 @@ exports.runFreshInstall = async context => {
     await filesSettings.update('simpleDialog.enable',true,vscode.ConfigurationTarget.Global);
     await clickStudioAction(context,'notebook');
     const dialog=windowPage.locator('.quick-input-widget').filter({has:windowPage.locator('.quick-input-title').filter({hasText:/^PerfChecker · Create Pluto notebook$/})});
-    await dialog.waitFor({state:'visible',timeout:30000});
-    const input=dialog.locator('input[type="text"]');await input.fill(file);await input.press('Enter');
+    await dialog.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
+    const input=dialog.locator('input[type="text"]');await input.fill(file,{timeout:NATIVE_READINESS_MS});await input.press('Enter',{timeout:NATIVE_READINESS_MS});
     const picker=windowPage.locator('.quick-input-widget');let folderCreationConfirmed=false;
     await eventually(async()=>{
       const createFolder=picker.filter({hasText:'The folder notebooks does not exist. Would you like to create it?'});
       if(!folderCreationConfirmed&&await createFolder.isVisible()){
-        await createFolder.getByRole('button',{name:'OK',exact:true}).click();folderCreationConfirmed=true;
+        await createFolder.getByRole('button',{name:'OK',exact:true}).click({timeout:NATIVE_READINESS_MS});folderCreationConfirmed=true;
         context.log('native-ui-action',{surface:'Published Pluto save dialog',action:'Confirm creation of notebooks folder'});
       }
-      return await picker.locator('.monaco-list-row').filter({hasText:'Feature suite'}).isVisible();
-    },'The real Save dialog finishes folder creation and shows notebook kinds',30000);
-    await picker.locator('.monaco-list-row').filter({hasText:'Feature suite'}).click();
+      const row=picker.locator('.monaco-list-row').filter({hasText:'Feature suite'});
+      if(!await row.isVisible())return false;
+      await row.click({timeout:10000});
+      return true;
+    },'The real Save dialog finishes folder creation and selects the Feature suite notebook kind',NATIVE_READINESS_MS);
     const install=windowPage.getByRole('button',{name:'Install Pluto environment',exact:true});
-    await install.waitFor({state:'visible',timeout:30000});await install.click();
-    const source=await eventually(()=>fs.readFile(file,'utf8'),'The real published installer generates the first native notebook',600000);
+    await install.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});await install.click({timeout:NATIVE_READINESS_MS});
+    const source=await eventually(()=>fs.readFile(file,'utf8'),'The real published installer generates the first native notebook',NATIVE_READINESS_MS);
     assert(source.startsWith('### A Pluto.jl notebook ###'));
     const state={source,...await view(context)};await ready(state.frame,'Launch selected checks');
     await capture(context,'fresh-published-pluto');
@@ -1068,7 +1072,7 @@ exports.runFreshInstall = async context => {
     for(const [name,directory]of [['controller',controller],['pluto',project]]){
       const result=await execute(process.env.PERFCHECKER_NATIVE_JULIA,['--startup-file=no','--history-file=no',`--project=${directory}`,'-e',
         'using Pkg,PerfChecker; modules=Module[PerfChecker];if ARGS[1]=="pluto";using PerfCheckerPluto,Pluto;append!(modules,[PerfCheckerPluto,Pluto]);end;print("PUBLISHED_BOOTSTRAP_PROVENANCE ");PerfChecker.JSON.print(Dict(string(nameof(m))=>begin;i=Pkg.dependencies()[Base.PkgId(m).uuid];Dict("version"=>string(Base.pkgversion(m)),"tree"=>string(i.tree_hash),"registered"=>i.is_tracking_registry,"revision"=>i.git_revision,"source"=>i.git_source,"pathof"=>pathof(m),"pkgdir"=>pkgdir(m));end for m in modules));println()',name],
-        {cwd:workspace,env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)},timeout:180000,maxBuffer:1000000});
+        {cwd:workspace,env:{...process.env,JULIA_LOAD_PATH:['@','@stdlib'].join(path.delimiter)},timeout:NATIVE_READINESS_MS,maxBuffer:1000000});
       const line=result.stdout.split(/\r?\n/).find(value=>value.startsWith('PUBLISHED_BOOTSTRAP_PROVENANCE '));assert(line,'The actual installed modules report their source provenance');
       environments[name]=JSON.parse(line.slice('PUBLISHED_BOOTSTRAP_PROVENANCE '.length));
       assert.equal(environments[name].PerfChecker.version,process.env.PERFCHECKER_NATIVE_GENERAL_MINIMUM_VERSION);assert.equal(environments[name].PerfChecker.registered,true);
@@ -1186,10 +1190,10 @@ exports.runStartStop = async context => {
   }};
   observer=(async()=>{while(observing){try{await inspect('first-open-live',port);await observeLogs('first-open-live');await observeUI();}catch(error){observationFailure ||= error;observing=false;}if(observing)await wait(500);}})();
   try{
-    const created=await context.vscode.commands.executeCommand('perfchecker.newNotebook',context.vscode.Uri.file(file),{kind:'suite'});assert.equal(created.fsPath,file);
+    const created=await waitForNativeAvailability(context.vscode.commands.executeCommand('perfchecker.newNotebook',context.vscode.Uri.file(file),{kind:'suite'}),"perfchecker.newNotebook");assert.equal(created.fsPath,file);
     state=await view(context);port=Number(new URL(state.frame.url()).port);assert(Number.isInteger(port)&&port>0&&port<65536);
     context.log('pluto-first-start-ready-iframe',{observedAt:new Date().toISOString(),port,notebookSha256:createHash('sha256').update(await fs.readFile(file)).digest('hex'),sessionCredentialsOmitted:true});
-    await eventually(async()=>/idle/.test(await state.frame.locator('[data-suite-state]').innerText()),'The first prepared dashboard is idle without launching checks',180000);
+    await eventually(async()=>/idle/.test(await state.frame.locator('[data-suite-state]').innerText({timeout:NATIVE_READINESS_MS})),'The first prepared dashboard is idle without launching checks',NATIVE_READINESS_MS);
     observing=false;await observer;if(observationFailure)throw observationFailure;
     const active=await inspect('idle-before-first-stop',port);assert.equal(active.listeners.length,1);assert.equal(active.listeners[0].owners.length,1);
     owner=active.rows.find(row=>row.pid===active.listeners[0].owners[0]);assert(owner&&owner.parent===process.pid&&owner.canonicalExecutable===executable&&owner.serverReadyMarker&&owner.projects.includes(project));

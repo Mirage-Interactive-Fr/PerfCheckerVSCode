@@ -1,3 +1,4 @@
+const {NATIVE_READINESS_MS}=require('./native-readiness.cjs');
 // Real HTTP MCP transport and Julia workers, driven through the installed webview.
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
@@ -11,7 +12,7 @@ const {clickStudioAction}=require('./native-studio-controls.cjs');
 const execute = promisify(execFile);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const hold = async()=>{if(process.env.PERFCHECKER_NATIVE_VIDEO==='1')await delay(3000);};
-async function eventually(read, label, timeout = 180000) {
+async function eventually(read, label, timeout = NATIVE_READINESS_MS) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {if (await read()) return; await delay(100);}
   throw new Error(label);
@@ -307,22 +308,22 @@ async function verifyPersistedStdioSettings(context,fixture,stage){
   assert.equal(state.workspace,vscode.workspace.getWorkspaceFolder(uri).name);
   assert.equal(state.connectionKind,undefined);assert.equal(state.busy,false);
   assert.deepEqual(state.implementation.arguments,fixture.values.advisorImplementationMcpArguments);
-  await chat.getByRole('tab',{name:'02 · Implementation',exact:true}).click();
-  await chat.getByText('Configure the MCP implementation tool',{exact:true}).click();
-  await eventually(async()=>JSON.stringify(JSON.parse(await chat.getByLabel('Other implementation tool arguments (JSON)',{exact:true}).inputValue()))===JSON.stringify(fixture.values.advisorImplementationMcpArguments),
-    'The real Chat UI receives the selected folder implementation arguments',15000);
-  await chat.getByRole('tab',{name:'01 · Advice',exact:true}).click();
-  assert.equal(await chat.getByRole('tab',{name:'01 · Advice',exact:true}).getAttribute('aria-selected'),'true');
-  await chat.getByRole('button',{name:'Connect local MCP server',exact:true}).click();
+  await chat.getByRole('tab',{name:'02 · Implementation',exact:true}).click({timeout:NATIVE_READINESS_MS});
+  await chat.getByText('Configure the MCP implementation tool',{exact:true}).click({timeout:NATIVE_READINESS_MS});
+  await eventually(async()=>JSON.stringify(JSON.parse(await chat.getByLabel('Other implementation tool arguments (JSON)',{exact:true}).inputValue({timeout:NATIVE_READINESS_MS})))===JSON.stringify(fixture.values.advisorImplementationMcpArguments),
+    'The real Chat UI receives the selected folder implementation arguments',NATIVE_READINESS_MS);
+  await chat.getByRole('tab',{name:'01 · Advice',exact:true}).click({timeout:NATIVE_READINESS_MS});
+  assert.equal(await chat.getByRole('tab',{name:'01 · Advice',exact:true}).getAttribute('aria-selected',{timeout:NATIVE_READINESS_MS}),'true');
+  await chat.getByRole('button',{name:'Connect local MCP server',exact:true}).click({timeout:NATIVE_READINESS_MS});
   const setup=await findFrame('#advisor-root');
-  assert.equal(await setup.getByLabel('Absolute MCP server executable',{exact:true}).inputValue(),fixture.values.advisorMcpStdioCommand);
-  assert.deepEqual(JSON.parse(await setup.getByLabel('Executable arguments (JSON array)',{exact:true}).inputValue()),fixture.values.advisorMcpStdioArguments);
-  assert.equal(await setup.getByLabel('Absolute server working directory',{exact:true}).inputValue(),fixture.values.advisorMcpStdioDirectory);
+  assert.equal(await setup.getByLabel('Absolute MCP server executable',{exact:true}).inputValue({timeout:NATIVE_READINESS_MS}),fixture.values.advisorMcpStdioCommand);
+  assert.deepEqual(JSON.parse(await setup.getByLabel('Executable arguments (JSON array)',{exact:true}).inputValue({timeout:NATIVE_READINESS_MS})),fixture.values.advisorMcpStdioArguments);
+  assert.equal(await setup.getByLabel('Absolute server working directory',{exact:true}).inputValue({timeout:NATIVE_READINESS_MS}),fixture.values.advisorMcpStdioDirectory);
   // The untouched form has not called state(), so aria-busy is absent until
   // its first explicit operation. Assert the actual initial controls instead.
-  assert.equal(await setup.getByRole('button',{name:'Test connection / discover',exact:true}).isEnabled(),true);
-  assert.equal(await setup.getByRole('button',{name:'Cancel operation',exact:true}).isDisabled(),true);
-  assert.equal(await setup.getByRole('status').innerText(),'Ready.');
+  assert.equal(await setup.getByRole('button',{name:'Test connection / discover',exact:true}).isEnabled({timeout:NATIVE_READINESS_MS}),true);
+  assert.equal(await setup.getByRole('button',{name:'Cancel operation',exact:true}).isDisabled({timeout:NATIVE_READINESS_MS}),true);
+  assert.equal(await setup.getByRole('status').innerText({timeout:NATIVE_READINESS_MS}),'Ready.');
   // Inspect and close the actual form without discovering or connecting.
   await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   await vscode.commands.executeCommand('perfchecker.openChat');
@@ -503,9 +504,9 @@ async function measuredEvidence(context) {
   let frame=await context.findFrame('#app nav[aria-label="Investigation views"]');
   let declared,discoveryId;
   try{
-  await frame.getByRole('button',{name:'Discover tests',exact:true}).click();
+  await frame.getByRole('button',{name:'Discover tests',exact:true}).click({timeout:NATIVE_READINESS_MS});
   await eventually(async()=>{
-  if((await frame.locator('#app .status').getAttribute('class')).includes('busy')||
+  if((await frame.locator('#app .status').getAttribute('class',{timeout:NATIVE_READINESS_MS})).includes('busy')||
     await frame.locator('.scenario-title strong').filter({hasText:/^advisor_sum_squares$/}).count()!==1)return false;
   const advisorCard=frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:/^advisor_sum_squares$/})})
     .filter({has:frame.locator('.implementation',{hasText:/^allocating$/})});
@@ -527,13 +528,13 @@ async function measuredEvidence(context) {
     discoveryId=id;
   }
   return Boolean(declared);
-  },'Actual Core saves a new exact advisor catalogue and finishes its visible discovery',240000);
+  },'Actual Core saves a new exact advisor catalogue and finishes its visible discovery',NATIVE_READINESS_MS);
   assert(declared,'The saved discovery must identify the exact single-collector catalogue before launch');
   }catch(primary){
     const diagnostic={stage:'discovery',errorClass:primary.name,message:String(primary),recoveryAfterFailure:true};
     context.log('native-mcp-discovery-primary-failure-before-recovery',diagnostic);
     try{
-      diagnostic.status={text:await frame.locator('#app .status').innerText(),className:await frame.locator('#app .status').getAttribute('class')};
+      diagnostic.status={text:await frame.locator('#app .status').innerText({timeout:30000}),className:await frame.locator('#app .status').getAttribute('class',{timeout:30000})};
       diagnostic.newReportIds=(await entries()).filter(id=>!previousDiscovery.has(id));
       diagnostic.screenshot=`native-${process.platform}-mcp-discovery-before-recovery.png`;
       await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,diagnostic.screenshot)});
@@ -541,23 +542,23 @@ async function measuredEvidence(context) {
     context.log('native-mcp-discovery-state-before-recovery',diagnostic);
     try{
       await context.vscode.commands.executeCommand('perfchecker.cancelInvestigation');
-      await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class')).includes('busy'),
+      await eventually(async()=>!(await frame.locator('#app .status').getAttribute('class',{timeout:30000})).includes('busy'),
         'Explicit recovery waits for the failed discovery controller cleanup',120000);
       context.log('native-mcp-discovery-recovery-after-failure',{cancelCommand:'perfchecker.cancelInvestigation',
-        status:await frame.locator('#app .status').innerText(),naturalCompletionClaimed:false,originalFailureRetained:true});
+        status:await frame.locator('#app .status').innerText({timeout:30000}),naturalCompletionClaimed:false,originalFailureRetained:true});
     }catch(cleanup){throw new AggregateError([primary,cleanup],'Discovery failed and explicit recovery did not complete');}
     throw primary;
   }
   context.proof('native-mcp-benchmark-catalog-discovery',{id:declared.id,implementation:declared.implementation,catalog:declared.catalog,
     source:declared.source,collectors:declared.collectors,discoveryId,newSavedDiscovery:true,originalFourCollectorsPreserved:true,assertedBeforeMeasurement:true});
-  await frame.getByRole('button',{name:'Scenarios',exact:true}).click();
-  await frame.getByRole('button',{name:'Clear selection',exact:true}).click();
+  await frame.getByRole('button',{name:'Scenarios',exact:true}).click({timeout:NATIVE_READINESS_MS});
+  await frame.getByRole('button',{name:'Clear selection',exact:true}).click({timeout:NATIVE_READINESS_MS});
   const selectedCard=frame.locator('article.card').filter({has:frame.locator('.scenario-title strong',{hasText:/^advisor_sum_squares$/})})
     .filter({has:frame.locator('.implementation',{hasText:/^allocating$/})});
   assert.equal(await selectedCard.count(),1,'Only the exact advisor declaration is selected');
-  await selectedCard.locator('.scenario-title input').check();
+  await selectedCard.locator('.scenario-title input').check({timeout:NATIVE_READINESS_MS});
   const before=new Set(await entries());
-  await frame.getByRole('button',{name:'Measure selected',exact:true}).click();
+  await frame.getByRole('button',{name:'Measure selected',exact:true}).click({timeout:NATIVE_READINESS_MS});
   let measured;
   await eventually(async()=>{
     for(const id of await entries()){
@@ -618,10 +619,10 @@ async function measuredEvidence(context) {
         measurementEnvironments:environments.map(environment=>({path:environment.path,projectSha256:environment.project_sha256,
           manifestSha256:environment.manifest_sha256,collector:environment.resolved_packages.find(item=>item.name==='BenchmarkTools'),
           providerDependenciesAbsent:true}))};
-      return !(await frame.locator('#app .status').getAttribute('class')).includes('busy');
+      return !(await frame.locator('#app .status').getAttribute('class',{timeout:NATIVE_READINESS_MS})).includes('busy');
     }
     return false;
-  },'Real Julia measurements and their saved deterministic advice complete',360000);
+  },'Real Julia measurements and their saved deterministic advice complete',NATIVE_READINESS_MS);
   return measured;
 }
 
@@ -793,7 +794,7 @@ exports.run = async (context,options={}) => {
   const stdioRecords=async connection=>(await fs.readFile(path.join(connection.root,'stdio-requests.jsonl'),'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);
   const stdioSelect=async(panel,id,caption)=>{
     const input=panel.locator('select#'+id);assert.equal(await input.count(),1);
-    assert.equal(await input.locator('..').locator(':scope > span').innerText(),caption);return input;
+    assert.equal(await input.locator('..').locator(':scope > span').innerText({timeout:NATIVE_READINESS_MS}),caption);return input;
   };
   const connectStdio=async(version)=>{
     assert.equal((await state()).connectionKind,undefined,'A new native connection starts from a disconnected chat');
@@ -802,31 +803,31 @@ exports.run = async (context,options={}) => {
     assert.equal(await fs.realpath(path.dirname(root)),await fs.realpath(process.env.PERFCHECKER_NATIVE_SESSION));
     assert.equal((await fs.lstat(root)).isSymbolicLink(),false);
     await vscode.commands.executeCommand('perfchecker.openChat');let chat=await findFrame('#chat-root');
-    await chat.getByRole('button',{name:'Connect local MCP server',exact:true}).click();
+    await chat.getByRole('button',{name:'Connect local MCP server',exact:true}).click({timeout:NATIVE_READINESS_MS});
     const panel=await findFrame('#advisor-root');
-    await(await stdioSelect(panel,'advisor-protocol','Mode')).selectOption('mcp_stdio');
-    await panel.getByLabel('Absolute MCP server executable',{exact:true}).fill(command);
-    await panel.getByLabel('Executable arguments (JSON array)',{exact:true}).fill(JSON.stringify(args));
-    await panel.getByLabel('Absolute server working directory',{exact:true}).fill(root);
-    await(await stdioSelect(panel,'advisor-mcp_version','MCP version')).selectOption(version);
-    await panel.getByLabel('Connection / download timeout (seconds)',{exact:true}).fill(String(values.advisorTimeout));
-    await panel.getByRole('button',{name:'Test connection / discover',exact:true}).click();
+    await(await stdioSelect(panel,'advisor-protocol','Mode')).selectOption('mcp_stdio',{timeout:NATIVE_READINESS_MS});
+    await panel.getByLabel('Absolute MCP server executable',{exact:true}).fill(command,{timeout:NATIVE_READINESS_MS});
+    await panel.getByLabel('Executable arguments (JSON array)',{exact:true}).fill(JSON.stringify(args),{timeout:NATIVE_READINESS_MS});
+    await panel.getByLabel('Absolute server working directory',{exact:true}).fill(root,{timeout:NATIVE_READINESS_MS});
+    await(await stdioSelect(panel,'advisor-mcp_version','MCP version')).selectOption(version,{timeout:NATIVE_READINESS_MS});
+    await panel.getByLabel('Connection / download timeout (seconds)',{exact:true}).fill(String(values.advisorTimeout),{timeout:NATIVE_READINESS_MS});
+    await panel.getByRole('button',{name:'Test connection / discover',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async()=>await panel.getByRole('heading',{name:adviceTool,exact:true}).count()===1&&await panel.getByRole('heading',{name:implementationTool,exact:true}).count()===1&&
-      await panel.locator('#advisor-root').getAttribute('aria-busy')==='false','The real stdio transport displays both paginated tool schemas');
+      await panel.locator('#advisor-root').getAttribute('aria-busy',{timeout:NATIVE_READINESS_MS})==='false','The real stdio transport displays both paginated tool schemas');
     const row=name=>panel.locator('article.card').filter({has:panel.getByRole('heading',{name,exact:true})});
-    await row(adviceTool).getByRole('button',{name:'Use',exact:true}).click();
-    await row(implementationTool).getByRole('button',{name:'Use for implementation',exact:true}).click();
-    await panel.getByLabel('Other tool arguments (JSON)',{exact:true}).fill(JSON.stringify(additional));
-    await panel.getByLabel('Implementation prompt argument',{exact:true}).fill(implementationArgument);
-    await panel.getByLabel('Isolated checkout argument',{exact:true}).fill(workspaceArgument);
-    await panel.getByLabel('Other implementation arguments (JSON)',{exact:true}).fill(JSON.stringify(implementationAdditional));
-    assert.equal(await panel.getByLabel('Selected MCP tool',{exact:true}).inputValue(),adviceTool);
-    assert.equal(await panel.getByLabel('Prompt argument',{exact:true}).inputValue(),adviceArgument);
-    assert.equal(await panel.getByLabel('Optional implementation tool',{exact:true}).inputValue(),implementationTool);
+    await row(adviceTool).getByRole('button',{name:'Use',exact:true}).click({timeout:NATIVE_READINESS_MS});
+    await row(implementationTool).getByRole('button',{name:'Use for implementation',exact:true}).click({timeout:NATIVE_READINESS_MS});
+    await panel.getByLabel('Other tool arguments (JSON)',{exact:true}).fill(JSON.stringify(additional),{timeout:NATIVE_READINESS_MS});
+    await panel.getByLabel('Implementation prompt argument',{exact:true}).fill(implementationArgument,{timeout:NATIVE_READINESS_MS});
+    await panel.getByLabel('Isolated checkout argument',{exact:true}).fill(workspaceArgument,{timeout:NATIVE_READINESS_MS});
+    await panel.getByLabel('Other implementation arguments (JSON)',{exact:true}).fill(JSON.stringify(implementationAdditional),{timeout:NATIVE_READINESS_MS});
+    assert.equal(await panel.getByLabel('Selected MCP tool',{exact:true}).inputValue({timeout:NATIVE_READINESS_MS}),adviceTool);
+    assert.equal(await panel.getByLabel('Prompt argument',{exact:true}).inputValue({timeout:NATIVE_READINESS_MS}),adviceArgument);
+    assert.equal(await panel.getByLabel('Optional implementation tool',{exact:true}).inputValue({timeout:NATIVE_READINESS_MS}),implementationTool);
     const schemas=[];
     for(const name of [adviceTool,implementationTool]){
-      await row(name).locator('summary').click();
-      const schema=JSON.parse(await row(name).locator('pre').innerText());schemas.push({name,schema});
+      await row(name).locator('summary').click({timeout:NATIVE_READINESS_MS});
+      const schema=JSON.parse(await row(name).locator('pre').innerText({timeout:NATIVE_READINESS_MS}));schemas.push({name,schema});
       assert.deepEqual(schema.required,name===adviceTool?[adviceArgument,'native_contract']:[implementationArgument,workspaceArgument,'native_contract']);
     }
     const discoveredPID=Number(await fs.readFile(path.join(root,'server.pid'),'utf8'));
@@ -840,11 +841,11 @@ exports.run = async (context,options={}) => {
     proof('native-mcp-stdio-discovered-schema',{version,command,args,cwd:root,sourceSha256:hash(await fs.readFile(serverFile)),identity,windowsJobOwner,
       schemas,timeoutSeconds:values.advisorTimeout,timeoutScope:'Explicit qualification configuration, not the default',toolsCalled:0,
       provider:providerLabel,explicitNativeFieldGestures:true,independentImplementationArguments:implementationAdditional});
-    await panel.getByLabel('Absolute MCP server executable',{exact:true}).scrollIntoViewIfNeeded();
+    await panel.getByLabel('Absolute MCP server executable',{exact:true}).scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-${vscode.version}-mcp-stdio-${version}-configuration.png`)});
-    await row(implementationTool).scrollIntoViewIfNeeded();
+    await row(implementationTool).scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-${vscode.version}-mcp-stdio-${version}-schema.png`)});
-    await panel.getByRole('button',{name:'Connect for this editor session',exact:true}).click();
+    await panel.getByRole('button',{name:'Connect for this editor session',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async()=>(await state()).connectionKind==='stdio','Native Save publishes the connection and does not cancel its server');
     assert.deepEqual(await nativeIdentity(identity.pid,command),identity,
       'Discovery and Connect retain exactly the same native server');
@@ -857,7 +858,7 @@ exports.run = async (context,options={}) => {
       adviceTool,implementationTool,adviceArgument,implementationArgument,workspaceArgument,
       independentImplementationArguments:implementationAdditional,sessionOnly:true,savedSettingsNotQualified:true,provider:providerLabel});
     await vscode.commands.executeCommand('perfchecker.openChat');chat=await findFrame('#chat-root');
-    await chat.getByRole('button',{name:'New conversation',exact:true}).click();
+    await chat.getByRole('button',{name:'New conversation',exact:true}).click({timeout:NATIVE_READINESS_MS});
     return chat;
   };
   try {
@@ -876,9 +877,9 @@ exports.run = async (context,options={}) => {
     let view = await findFrame('#chat-root');
     await context.editorQualification?.surface('custom-mcp-before-connect',view);
     if(!stdio&&!documentedInstall){
-    await view.locator('summary').filter({hasText: 'Optional Codex CLI connector'}).click();
-    await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click();
-    await eventually(async () => /ENOENT|executable|could not|launch/i.test(await view.locator('[role="status"]').innerText()), 'Missing Codex explains its executable prerequisite');
+    await view.locator('summary').filter({hasText: 'Optional Codex CLI connector'}).click({timeout:NATIVE_READINESS_MS});
+    await view.getByRole('button', {name: 'Connect Codex CLI', exact: true}).click({timeout:NATIVE_READINESS_MS});
+    await eventually(async () => /ENOENT|executable|could not|launch/i.test(await view.locator('[role="status"]').innerText({timeout:NATIVE_READINESS_MS})), 'Missing Codex explains its executable prerequisite');
     assert.equal((await vscode.commands.executeCommand('perfchecker.codexConnectionState')).connected, false);
     proof('codex-missing-native-prerequisite',{command:'perfchecker.connectCodex',status:'prerequisite',reason:'Codex executable absent from disposable CI; no human credentials are transferred.'});
     assert.deepEqual(await vscode.commands.executeCommand('perfchecker.disconnectCodex'),{connected:false});
@@ -887,7 +888,7 @@ exports.run = async (context,options={}) => {
     assert.deepEqual(await readSavedConfiguration(),savedConfig,'The failed temporary CLI connection and explicit disconnect preserve the saved provider bytes');
     proof('codex-disconnected-command',{command:'perfchecker.disconnectCodex',returnValueVerified:true,alreadyDisconnected:true,savedConfigurationPreserved:true,optionalConfigurationPath:configuredPath,directoryRead:false,activeAuthenticatedDisconnection:false});
     }
-    await view.getByRole('button', {name: 'New conversation', exact: true}).click();
+    await view.getByRole('button', {name: 'New conversation', exact: true}).click({timeout:NATIVE_READINESS_MS});
     const diagnoseSend=async(stage)=>{
       const diagnostic={stage,extensionHost:process.pid,controllerProject,measurementProject,
         configuredTimeoutSeconds:values.advisorTimeout,externalTimeoutSeconds:values.advisorTimeout+60,
@@ -939,9 +940,9 @@ exports.run = async (context,options={}) => {
       log('native-mcp-send-diagnostic',diagnostic);
     };
     const send = async (question, count) => {
-      await view.locator('#chat-question').fill(question);
+      await view.locator('#chat-question').fill(question,{timeout:NATIVE_READINESS_MS});
       log('native-ui-action',{surface:'MCP conversation',action:'Send question',turn:count/2});
-      await view.getByRole('button', {name: 'Send question', exact: true}).click();
+      await view.getByRole('button', {name: 'Send question', exact: true}).click({timeout:NATIVE_READINESS_MS});
       let nextDiagnostic=Date.now()+60000;
       try{
         await eventually(async () => {assert.deepEqual(providerErrors,[],'The real provider must accept the exact Core request');const value = await state();
@@ -960,14 +961,14 @@ exports.run = async (context,options={}) => {
       const connection=activeStdio;
       await legacyIdentity(connection,'after-completed-advice');
       assert.equal((await state()).connectionKind,'stdio','The completed legacy advice retains its existing stdio connection');
-      await view.getByRole('button',{name:'Configure MCP connection',exact:true}).click();
+      await view.getByRole('button',{name:'Configure MCP connection',exact:true}).click({timeout:NATIVE_READINESS_MS});
       const panel=await findFrame('#advisor-root');
-      assert.equal(await(await stdioSelect(panel,'advisor-protocol','Mode')).inputValue(),'mcp_stdio');
-      assert.equal(await(await stdioSelect(panel,'advisor-mcp_version','MCP version')).inputValue(),'2025-11-25',
+      assert.equal(await(await stdioSelect(panel,'advisor-protocol','Mode')).inputValue({timeout:NATIVE_READINESS_MS}),'mcp_stdio');
+      assert.equal(await(await stdioSelect(panel,'advisor-mcp_version','MCP version')).inputValue({timeout:NATIVE_READINESS_MS}),'2025-11-25',
         'Reopening configuration reads the connected legacy revision from memory, rather than the modern saved settings');
       legacyMarker('probe-before',{server:connection.identity});
-      await panel.getByRole('button',{name:'Test connection / discover',exact:true}).click();
-      await eventually(async()=>await panel.locator('#advisor-root').getAttribute('aria-busy')==='false'&&
+      await panel.getByRole('button',{name:'Test connection / discover',exact:true}).click({timeout:NATIVE_READINESS_MS});
+      await eventually(async()=>await panel.locator('#advisor-root').getAttribute('aria-busy',{timeout:NATIVE_READINESS_MS})==='false'&&
         await panel.getByRole('heading',{name:adviceTool,exact:true}).count()===1,'Probe after a completed legacy conversation keeps the existing server usable');
       legacyMarker('probe-after',{server:connection.identity});
       await legacyIdentity(connection,'after-probe');
@@ -976,7 +977,7 @@ exports.run = async (context,options={}) => {
       assert(records.every(row=>row.version==='2025-11-25'));assert.equal(records.some(row=>row.method==='server/discover'),false);
       const disconnectUntil=Date.now()+60000;
       legacyMarker('disconnect-before-click',{server:connection.identity});
-      await panel.getByRole('button',{name:'Disconnect local MCP server',exact:true}).click();
+      await panel.getByRole('button',{name:'Disconnect local MCP server',exact:true}).click({timeout:30000});
       legacyMarker('disconnect-after-click',{server:connection.identity});
       await eventually(async()=>await sameNativeIdentityGone(connection.identity)&&
         (!connection.windowsJobOwner||await sameNativeIdentityGone(connection.windowsJobOwner))&&!(await state()).connectionKind&&
@@ -1002,8 +1003,8 @@ exports.run = async (context,options={}) => {
         messages:completed.messages.length,assistantRole:completed.messages[1].role,actualProviderRequests:calls.length,configuredSeconds:90,externalSeconds:150});
       const reply=view.locator('.transcript .message.assistant .message-text');
       assert.equal(await reply.count(),1,'One actual assistant bubble is present in the conversation');
-      assert.equal(await reply.innerText(),completed.messages[1].content,'The visible Advice bubble contains the full actual response');
-      await reply.waitFor({state:'visible',timeout:15000});
+      assert.equal(await reply.innerText({timeout:NATIVE_READINESS_MS}),completed.messages[1].content,'The visible Advice bubble contains the full actual response');
+      await reply.waitFor({state:'visible',timeout:NATIVE_READINESS_MS});
       assert.equal(await fs.readFile(source,'utf8'),original);assert.equal(await git('rev-parse','HEAD'),head);
       proof('native-mcp-documented-install-first-send',{installation,requestStartedAt:firstSendStartedAt,completedAt,
         elapsedSeconds,configuredSeconds:90,externalSeconds:150,
@@ -1019,7 +1020,7 @@ exports.run = async (context,options={}) => {
       await require('./native-suite-chat-evidence.cjs').run(context,{calls:suiteCalls,receipts,providerErrors,state,
         setAttached:value=>{attached=value;}});
     attached=savedEvidence;
-    await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(attached.id);
+    await view.getByRole('combobox',{name:'Attach saved evidence',exact:true}).selectOption(attached.id,{timeout:NATIVE_READINESS_MS});
     await eventually(async()=>{const value=await state();return value.evidenceId===attached.id&&value.messages.length===0;},'The real evidence selector starts a conversation with the selected measured bundle');
     await send('Inspect the intermediate allocation in sum_squares using this measured evidence without editing. What should I verify?',2);
     await send('Continue this conversation: how should empty inputs and signed Float64 values be checked?', 4);
@@ -1044,13 +1045,13 @@ exports.run = async (context,options={}) => {
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,
       `native-${process.env.PERFCHECKER_NATIVE_EXPECTED_VERSION}-${process.platform}-${vscode.version}-mcp-controlled-provider.png`)});
     await hold();
-    await view.getByRole('tab', {name: '02 · Implementation', exact: true}).click();
-    assert.match(await view.locator('.warning').innerText(), /Git checkpoint.*isolated copy.*diff review/);
+    await view.getByRole('tab', {name: '02 · Implementation', exact: true}).click({timeout:NATIVE_READINESS_MS});
+    assert.match(await view.locator('.warning').innerText({timeout:NATIVE_READINESS_MS}), /Git checkpoint.*isolated copy.*diff review/);
     if(!stdio){
-      await view.getByText('Configure the MCP implementation tool', {exact: true}).click();
-      await view.getByRole('textbox', {name: 'Implementation tool name', exact: true}).fill(implementationTool);
-      await view.getByRole('textbox',{name:'Other implementation tool arguments (JSON)',exact:true}).fill(JSON.stringify(implementationAdditional));
-      await view.getByRole('button', {name: 'Save implementation tool', exact: true}).click();
+      await view.getByText('Configure the MCP implementation tool', {exact: true}).click({timeout:NATIVE_READINESS_MS});
+      await view.getByRole('textbox', {name: 'Implementation tool name', exact: true}).fill(implementationTool,{timeout:NATIVE_READINESS_MS});
+      await view.getByRole('textbox',{name:'Other implementation tool arguments (JSON)',exact:true}).fill(JSON.stringify(implementationAdditional),{timeout:NATIVE_READINESS_MS});
+      await view.getByRole('button', {name: 'Save implementation tool', exact: true}).click({timeout:NATIVE_READINESS_MS});
       await eventually(async () => /Implementation tool saved/.test((await state()).status), 'The native tool configuration is saved');
       assert.deepEqual(settings().inspect('advisorImplementationMcpArguments')?.workspaceFolderValue,implementationAdditional,
         'The real implementation form persists its explicit independent arguments in the owning folder');
@@ -1062,8 +1063,8 @@ exports.run = async (context,options={}) => {
     // editor activity; earlier stat-cache changes are not part of this action.
     const index = await fs.readFile(path.join(workspace, '.git', 'index'));
     log('native-ui-action',{surface:'MCP implementation',action:'Prepare implementation after review'});
-    await view.getByRole('button', {name: 'I reviewed the advice · Prepare implementation', exact: true}).click();
-    await eventually(async () => {const value = await state(); return !value.busy && value.proposal?.files.includes('src/PerfCheckerNativeFixture.jl');}, 'The real implementation worker returns its Git proposal', 240000);
+    await view.getByRole('button', {name: 'I reviewed the advice · Prepare implementation', exact: true}).click({timeout:NATIVE_READINESS_MS});
+    await eventually(async () => {const value = await state(); return !value.busy && value.proposal?.files.includes('src/PerfCheckerNativeFixture.jl');}, 'The real implementation worker returns its Git proposal', NATIVE_READINESS_MS);
     const proposal=(await state()).proposal;
     await fs.writeFile(path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,'native-mcp-reviewed-proposal.patch'),proposal.patch);
     log('native-mcp-reviewed-proposal',{files:proposal.files,patchBytes:Buffer.byteLength(proposal.patch),patchSha256:hash(Buffer.from(proposal.patch))});
@@ -1074,8 +1075,8 @@ exports.run = async (context,options={}) => {
     await eventually(async()=>!await context.windowPage.locator('[id="workbench.parts.sidebar"]').isVisible()&&!await context.windowPage.locator('[id="workbench.parts.panel"]').isVisible(),
       'Native workbench actions expose the full editor review viewport');
     const proposedChanges=view.getByLabel('Proposed changes',{exact:true});
-    assert((await proposedChanges.innerText()).includes('init=zero'),'The real proposed patch is populated before the review capture');
-    await proposedChanges.scrollIntoViewIfNeeded();
+    assert((await proposedChanges.innerText({timeout:NATIVE_READINESS_MS})).includes('init=zero'),'The real proposed patch is populated before the review capture');
+    await proposedChanges.scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
     const reviewGeometry=()=>proposedChanges.evaluate(element=>({rectangle:element.getBoundingClientRect().toJSON(),
       viewport:{width:innerWidth,height:innerHeight},documentScroll:{x:scrollX,y:scrollY},
       content:{height:element.scrollHeight,clientHeight:element.clientHeight,scrollTop:element.scrollTop}}));
@@ -1096,17 +1097,17 @@ exports.run = async (context,options={}) => {
     await view.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
     await context.windowPage.screenshot({path:path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-${vscode.version}-mcp-reviewed-proposal.png`)});await hold();
     log('native-ui-action',{surface:'MCP implementation',action:'Open full diff'});
-    await view.getByRole('button', {name: 'Open full diff', exact: true}).click();
+    await view.getByRole('button', {name: 'Open full diff', exact: true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(() => vscode.workspace.textDocuments.some(document => document.languageId === 'diff' && document.getText().includes('init=zero')), 'The actual diff editor opens');
     await hold();
     await vscode.commands.executeCommand('perfchecker.openChat'); view = await findFrame('#chat-root');
     log('native-ui-action',{surface:'MCP implementation',action:'Apply reviewed changes'});
-    await view.getByRole('button', {name: 'Apply reviewed changes', exact: true}).click();
+    await view.getByRole('button', {name: 'Apply reviewed changes', exact: true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async () => !((await state()).busy) && (await fs.readFile(source, 'utf8')) === proposed, 'Apply changes the original only after the native user click');
     assert.equal(await probe(workspace), implementationBytes);
     log('native-mcp-applied-oracle',{allocationBytes:implementationBytes,baselineBytes,originalChangedAfterReview:true});await hold();
     log('native-ui-action',{surface:'MCP implementation',action:'Restore previous code'});
-    await view.getByRole('button', {name: 'Restore previous code', exact: true}).click();
+    await view.getByRole('button', {name: 'Restore previous code', exact: true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async () => !((await state()).busy) && (await fs.readFile(source, 'utf8')) === original, 'Restore returns the exact original bytes');
     assert.deepEqual(await fs.readFile(path.join(workspace, '.git', 'index')), index);
     assert.equal(await git('rev-parse', 'HEAD'), head);
@@ -1115,11 +1116,11 @@ exports.run = async (context,options={}) => {
       allocationBaselineBytes:baselineBytes,allocationCandidateBytes:implementationBytes,indexSha256:hash(index)});
     if(custom)proof('native-mcp-custom-arguments',{adviceArgument,implementationArgument,workspaceArgument,additionalArgumentsVerified:true,
       actualHttpCalls:calls.length,measuredEvidenceIds:attached.evidence.map(row=>row.id),configurationRestoredInFinally:true});
-    await view.getByRole('button', {name: 'Discard proposal', exact: true}).click();
+    await view.getByRole('button', {name: 'Discard proposal', exact: true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async () => !(await state()).proposal, 'Discard closes the recovery proposal');
-    await view.getByRole('tab', {name: '01 · Advice', exact: true}).click();
-    await view.locator('#chat-question').fill('native cancellation probe');
-    await view.getByRole('button', {name: 'Send question', exact: true}).click();
+    await view.getByRole('tab', {name: '01 · Advice', exact: true}).click({timeout:NATIVE_READINESS_MS});
+    await view.locator('#chat-question').fill('native cancellation probe',{timeout:NATIVE_READINESS_MS});
+    await view.getByRole('button', {name: 'Send question', exact: true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(() => pending.size > 0, 'The actual MCP request reached the provider');
     const ownershipSnapshot=async()=>({pending:pending.size,uiBusy:(await state()).busy});
     const owned=stdio?await ownedStdioJuliaProcesses():await ownedChatProcesses(log,[...pendingSockets.values()],ownershipSnapshot,'before-folder-switch');
@@ -1145,7 +1146,7 @@ exports.run = async (context,options={}) => {
     });
     try{
       assert(vscode.workspace.updateWorkspaceFolders(vscode.workspace.workspaceFolders.length,0,{uri:alternateFolder,name:'Chat alternate folder'}));
-      await eventually(()=>alternateAcknowledged,'The workbench acknowledges the alternate folder and its configuration model',30000);
+      await eventually(()=>alternateAcknowledged,'The workbench acknowledges the alternate folder and its configuration model',NATIVE_READINESS_MS);
     }finally{alternateChanged.dispose();}
     assert.equal(vscode.workspace.getWorkspaceFolder(alternateFolder)?.uri.toString(),alternateFolder.toString());
     log('native-mcp-alternate-workspace-acknowledged',{resource:alternateFolder.toString(),actualWorkspaceEvent:true});
@@ -1171,12 +1172,12 @@ exports.run = async (context,options={}) => {
     }
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',alternateFolder);
     const alternateStudio=await findFrame('#studio-root');
-    await eventually(async()=>await alternateStudio.locator('.workspace strong').innerText()==='Chat alternate folder',
+    await eventually(async()=>await alternateStudio.locator('.workspace strong').innerText({timeout:NATIVE_READINESS_MS})==='Chat alternate folder',
       'Studio selects the second folder while the first chat request is still active');
     const owningChatTab=()=>context.windowPage.locator('.tabs-container .tab').filter({
       has:context.windowPage.locator('.label-name').filter({hasText:/^PerfChecker · Chat$/})}).filter({visible:true}).first();
-    await owningChatTab().click();
-    await eventually(async()=>await owningChatTab().getAttribute('aria-selected')==='true',
+    await owningChatTab().click({timeout:NATIVE_READINESS_MS});
+    await eventually(async()=>await owningChatTab().getAttribute('aria-selected',{timeout:NATIVE_READINESS_MS})==='true',
       'The exact owning Chat tab is active, rather than the alternate Studio with a similar title');
     view=await findFrame('#chat-root');
     const requestedOwner=vscode.Uri.file(workspace),owner=vscode.workspace.getWorkspaceFolder(requestedOwner);
@@ -1193,7 +1194,7 @@ exports.run = async (context,options={}) => {
     assert.equal(calls.length,callsBeforeSwitch,'Selecting another Studio must not send another provider request');
     log('native-mcp-cancel-before',{...owned,foreign:foreign.pid,heldResponses:pending.size,uiBusy:(await state()).busy});
     const cancelUntil=Date.now()+60000;
-    await view.getByRole('button', {name: 'Cancel request', exact: true}).click();
+    await view.getByRole('button', {name: 'Cancel request', exact: true}).click({timeout:30000});
     await eventually(async () => {
       const idle=!(await state()).busy;
       const localGone=!stdio||await sameNativeIdentityGone(activeStdio.identity)&&await sameNativeIdentityGone(stdioDescendant)&&
@@ -1225,11 +1226,11 @@ exports.run = async (context,options={}) => {
       originalOwnedProcessesPreservedBeforeCancel:true,owningEvidenceInventoryPreserved:true,
       additionalProviderRequestsOnWorkspaceSwitch:calls.length-callsBeforeSwitch});
     await vscode.commands.executeCommand('perfchecker.openStudioForWorkspace',vscode.Uri.file(workspace));
-    await owningChatTab().click();
-    await eventually(async()=>await owningChatTab().getAttribute('aria-selected')==='true','The exact Chat tab is active after restoring Studio selection');
+    await owningChatTab().click({timeout:NATIVE_READINESS_MS});
+    await eventually(async()=>await owningChatTab().getAttribute('aria-selected',{timeout:NATIVE_READINESS_MS})==='true','The exact Chat tab is active after restoring Studio selection');
     view=await findFrame('#chat-root');
     assert.equal(await fs.readFile(source, 'utf8'), original);
-    await view.getByRole('button', {name: 'New conversation', exact: true}).click();
+    await view.getByRole('button', {name: 'New conversation', exact: true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async () => (await state()).messages.length === 0, 'The native clear command removes the conversation');
     proof('native-mcp-advice-implementation-restore', {provider: providerLabel,protocolRevision:'2026-07-28',
       adviceTurns: 2, checkpoint: true, diffEditor: true, apply: true, exactRestore: true, cancellation: true,
@@ -1243,7 +1244,7 @@ exports.run = async (context,options={}) => {
       assert.deepEqual(await readSavedConfiguration(),savedConfig);
       view=await connectStdio('2026-07-28');const disconnected=activeStdio;
       const disconnectUntil=Date.now()+60000;
-      await view.getByRole('button',{name:'Disconnect local MCP server',exact:true}).click();
+      await view.getByRole('button',{name:'Disconnect local MCP server',exact:true}).click({timeout:30000});
       await eventually(async()=>await sameNativeIdentityGone(disconnected.identity)&&
         (!disconnected.windowsJobOwner||await sameNativeIdentityGone(disconnected.windowsJobOwner))&&!(await state()).connectionKind&&Date.now()<disconnectUntil,
       'Native Disconnect closes the explicit modern server and restores its saved provider',Math.max(1,disconnectUntil-Date.now()));
