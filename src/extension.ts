@@ -2,6 +2,8 @@ import { normalizedChart, normalizedChartScript, type NormalizedPlot } from './n
 import {distributionChartScript} from './distribution-plot';
 import {flameGraph, flameChartScript, flameChartStyle, profileGroups, type ProfileObservation} from './flame-plot';
 import {readProfileObservations} from './observation-reader';
+import {verificationSelection} from './verificationSelection';
+import {SuiteChatSource, SuiteChatEvidence, captureSuiteChatSource, validateSuiteChatSource} from './suiteChatEvidence';
 import * as vscode from 'vscode';
 import {randomUUID} from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -286,6 +288,7 @@ class Controller {
   private designerSave?: {id: string; panel: vscode.WebviewPanel; resolve: () => void;
     reject: (error: unknown) => void; timer: ReturnType<typeof setTimeout>};
   private resultsPanel?: vscode.WebviewPanel;
+  private resultsSelection?: {workspace: vscode.Uri; source?: SuiteChatSource; runs: PlanRun[]};
   private plan?: SuitePlan;
   private uiConfiguration?: any;
   private selectedWorkspace?: vscode.Uri;
@@ -637,7 +640,25 @@ class Controller {
   }
 
   async run(node?: PerfNode, explicitIds?: string[], revealOutput = false): Promise<void> {
-    return this.inWorkspace(() => this.exclusiveSuite(() => this.runSelection(node, explicitIds, revealOutput)));
+    await this.inWorkspace(() => this.exclusiveSuite(() => this.runSelection(node, explicitIds, revealOutput)));
+  }
+
+  async runAndAnalyze(ids?: string[], instructions?: unknown): Promise<void> {
+    const result = await this.inWorkspace(() => this.exclusiveSuite(() => this.runSelection(undefined, ids, true)));
+    if (result) await vscode.commands.executeCommand('perfchecker.analyzeSelectedResults', {
+      workspace: this.folder().uri, runId: result.runId, selections: result.selections, instructions,
+    });
+  }
+
+  async verifyChecks(input: {workspace: vscode.Uri; selections?: {package: string; feature: string; version: string}[]; signal?: AbortSignal}) {
+    if (input?.workspace?.toString() !== this.folder().uri.toString()) throw new Error('The verification workspace changed.');
+    return this.inWorkspace(() => this.exclusiveSuite(async () => {
+      if (input.signal?.aborted) return {status: 'cancelled'};
+      await this.refresh();
+      const {runs, trialRuns} = verificationSelection(this.plan!.runs, input.selections);
+      const result = await this.runSelection(undefined, runs.map(run => run.id), false, input.signal);
+      return result ? {...result, trialSelections: trialRuns.map(run => ({package: run.package, feature: run.feature, version: run.version}))} : {status: 'cancelled'};
+    }));
   }
 
   async runAll(): Promise<void> {
@@ -647,7 +668,9 @@ class Controller {
     }));
   }
 
-  private async runSelection(node?: PerfNode, explicitIds?: string[], revealOutput = false): Promise<void> {
+  private async runSelection(node?: PerfNode, explicitIds?: string[], revealOutput = false, signal?: AbortSignal): Promise<{
+    runId: string; status: 'passed' | 'failed'; selections: {package: string; feature: string; version: string}[];
+  } | undefined> {
     if (!this.plan) await this.refresh();
     const ids = explicitIds ?? this.ids(node);
     if (!ids.length) throw new Error('Select at least one run.');
@@ -655,6 +678,7 @@ class Controller {
     if (ids.some(id => !current.has(id)) || node?.runs.some(run => current.get(run.id)?.entrypoint !== run.entrypoint)) {
       throw new Error('This selection belongs to an earlier plan or workspace. Refresh and select current runs.');
     }
+    const previousRun = (await this.readReport<VersionSeriesFile>('version-series.json'))?.run_id;
     const completed = await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: `PerfChecker · ${ids.length} run(s)`, cancellable: true,
@@ -668,22 +692,37 @@ class Controller {
         ...this.comparisonArguments(),
         ...ids.flatMap(id => [`--run-id=${id}`]),
       ];
-      const code = await this.invoke('run', args, value => {
+      const cancellation = signal ? new vscode.CancellationTokenSource() : undefined;
+      const abort = () => cancellation?.cancel();
+      const subscription = cancellation ? token.onCancellationRequested(abort) : undefined;
+      signal?.addEventListener('abort', abort, {once: true});
+      if (signal?.aborted || token.isCancellationRequested) abort();
+      let code: number;
+      try {code = await this.invoke('run', args, value => {
         const percent = Number(value.percent ?? 0);
         report.report({increment: Math.max(percent - previous, 0),
           message: value.current_run ? `${value.current_run.package} · ${value.current_run.feature} · ${value.current_run.version}` : value.state});
         previous = percent;
         this.designer?.webview.postMessage({type: 'progress', value});
-      }, undefined, token);
-      if (code === 130) {this.output.appendLine('Cancelled after controller cleanup.'); return false;}
+      }, undefined, cancellation?.token ?? token);}
+      finally {signal?.removeEventListener('abort', abort); subscription?.dispose(); cancellation?.dispose();}
+      if (code === 130 || signal?.aborted || token.isCancellationRequested) {this.output.appendLine('Cancelled after controller cleanup.'); return;}
       if (code !== 0) throw new Error(`PerfChecker run failed with code ${code}. Inspect PerfChecker output for cleanup errors and retained inventories.`);
+      const series = await this.readReport<VersionSeriesFile>('version-series.json');
+      const suite = await this.readReport<SuiteResultFile>('suite-result.json');
+      if (!series?.run_id || series.run_id === previousRun || !suite) throw new Error('The controller did not produce a new saved execution. No previous result was analyzed.');
+      const selectedRuns = this.plan!.runs.filter(run => ids.includes(run.id));
+      const outputs = outputsForRuns(suite.runs, selectedRuns);
+      if (outputs.length !== selectedRuns.length) throw new Error('The saved execution does not contain every selected check.');
       if (revealOutput) {
         const selectedRuns = this.plan?.runs.filter(run => ids.includes(run.id)) ?? [];
         await this.openOutput(undefined, selectedRuns);
       }
-      return true;
+      return {runId: series.run_id, status: outputs.every(output => output.status === 'pass') ? 'passed' as const : 'failed' as const,
+        selections: selectedRuns.map(run => ({package: run.package, feature: run.feature, version: run.version}))};
     });
     if (completed) void vscode.window.showInformationMessage('PerfChecker run completed.');
+    return completed;
   }
 
   async open(nodeOrRun: PerfNode | PlanRun): Promise<void> {
@@ -750,6 +789,11 @@ class Controller {
     const logo = this.resultsPanel!.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'perfchecker.png'));
     const outputs = outputsForRuns(suite?.runs ?? [], runs);
     const selectedVersions = new Set(runs.map(run => run.version));
+    const targetLabel = (version: string) => {
+      const revision = runs.find(run => run.version === version)?.target_revision;
+      return revision ? `${version} · ${revision.slice(0, 12)}` : version;
+    };
+    const targetLegend = [...selectedVersions].map(version => `<span title="${html(runs.find(run => run.version === version)?.target_revision ?? '')}">${html(targetLabel(version))}</span>`).join(' · ');
     const series = seriesForRuns(versionFile?.series ?? [], runs);
     let comparisons = comparisonsForRuns(comparisonFile?.records ?? [], runs);
     if (runs.length === 1) comparisons = comparisons.filter(record => selectedVersions.has(record.baseline_version) || selectedVersions.has(record.candidate_version));
@@ -760,7 +804,7 @@ class Controller {
       backend: string, version: string, status: string, search: string): string =>
       `data-result-item data-kind="${html(kind)}" data-package="${html(packageName)}" ` +
       `data-workload="${html(workload)}" data-backend="${html(backend)}" ` +
-      `data-version="${html(version)}" data-status="${html(status)}" ` +
+      `data-version="${html(targetLabel(version))}" data-status="${html(status)}" ` +
       `data-search="${html(search.toLowerCase())}"`;
     const counts = new Map<string, number>();
     const overlayCards = (versionFile?.plots ?? []).filter(plot => plot.kind === 'normalized_metrics' &&
@@ -780,7 +824,7 @@ class Controller {
       const backend = runs.find(run => run.package === output.package && run.feature === output.feature && run.version === output.version)?.backend ?? 'benchmark';
       const attributes = filterAttributes('run', output.package, workload, backend, output.version,
         output.status, `${output.package} ${workload} ${checkLabel(backend)} ${output.version} ${output.status}`);
-      return `<article class="result-card" ${attributes}><header><span class="status ${html(output.status)}">${html(output.status)}</span><div><strong>${html(output.package)} · ${html(workload)}</strong><small>${html(checkLabel(backend))} · ${html(output.version)} · ${html(output.target_kind)}</small></div><time>${html(formatSeconds(output.elapsed_seconds))}</time></header>${output.message ? `<p class="message">${html(output.message)}</p>` : ''}<div class="metrics">${values || '<span class="muted">No numeric summary for this run.</span>'}</div></article>`;
+      return `<article class="result-card" ${attributes}><header><span class="status ${html(output.status)}">${html(output.status)}</span><div><strong>${html(output.package)} · ${html(workload)}</strong><small>${html(checkLabel(backend))} · ${html(targetLabel(output.version))} · ${html(output.target_kind)}</small></div><time>${html(formatSeconds(output.elapsed_seconds))}</time></header>${output.message ? `<p class="message">${html(output.message)}</p>` : ''}<div class="metrics">${values || '<span class="muted">No numeric summary for this run.</span>'}</div><button data-analyze="${runs.findIndex(run => run.package === output.package && run.feature === output.feature && run.version === output.version)}">Analyze this check</button></article>`;
     }).join('');
     const seriesCards = series.map((item, index) => {
       const backend = definitionBackend(item.measurement_definition);
@@ -810,7 +854,7 @@ class Controller {
       const backend = definitionBackend(definition);
       const workload = group[0].attributes.workload ?? logicalFeature({feature: group[0].attributes.feature ?? caseId, backend});
       const attributes = filterAttributes('flame', packageName, workload, backend, version, '', `${caseId} ${version} ${label}`);
-      return `<article class="flame-card" ${attributes}><header><div><strong>${label}</strong><small>${html(packageName)} · ${html(workload)} · ${html(version)}</small></div><span>${html(group[0].metric)}</span></header>${flameGraph(group, `flame-${index}`)}</article>`;
+      return `<article class="flame-card" ${attributes}><header><div><strong>${label}</strong><small>${html(packageName)} · ${html(workload)} · ${html(targetLabel(version))}</small></div><span>${html(group[0].metric)}</span></header>${flameGraph(group, `flame-${index}`)}</article>`;
     }).join('');
     const distributions = new Map<string, ProfileObservation[]>();
     const distributionDomains = new Map<string, [number, number]>();
@@ -834,7 +878,7 @@ class Controller {
       const backend = definitionBackend(definition);
       const workload = group[0].attributes.workload ?? logicalFeature({feature: group[0].attributes.feature ?? caseId, backend});
       const attributes = filterAttributes('distribution', packageName, workload, backend, version, '', `${caseId} ${version} ${collector} ${group[0].metric}`);
-      return `<article class="chart-card" ${attributes}><header><div><strong>${html(group[0].metric)} distribution</strong><small>${html(packageName)} · ${html(workload)} · ${html(version)} · ${collector}</small></div><span class="distribution-unit">${html(group[0].unit)}</span></header>${distributionPlot(group, `distribution-${index}`, distributionDomains.get(distributionIdentity(group[0])) ?? [0, 0], distributionIdentity(group[0]))}</article>`;
+      return `<article class="chart-card" ${attributes}><header><div><strong>${html(group[0].metric)} distribution</strong><small>${html(packageName)} · ${html(workload)} · ${html(targetLabel(version))} · ${collector}</small></div><span class="distribution-unit">${html(group[0].unit)}</span></header>${distributionPlot(group, `distribution-${index}`, distributionDomains.get(distributionIdentity(group[0])) ?? [0, 0], distributionIdentity(group[0]))}</article>`;
     }).join('');
     const allocationGroups = profileGroups(observations, 'allocation');
     const allocations = [...allocationGroups.entries()].map(([key, group], index) => {
@@ -843,7 +887,7 @@ class Controller {
       const backend = definitionBackend(definition);
       const workload = group[0].attributes.workload ?? logicalFeature({feature: group[0].attributes.feature ?? caseId, backend});
       const attributes = filterAttributes('allocation', packageName, workload, backend, version, '', `${caseId} ${version} allocations`);
-      return `<article class="chart-card" ${attributes}><header><div><strong>Allocation share by source line</strong><small>${html(packageName)} · ${html(workload)} · ${html(version)}</small></div><span>100%</span></header>${allocationPlot(group, `allocation-${index}`)}</article>`;
+      return `<article class="chart-card" ${attributes}><header><div><strong>Allocation share by source line</strong><small>${html(packageName)} · ${html(workload)} · ${html(targetLabel(version))}</small></div><span>100%</span></header>${allocationPlot(group, `allocation-${index}`)}</article>`;
     }).join('');
     const optionList = (values: string[]): string => [...new Set(values.filter(Boolean))].sort()
       .map(value => `<option value="${html(value)}">${html(value)}</option>`).join('');
@@ -854,7 +898,7 @@ class Controller {
       !outputs.length ? `<section class="empty"><h2>No matching output</h2><p>The report exists, but it does not contain this package, feature or version. Run this node to refresh it.</p></section>` : '';
     return `<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${this.resultsPanel!.webview.cspSource}; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'"><style nonce="${nonce}">
       :root{color-scheme:light dark;font-family:var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-editor-background)}body{margin:0;padding:28px;max-width:1560px;margin:auto}*{box-sizing:border-box}.brand-heading{display:flex;align-items:center;gap:18px}.brand-heading>img{width:72px;height:72px;object-fit:contain}.normalized-legend{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px}.normalized-chart{display:block}.normalized-controls{display:grid;gap:10px}.normalized-legend{min-width:0;margin:0;padding:8px;border:1px solid var(--vscode-panel-border)}.normalized-legend label{display:inline-flex;align-items:center;gap:5px;overflow-wrap:anywhere}.normalized-range{display:flex;flex-wrap:wrap;gap:8px;align-items:end}.normalized-range label{display:grid;gap:4px;min-width:0;flex:1 1 160px;font-size:12px}.normalized-range select{width:100%;min-width:0;max-width:100%;padding:6px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border)}.normalized-scope{font-size:12px;color:var(--vscode-descriptionForeground)}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--vscode-focusBorder);outline-offset:2px}.top,.toolbar,.summary,.result-card header,.chart-card header,.flame-card header{display:flex;align-items:center}.top{justify-content:space-between;gap:20px}.top h1{margin:.2rem 0}.eyebrow{letter-spacing:.15em;color:var(--vscode-descriptionForeground);font-size:11px}.toolbar{gap:8px;flex-wrap:wrap}button{cursor:pointer;color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;border-radius:4px;padding:7px 10px}.meta,.muted,small{color:var(--vscode-descriptionForeground)}.summary{gap:10px;margin:20px 0;flex-wrap:wrap}.stat{min-width:72px;padding:10px 14px;border:1px solid var(--vscode-panel-border);border-radius:6px;display:grid}.stat strong{font-size:20px}.result-filters{position:sticky;top:0;z-index:5;display:grid;grid-template-columns:minmax(190px,2fr) repeat(6,minmax(110px,1fr));gap:8px;align-items:end;margin:18px 0;padding:12px;border:1px solid var(--vscode-panel-border);border-radius:7px;background:var(--vscode-editor-background)}.result-filters label{display:grid;gap:4px;font-size:11px;color:var(--vscode-descriptionForeground)}.result-filters input,.result-filters select{min-width:0;padding:6px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border)}#visible-count{padding:7px;white-space:nowrap;grid-column:1/-1;font-size:11px;font-weight:normal;color:var(--vscode-descriptionForeground)}.result-list,.chart-grid,.flame-grid{display:grid;gap:12px}.chart-grid{grid-template-columns:repeat(auto-fit,minmax(min(350px,100%),1fr))}.result-card,.chart-card,.flame-card,.empty{min-width:0;overflow-wrap:anywhere;border:1px solid var(--vscode-panel-border);border-radius:7px;padding:14px;background:var(--vscode-sideBar-background)}.result-card header,.chart-card header,.flame-card header{justify-content:space-between;gap:12px}.result-card header>div,.chart-card header>div,.flame-card header>div{display:grid;gap:3px}.status{font-size:11px;padding:3px 7px;border-radius:999px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground)}.status.pass,.stat.pass{border-color:var(--vscode-testing-iconPassed)}.status.error,.status.fail,.stat.error{border-color:var(--vscode-testing-iconFailed)}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin-top:12px}.metrics>div{display:grid;border-left:2px solid var(--vscode-focusBorder);padding-left:8px}.metrics span{color:var(--vscode-descriptionForeground);font-size:11px;text-transform:capitalize}.message,.notice{padding:8px;background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-textBlockQuote-border)}section h2{margin-top:28px}.spark{width:100%;height:110px;overflow:visible}.distribution{display:block;width:100%;height:auto;aspect-ratio:7/1;overflow:hidden}.distribution-unit{white-space:nowrap;flex:none}.distribution-view{min-width:0}.distribution-toolbar{display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin:12px 0 4px}.distribution-toolbar button{font-size:12px;min-height:36px;padding:6px 8px}.distribution-toolbar button:disabled{opacity:.5;cursor:default}.distribution-range{flex:1 0 100%;font-size:12px}.distribution-range summary{cursor:pointer;padding:7px 0}.distribution-range>div{display:grid;grid-template-columns:1fr 1fr;gap:8px}.distribution-range label{display:grid;min-width:0;gap:4px}.distribution-range input{width:100%;min-width:0;max-width:100%;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border);padding:5px}.distribution-range input[type=range]{padding:0;min-height:30px;touch-action:pan-y}.distribution-scale,.distribution-visible,.distribution-sampling{font-size:12px;line-height:1.5;margin:7px 0}.distribution-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(85px,1fr));gap:8px;margin:12px 0}.distribution-stats>div{min-width:0}.distribution-stats dt{font-size:11px;color:var(--vscode-descriptionForeground)}.distribution-stats dd{margin:2px 0 0;white-space:nowrap;font-size:12px;font-variant-numeric:tabular-nums}.distribution-view .plot-detail{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}@media(max-width:400px){.distribution-toolbar button{min-height:44px}.distribution-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}.spark polyline{fill:none;stroke:var(--vscode-charts-blue);stroke-width:2}.spark .point,.sample{fill:var(--vscode-charts-blue)}.spark .point.current{fill:var(--vscode-charts-orange);stroke:var(--vscode-editor-background);stroke-width:2}.hover-value{outline:none;cursor:crosshair}.hover-value:hover,.hover-value:focus{stroke:var(--vscode-focusBorder);stroke-width:3;filter:brightness(1.18)}.distribution .whisker,.distribution .median{stroke:var(--vscode-foreground);stroke-width:2}.distribution .box{fill:var(--vscode-charts-blue);fill-opacity:.28;stroke:var(--vscode-charts-blue)}.plot-detail,.flame-detail{white-space:pre-wrap;min-height:34px;padding:7px;background:var(--vscode-textCodeBlock-background);border-radius:4px}.version-values{display:flex;gap:6px;flex-wrap:wrap}.version-values span{font-size:11px;padding:3px 6px;background:var(--vscode-badge-background);border-radius:4px}.version-values .current{outline:2px solid var(--vscode-focusBorder)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--vscode-panel-border)}.table-wrap,.flame-wrap{overflow:auto}.delta.worse{color:var(--vscode-testing-iconFailed)}.delta.better{color:var(--vscode-testing-iconPassed)}.flame-card{margin-bottom:12px}.flame{min-width:800px;width:100%;height:auto}.flame-node{outline:none}.flame-node rect{fill:var(--vscode-charts-blue);stroke:var(--vscode-editor-background);stroke-width:.6}.flame-node.dynamic rect{fill:var(--vscode-charts-red)}.flame-node.unstable rect{fill:var(--vscode-charts-purple)}.flame-node.gc rect{fill:var(--vscode-charts-orange)}.flame-node:hover rect,.flame-node:focus rect{stroke:var(--vscode-focusBorder);stroke-width:2;filter:brightness(1.2)}.flame-node text{font-size:11px;fill:var(--vscode-editor-foreground);pointer-events:none}.legend{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 16px}.legend i,.allocation-legend i{display:inline-block;width:12px;height:12px;margin-right:5px;vertical-align:-2px}.legend .normal{background:var(--vscode-charts-blue)}.legend .dynamic{background:var(--vscode-charts-red)}.legend .unstable{background:var(--vscode-charts-purple)}.legend .gc{background:var(--vscode-charts-orange)}.allocation-layout{display:grid;grid-template-columns:190px 1fr;gap:12px;align-items:center}.pie{width:190px;height:190px}.allocation-legend{list-style:none;margin:0;padding:0;display:grid;gap:5px}.allocation-legend li{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:5px;align-items:center}.allocation-legend span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}[hidden]{display:none!important}code{user-select:all}@media(max-width:1100px){.result-filters{grid-template-columns:repeat(4,minmax(120px,1fr))}}@media(max-width:700px){body{padding:14px}.top{align-items:flex-start;flex-direction:column}.result-filters{position:static;grid-template-columns:1fr 1fr}.chart-grid{grid-template-columns:1fr}.allocation-layout{grid-template-columns:1fr}}
-    ${flameChartStyle}</style></head><body><header class="top"><div class="brand-heading"><img src="${html(logo)}" alt="PerfChecker"><div><div class="eyebrow">PERFCHECKER OUTPUT</div><h1>${html(title)}</h1><div class="meta">${suite ? `${html(suite.suite)} · ${html(suite.profile)} · ${html(suite.finished_at)}` : html(this.absolute('reports'))}</div></div></div><div class="toolbar"><button data-report="suite-report.md">Summary</button><button data-report="suite-result.json">JSON</button><button data-report="version-comparison.md">Comparisons</button><button data-report="version-series.json">Series JSON</button></div></header>${empty}${suite ? filters : ''}${suite ? `<div class="summary">${countCards}<div class="stat"><strong>${outputs.length}</strong><span>runs</span></div></div>` : ''}${overlayCards ? `<section><h2>Overlaid measurements · minimum = 1</h2>${overlayCards}</section>` : ''}${distributionCards ? `<section><h2>Benchmark and measurement distributions</h2><div class="chart-grid">${distributionCards}</div></section>` : ''}${allocations ? `<section><h2>Allocation views</h2><div class="chart-grid">${allocations}</div></section>` : ''}${flames ? `<section><h2>Flame graphs</h2><div class="legend"><span><i class="normal"></i>Normal</span><span><i class="dynamic"></i>Runtime dispatch</span><span><i class="unstable"></i>Non-concrete inference</span><span><i class="gc"></i>GC</span></div><div class="flame-grid">${flames}</div></section>` : ''}${runCards ? `<section><h2>Run output</h2><div class="result-list">${runCards}</div></section>` : ''}${seriesCards ? `<section><h2>Version series</h2><div class="chart-grid">${seriesCards}</div></section>` : ''}${comparisonRows ? `<section><h2>Version comparisons</h2>${comparisons.length > visibleComparisons.length ? `<p class="notice">Showing ${visibleComparisons.length} of ${comparisons.length} comparisons. Open the Markdown report for all records.</p>` : ''}<div class="table-wrap"><table><thead><tr><th>Check</th><th>Metric</th><th>Versions</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Status</th></tr></thead><tbody>${comparisonRows}</tbody></table></div></section>` : ''}<script nonce="${nonce}">const vscode=acquireVsCodeApi();${normalizedChartScript}${distributionChartScript}${flameChartScript}document.querySelectorAll('[data-report]').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:'report',name:button.dataset.report})));document.querySelectorAll('.hover-value').forEach(node=>{const show=()=>{const target=document.getElementById(node.dataset.target);if(target)target.textContent=node.dataset.detail};node.addEventListener('mouseenter',show);node.addEventListener('focus',show)});const controls=['result-search','result-package','result-workload','result-backend','result-kind','result-status','result-sort'].map(id=>document.getElementById(id)).filter(Boolean);const apply=()=>{const value=id=>document.getElementById(id)?.value||'';const query=value('result-search').trim().toLowerCase();const fields={package:value('result-package'),workload:value('result-workload'),backend:value('result-backend'),kind:value('result-kind'),status:value('result-status')};const items=[...document.querySelectorAll('[data-result-item]')];for(const item of items){const matches=(!query||item.dataset.search.includes(query))&&Object.entries(fields).every(([key,expected])=>!expected||item.dataset[key]===expected);item.hidden=!matches}const mode=value('result-sort');for(const container of document.querySelectorAll('.result-list,.chart-grid,.flame-grid,tbody')){[...container.children].sort((a,b)=>{const key=mode==='version'?'version':mode==='status'?'status':'search';return(a.dataset[key]||'').localeCompare(b.dataset[key]||'',undefined,{numeric:true})}).forEach(item=>container.appendChild(item))}const sections=new Set(items.map(item=>item.closest('section')).filter(Boolean));for(const section of sections)section.hidden=![...section.querySelectorAll('[data-result-item]')].some(item=>!item.hidden);const visible=items.filter(item=>!item.hidden).length;const counter=document.getElementById('visible-count');if(counter)counter.textContent=visible+' / '+items.length};controls.forEach(control=>control.addEventListener('input',apply));apply();</script></body></html>`;
+    ${flameChartStyle}</style></head><body><header class="top"><div class="brand-heading"><img src="${html(logo)}" alt="PerfChecker"><div><div class="eyebrow">PERFCHECKER OUTPUT</div><h1>${html(title)}</h1><div class="meta">${suite ? `${html(suite.suite)} · ${html(suite.profile)} · ${html(suite.finished_at)}` : html(this.absolute('reports'))}</div><div class="meta">${targetLegend}</div></div></div><div class="toolbar"><button data-analyze>Analyze these results</button><button data-report="suite-report.md">Summary</button><button data-report="suite-result.json">JSON</button><button data-report="version-comparison.md">Comparisons</button><button data-report="version-series.json">Series JSON</button></div></header>${empty}${suite ? filters : ''}${suite ? `<div class="summary">${countCards}<div class="stat"><strong>${outputs.length}</strong><span>runs</span></div></div>` : ''}${overlayCards ? `<section><h2>Overlaid measurements · minimum = 1</h2>${overlayCards}</section>` : ''}${distributionCards ? `<section><h2>Benchmark and measurement distributions</h2><div class="chart-grid">${distributionCards}</div></section>` : ''}${allocations ? `<section><h2>Allocation views</h2><div class="chart-grid">${allocations}</div></section>` : ''}${flames ? `<section><h2>Flame graphs</h2><div class="legend"><span><i class="normal"></i>Normal</span><span><i class="dynamic"></i>Runtime dispatch</span><span><i class="unstable"></i>Non-concrete inference</span><span><i class="gc"></i>GC</span></div><div class="flame-grid">${flames}</div></section>` : ''}${runCards ? `<section><h2>Run output</h2><div class="result-list">${runCards}</div></section>` : ''}${seriesCards ? `<section><h2>Version series</h2><div class="chart-grid">${seriesCards}</div></section>` : ''}${comparisonRows ? `<section><h2>Version comparisons</h2>${comparisons.length > visibleComparisons.length ? `<p class="notice">Showing ${visibleComparisons.length} of ${comparisons.length} comparisons. Open the Markdown report for all records.</p>` : ''}<div class="table-wrap"><table><thead><tr><th>Check</th><th>Metric</th><th>Versions</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Status</th></tr></thead><tbody>${comparisonRows}</tbody></table></div></section>` : ''}<script nonce="${nonce}">const vscode=acquireVsCodeApi();document.querySelectorAll('[data-analyze]').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:'analyze',...(button.dataset.analyze ? {index:Number(button.dataset.analyze)} : {})})));${normalizedChartScript}${distributionChartScript}${flameChartScript}document.querySelectorAll('[data-report]').forEach(button=>button.addEventListener('click',()=>vscode.postMessage({type:'report',name:button.dataset.report})));document.querySelectorAll('.hover-value').forEach(node=>{const show=()=>{const target=document.getElementById(node.dataset.target);if(target)target.textContent=node.dataset.detail};node.addEventListener('mouseenter',show);node.addEventListener('focus',show)});const controls=['result-search','result-package','result-workload','result-backend','result-kind','result-status','result-sort'].map(id=>document.getElementById(id)).filter(Boolean);const apply=()=>{const value=id=>document.getElementById(id)?.value||'';const query=value('result-search').trim().toLowerCase();const fields={package:value('result-package'),workload:value('result-workload'),backend:value('result-backend'),kind:value('result-kind'),status:value('result-status')};const items=[...document.querySelectorAll('[data-result-item]')];for(const item of items){const matches=(!query||item.dataset.search.includes(query))&&Object.entries(fields).every(([key,expected])=>!expected||item.dataset[key]===expected);item.hidden=!matches}const mode=value('result-sort');for(const container of document.querySelectorAll('.result-list,.chart-grid,.flame-grid,tbody')){[...container.children].sort((a,b)=>{const key=mode==='version'?'version':mode==='status'?'status':'search';return(a.dataset[key]||'').localeCompare(b.dataset[key]||'',undefined,{numeric:true})}).forEach(item=>container.appendChild(item))}const sections=new Set(items.map(item=>item.closest('section')).filter(Boolean));for(const section of sections)section.hidden=![...section.querySelectorAll('[data-result-item]')].some(item=>!item.hidden);const visible=items.filter(item=>!item.hidden).length;const counter=document.getElementById('visible-count');if(counter)counter.textContent=visible+' / '+items.length};controls.forEach(control=>control.addEventListener('input',apply));apply();</script></body></html>`;
   }
 
   async openOutput(nodeOrRun?: PerfNode | PlanRun, explicitRuns?: PlanRun[]): Promise<void> {
@@ -877,6 +921,41 @@ class Controller {
       this.readReport<VersionComparisonFile>('version-comparison.json'),
     ]);
     const observations = await this.reportObservations(runs, versionFile?.run_id);
+    const inventory = new SuiteChatEvidence(), folder = this.folder();
+    await inventory.refresh(folder.uri.toString(), folder.uri.fsPath, this.setting('reports'));
+    const entry = inventory.options(folder.uri.toString()).find(item => !item.unavailable);
+    const source = entry ? await captureSuiteChatSource(await inventory.read(entry.id, folder.uri.toString())) : undefined;
+    if (source && source.runId !== versionFile?.run_id) throw new Error('The saved execution changed while opening results. Reopen the selection.');
+    await this.showResults(title, runs, suite, versionFile, comparisonFile, observations, source);
+  }
+
+  async openSavedResults(input: {workspace: vscode.Uri; source: SuiteChatSource; selections: {package: string; feature: string; version: string}[]}) {
+    return this.inWorkspace(async () => {
+      const source = input?.source, folder = this.folder();
+      if (!source || input.workspace?.toString() !== folder.uri.toString() || source.workspace !== folder.uri.toString() || source.root !== await fs.realpath(folder.uri.fsPath))
+        throw new Error('Reopen the results in their workspace.');
+      await validateSuiteChatSource(source, true);
+      if (!source.snapshot || !Array.isArray(input.selections) || !input.selections.length) throw new Error('Choose saved check results.');
+      const manifest = JSON.parse(await fs.readFile(path.join(source.directory, 'manifest.json'), 'utf8'));
+      const runs = (manifest.plan?.runs ?? []).filter((run: PlanRun) => input.selections.some(selected =>
+        selected.package === run.package && selected.feature === run.feature && selected.version === run.version));
+      if (runs.length !== input.selections.length) throw new Error('The selected checks have no matching saved plan.');
+      const observations = await readProfileObservations(path.join(source.directory, 'observations.jsonl'), runs);
+      await this.showResults(`Saved execution · ${source.runId}`, runs, JSON.parse(source.snapshot.suite), JSON.parse(source.snapshot.series), undefined, observations, source);
+    });
+  }
+
+  private async showResults(title: string, runs: PlanRun[], suite?: SuiteResultFile, versionFile?: VersionSeriesFile,
+    comparisonFile?: VersionComparisonFile, observations: ProfileObservation[] = [], source?: SuiteChatSource) {
+    if (source) {
+      const manifest = JSON.parse(await fs.readFile(path.join(source.directory, 'manifest.json'), 'utf8'));
+      runs = runs.map(run => {
+        const captured = (manifest.plan?.runs ?? []).find((saved: PlanRun) => saved.package === run.package && saved.feature === run.feature && saved.version === run.version);
+        const provenance = (manifest.source_provenance ?? []).filter((item: any) => item.target_label === run.version);
+        return {...run, ...captured, target_revision: captured?.target_revision ?? (provenance.length === 1 ? provenance[0].revision : null)};
+      });
+    }
+    this.resultsSelection = {workspace: this.folder().uri, source, runs};
     if (!this.resultsPanel) {
       this.resultsPanel = vscode.window.createWebviewPanel('perfchecker.output', 'PerfChecker output', vscode.ViewColumn.One,
         {enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]});
@@ -888,7 +967,27 @@ class Controller {
         let sameWorkspace = false;
         try {sameWorkspace = currentWorkspaceFolder<vscode.WorkspaceFolder>(vscode.workspace.workspaceFolders).uri.toString() === workspace;} catch {/* selected folder was closed */}
         if (!sameWorkspace) {void vscode.window.showWarningMessage('PerfChecker folder changed. Reopen results for the selected folder.'); return;}
-        if (message.type === 'report') await this.openReportFile(String(message.name));
+        try {
+          const selection = this.resultsSelection;
+          if (!selection) return;
+          if (message.type === 'analyze') {
+            const runs = message.index === undefined ? selection.runs : [selection.runs[Number(message.index)]];
+            if (!selection.source || runs.some(run => !run)) throw new Error('Choose valid saved results to analyze.');
+            await vscode.commands.executeCommand('perfchecker.analyzeSelectedResults', {workspace: selection.workspace,
+              source: selection.source, selections: runs.map(run => ({package: run.package, feature: run.feature, version: run.version}))});
+          }
+          if (message.type === 'report') {
+            const snapshot = selection.source?.snapshot;
+            if (snapshot && ['suite-result.json', 'version-series.json'].includes(message.name))
+              await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({language: 'json', content:
+                message.name === 'suite-result.json' ? snapshot.suite : snapshot.series}), {preview: true});
+            else {
+              if (selection.source && (await this.readReport<VersionSeriesFile>('version-series.json'))?.run_id !== selection.source.runId)
+                throw new Error('This execution is preserved in the agent workflow. Open its saved JSON or charts.');
+              await this.openReportFile(String(message.name));
+            }
+          }
+        } catch (error) {void vscode.window.showErrorMessage(String(error));}
       });
     } else this.resultsPanel.reveal(vscode.ViewColumn.One);
     this.resultsPanel.title = title;
@@ -910,7 +1009,7 @@ class Controller {
     const script = this.designer.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'designer.js'));
     const style = this.designer.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'designer.css'));
     this.designer.webview.html = `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${this.designer.webview.cspSource}; style-src ${this.designer.webview.cspSource}; script-src 'nonce-${nonce}'"><link rel="stylesheet" href="${style}"></head><body>
-      <header><div class="brand-heading"><img src="${html(logo)}" alt="PerfChecker"><div><small>PERFCHECKER</small><h1>Suite editor</h1></div></div><div class="actions"><button id="refresh">Refresh</button><button id="results">Results</button><button id="save">Save configuration</button><button id="run" class="primary">Run selection</button></div></header>
+      <header><div class="brand-heading"><img src="${html(logo)}" alt="PerfChecker"><div><small>PERFCHECKER</small><h1>Suite editor</h1></div></div><div class="actions"><button id="refresh">Refresh</button><button id="results">Results</button><button id="save">Save configuration</button><button id="run-only">Run only</button><button id="run" class="primary">Run &amp; analyze</button></div></header>
       <section class="filters"><input id="search" aria-label="Filter workload runs" placeholder="Filter package, feature or check…"><select id="package" aria-label="Package filter"><option value="">All packages</option></select><select id="target-filter" aria-label="Target filter"><option value="">All targets</option></select><select id="target-kind" aria-label="Target kind filter"><option value="">All target kinds</option></select><select id="sort" aria-label="Sort workload runs"><option value="suite">Suite order</option><option value="package">Package</option><option value="feature">Feature</option><option value="version">Version</option></select><input id="from" aria-label="From version" list="versions" placeholder="From version"><input id="to" aria-label="To version" list="versions" placeholder="To version"><datalist id="versions"></datalist></section>
       <section class="check-filter"><strong>Include check types</strong><div id="check-types"></div></section>
       <section class="selection-actions"><button id="select-visible">Select visible</button><button id="clear-visible">Clear visible</button><button id="clear-all">Clear selection</button><button id="reset-filters">Reset filters</button><label><input id="open-after-run" type="checkbox" checked> Open visual results after the run</label></section>
@@ -939,7 +1038,10 @@ class Controller {
       try {
       if (message.type === 'designerReady' && this.designer === designer) {this.postPlan(); void designer.webview.postMessage({type: 'designerBusy', busy: this.designerBusy});}
       if (message.type === 'open') await this.open(message.run as PlanRun);
-      if (message.type === 'run') await this.run(undefined, message.ids as string[], Boolean(message.reveal));
+      if (message.type === 'run') {
+        if (message.analyze) await this.runAndAnalyze(message.ids as string[], message.instructions);
+        else await this.run(undefined, message.ids as string[], Boolean(message.reveal));
+      }
       if (message.type === 'output') await this.openOutput(message.run as PlanRun | undefined,
         message.runs as PlanRun[] | undefined);
       if (message.type === 'refresh') await this.refresh();
@@ -1145,6 +1247,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('perfchecker.initialize', requested => controller.initialize(requested)),
     vscode.commands.registerCommand('perfchecker.runAll', () => controller.runAll()),
     vscode.commands.registerCommand('perfchecker.runNode', (node?: PerfNode) => controller.run(node)),
+    vscode.commands.registerCommand('perfchecker.runAndAnalyze', () => controller.runAndAnalyze()),
+    vscode.commands.registerCommand('perfchecker.runVerificationChecks', input => controller.verifyChecks(input)),
+    vscode.commands.registerCommand('perfchecker.openSelectedAnalysisResults', input => controller.openSavedResults(input)),
     vscode.commands.registerCommand('perfchecker.openEntrypoint', (node: PerfNode) => controller.open(node)),
     vscode.commands.registerCommand('perfchecker.openOutput', (node?: PerfNode) => controller.openOutput(node)),
     vscode.commands.registerCommand('perfchecker.showLog', () => controller.showLog()),

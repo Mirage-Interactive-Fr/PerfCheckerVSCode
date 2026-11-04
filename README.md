@@ -1,8 +1,8 @@
 # PerfChecker for VS Code
 
-PerfChecker for VS Code 1.0.3 provides Studio, interactive plots, Julia tools, MCP
-conversation, and reviewed agent implementation with Git recovery. Chat adapts to
-narrow VS Code webviews. New controller and Pluto installations require
+PerfChecker for VS Code provides Studio, interactive plots, Julia tools and a
+guided agent workflow with reviewed changes, verification and Git recovery.
+The workflow adapts to narrow VS Code webviews. New controller and Pluto installations require
 PerfChecker.jl 1.1.1 or newer in 1.x, which fixes loading on ARM.
 Existing prepared environments still accept Core 1.1.0, and CLI controllers
 with Core 1.0.1 remain compatible. Opening a workspace never installs or
@@ -302,16 +302,16 @@ and the new workspace path. Set `PERFCHECKER_HOST_RESULT` to an output JSON path
 The test exercises real Julia discovery, measurement, JET findings, CodeLens,
 Problems, evidence actions and cancellation. Do not use your normal editor profile.
 
-### Chat, implementation and recovery qualification
+### Guided workflow, implementation and recovery qualification
 
-`npm test` includes the chat model and Git checkpoint tests, including dirty/staged
+`npm test` includes the guided protocol, ACP/MCP transport and Git checkpoint tests, including dirty/staged
 state, ignored-but-staged files, binary/non-UTF8 byte preservation, drift, nested
 folder boundaries, split indexes, linked worktrees and diff limits. Browser tests
 are opt-in and use an existing Playwright/Chromium installation:
 
 ```sh
-PERFCHECKER_PLAYWRIGHT_MODULE=/existing/playwright \
-PERFCHECKER_BROWSER=/existing/chromium node test/advisor-chat.browser.cjs
+PERFCHECKER_BROWSER_TESTS=1 PERFCHECKER_PLAYWRIGHT=/existing/playwright \
+PERFCHECKER_BROWSER=/existing/chromium node --test test/guided-workflow-browser.test.mjs test/webviews-browser.test.mjs
 ```
 
 The Linux native-host fixtures deliberately require a **new sacrificial** Git
@@ -375,12 +375,12 @@ npm run package -- --out perfchecker-vscode-1.0.3.vsix
 `npm test` compiles TypeScript and runs the model/contract tests. The generated
 `dist` directory and VSIX archives are intentionally not committed.
 
-## Marketplace publication
+## Marketplace and OpenVSX publication
 
-Publish version 1.0.3 only after PerfChecker.jl 1.1.1 is available in
-Julia's General registry. Build and test the exact VSIX before publishing it.
-Declare a new candidate origin for this version and reuse its qualified bytes
-for publication.
+Version 1.1.0 uses the existing registered PerfChecker.jl interfaces. Build and test
+the exact VSIX before publishing it. Declare a new candidate origin, freeze its
+run, source commit and SHA256 in the native workflow, then qualify those same
+bytes on every supported host. Changes to product inputs require a new origin.
 
 The immutable Marketplace identity is
 `mirage-interactive-fr.perfchecker-vscode`. Repository extraction therefore does
@@ -390,13 +390,22 @@ For a manual stable release:
 
 ```powershell
 npx vsce login mirage-interactive-fr
-npx vsce publish --packagePath .\perfchecker-vscode-1.0.3.vsix
+npx vsce publish --packagePath .\perfchecker-vscode-1.1.0.vsix
+npx ovsx publish .\perfchecker-vscode-1.1.0.vsix
 ```
 
-Publishing requires a free Microsoft identity and Marketplace publisher, not a
-paid Azure subscription. Never commit a publication token. The future release
-workflow can use Marketplace identity-based publishing after its identity and
-publisher permissions have been configured.
+The **Publish qualified extension** workflow accepts the release version, original
+candidate run/artifact and SHA256. It requires successful CI and native checks
+for the tagged commit, verifies that it is merged into main, and refuses changes
+to product inputs after qualification. It publishes the same archive to both
+registries and creates the GitHub release only after both versions are public.
+
+Publish the same qualified archive to both registries. Marketplace credentials
+use `VSCE_PAT`; OpenVSX credentials use `OVSX_PAT`. Keep these in the repository's
+Actions secrets or the publishing tool's credential store, never in source or
+release artifacts. Verify the publicly served version on both registries after
+publishing. OpenVSX namespace ownership and its publisher agreement are separate
+from the Marketplace publisher account.
 
 ## License
 
@@ -406,13 +415,56 @@ MIT. See [LICENSE](LICENSE).
 
 Open **PerfChecker: Configure MCP connection and models** for the guided panel.
 Choose an MCP HTTP endpoint or an explicit local MCP stdio server. Discover its
-tool schemas and select an advice tool in text mode, then open
-**PerfChecker: Chat with performance advisor**. Nothing is generated on opening.
-Source files are not attached automatically; typed messages and explicitly selected
-bounded evidence are sent when requested. Replies remain unverified advice.
+tool schemas and select an analysis tool and, optionally, an implementation tool.
+Then open **PerfChecker: Open agent workflow**. Opening it makes no agent request.
+Choose or create checks, then use **Run & analyze**, **Analyze these results** or
+**Analyze this check**. Select the execution, checks and analysis topics in the UI;
+optional notes supplement those choices. The extension supplies the measured
+quantities, profile evidence, target revisions and check failures automatically.
+Saved selections retain their original report bytes when a later run replaces
+the latest reports. Bundle integrity is checked before sending evidence.
 
-Implementation requires a separate explicit tool configuration in the chat's
-**Implementation** tab. The supplied checkout is not an operating-system sandbox:
+The analysis returns findings and separate selectable suggestions. Trying a
+suggestion implements only that choice in an isolated checkout. Review the diff,
+then use **Apply, test & analyze** to run `Pkg.test()` and repeat the selected
+performance checks. Failing package tests prevent performance measurements.
+Verification feeds the observed comparison and test output back into analysis.
+Choose **Keep trial** after successful verification or **Restore previous code**.
+Operation medians are compared only when workload identity, metric, unit,
+measurement definition and scope match. Profile weights never become speedups;
+observed changes between executions are not statistical performance verdicts.
+
+**Action history** preserves branches. **Continue from here** selects a prior
+action without deleting its descendants or changing source files. Restore the
+current trial before trying a different suggestion. The extension records its
+explicit inputs, agent responses and test feedback. Codex CLI uses native advice
+forks when its installed version supports `exec fork`. The shared ACP adapter
+uses `session/fork` when advertised; other connections replay the selected
+branch's context. Reconnecting also uses context replay. The UI
+labels the actual mode. Replay does not clone hidden agent state.
+
+Under **Local agent connections**, choose **Connect Mistral Vibe**, **Connect
+Claude (ACP)** or **Connect another ACP agent**. These open the connection form
+with the MCP tools supplied by the shared ACP bridge. Installed Vibe and Claude
+ACP entry points are located on PATH; nothing is installed or authenticated
+automatically. Discover, review the tools and connect for this editor session.
+The adapter negotiates ACP v1, keeps native forks within their connection, denies
+command/network permissions and restricts its file service to the selected
+workspace or isolated trial. Existing credentials stay with the installed agent.
+Vibe 3.0.4 native context inheritance and parent isolation were tested locally.
+Claude's ACP contract is covered by protocol fixtures; a real authenticated
+Claude run has not been qualified here.
+
+MCP does not standardize conversation forks. A tool can opt into PerfChecker's
+custom contract by declaring `_meta["perfchecker/conversation"]` with `provider`,
+an opaque connection identifier in `connection`, and `forkArgument`. The argument
+must create a child conversation without changing the parent. Return the child's
+handle as `_meta["perfchecker/agentSession"]` containing `provider`, `connection`
+and `id`. Handles are reused only for the matching connection and selected branch.
+Tools without this contract remain usable through context replay.
+
+Implementation requires an explicitly selected tool that accepts the local
+checkout path. The supplied checkout is not an operating-system sandbox:
 use a trusted agent that respects the path and can access the local filesystem.
 Preparation creates a checkpoint; application requires a separate reviewed action.
 The controller's public `chat` and `implement` commands remain compatible with

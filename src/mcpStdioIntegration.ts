@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import {McpStdioConnector, McpStdioOptions} from './mcpStdioConnector';
 import {localAdvisorConnection, setLocalAdvisorConnection, disconnectLocalAdvisorConnection, beginLocalAdvisorConnectionOperation} from './advisorConnection';
 import {currentWorkspaceFolder} from './workspace-root';
+import {AcpAgent} from './acpAgent';
 
 const shutdowns = new Set<() => Promise<void>>(), closing = new Set<Promise<void>>();
 export async function shutdownMcpStdioConnections() {
@@ -46,7 +47,7 @@ export function registerMcpStdioConnections(context: vscode.ExtensionContext, bu
     const generation = cancellations.get(key) ?? 0;
     const options: McpStdioOptions = {command: input.stdio_command, args: input.stdio_args, cwd: input.stdio_cwd,
       version: input.mcp_version, timeoutMs: Math.min(Math.max(Number(input.timeout) || 90, 1), 3600) * 1000};
-    const signature = JSON.stringify(options);
+    const signature = JSON.stringify({...options, agentProtocol: input.protocol === 'acp' ? 'acp' : undefined, workspace: key});
     const existing = connectors.get(key);
     if (existing?.signature === signature) return {key, selected, connector: existing.connector};
     connecting = true;
@@ -56,7 +57,7 @@ export function registerMcpStdioConnections(context: vscode.ExtensionContext, bu
       assertCurrent(key);
       if ((cancellations.get(key) ?? 0) !== generation) throw new Error('Local MCP connection cancelled before launch.');
       let connector: McpStdioConnector;
-      connector = new McpStdioConnector({...options, onClosed: () => {
+      connector = new McpStdioConnector({...options, ...(input.protocol === 'acp' ? {agent: new AcpAgent(selected.uri.fsPath)} : {}), onClosed: () => {
         if (connectors.get(key)?.connector !== connector) return;
         connectors.delete(key);
         if (localAdvisorConnection(key)?.kind === 'stdio') setLocalAdvisorConnection(key);
@@ -106,14 +107,14 @@ export function registerMcpStdioConnections(context: vscode.ExtensionContext, bu
         const supplied = new Set([...Object.keys(selection.args), ...selection.reserved]);
         if (Array.isArray(required) && required.some(name => typeof name !== 'string' || !supplied.has(name))) throw new Error('Supply all required arguments displayed in the tool schema.');
       }
-      setLocalAdvisorConnection(key, {kind: 'stdio', label: `${connector.serverName} · local MCP stdio`,
+      setLocalAdvisorConnection(key, {kind: 'stdio', label: `${connector.serverName} · ${input.protocol === 'acp' ? 'ACP via MCP' : 'local MCP stdio'}`,
         config: {protocol: 'mcp_http', endpoint: connector.endpoint, model: connector.serverName,
           timeout: Math.min(Math.max(Number(input.timeout) || 90, 1), 3600), instructions: input.instructions ?? '',
           mcp_tool: input.mcp_tool, mcp_prompt_argument: input.mcp_prompt_argument, mcp_arguments: adviceArguments,
           mcp_response: 'text', mcp_version: input.mcp_version, api_key_env: connector.keyEnvironment, allow_remote: false},
         implementation: {tool: implementation.tool ?? '', promptArgument: implementation.promptArgument ?? 'prompt',
           workspaceArgument: implementation.workspaceArgument ?? 'workspace', arguments: implementationArguments},
-        connectionConfiguration: {...input, protocol: 'mcp_stdio'}}, () => disconnect(key));
+        connectionConfiguration: {...input, protocol: input.protocol === 'acp' ? 'acp' : 'mcp_stdio'}}, () => disconnect(key));
       changed();
       return {status: 'complete', message: 'Local MCP server connected for this editor session. Saved provider configuration is preserved. No advice request was sent.'};
       } catch (error) {await disconnect(key); throw error;}

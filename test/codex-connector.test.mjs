@@ -136,6 +136,7 @@ if(args[1]==='--help'){console.log('--ephemeral --sandbox --output-last-message 
 if(args[0]==='login'){process.exit(process.env.PERFCHECKER_FAKE_AUTH==='no'?1:0)}
 let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',s=>prompt+=s);process.stdin.on('end',()=>{
 fs.writeFileSync(path.join(process.cwd(),'captured.json'),JSON.stringify({args,prompt,leaked:Object.keys(process.env).some(k=>k.startsWith('PERFCHECKER_CODEX_TOKEN_'))}));
+if(prompt.includes('NATIVE_SESSION'))console.log(JSON.stringify({type:'thread.started',thread_id:args.includes('fork')?'22222222-2222-4222-8222-222222222222':'11111111-1111-4111-8111-111111111111'}));
 if(prompt.includes('EXEC_IMAGE')){execImage();return}
 if(prompt.includes('REPARENT_COHORT')){const middle=cp.spawn(process.execPath,[__filename,'--cohort-middle'],{stdio:'ignore'});fs.writeFileSync('cohort-leader.json',JSON.stringify({leader:process.pid,middle:middle.pid}));setInterval(()=>{if(fs.existsSync('release-leader'))process.exit(0)},10);return}
 if(prompt.includes('EXIT_WITH_CHILD')||prompt.includes('OWNED_ACTIVE_CHILD')){const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:['ignore','inherit','inherit']});fs.writeFileSync(path.join(process.cwd(),'exited-cli.json'),JSON.stringify({leader:process.pid,descendant:child.pid}));if(prompt.includes('EXIT_WITH_CHILD'))process.exit(0);setInterval(()=>{},1000);return}
@@ -323,6 +324,25 @@ test('authenticated local MCP exposes two exact tools and never forwards its tok
   } finally {await connector.dispose();}
   assert.equal(process.env[connector.keyEnvironment],undefined);
   await assert.rejects(fetch(connector.endpoint));
+}));
+
+test('native advice forks use only checkpoints owned by this connection and leave editing ephemeral',async()=>environment(async root=>{
+  const connector=await new CodexConnector({cli:'sacrificial-codex',root,nativeFork:true}).start();
+  try {
+    const listed=await call(connector,'tools/list'),capability=listed.tools[0]._meta['perfchecker/conversation'];
+    assert.equal(capability.provider,'codex');assert.equal(capability.forkArgument,'parent_session');
+    assert.equal(listed.tools[1]._meta,undefined);
+    const first=await tool(connector,'ask_perfchecker',{prompt:'NATIVE_SESSION first'});
+    const session=first._meta['perfchecker/agentSession'];assert.equal(session.connection,capability.connection);
+    assert.equal(session.id,'11111111-1111-4111-8111-111111111111');
+    assert.equal(JSON.parse(await readFile(path.join(root,'captured.json'),'utf8')).args.includes('--ephemeral'),false);
+    const foreign=await tool(connector,'ask_perfchecker',{prompt:'NATIVE_SESSION foreign',parent_session:'33333333-3333-4333-8333-333333333333'});
+    assert.equal(foreign.isError,true);
+    const fork=await tool(connector,'ask_perfchecker',{prompt:'NATIVE_SESSION next',parent_session:session.id});
+    assert.equal(fork._meta['perfchecker/agentSession'].id,'22222222-2222-4222-8222-222222222222');
+    const args=JSON.parse(await readFile(path.join(root,'captured.json'),'utf8')).args;
+    assert.deepEqual(args.slice(-3),['fork',session.id,'-']);assert.equal(args[args.indexOf('--sandbox')+1],'read-only');
+  } finally {await connector.dispose();}
 }));
 
 test('implementation accepts a canonical PerfChecker checkout and uses workspace-write without touching original files', async () => environment(async root => {

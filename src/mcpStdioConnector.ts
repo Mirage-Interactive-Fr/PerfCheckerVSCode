@@ -10,9 +10,19 @@ import {PosixProcessCohort} from './posixProcessCohort';
 
 export type McpVersion = '2025-11-25' | '2026-07-28';
 export interface McpTool {name: string; description?: string; inputSchema: Record<string, unknown>}
+export type AgentRpc = (method: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<any>;
+/** Optional agent protocol behind the same authenticated MCP bridge and process owner. */
+export interface StdioAgentAdapter {
+  initialize(rpc: AgentRpc): Promise<{name: string; tools: McpTool[]}>;
+  notification(method: string, params: Record<string, any>): void;
+  request(method: string, params: Record<string, any>): Promise<unknown>;
+  invoke(rpc: AgentRpc, name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>>;
+  cancel(notify: (method: string, params: Record<string, unknown>) => void): void;
+}
 export interface McpStdioOptions {
   command: string; args: string[]; cwd: string; version: McpVersion;
   timeoutMs?: number; onClosed?: () => void;
+  agent?: StdioAgentAdapter;
 }
 const MAX_BYTES = 1_000_000;
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -34,6 +44,7 @@ export class McpStdioConnector {
   private sequence = 0;
   private pending = new Map<number, {method: string; resolve: (value: any) => void; reject: (error: Error) => void}>();
   private requests = new Set<Promise<void>>();
+  private agentRequests = new Set<Promise<void>>();
   private closing?: Promise<void>;
   private failure?: Error;
   private closed = false;
@@ -61,8 +72,10 @@ export class McpStdioConnector {
     const env = {...process.env};
     // Never give an external server the private tokens of another local bridge.
     for (const name of Object.keys(env)) if (/^PERFCHECKER_(MCP|CODEX)_TOKEN_/.test(name)) delete env[name];
-    this.child = process.platform === 'win32' ? spawnWindowsOwnedProcess(command, this.options.args, {cwd, env, privateStdout: true}) :
-      spawn(command, this.options.args, {cwd, env, detached: true, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
+    // Preserve a selected interpreter's virtual-environment entry path. Its
+    // resolved native image remains the process-identity anchor below.
+    this.child = process.platform === 'win32' ? spawnWindowsOwnedProcess(this.options.command, this.options.args, {cwd, env, privateStdout: true}) :
+      spawn(this.options.command, this.options.args, {cwd, env, detached: true, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
     if (process.platform !== 'win32') this.cohort = new PosixProcessCohort(this.child);
     const child = this.child, decoder = new StringDecoder('utf8');
     const output = this.output = (child as WindowsOwnedChild).protocolOutput ?? child.stdout ?? undefined;
@@ -121,7 +134,10 @@ export class McpStdioConnector {
           });
         }, 250);
       }
-      if (this.options.version === '2025-11-25') {
+      if (this.options.agent) {
+        const result = await this.options.agent.initialize(this.rpc.bind(this));
+        this.serverName = result.name; this.tools = result.tools;
+      } else if (this.options.version === '2025-11-25') {
         const result = await this.rpc('initialize', {protocolVersion: this.options.version, capabilities: {},
           clientInfo: {name: 'PerfChecker', version: '1.0.2'}});
         if (result.protocolVersion !== this.options.version || !object(result.capabilities?.tools))
@@ -134,7 +150,7 @@ export class McpStdioConnector {
           throw new Error('The selected MCP revision or tools capability is unavailable.');
         this.serverName = this.name(result._meta?.['io.modelcontextprotocol/serverInfo']);
       }
-      this.tools = await this.discover();
+      if (!this.options.agent) this.tools = await this.discover();
       this.server = createServer((request, response) => {
         const pending = this.respond(request, response); this.requests.add(pending);
         void pending.finally(() => this.requests.delete(pending));
@@ -153,13 +169,23 @@ export class McpStdioConnector {
   private receive(message: any) {
     if (!object(message) || message.jsonrpc !== '2.0') throw new Error('Invalid JSON-RPC.');
     if (typeof message.method === 'string') {
+      if (this.options.agent) {
+        if (Object.hasOwn(message, 'id')) {
+          if (!(typeof message.id === 'string' || Number.isSafeInteger(message.id))) throw new Error('Invalid agent request ID.');
+          const pending = this.options.agent.request(message.method, message.params ?? {}).then(result => {
+            this.write({jsonrpc: '2.0', id: message.id, result});
+          }, () => {this.write({jsonrpc: '2.0', id: message.id, error: {code: -32601, message: 'This client operation is unavailable for the selected action.'}});}).catch(() => {});
+          this.agentRequests.add(pending); void pending.finally(() => this.agentRequests.delete(pending));
+        } else this.options.agent.notification(message.method, message.params ?? {});
+        return;
+      }
       if (Object.hasOwn(message, 'id')) throw new Error('Server requests are unsupported.');
       return; // No roots, sampling, elicitation or subscription capability offered.
     }
     if (!Number.isSafeInteger(message.id) || !this.pending.has(message.id)) throw new Error('Unexpected MCP response ID.');
     const pending = this.pending.get(message.id)!; this.pending.delete(message.id);
     if (object(message.error)) {pending.reject(new Error(`MCP request failed (${Number.isInteger(message.error.code) ? message.error.code : 'unknown'}).`)); return;}
-    if (!object(message.result) || (this.options.version === '2026-07-28' && message.result.resultType !== 'complete') || Object.hasOwn(message.result, 'inputRequests')) {
+    if (!object(message.result) || (!this.options.agent && this.options.version === '2026-07-28' && message.result.resultType !== 'complete') || Object.hasOwn(message.result, 'inputRequests')) {
       pending.reject(new Error('This MCP tool requires unsupported client interaction.')); return;
     }
     pending.resolve(message.result);
@@ -173,13 +199,14 @@ export class McpStdioConnector {
     if (this.failure || this.closed || this.closing) throw this.failure ?? new Error('The local MCP server is disconnected.');
     if (signal?.aborted) throw new Error('MCP request cancelled.');
     const id = ++this.sequence;
-    if (this.options.version === '2026-07-28') params = {...params, _meta: {
+    if (!this.options.agent && this.options.version === '2026-07-28') params = {...params, _meta: {
       'io.modelcontextprotocol/protocolVersion': this.options.version,
       'io.modelcontextprotocol/clientInfo': {name: 'PerfChecker', version: '1.0.2'},
       'io.modelcontextprotocol/clientCapabilities': {}}};
     let timer: ReturnType<typeof setTimeout>;
     const stop = () => {
-      try {if (method !== 'initialize') this.notify('notifications/cancelled', {requestId: id});} catch {/* EOF may already be observed. */}
+      try {if (this.options.agent) this.options.agent.cancel(this.notify.bind(this));
+        else if (method !== 'initialize') this.notify('notifications/cancelled', {requestId: id});} catch {/* EOF may already be observed. */}
       this.fail(new Error(signal?.aborted ? 'MCP request cancelled. Reconnect the local server to continue.' : 'MCP request timed out. Reconnect the local server to continue.'));
     };
     try {
@@ -193,6 +220,7 @@ export class McpStdioConnector {
     } finally {clearTimeout(timer!); signal?.removeEventListener('abort', stop);}
   }
   async discover(signal?: AbortSignal): Promise<McpTool[]> {
+    if (this.options.agent) return structuredClone(this.tools);
     const bounded = new AbortController();
     const cancel = () => bounded.abort();
     signal?.addEventListener('abort', cancel, {once: true});
@@ -249,7 +277,10 @@ export class McpStdioConnector {
       else if (body.method === 'tools/call') {
         const tool = this.tools.find(tool => tool.name === body.params?.name);
         if (!tool || !object(body.params?.arguments)) throw new Error('Select an available MCP tool and an arguments object.');
-        const result = await this.rpc('tools/call', {name: tool.name, arguments: body.params.arguments}, abort.signal);
+        const result = this.options.agent ? await this.options.agent.invoke(this.rpc.bind(this), tool.name, body.params.arguments, abort.signal) :
+          await this.rpc('tools/call', {name: tool.name, arguments: body.params.arguments}, abort.signal);
+        if (this.options.agent) await Promise.all([...this.agentRequests]);
+        if (this.options.agent && this.options.version === '2026-07-28') result.resultType = 'complete';
         send(result);
       } else throw new Error('This MCP method is not supported by the local connector.');
     } catch {send({code: -32000, message: 'Local MCP request failed. Check the selected tool, its arguments and connection state.'}, true);}
@@ -270,10 +301,12 @@ export class McpStdioConnector {
     delete process.env[this.keyEnvironment];
     if (this.observer) clearInterval(this.observer);
     for (const [id, pending] of this.pending) {
-      try {if (pending.method !== 'initialize') this.notify('notifications/cancelled', {requestId: id});} catch {/* The transport may already have closed. */}
+      try {if (this.options.agent) this.options.agent.cancel(this.notify.bind(this));
+        else if (pending.method !== 'initialize') this.notify('notifications/cancelled', {requestId: id});} catch {/* The transport may already have closed. */}
       pending.reject(this.failure ?? new Error('Local MCP server disconnected.'));
     }
     this.pending.clear();
+    await Promise.all([...this.agentRequests]);
     await this.observation;
     const child = this.child;
     child?.stdin?.end();

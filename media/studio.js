@@ -15,7 +15,7 @@ function mountPerfCheckerStudio(root, send, logo) {
       ['investigations','Investigations','Discover scenarios, diagnose findings and compare saved measurements.','◎'],
       ['tools','Tool catalogue','Inspect available analyzers and collectors for this controller.','⊞']]},
     {title:'03 / Improve', description:'Review advice, prepare changes, then verify the result.', items:[
-      ['chat','Talk to your agent','Advice and implementation through MCP, with checkpoints and diff review.','✦'],
+      ['chat','Agent workflow','Analyze results, try a suggestion and verify the change, with a history of every choice.','✦'],
       ['advisor','Connect an advisor','Choose an endpoint, discover tools and configure bounded investigations.','⚙'],
       ['debug','Debug Julia code','Use the Julia debugger with the selected scenario environment.','◇']]}
   ];

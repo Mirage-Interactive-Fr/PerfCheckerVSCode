@@ -96,6 +96,15 @@ export interface ImplementationProposal {
   base: string; candidate: string; patch: string; patchBytes: Buffer; lossyPreview: boolean; files: string[]; applied: boolean;
 }
 
+/** Bind analysis and verification to the bytes on disk without changing staging. */
+export async function implementationWorkingTree(workspace: string): Promise<string> {
+  workspace = await fs.realpath(workspace);
+  const repository = (await git(workspace, ['rev-parse', '--show-toplevel'])).trim();
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'perfchecker-code-identity-'));
+  try {return await tree(repository, directory);}
+  finally {await fs.rm(directory, {recursive: true, force: true});}
+}
+
 function activeReference(workspace: string): string {return `refs/perfchecker/active/${createHash('sha256').update(workspace).digest('hex')}`;}
 
 /** Retain an active recovery pointer even if VS Code's workspace storage is lost. */

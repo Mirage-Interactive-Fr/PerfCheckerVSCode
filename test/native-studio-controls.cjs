@@ -18,7 +18,7 @@ async function capture(context, name) {
 const studioActions = {
   suite: 'Feature suite', items: 'Existing Julia tests', testing: 'Test Explorer',
   results: 'Plots & results', investigations: 'Investigations', tools: 'Tool catalogue',
-  chat: 'Talk to your agent', advisor: 'Connect an advisor', debug: 'Debug Julia code',
+  chat: 'Agent workflow', advisor: 'Connect an advisor', debug: 'Debug Julia code',
   notebook: 'New Pluto notebook', openNotebook: 'Open Pluto notebook',
   terminal: 'PerfChecker terminal', julia: 'Julia extension REPL', tasks: 'Project tasks',
 };
@@ -288,7 +288,7 @@ async function testSuiteSelection(context) {
   assert.equal(await selectionCount(view), all);
   await view.locator('#clear-all').click({timeout:NATIVE_READINESS_MS});
   assert.equal(await selectionCount(view), 0);
-  assert(await view.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS}), 'No selection cannot launch a run');
+  assert(await view.locator('#run-only, #run').first().isDisabled({timeout:NATIVE_READINESS_MS}), 'No selection cannot launch a run');
   await view.locator('#select-visible').click({timeout:NATIVE_READINESS_MS});
 
   await view.locator('#search').fill('a-query-that-matches-no-fixture',{timeout:NATIVE_READINESS_MS});
@@ -876,18 +876,18 @@ async function testComputedAggregations(context){
       await view.locator('#comparison-aggregation').selectOption(aggregation,{timeout:NATIVE_READINESS_MS});
       await view.locator('#add-comparison').click({timeout:NATIVE_READINESS_MS});
       await eventually(()=>settings().get('comparisonPolicies',[]).length===1,`The native ${aggregation} comparison policy is persisted`);
-      await eventually(async()=>!(await view.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS})),'The policy replan finishes',NATIVE_READINESS_MS);
+      await eventually(async()=>!(await view.locator('#run-only, #run').first().isDisabled({timeout:NATIVE_READINESS_MS})),'The policy replan finishes',NATIVE_READINESS_MS);
       await view.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});await view.locator('#clear-all').click({timeout:NATIVE_READINESS_MS});
       await view.locator('#package').selectOption('Example',{timeout:NATIVE_READINESS_MS});await view.locator('#select-visible').click({timeout:NATIVE_READINESS_MS});
       assert.equal(await selectionCount(view),4,'Three registered references and a registered candidate are really measured');
-      await view.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});context.log('native-ui-action',{surface:'Suite designer',action:'Run comparison',aggregation});await view.locator('#run').click({timeout:NATIVE_READINESS_MS});
+      await view.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});context.log('native-ui-action',{surface:'Suite designer',action:'Run comparison',aggregation});await view.locator('#run-only, #run').first().click({timeout:NATIVE_READINESS_MS});
       const comparison=await eventually(async()=>{
         const suite=JSON.parse(await fs.readFile(path.join(reports,'suite-result.json'),'utf8'));
         if(suite.runs.length!==4)return false;
         assert(suite.runs.every(run=>run.status==='pass'&&run.qualification.correctness.status==='passed'));
         return JSON.parse(await fs.readFile(path.join(reports,'version-comparison.json'),'utf8'));
       },`Actual benchmark reports complete for ${aggregation}`,NATIVE_READINESS_MS);
-      await eventually(async()=>!(await view.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS})),'The measured comparison returns to idle');
+      await eventually(async()=>!(await view.locator('#run-only, #run').first().isDisabled({timeout:NATIVE_READINESS_MS})),'The measured comparison returns to idle');
       const records=comparison.records.filter(record=>record.package==='Example'&&record.candidate_version===candidate);
       assert(records.length>0,'The measured policy produces comparisons, rather than merely saving an option');
       for(const record of records){
@@ -1203,7 +1203,7 @@ exports.runSelection = async context => {
   const beforeLaunches=await controllerLaunches();
   const launchCount=entries=>entries.reduce((sum,item)=>sum+item.commands.length,0);
   context.log('native-ui-action',{surface:'Suite designer',action:'Run selected check'});
-  await view.locator('#run').click({timeout:NATIVE_READINESS_MS});
+  await view.locator('#run-only, #run').first().click({timeout:NATIVE_READINESS_MS});
   const freshReport=async()=>{
     try{const text=await fs.readFile(reportPath,'utf8');if(text===old)return false;const value=JSON.parse(text);
       return value.schema_version==='perfchecker-suite-result/1'&&value.runs.length===1&&value.runs[0].status==='pass'&&value;
@@ -1255,7 +1255,7 @@ exports.runSelection = async context => {
     return value;
   }, 'The native Run button completes the registered Julia backend and writes current evidence', NATIVE_READINESS_MS);
   assert.equal(report.runs[0].status, 'pass', 'Actual correctness-checked benchmark succeeds');
-  await eventually(async () => !(await view.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS})), 'Run control returns to idle');
+  await eventually(async () => !(await view.locator('#run-only, #run').first().isDisabled({timeout:NATIVE_READINESS_MS})), 'Run control returns to idle');
   assert.deepEqual(await state(),idleState,'The same reloaded run finishes with the original exact idle controls and inventory');
   assert.deepEqual(await controllerLaunches(),runningLaunches,'No additional controller launches occur through completion of the same selected run');
   assert.deepEqual(await fs.readFile(planFile),planBytes,'Active reload preserves the exact canonical real plan');

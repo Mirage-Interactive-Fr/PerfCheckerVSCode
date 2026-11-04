@@ -22,7 +22,7 @@ class DelayedConnector extends CodexConnector {
 Module._load = function(name, ...args) {
   if (name === 'vscode') return vscode;
   // Only CLI preflight is replaced; startup, token lifetime and HTTP disposal are real.
-  if (name === './codexConnector') return {CodexConnector: DelayedConnector, inspectCodex: async () => 'qualified fixture CLI', shutdownCodexPreflights};
+  if (name === './codexConnector') return {CodexConnector: DelayedConnector, inspectCodex: async () => 'qualified fixture CLI', supportsCodexFork: () => false, shutdownCodexPreflights};
   return original.call(this, name, ...args);
 };
 let registerCodexConnections, shutdownCodexConnections;

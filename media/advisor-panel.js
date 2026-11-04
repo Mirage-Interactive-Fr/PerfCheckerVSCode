@@ -20,7 +20,7 @@
       wrap.append(caption, input); form.append(wrap); fields[key] = input;
       return wrap;
     }
-    field('protocol', 'Mode', 'text', [['none', 'Rule-based advice only'], ['ollama', 'Local model · Ollama'], ['chat_completions', 'Local or remote model · Chat Completions'], ['chat_completions_schema', 'Chat Completions · schema-constrained response'], ['mcp_http', 'Advisor provided by an MCP HTTP tool']]);
+    field('protocol', 'Mode', 'text', [['none', 'Rule-based advice only'], ['ollama', 'Local model · Ollama'], ['chat_completions', 'Local or remote model · Chat Completions'], ['chat_completions_schema', 'Chat Completions · schema-constrained response'], ['mcp_http', 'Advisor provided by an MCP HTTP tool'], ['acp', 'ACP agent · Vibe, Claude or another agent']]);
     if (initial.stdioSupported) {const option = node('option', 'Local MCP server · stdio'); option.value = 'mcp_stdio'; fields.protocol.append(option);}
     fields.protocol.value = initial.enabled === false ? 'none' : config.protocol || 'none';
     if (initial.enabled !== false && config.protocol && !fields.protocol.value) {
@@ -47,7 +47,7 @@
     const stdioCommand = field('stdio_command', 'Absolute MCP server executable');
     const stdioArgs = field('stdio_args', 'Executable arguments (JSON array)', 'textarea'); fields.stdio_args.value = JSON.stringify(config.stdio_args || [], null, 2);
     const stdioCwd = field('stdio_cwd', 'Absolute server working directory');
-    const stdioNote = node('p', 'Local stdio starts only when you discover or connect. It inherits the extension host environment, except private connector tokens. The program and argument array are passed directly, without shell interpretation or expansion; no login is inferred. Do not put secrets in arguments. The connection and tool selections last for this editor session; reconnect after restarting. Choose a trusted advice tool: its permissions are managed by the server. PerfChecker does not start experiments or Apply automatically in text advice mode. MCP alone does not supply an agent or a model.');
+    const stdioNote = node('p', 'ACP mode uses an installed agent adapter, such as vibe-acp or claude-agent-acp, through the same MCP workflow. Select its native interpreter and script arguments when needed. No adapter is downloaded. Local stdio starts only when you discover or connect. It inherits the extension host environment, except private connector tokens. The program and argument array are passed directly, without shell interpretation or expansion; no login is inferred. Do not put secrets in arguments. The connection and tool selections last for this editor session; reconnect after restarting. Choose a trusted advice tool: its permissions are managed by the server. PerfChecker does not start experiments or Apply automatically in text advice mode. MCP alone does not supply an agent or a model.');
     form.append(stdioNote);
     const implementation = config.implementation || {};
     const implementationTool = field('implementation_tool', 'Optional implementation tool'); fields.implementation_tool.value = implementation.tool || '';
@@ -66,7 +66,7 @@
       for (const key of ['protocol', 'endpoint', 'model', 'api_key_env', 'instructions', 'mcp_version', 'mcp_tool', 'mcp_prompt_argument', 'mcp_response']) value[key] = fields[key].value;
       value.allow_remote = fields.allow_remote.checked; value.timeout = Number(fields.timeout.value);
       value.mcp_arguments = JSON.parse(fields.mcp_arguments.value || '{}');
-      if (value.protocol === 'mcp_stdio') {
+      if (['mcp_stdio', 'acp'].includes(value.protocol)) {
         value.stdio_command = fields.stdio_command.value; value.stdio_args = JSON.parse(fields.stdio_args.value || '[]'); value.stdio_cwd = fields.stdio_cwd.value;
         value.implementation = {tool: fields.implementation_tool.value, promptArgument: fields.implementation_prompt.value,
           workspaceArgument: fields.implementation_workspace.value, arguments: JSON.parse(fields.implementation_arguments.value || '{}')};
@@ -87,7 +87,10 @@
         if (!enabled && action !== 'save') throw new Error('Select a provider before testing a connection.');
         if (fields.investigates.checked && value.protocol === 'mcp_http' && value.mcp_response === 'text') throw new Error('Selecting MCP experiments requires a structured response.');
         state(true); status.textContent = action === 'pull' ? 'Downloading… The server manages the files; you can cancel the wait.' : 'Working…';
-        send({type: 'advisorAction', action, config: enabled ? value : null, model, confirmed,
+        const implementation = value.protocol === 'mcp_http' ? {tool: fields.implementation_tool.value,
+          promptArgument: fields.implementation_prompt.value, workspaceArgument: fields.implementation_workspace.value,
+          arguments: JSON.parse(fields.implementation_arguments.value || '{}')} : undefined;
+        send({type: 'advisorAction', action, config: enabled ? value : null, implementation, model, confirmed,
           investigates: fields.investigates.checked, max_experiments: Number(fields.max_experiments.value), budget_seconds: Number(fields.budget_seconds.value)});
       } catch (e) {state(false); status.textContent = String(e.message || e);}
     }
@@ -114,10 +117,11 @@
       commit.focus();
     }
     function visibility() {
-      const mode = fields.protocol.value, enabled = mode !== 'none', stdio = mode === 'mcp_stdio', mcp = mode === 'mcp_http' || stdio;
+      const mode = fields.protocol.value, enabled = mode !== 'none', stdio = mode === 'mcp_stdio' || mode === 'acp', mcp = mode === 'mcp_http' || stdio;
       for (const wrap of [endpointWrap, modelWrap, remoteWrap, authWrap, promptWrap, timeoutWrap, investigateWrap]) wrap.hidden = !enabled;
       for (const wrap of [versionWrap, toolWrap, argumentWrap, argsWrap, responseWrap]) wrap.hidden = !mcp;
-      for (const wrap of [stdioCommand, stdioArgs, stdioCwd, stdioNote, implementationTool, implementationPrompt, implementationWorkspace, implementationArgs, implementationNote]) wrap.hidden = !stdio;
+      for (const wrap of [stdioCommand, stdioArgs, stdioCwd, stdioNote]) wrap.hidden = !stdio;
+      for (const wrap of [implementationTool, implementationPrompt, implementationWorkspace, implementationArgs, implementationNote]) wrap.hidden = !mcp;
       if (stdio) {endpointWrap.hidden = modelWrap.hidden = remoteWrap.hidden = authWrap.hidden = investigateWrap.hidden = responseWrap.hidden = true; fields.mcp_response.value = 'text';}
       disconnectStdio.hidden = !stdio; save.textContent = stdio ? 'Connect for this editor session' : 'Save configuration';
       maxWrap.hidden = budgetWrap.hidden = !enabled || !fields.investigates.checked;
@@ -160,8 +164,14 @@
                 status.textContent = 'Tool selected. Check the prompt argument and required arguments, then save.';
               } else {fields.model.value = item.name; status.textContent = 'Model selected. Save to use it.';}
             }, row);
-            if (result.tools && fields.protocol.value === 'mcp_stdio') button('Use for implementation', () => {
+            if (result.tools) button('Use for implementation', () => {
               fields.implementation_tool.value = item.name;
+              const properties = item.inputSchema?.properties || {};
+              const strings = Object.keys(properties).filter(key => properties[key]?.type === 'string');
+              const prompt = strings.find(key => ['prompt', 'question', 'message'].includes(key));
+              const workspace = strings.find(key => ['workspace', 'cwd', 'working_directory', 'project'].includes(key));
+              if (prompt) fields.implementation_prompt.value = prompt;
+              if (workspace) fields.implementation_workspace.value = workspace;
               status.textContent = 'Implementation tool selected. Check its prompt, checkout and other required arguments before connecting.';
             }, row);
             if (result.tools) {

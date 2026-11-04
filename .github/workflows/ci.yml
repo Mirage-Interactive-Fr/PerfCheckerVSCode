@@ -89,7 +89,7 @@ jobs:
       - name: Validate advice and implementation in a browser
         run: node test/advisor-chat.browser.cjs
       - name: Validate Studio, complete selections and plots in a browser
-        run: node --test test/webviews-browser.test.mjs
+        run: node --test --test-concurrency=1 test/webviews-browser.test.mjs test/guided-workflow-browser.test.mjs
         env:
           PERFCHECKER_BROWSER_TESTS: "1"
       - name: Validate Marketplace package

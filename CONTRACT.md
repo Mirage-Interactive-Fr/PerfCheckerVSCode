@@ -51,7 +51,7 @@ agent running.
 
 ## Consumed contracts
 
-The stable 1.0 extension line accepts these versioned interfaces:
+The stable 1.x extension line accepts these versioned interfaces:
 
 | Interface | Identifier or transport | Purpose |
 | --- | --- | --- |
@@ -99,33 +99,54 @@ display samples per metric. They do not replace raw evidence. Availability,
 correctness, quality and performance are separate, and diagnostic findings are
 advisory until measured before/after. Existing suite/bundle commands stay intact.
 
-## MCP conversation and reviewed implementation
+## Guided agent workflow and reviewed implementation
 
-The extension requires PerfChecker.jl 1.0.0 or later and its public `chat` and `implement` CLI commands.
-Both accept `--source`, `--advisor-config` and `--project`; files live in a private
-temporary directory and are removed after the process ends. Requests and provider
-configuration are not written into run bundles or conversation logs.
+The extension projects selected saved bundles through Core's read-only `advise`
+command, then calls the explicitly configured MCP tool directly. Result identity,
+target revision, canonical measurements, profile records and qualifications come
+from saved evidence. Integrity is revalidated before transmission. A captured
+suite/series snapshot remains attached to its execution when newer reports are
+written. Historical charts read the original bundle and captured plan metadata.
 
-`chat` receives alternating user/assistant messages ending in a user question,
-with up to 21 messages, 16,000 Unicode characters per message and 32,000 in total.
-The stored transcript retains up to 20 messages/32,000 characters as whole
-exchanges. Optional `advice` is explicitly selected saved evidence. The extension
-does not automatically attach editor buffers or arbitrary workspace files.
+An analysis returns `perfchecker-guided-analysis/1`, with a summary, findings and
+separate suggestions. Each finding and suggestion references only selected result
+IDs. Suggestions include verification checks. Malformed prose, unknown IDs or
+an outdated selection cannot authorize an implementation. Only a selected
+suggestion is implemented; optional notes supplement its fixed action context.
 
-The result must be `perfchecker-narrative/1`, `status=complete`,
-`authority=unverified_narrative` and `reference_status=unstructured_not_verified`,
-with a nonempty `external_review` string of at most 16,000 characters. Provider
-content is rendered as text, including code-looking HTML. It cannot change
-deterministic verdicts. JSON responses are bounded to 2 MB and timeouts/cancellation
-terminate the local process tree; a remote tool may continue work.
+MCP requests are bounded to 200 KB; analysis input is bounded to 160 KB and each
+returned text to 16,000 Unicode characters. The HTTP client supports explicitly
+selected 2025-11-25 and 2026-07-28 revisions, JSON/SSE replies and cancellation.
+It does not offer MCP roots, sampling, tasks or elicitation. Source code is not
+implicitly attached, but saved profile evidence may include source locations.
 
-`implement` additionally receives `workspace`, the canonical absolute path to a
-temporary checkout, and `workspace_argument`, the configured tool argument name.
-The endpoint, revision, credentials and additional MCP arguments come from the
-advice configuration, with an explicitly configured implementation tool and prompt
-argument. The tool must be able to access and respect that path. MCP is not a
-filesystem sandbox. The response remains unverified narrative and declares
-`implementation_status=requires_diff_review`; its prose never applies a change.
+The extension owns a branchable action history with exact explicit inputs,
+structured responses, execution snapshots and verification feedback. Workspace
+state is bounded to 24 MB, with at most 256 action nodes and 8 MB of history.
+Continuing from a checkpoint preserves descendants and source files. A matching
+agent connection can use a declared native fork; other connections replay only
+that branch's explicit context. This does not clone hidden agent state.
+
+The custom MCP metadata `perfchecker/conversation` declares `provider`,
+`connection` and `forkArgument`; `perfchecker/agentSession` returns the child
+session's provider, connection and ID. These are optional PerfChecker contracts,
+not standard MCP session-fork methods. Codex uses its qualified native CLI fork.
+The shared ACP v1 adapter negotiates `sessionCapabilities.fork`, uses
+`session/fork`, and exposes the same MCP tools for Vibe, Claude and other agents.
+Its file service is scoped to the selected workspace or isolated checkout;
+command/network permissions are denied. Agents retain their own credentials.
+
+After diff review, verification runs a fixed `Pkg.test()` command. Passing package
+tests permit repetition of the selected performance checks. Compatible operation
+medians retain units, definitions, workload fingerprints and scope; profile
+weights never become timing gains. Test failures and measured comparisons return
+to analysis. Keeping a trial requires successful verification against the same
+candidate and unchanged source bytes. Restore uses the retained Git checkpoint.
+
+The older Core `chat` and `implement` CLI adapters remain compatible with their
+unstructured narrative contracts. The primary VS Code interface uses the guided
+protocol above. Provider responses are rendered as text and never change Core's
+deterministic qualifications.
 
 Before sending implementation, the extension requires saved editor buffers, a Git
 repository with an existing HEAD, no merge conflicts or submodules, and no absolute
@@ -157,8 +178,8 @@ drift rejection. Failed or cancelled requests never auto-apply a partial proposa
 Recovery stores only Git references and the applied flag in folder-specific VS Code
 workspace state, with a discoverable `refs/perfchecker/active/<workspace-path-hash>`
 pointer independent of that storage. Reopening reconstructs the diff and checks
-the current tree to detect an interrupted apply. Conversation and source/patch
-contents are not duplicated in workspace state. Closing a proposal removes its
+the current tree to detect an interrupted apply. Proposal patch bytes remain in Git; the guided workflow separately retains
+its bounded explicit context and response history in workspace state. Closing a proposal removes its
 active pointer; checkpoint/proposal refs remain. Starting a new conversation or
 changing its attached evidence preserves the current proposal and its restore
 action; only explicit proposal abandonment clears the active recovery pointer.
@@ -183,7 +204,8 @@ server with `ask_perfchecker(prompt)` and `implement_perfchecker(prompt, workspa
 the implementation path must resolve into a temporary PerfChecker checkout.
 
 The CLI preflight checks version, help capabilities and login status. Calls use
-`--no-daemon exec --json --ephemeral --ignore-user-config --ignore-rules`, explicit
+`--no-daemon exec --json --ignore-user-config --ignore-rules`
+(with `--ephemeral` for implementation and advice without native forks), explicit
 `read-only`/`workspace-write` sandbox policies and `approval_policy="never"`.
 Project `.codex` directories are refused, including configurations in ancestors
 up to the containing Git root, before CLI invocation. Custom user configuration

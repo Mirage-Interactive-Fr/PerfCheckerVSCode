@@ -10,7 +10,7 @@ import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {pathToFileURL} from 'node:url';
 
-const require=createRequire(import.meta.url),{SuiteChatEvidence,validateSuiteChatSource}=require('../dist/suiteChatEvidence.js');
+const require=createRequire(import.meta.url),{SuiteChatEvidence,validateSuiteChatSource,captureSuiteChatSource,suiteAnalysisContext}=require('../dist/suiteChatEvidence.js');
 const runId='12345678-1234-4234-8234-123456789abc';
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function fixture(root) {
@@ -57,6 +57,22 @@ test('suite Send verifies actual protocol bytes while the picker remains read-on
     await validateSuiteChatSource(source,true);
     await writeFile(path.join(value.directory,'observations.jsonl'),'tampered saved bytes\n');
     await assert.rejects(validateSuiteChatSource(source,true),/byte integrity/);
+  } finally {await rm(root,{recursive:true,force:true});}
+});
+
+test('captured execution survives replacement of latest reports but still rejects changed bundle bytes',async()=>{
+  const root=await mkdtemp(path.join(tmpdir(),'perfchecker-suite-snapshot-'));
+  try {
+    const value=await fixture(root), inventory=new SuiteChatEvidence();
+    await inventory.refresh(value.workspace,value.root,'perf/results/vscode');
+    const option=inventory.options(value.workspace)[0], source=await captureSuiteChatSource(await inventory.read(option.id,value.workspace));
+    await writeFile(path.join(value.reports,'suite-result.json'),'a newer report');
+    await writeFile(path.join(value.reports,'version-series.json'),'a newer execution');
+    await validateSuiteChatSource(source,true);
+    assert.equal((await suiteAnalysisContext(source,option.id)).runId,runId);
+    assert.equal((await suiteAnalysisContext(source,option.id)).results.length,0);
+    await writeFile(path.join(value.directory,'observations.jsonl'),'changed bundle bytes');
+    await assert.rejects(validateSuiteChatSource(source,true),/integrity/);
   } finally {await rm(root,{recursive:true,force:true});}
 });
 

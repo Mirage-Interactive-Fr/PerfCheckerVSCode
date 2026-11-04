@@ -2,7 +2,7 @@
   "name": "perfchecker-vscode",
   "displayName": "PerfChecker",
   "description": "Measure Julia performance, explore interactive results and improve code with a connected agent.",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "publisher": "mirage-interactive-fr",
   "author": "Mirage Interactive",
   "repository": {
@@ -193,7 +193,7 @@
       },
       {
         "command": "perfchecker.openChat",
-        "title": "PerfChecker: Chat with performance advisor",
+        "title": "PerfChecker: Open agent workflow",
         "icon": "$(comment-discussion)"
       },
       {
@@ -218,7 +218,7 @@
       },
       {
         "command": "perfchecker.prepareImplementation",
-        "title": "PerfChecker: Prepare implementation from reviewed advice",
+        "title": "PerfChecker: Try the selected agent suggestion",
         "icon": "$(git-branch)"
       },
       {
@@ -255,6 +255,16 @@
         "command": "perfchecker.stopNotebookSession",
         "title": "PerfChecker: Stop Pluto notebook sessions",
         "icon": "$(debug-stop)"
+      },
+      {
+        "command": "perfchecker.runAndAnalyze",
+        "title": "PerfChecker: Run selected checks and analyze results",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "perfchecker.analyzeSelectedResults",
+        "title": "PerfChecker: Analyze saved check results",
+        "icon": "$(lightbulb)"
       }
     ],
     "viewsContainers": {
@@ -285,7 +295,7 @@
       },
       {
         "view": "perfchecker.scenarios",
-        "contents": "[Open PerfChecker Studio](command:perfchecker.openStudio)\n[Chat with an advisor](command:perfchecker.openChat)\n[Discover shared scenarios](command:perfchecker.discoverScenarios)"
+        "contents": "[Open PerfChecker Studio](command:perfchecker.openStudio)\n[Open agent workflow](command:perfchecker.openChat)\n[Discover shared scenarios](command:perfchecker.discoverScenarios)"
       }
     ],
     "menus": {
@@ -742,7 +752,9 @@
         },
         "perfchecker.advisorMcpStdioArguments": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": {
+            "type": "string"
+          },
           "scope": "resource",
           "default": [],
           "description": "Initial argument array for the local MCP server form. Never put secrets here; the server inherits the extension host environment except private connector tokens."
@@ -781,6 +793,7 @@
     "@types/vscode": "1.96.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^4.0.0",
+    "ovsx": "1.3.0",
     "typescript": "^5.7.2"
   }
 }

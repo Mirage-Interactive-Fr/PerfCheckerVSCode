@@ -148,11 +148,16 @@ test('ordinary validated Save still persists the chosen provider and only its ca
   vscode.workspace.getConfiguration=(_section,uri)=>({get:(name,fallback)=>saved[name]??fallback,update:(name,value)=>updates.push({workspace:uri.toString(),name,value})});
   setup.invoke=async(input,cwd,project,julia)=>{assert.equal(input.action,'validate');assert.equal(cwd,root);assert.equal(project,path.join(root,'perf'));assert.equal(julia,'julia');return {status:'complete',config};};
   try {
-    assert.equal((await setup.action({action:'save',config})).status,'complete');
+    const implementation={tool:'edit_selected',promptArgument:'request',workspaceArgument:'directory',arguments:{mode:'review'}};
+    await assert.rejects(setup.action({action:'save',config,implementation:{...implementation,arguments:{directory:'/foreign'}}}),/without the prompt or workspace argument/);
+    assert.equal(updates.length,0);
+    assert.equal((await setup.action({action:'save',config,implementation})).status,'complete');
     assert.deepEqual(JSON.parse(await readFile(path.join(root,'advisor.json'),'utf8')),config);
     assert.ok(updates.every(update=>update.workspace===key));
     assert.ok(updates.some(update=>update.name==='advisorConfig'&&update.value==='advisor.json'));
     assert.ok(updates.some(update=>update.name==='advisorEnabled'&&update.value===true));
+    assert.ok(updates.some(update=>update.name==='advisorImplementationMcpTool'&&update.value==='edit_selected'));
+    assert.ok(updates.some(update=>update.name==='advisorImplementationMcpWorkspaceArgument'&&update.value==='directory'));
   } finally {vscode.workspace.getConfiguration=originalConfiguration;setup.dispose();await rm(root,{recursive:true,force:true});}
 });
 
