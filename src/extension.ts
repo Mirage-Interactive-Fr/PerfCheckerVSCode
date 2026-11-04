@@ -706,8 +706,10 @@ class Controller {
         this.designer?.webview.postMessage({type: 'progress', value});
       }, undefined, cancellation?.token ?? token);}
       finally {signal?.removeEventListener('abort', abort); subscription?.dispose(); cancellation?.dispose();}
-      if (code === 130 || signal?.aborted || token.isCancellationRequested) {this.output.appendLine('Cancelled after controller cleanup.'); return;}
+      if (code === 130) {this.output.appendLine('Cancelled after controller cleanup.'); return;}
       if (code !== 0) throw new Error(`PerfChecker run failed with code ${code}. Inspect PerfChecker output for cleanup errors and retained inventories.`);
+      // A cancellation request cannot turn a failed cleanup into a successful stop.
+      if (signal?.aborted || token.isCancellationRequested) {this.output.appendLine('Cancelled after controller cleanup.'); return;}
       const series = await this.readReport<VersionSeriesFile>('version-series.json');
       const suite = await this.readReport<SuiteResultFile>('suite-result.json');
       if (!series?.run_id || series.run_id === previousRun || !suite) throw new Error('The controller did not produce a new saved execution. No previous result was analyzed.');

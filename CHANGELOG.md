@@ -14,6 +14,8 @@
   checkpoints and exact restore.
 - Expose analysis from the suite editor and result cards. Select implementation
   tools graphically for HTTP connections as well as local stdio connections.
+- Preserve controller cleanup failures when a suite is cancelled; a cancellation
+  request cannot hide retained inventories or produce a successful stop.
 
 ## 1.0.3 — ARM-compatible setup
 

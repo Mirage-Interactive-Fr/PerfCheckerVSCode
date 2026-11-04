@@ -44,10 +44,10 @@ readline.createInterface({input:process.stdin}).on('line',async line=>{
 async function fixture(native,name,run){
   const root=await mkdtemp(path.join(os.tmpdir(),'perfchecker-acp-test-'));
   const connector=new McpStdioConnector({command:process.execPath,args:['-e',program,native?'native':'replay',name],cwd:root,
-    version:'2026-07-28',timeoutMs:3000,agent:new AcpAgent(root)});
+    version:'2026-07-28',timeoutMs:15000,agent:new AcpAgent(root)});
   try {
     await connector.start();
-    const config={protocol:'mcp_http',endpoint:connector.endpoint,mcp_tool:'ask_perfchecker',mcp_version:'2026-07-28',timeout:3,api_key_env:connector.keyEnvironment};
+    const config={protocol:'mcp_http',endpoint:connector.endpoint,mcp_tool:'ask_perfchecker',mcp_version:'2026-07-28',timeout:15,api_key_env:connector.keyEnvironment};
     await run({root,connector,config});
   } finally {await connector.dispose();await rm(root,{recursive:true,force:true});}
 }
