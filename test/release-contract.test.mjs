@@ -14,10 +14,14 @@ test('release validation retains the exact qualified bytes and refuses changed o
     assert.throws(()=>assertQualifiedArchive({...valid,...change}));
 });
 test('release gates require current successful CI and native qualification for the tagged commit',()=>{
-  const runs=['ci','native-vsix'].map((name,index)=>({id:index+1,head_sha:commit,path:`.github/workflows/${name}.yml`,status:'completed',conclusion:'success'}));
+  const runs=['ci','native-vsix'].map((name,index)=>({id:index+1,head_sha:commit,event:'pull_request',path:`.github/workflows/${name}.yml`,status:'completed',conclusion:'success'}));
   assertGreenReleaseRuns(runs,commit);
   for(const conclusion of ['failure','cancelled','skipped'])assert.throws(()=>assertGreenReleaseRuns([...runs,{...runs[0],id:3,conclusion}],commit));
   assert.throws(()=>assertGreenReleaseRuns([...runs,{...runs[0],id:3,status:'in_progress'}],commit));
   assert.throws(()=>assertGreenReleaseRuns(runs,tree));
   assert.throws(()=>assertGreenReleaseRuns(runs.slice(0,1),commit));
+  const focused={...runs[1],id:10,event:'workflow_dispatch'};
+  assert.throws(()=>assertGreenReleaseRuns([runs[0],focused],commit),'A focused manual run cannot replace the full native matrix');
+  assert.throws(()=>assertGreenReleaseRuns([runs[0],{...runs[1],conclusion:'failure'},focused],commit));
+  assertGreenReleaseRuns([...runs,{...focused,conclusion:'failure'}],commit);
 });

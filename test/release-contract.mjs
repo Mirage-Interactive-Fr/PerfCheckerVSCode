@@ -17,10 +17,10 @@ export function assertQualifiedArchive({version,tag,packageVersion,runId,candida
   return {version,tag,filename:`perfchecker-vscode-${version}.vsix`,sha256:expectedSha};
 }
 
-/** A previous green run must not hide a newer failed, cancelled or active run. */
+/** Only automatic PR qualification covers the full release matrix, unlike focused manual runs. */
 export function assertGreenReleaseRuns(runs,commit) {
   for(const workflow of ['.github/workflows/ci.yml','.github/workflows/native-vsix.yml']) {
-    const latest=runs.filter(run=>run.head_sha===commit&&run.path?.split('@')[0]===workflow).sort((a,b)=>b.id-a.id)[0];
+    const latest=runs.filter(run=>run.head_sha===commit&&run.event==='pull_request'&&run.path?.split('@')[0]===workflow).sort((a,b)=>b.id-a.id)[0];
     assert(latest,`Missing qualification: ${workflow}`);
     assert.equal(latest.status,'completed',`Qualification is still active: ${workflow}`);
     assert.equal(latest.conclusion,'success',`Qualification did not pass: ${workflow}`);
