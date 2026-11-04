@@ -82,7 +82,8 @@ exports.run=async(context,options={})=>{
     const designer=await findFrame('#cards',{allowAttached:true});
     await eventually(async()=>await designer.locator('#cards .card').count()>0,'The real suite plan is ready');
     await designer.locator('#reset-filters').click({timeout:NATIVE_READINESS_MS});await designer.locator('#clear-all').click({timeout:NATIVE_READINESS_MS});
-    const card=designer.locator('#cards .card').filter({has:designer.locator('.package',{hasText:/^PerfCheckerNativeFixture$/})}).filter({has:designer.locator('strong',{hasText:/^sum_squares$/})}).first();
+    const card=designer.locator('#cards .card').filter({has:designer.locator('.package',{hasText:/^PerfCheckerNativeFixture$/})})
+      .filter({has:designer.locator('strong',{hasText:/^sum_squares$/})}).filter({has:designer.locator('.version',{hasText:/^baseline$/})});
     await card.locator('.check-option.ready').filter({hasText:'BenchmarkTools'}).locator('input').check({timeout:NATIVE_READINESS_MS});
     await designer.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});
     const reports=path.resolve(workspace,settings.get('reports','perf/results/vscode'));
@@ -94,11 +95,12 @@ exports.run=async(context,options={})=>{
     const entry=await eventually(async()=>(await state()).evidence.find(item=>item.id.startsWith('suite:')&&item.id.includes(series.run_id)),'The saved execution appears');
     await view.locator('#workflow-execution').selectOption(entry.id,{timeout:NATIVE_READINESS_MS});
     await eventually(async()=>(await state()).guided.selectedResultIds.length===1,'The result is selected without calling an agent');assert.equal(calls.length,0);
+    const reference=(await state()).guided.context.results[0];assert.equal(reference.target,'baseline');assert.equal(reference.revision,head);
     await click('Analyze selected results');
     if(options.general100){await eventually(async()=>!(await state()).busy,'Legacy Core refuses unavailable canonical measurements');assert.equal(calls.length,0);return;}
     await eventually(async()=>{assert.deepEqual(errors,[]);const value=await state();return !value.busy&&value.guided.analysis;},'The selected result has a structured MCP analysis');
     const checkpoint=(await state()).guided.history.current;assert.equal(calls.length,1);
-    proof('native-guided-selected-result-analysis',{runId:series.run_id,actualCoreMeasurements:true,noProviderOnOpenOrSelection:true,structuredSuggestions:true});
+    proof('native-guided-selected-result-analysis',{runId:series.run_id,referenceCommit:head,actualCoreMeasurements:true,noProviderOnOpenOrSelection:true,structuredSuggestions:true});
     await view.getByRole('radio').check({timeout:NATIVE_READINESS_MS});await click('Try selected suggestion');
     await eventually(async()=>{const value=await state();return !value.busy&&value.proposal;},'The isolated implementation produces a reviewable diff');
     assert.equal(await fs.readFile(source,'utf8'),original);assert.equal((await state()).proposal.applied,false);
@@ -107,7 +109,8 @@ exports.run=async(context,options={})=>{
     assert.equal(verified.guided.verification.error,undefined,JSON.stringify(verified.guided.verification));
     assert.equal(verified.guided.verification.packageTests.status,'passed');assert.equal(verified.guided.verification.checks.status,'passed');
     assert(verified.guided.verification.checks.trialSelections.every(result=>result.version.startsWith('dev')),'The actual modified working tree is measured');
-    assert(verified.guided.verification.checks.comparisons.length>0);assert(verified.guided.verification.checks.comparisons.every(row=>row.candidate_version.startsWith('dev')));
+    assert(verified.guided.verification.checks.comparisons.length>0);assert(verified.guided.verification.checks.comparisons.every(row=>
+      row.baseline_version.startsWith('baseline')&&row.candidate_version.startsWith('dev')));
     await eventually(async()=>{const value=await state();return !value.busy&&value.guided.analysis&&value.guided.context.runId!==series.run_id;},'Verification feedback returns to the analysis');
     assert.equal(await fs.readFile(source,'utf8'),proposed);
     proof('native-guided-package-and-performance-verification',{packageTests:'passed',checks:'passed',comparison:verified.guided.verification.checks.comparisons,
