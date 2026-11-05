@@ -257,6 +257,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
         observation.rechecks.push({at:new Date().toISOString(),current:current??null});
         if(!current){observation.resolution='proved-absent-or-zombie';return undefined;}
         for(const key of ['parent','group','started'])assert.equal(current[key],before[key],'An inconclusive mapped-executable observation must retain the same incarnation');
+        if(current.state.slice(1).includes('E')){await waitForExit(current);observation.resolution='proved-absent-or-zombie';return undefined;}
         try{
           const value=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(Math.max(1,until-Date.now()))});
           assert(!value.stderr.trim(),'Mapped-executable revalidation must not hide an inspection error');
@@ -269,6 +270,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
         observation.rechecks.at(-1).after=checked??null;observation.rechecks.at(-1).mappings=mappings;
         if(!checked){observation.resolution='proved-absent-or-zombie';return undefined;}
         for(const key of ['parent','group','started'])assert.equal(checked[key],before[key],'Mapped paths still belong to the original incarnation');
+        if(!mappings.length&&checked.state.slice(1).includes('E')){await waitForExit(checked);observation.resolution='proved-absent-or-zombie';return undefined;}
         if(mappings.length){observation.resolution='mapped-executable-restored';break;}
       }
       if(!mappings.length)observation.resolution='live-executable-unqualified';
