@@ -56,6 +56,10 @@ on:
         description: Explicitly declare a new candidate origin after product changes; otherwise reuse the frozen release archive
         type: boolean
         default: false
+      record_video:
+        description: Record the disposable Linux stable desktop during an explicit manual reproduction
+        type: boolean
+        default: false
   pull_request:
     paths:
       - '.github/workflows/native-vsix.yml'
@@ -297,7 +301,7 @@ jobs:
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
       PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || 'd079efd5c24c3dcac5b7550781822038e0ff780f') || '' }}
       PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || '749f8eac351ed2a1f0bc110456f2eb37a3bc08ee') || '' }}
-      PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
+      PERFCHECKER_NATIVE_VIDEO: ${{ github.event_name == 'workflow_dispatch' && inputs.record_video && matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
       JULIA_NUM_PRECOMPILE_TASKS: '1'
