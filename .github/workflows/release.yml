@@ -107,8 +107,10 @@ jobs:
             const version=process.env.RELEASE_VERSION;
             for(let attempt=0;attempt<30;attempt++){
               const [marketplace,openvsx]=await Promise.all([
-                fetch(`https://marketplace.visualstudio.com/_apis/public/gallery/publishers/mirage-interactive-fr/vsextensions/perfchecker-vscode/${version}/vspackage`,{method:'HEAD'}),
+                fetch(`https://marketplace.visualstudio.com/_apis/public/gallery/publishers/mirage-interactive-fr/vsextensions/perfchecker-vscode/${version}/vspackage`),
                 fetch(`https://open-vsx.org/api/mirage-interactive-fr/perfchecker-vscode/${version}`)]);
+              // Marketplace rejects HEAD even for published versions; GET validates the exact version without retaining its download.
+              await marketplace.body?.cancel();
               if(marketplace.ok&&openvsx.ok&&(await openvsx.json()).version===version){console.log('Both registries serve '+version);return;}
               await new Promise(resolve=>setTimeout(resolve,10000));
             }
