@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import {EventEmitter} from 'node:events';
 import {writeSync} from 'node:fs';
+import {waitForMacProcessExit} from './native-controller-preflight.mjs';
 import {controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,nativeOperationSnapshot,observeNativeOperation,captureQualifiedNativeProgress,assertNativeDiscoveryDiagnostic,nativeDiscoverySpawnOutput,installNativeDiscoveryObserver,readBoundedNativeFile,nativeSampleProjection,nativeSampleManualContract,createNativeDiscoveryReaders,discoveryOwnedCommand} from './native-controller-preflight.mjs';
 
 const nextObservationTurn=()=>new Promise(resolve=>setImmediate(resolve));
@@ -489,4 +490,47 @@ for(const [deadlineAt,maximum]of [[5000,1000],[175,175]])
 test('an unqualified process cannot enter executable revalidation',async()=>{
   const probe=executableRevalidation({identity:null});await assert.rejects(probe.run());
   assert.deepEqual(probe.history,[]);assert.deepEqual(probe.counts(),{stateReads:0,imageReads:0,elapsed:0});
+});
+
+const macExiting={pid:55699,parent:25851,group:25851,started:'Thu Nov  5 00:28:59 2026',state:'?<E'};
+function macExitProbe({states=[macExiting],identity=macExiting,deadlineAt=5000}={}){
+  let elapsed=0,reads=0;const history=[];
+  return {history,counts:()=>({elapsed,reads}),run:()=>waitForMacProcessExit({identity,deadlineAt,now:()=>elapsed,
+    wait:async milliseconds=>{elapsed+=milliseconds;},record:value=>history.push(value),
+    readCurrent:async()=>{const value=states[Math.min(reads++,states.length-1)];if(value instanceof Error)throw value;return value;}})};
+}
+test('macOS exit flags wait for actual absence without granting signal authority',async()=>{
+  const probe=macExitProbe({states:[macExiting,{...macExiting,state:'?<Es'},undefined]});
+  assert.equal(await probe.run(),undefined);assert.deepEqual(probe.counts(),{elapsed:20,reads:3});
+  assert.equal(probe.history[0].resolution,'proved-absent');assert.equal(probe.history[0].signalAuthority,false);
+});
+test('macOS exit observation accepts a proved zombie of the same incarnation',async()=>{
+  const probe=macExitProbe({states:[{...macExiting,state:'Z<'}]});await probe.run();
+  assert.equal(probe.history[0].resolution,'same-incarnation-zombie');
+});
+for(const change of [{pid:55700},{started:'Thu Nov  5 00:29:00 2026'},{group:25852},{parent:25852}])
+  test(`macOS exit observation refuses changed ${Object.keys(change)[0]}`,async()=>{
+    const probe=macExitProbe({states:[{...macExiting,...change}]});await assert.rejects(probe.run(),/different macOS process/);
+    assert.equal(probe.history[0].resolution,'refused');
+  });
+for(const [deadlineAt,maximum]of [[5000,1000],[75,75]])
+  test(`a still-existing macOS exit state remains unqualified after ${maximum} ms`,async()=>{
+    const probe=macExitProbe({deadlineAt});await assert.rejects(probe.run(),/no confirmed absence/);
+    assert.equal(probe.counts().elapsed,maximum);assert.equal(probe.history[0].resolution,'refused');
+  });
+test('macOS exit observation never treats a resumed live state or failed inspection as absence',async()=>{
+  await assert.rejects(macExitProbe({states:[{...macExiting,state:'R<'}]}).run(),/mapped-executable qualification/);
+  const error=new Error('inspection failed');await assert.rejects(macExitProbe({states:[error]}).run(),value=>value===error);
+  const invalid=macExitProbe({identity:{...macExiting,state:'R<'}});await assert.rejects(invalid.run());assert.deepEqual(invalid.history,[]);
+});
+test('a hanging macOS process query is bounded by the remaining inspection deadline',{timeout:2000},async()=>{
+  const history=[];await assert.rejects(waitForMacProcessExit({identity:macExiting,deadlineAt:Date.now()+25,
+    readCurrent:()=>new Promise(()=>{}),record:value=>history.push(value)}),/no confirmed absence/);
+  assert.equal(history[0].resolution,'refused');
+});
+test('a macOS absence result arriving beyond its deadline does not qualify cleanup',async()=>{
+  let elapsed=0;const history=[];
+  await assert.rejects(waitForMacProcessExit({identity:macExiting,deadlineAt:5000,now:()=>elapsed,
+    readCurrent:async()=>{elapsed=1001;return undefined;},record:value=>history.push(value)}),/no confirmed absence/);
+  assert.equal(history[0].resolution,'refused');
 });

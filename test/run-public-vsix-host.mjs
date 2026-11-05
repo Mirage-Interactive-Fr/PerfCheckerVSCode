@@ -14,7 +14,7 @@ import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
 import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,waitForMacProcessExit,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const {NATIVE_READINESS_MS,NATIVE_ACTIVITY_MINUTES,nativeReadinessPolicy,createNativeActivityBudget,waitForNativeAvailability}=readiness;
@@ -231,6 +231,9 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
     if(/^Z/.test(row.state))return undefined;
     assert(Number.isFinite(Date.parse(row.started)),'macOS supplies a real process start date');
     const before=await macCurrent(row.pid);if(!before)return undefined;assert.equal(before.parent,row.parent);assert.equal(before.group,row.group);assert.equal(before.started,row.started);
+    const waitForExit=identity=>waitForMacProcessExit({identity,deadlineAt:cleanupUntil,readCurrent:macCurrent,
+      record:observation=>(receipt.ownership.revalidations??=[]).push(observation)});
+    if(before.state.slice(1).includes('E'))return waitForExit(before);
     let mappings;
     try{const current=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)});assert(!current.stderr.trim(),'Mapped-executable inspection has no stderr error');mappings=current.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
     catch(error){
@@ -241,6 +244,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
     }
     const after=await macCurrent(row.pid);if(!after)return undefined;
     for(const key of ['parent','group','started'])assert.equal(after[key],before[key],'The process keeps its real identity while mapped executable paths are read');
+    if(!mappings.length&&after.state.slice(1).includes('E'))return waitForExit(after);
     if(!mappings.length){
       const observation={stage:'mapped-executable-empty',pid:row.pid,before,after,startedAt:new Date().toISOString(),rechecks:[]};
       (receipt.ownership.inconclusive??=[]).push(observation);

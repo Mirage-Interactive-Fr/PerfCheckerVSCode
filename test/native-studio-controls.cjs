@@ -1264,7 +1264,12 @@ exports.runSelection = async context => {
     planSha256:createHash('sha256').update(planBytes).digest('hex'),planUnchanged:true,idleControlsRestored:true,
     inventorySelectionOrderPreserved:true,additionalControllerLaunches:0});
   await view.locator('#results').click({timeout:NATIVE_READINESS_MS});
-  const result = await frame(context, 'button[data-report="suite-result.json"]');
+  const result = await eventually(async()=>{
+    const current=await frame(context,'button[data-report="suite-result.json"]');
+    if(await current.locator('.empty').count()!==0)return false;
+    if(!(await current.locator('.meta').allTextContents()).some(text=>text.includes(report.finished_at)))return false;
+    return await current.locator('[data-result-item]').count()>0&&current;
+  },'Results replace the previously empty retained panel with this exact completed execution');
   assert.equal(await result.locator('.empty').count(), 0);
   assert((await result.locator('[data-result-item]').count()) > 0);
   context.proof('native-run-selection', {runs: 1, status: report.runs[0].status, reportPath, nativeClick: true});

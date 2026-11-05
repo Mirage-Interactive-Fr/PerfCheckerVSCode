@@ -643,3 +643,35 @@ export async function revalidateQualifiedLinuxExecutable({identity,error,deadlin
   }catch(refusal){observation.resolution='refused';observation.refusal=String(refusal.message??refusal).slice(0,1000);throw refusal;}
   finally{observation.finishedAt=new Date(now()).toISOString();}
 }
+
+// macOS ps marks an exiting process with the E modifier. Its executable maps
+// may already be gone while the PID still exists. Wait for actual absence or
+// zombie state; E alone grants neither an absence proof nor signal authority.
+export async function waitForMacProcessExit({identity,deadlineAt,readCurrent,record,
+  now=Date.now,wait=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds))}){
+  assert(identity&&Number.isSafeInteger(identity.pid)&&identity.pid>0&&Number.isFinite(Date.parse(identity.started))&&
+    Number.isSafeInteger(identity.group)&&identity.group>0&&typeof identity.state==='string'&&identity.state.slice(1).includes('E'));
+  const until=Math.min(deadlineAt,now()+1000);
+  const observation={stage:'macos-exiting-process',initial:identity,observedAt:new Date(now()).toISOString(),
+    deadlineAt:new Date(until).toISOString(),rechecks:[],resolution:'pending',signalAuthority:false};
+  record(observation);
+  const refusal=()=>new Error('The exiting macOS process has no confirmed absence within its bounded inspection deadline.');
+  try{
+    for(;;){
+      const remaining=until-now();if(remaining<=0)throw refusal();let timer,current;
+      try{current=await Promise.race([Promise.resolve().then(()=>readCurrent(identity.pid,remaining)),
+        new Promise((resolve,reject)=>{timer=setTimeout(()=>reject(refusal()),remaining);})]);}
+      finally{clearTimeout(timer);}
+      observation.rechecks.push({observedAt:new Date(now()).toISOString(),current:current??null});
+      if(now()>=until)throw refusal();
+      if(!current){observation.resolution='proved-absent';return undefined;}
+      for(const key of ['pid','started','group','parent'])assert.equal(current[key],identity[key],
+        'An exit observation cannot qualify a different macOS process incarnation');
+      if(/^Z/.test(current.state)){observation.resolution='same-incarnation-zombie';return undefined;}
+      assert(typeof current.state==='string'&&current.state.slice(1).includes('E'),
+        'A live process whose exit flag changed still requires mapped-executable qualification');
+      await wait(Math.min(10,Math.max(0,until-now())));
+    }
+  }catch(error){observation.resolution='refused';observation.refusal=String(error.message??error);throw error;}
+  finally{observation.finishedAt=new Date(now()).toISOString();}
+}
