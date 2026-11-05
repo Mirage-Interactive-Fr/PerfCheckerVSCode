@@ -6,6 +6,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const http = require('node:http');
 const {createHash}=require('node:crypto');
+const {isDeepStrictEqual}=require('node:util');
 
 async function capture(context, name) {
   const file=path.join(process.env.PERFCHECKER_NATIVE_OUTPUT,`native-${process.platform}-vscode-${context.vscode.version}-${name}.png`);
@@ -844,11 +845,18 @@ async function testResults(context) {
   if(await chart.count())await chart.scrollIntoViewIfNeeded({timeout:NATIVE_READINESS_MS});
   await capture(context,'measured-results');
   for (const [name, report] of [['Summary', 'suite-report.md'], ['JSON', 'suite-result.json'], ['Comparisons', 'version-comparison.md'], ['Series JSON', 'version-series.json']]) {
-    view = await output(context);
-    await view.getByRole('button', {name, exact: true}).click({timeout:NATIVE_READINESS_MS});
     const file = path.join(context.results, report);
     const exists = await fs.access(file).then(() => true, () => false);
-    if (exists) await eventually(() => context.vscode.window.tabGroups.all.some(group => group.tabs.some(tab =>
+    const expectedJson=exists&&report.endsWith('.json')?JSON.parse(await fs.readFile(file,'utf8')):undefined;
+    view = await output(context);
+    await view.getByRole('button', {name, exact: true}).click({timeout:NATIVE_READINESS_MS});
+    // Saved executions open frozen JSON snapshots in untitled editors. Verify the displayed execution contents.
+    if(expectedJson)await eventually(()=>{
+      const document=context.vscode.window.activeTextEditor?.document;
+      if(document?.languageId!=='json')return false;
+      try{return isDeepStrictEqual(JSON.parse(document.getText()),expectedJson);}catch{return false;}
+    },`Open the exact saved ${report} contents`);
+    else if (exists) await eventually(() => context.vscode.window.tabGroups.all.some(group => group.tabs.some(tab =>
       tab.input?.uri?.fsPath === context.vscode.Uri.file(file).fsPath || (report.endsWith('.md') && tab.label.includes(report)))), `Open actual ${report}`);
     else await eventually(async () => (await context.windowPage.locator('body').innerText({timeout:NATIVE_READINESS_MS})).includes(`PerfChecker has not produced ${report} yet.`), `Missing ${report} explains its prerequisite`);
     context.log(`result-report-${name}`, {exists, openedOrExplained: true});
