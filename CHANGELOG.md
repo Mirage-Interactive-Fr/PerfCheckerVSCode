@@ -16,6 +16,8 @@
   tools graphically for HTTP connections as well as local stdio connections.
 - Preserve controller cleanup failures when a suite is cancelled; a cancellation
   request cannot hide retained inventories or produce a successful stop.
+- Bind plot actions to their displayed execution so a retained view cannot
+  analyze a different result while the next view is loading.
 
 ## 1.0.3 — ARM-compatible setup
 
