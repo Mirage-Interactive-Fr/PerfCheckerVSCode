@@ -21,7 +21,7 @@ exports.run=async(context,options={})=>{
     'advisorMcpPromptArgument','advisorMcpResponse','advisorImplementationMcpTool','advisorImplementationMcpPromptArgument',
     'advisorImplementationMcpWorkspaceArgument','advisorImplementationMcpArguments','advisorInstructions'];
   const previous=keys.map(key=>[key,settings.inspect(key)?.workspaceFolderValue]);
-  const git=(...args)=>execute('git',args,{cwd:workspace,windowsHide:true}).then(result=>result.stdout);
+  const git=(...args)=>execute('git',args,{cwd:workspace,windowsHide:true}).then(result=>result.stdout.trim());
   const source=path.join(workspace,'src','PerfCheckerNativeFixture.jl'),original=await fs.readFile(source,'utf8');
   const proposed=original.replace('sum(xs .^ 2)','sum((x * x for x in xs); init=zero(eltype(xs)))');assert.notEqual(proposed,original);
   const tests=path.join(workspace,'test','runtests.jl'),oldTests=await fs.readFile(tests).catch(error=>{if(error.code!=='ENOENT')throw error;});
@@ -63,7 +63,7 @@ exports.run=async(context,options={})=>{
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const endpoint=`http://127.0.0.1:${server.address().port}/mcp`,state=()=>vscode.commands.executeCommand('perfchecker.chatState');
   let view;
-  const click=async name=>{await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#workflow-root');await view.getByRole('button',{name,exact:true}).click({timeout:NATIVE_READINESS_MS});};
+  const click=async name=>{context.log?.('native-guided-action',{name});await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#workflow-root');await view.getByRole('button',{name,exact:true}).click({timeout:NATIVE_READINESS_MS});};
   try {
     if(options.stdio){
       const node=await fs.realpath(process.env.PERFCHECKER_NATIVE_NODE);
@@ -91,6 +91,8 @@ exports.run=async(context,options={})=>{
     await designer.locator('#run-only').click({timeout:NATIVE_READINESS_MS});
     const series=await eventually(async()=>{const bytes=await fs.readFile(path.join(reports,'version-series.json'),'utf8').catch(()=>undefined);
       if(!bytes||bytes===oldSeries)return;const value=JSON.parse(bytes);return value.run_id&&!(await designer.locator('#run-only').isDisabled())&&value;},'One selected real check completes');
+    const initial=JSON.parse(await fs.readFile(path.join(reports,'suite-result.json'),'utf8'));
+    assert.equal(initial.runs.length,1);assert.equal(initial.runs[0].status,'pass',initial.runs[0].message);
     await vscode.commands.executeCommand('perfchecker.openChat');view=await findFrame('#workflow-root');
     const entry=await eventually(async()=>(await state()).evidence.find(item=>item.id.startsWith('suite:')&&item.id.includes(series.run_id)),'The saved execution appears');
     await view.locator('#workflow-execution').selectOption(entry.id,{timeout:NATIVE_READINESS_MS});
@@ -115,8 +117,11 @@ exports.run=async(context,options={})=>{
     assert.equal(await fs.readFile(source,'utf8'),proposed);
     proof('native-guided-package-and-performance-verification',{packageTests:'passed',checks:'passed',comparison:verified.guided.verification.checks.comparisons,
       actualRepeatedMeasurement:true,performanceVerdict:'Observed changes only; protocol fixture, no model inference or statistical gain claimed.'});
-    await click('Restore previous code');await eventually(async()=>await fs.readFile(source,'utf8')===original,'Restore reproduces the exact original source');
-    const beforeBranch=(await state()).guided.history.nodes.length;
+    await click('Restore previous code');
+    const restored=await eventually(async()=>{const value=await state();return !value.busy&&!value.proposal?.applied&&
+      value.guided.history.nodes.at(-1)?.action==='restore'&&await fs.readFile(source,'utf8')===original&&value;
+    },'Restore finishes its exact source restoration and history checkpoint before branching');
+    const beforeBranch=restored.guided.history.nodes.length;
     await view.locator('.history-node').filter({hasText:'Agent analysis'}).first().getByRole('button',{name:'Continue from here',exact:true}).click({timeout:NATIVE_READINESS_MS});
     await eventually(async()=>(await state()).guided.history.current===checkpoint,'The old analysis checkpoint is selected');
     await click('Analyze selected results');await eventually(async()=>{const value=await state();return !value.busy&&value.guided.history.nodes.length===beforeBranch+1;},'A new branch is appended');
