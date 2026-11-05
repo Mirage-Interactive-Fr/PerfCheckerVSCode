@@ -35,13 +35,13 @@ exports.run=async(context,{calls,receipts,providerErrors,state,setAttached})=>{
   const check=card.locator('.check-option.ready').filter({hasText:'BenchmarkTools'});
   assert.equal(await check.count(),1);await check.locator('input').check({timeout:NATIVE_READINESS_MS});
   assert.match(await designer.locator('#count').innerText({timeout:NATIVE_READINESS_MS}),/^1 selected/);
-  await designer.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});await designer.locator('#run').click({timeout:NATIVE_READINESS_MS});
+  await designer.locator('#open-after-run').uncheck({timeout:NATIVE_READINESS_MS});await designer.locator('#run-only, #run').first().click({timeout:NATIVE_READINESS_MS});
   let suite;
   await eventually(async()=>{
     const bytes=await fs.readFile(path.join(reports,'suite-result.json')).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;});
     if(!bytes||bytes.equals(previous??Buffer.alloc(0)))return false;
     try{suite=JSON.parse(bytes);}catch(error){if(error instanceof SyntaxError)return false;throw error;}
-    return suite.schema_version==='perfchecker-suite-result/1'&&suite.runs.length===1&&suite.runs[0].status==='pass'&&!(await designer.locator('#run').isDisabled({timeout:NATIVE_READINESS_MS}));
+    return suite.schema_version==='perfchecker-suite-result/1'&&suite.runs.length===1&&suite.runs[0].status==='pass'&&!(await designer.locator('#run-only, #run').first().isDisabled({timeout:NATIVE_READINESS_MS}));
   },'The one selected real BenchmarkTools suite check generates its saved report',NATIVE_READINESS_MS);
   assert.equal(suite.runs[0].package,'PerfCheckerNativeFixture');
   assert.equal(suite.runs[0].feature,'sum_squares_benchmark');

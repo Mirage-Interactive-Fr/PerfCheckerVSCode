@@ -56,6 +56,10 @@ on:
         description: Explicitly declare a new candidate origin after product changes; otherwise reuse the frozen release archive
         type: boolean
         default: false
+      record_video:
+        description: Record the disposable Linux stable desktop during an explicit manual reproduction
+        type: boolean
+        default: false
   pull_request:
     paths:
       - '.github/workflows/native-vsix.yml'
@@ -202,7 +206,7 @@ jobs:
           }
           if(newOrigin&&(e.NATIVE_EVENT!=='workflow_dispatch'||requested))throw Error('A new candidate origin requires an explicit manual run without archive-reuse inputs');
           const version=JSON.parse(fs.readFileSync('package.json')).version;
-          if(!['1.0.2','1.0.3'].includes(version)&&!requested&&!newOrigin)throw Error('A new extension version requires an explicit candidate origin before archive reuse can be frozen.');
+          if(!['1.0.2','1.0.3','1.1.0'].includes(version)&&!requested&&!newOrigin)throw Error('A new extension version requires an explicit candidate origin before archive reuse can be frozen.');
           if(version==='1.0.2'&&!requested&&!newOrigin){
             // Product commit df3085c9ccd92014586cd2b718ced606c0b912b7, tree cb36c394f91834a61fd58b6fe6a54cdc54f15fc2.
             fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38109028537\nREUSE_NAME=native-candidate-df3085c9ccd92014586cd2b718ced606c0b912b7\nREUSE_SHA=5fe530420b0ef8c7b8c0bdf19bc6223a6bdfd10ea6db9396b9f3f6d10d537f13\n');
@@ -212,6 +216,11 @@ jobs:
             // Product commit 4a27ae0d76a297c58d141c8396808e5d86e61ef3, tree a20c19dc66670bf39bb3e203ede0081f6048ddcf.
             fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=38769699307\nREUSE_NAME=native-candidate-4a27ae0d76a297c58d141c8396808e5d86e61ef3\nREUSE_SHA=416ea51fa31471545b022ca37f7ab30901a2e36b871ba230b54bbeadb97943ec\n');
             console.log('Release 1.0.3 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
+          }
+          if(version==='1.1.0'&&!requested&&!newOrigin){
+            // Product commit 559b3a4bd75685e1bfcb295cd7e39f3168f4107c, tree d1ea8dd57add60db784ce37b1cf4166775ec8fe3.
+            fs.appendFileSync(e.GITHUB_ENV,'REUSE_RUN=41949141544\nREUSE_NAME=native-candidate-559b3a4bd75685e1bfcb295cd7e39f3168f4107c\nREUSE_SHA=46ed78be1f943b8bae3b0f10316e0f8532e69c0c4bd9e5106d21b1b26aa41a6f\n');
+            console.log('Release 1.1.0 qualification reuses the frozen archive; product changes require a declared new qualification origin.');
           }
           NODE
       - name: Validate optional exact-archive reuse
@@ -292,7 +301,7 @@ jobs:
       PERFCHECKER_NATIVE_CORE: ${{ github.event_name == 'workflow_dispatch' && inputs.core || 'candidate' }}
       PERFCHECKER_NATIVE_CORE_COMMIT: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_commit || 'd079efd5c24c3dcac5b7550781822038e0ff780f') || '' }}
       PERFCHECKER_NATIVE_CORE_TREE: ${{ (github.event_name != 'workflow_dispatch' || inputs.core == 'candidate') && (inputs.core_tree || '749f8eac351ed2a1f0bc110456f2eb37a3bc08ee') || '' }}
-      PERFCHECKER_NATIVE_VIDEO: ${{ matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
+      PERFCHECKER_NATIVE_VIDEO: ${{ github.event_name == 'workflow_dispatch' && inputs.record_video && matrix.os == 'ubuntu-latest' && matrix.vscode == 'stable' && '1' || '0' }}
       PERFCHECKER_TEST_JULIA: julia
       JULIA_NUM_THREADS: '1'
       JULIA_NUM_PRECOMPILE_TASKS: '1'

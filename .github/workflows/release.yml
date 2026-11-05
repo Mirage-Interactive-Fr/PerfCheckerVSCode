@@ -1,0 +1,128 @@
+name: Publish qualified extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version whose tag is merged into main
+        required: true
+        type: string
+      candidate_run:
+        description: Successful original native qualification run
+        required: true
+        type: string
+      candidate_name:
+        description: Original native-candidate-COMMIT artifact
+        required: true
+        type: string
+      candidate_sha:
+        description: Exact SHA256 qualified on every supported host
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-perfchecker-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      CANDIDATE_RUN: ${{ inputs.candidate_run }}
+      CANDIDATE_NAME: ${{ inputs.candidate_name }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+    steps:
+      - name: Validate release identifiers and both publishing credentials
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          node <<'NODE'
+          const e=process.env;
+          if(!/^\d+\.\d+\.\d+$/.test(e.RELEASE_VERSION)||!/^\d+$/.test(e.CANDIDATE_RUN)||
+            !/^native-candidate-[a-f0-9]{40}$/.test(e.CANDIDATE_NAME)||! /^[a-f0-9]{64}$/.test(e.CANDIDATE_SHA))throw Error('Invalid release identifiers');
+          for(const key of ['VSCE_PAT','OVSX_PAT'])if(!e[key])throw Error('Configure the '+key+' repository secret before publishing either registry');
+          NODE
+      - uses: actions/checkout@v7
+        with:
+          ref: v${{ inputs.version }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Retrieve the qualified archive without rebuilding it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh run download "$CANDIDATE_RUN" --name "$CANDIDATE_NAME" --dir qualified
+      - name: Verify original provenance, green checks and merge into main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';import crypto from 'node:crypto';import cp from 'node:child_process';
+          import {assertQualifiedArchive,assertGreenReleaseRuns} from './test/release-contract.mjs';
+          const e=process.env,git=(...args)=>cp.execFileSync('git',args,{encoding:'utf8'}).trim();
+          const api=endpoint=>JSON.parse(cp.execFileSync('gh',['api',endpoint],{encoding:'utf8'}));
+          const tag='v'+e.RELEASE_VERSION,commit=git('rev-parse','HEAD');
+          cp.execFileSync('git',['merge-base','--is-ancestor',commit,'origin/main']);
+          const provenance=JSON.parse(fs.readFileSync('qualified/candidate.provenance.json'));
+          const actualSha=crypto.createHash('sha256').update(fs.readFileSync('qualified/candidate.vsix')).digest('hex');
+          const qualified=assertQualifiedArchive({version:e.RELEASE_VERSION,tag,packageVersion:JSON.parse(fs.readFileSync('package.json')).version,
+            runId:e.CANDIDATE_RUN,candidateName:e.CANDIDATE_NAME,expectedSha:e.CANDIDATE_SHA,actualSha,provenance,
+            originRun:api(`repos/${e.GITHUB_REPOSITORY}/actions/runs/${e.CANDIDATE_RUN}`),originTree:git('rev-parse',provenance.commit+'^{tree}'),
+            changed:cp.execFileSync('git',['diff','--name-only','-z',provenance.commit,'HEAD'],{encoding:'utf8'}).split('\0').filter(Boolean)});
+          const runs=[];for(let page=1;page<=10;page++){
+            const batch=api(`repos/${e.GITHUB_REPOSITORY}/actions/runs?head_sha=${commit}&per_page=100&page=${page}`).workflow_runs;
+            runs.push(...batch);if(batch.length<100)break;
+          }
+          assertGreenReleaseRuns(runs,commit);
+          fs.copyFileSync('qualified/candidate.vsix','qualified/'+qualified.filename);
+          fs.writeFileSync('qualified/'+qualified.filename+'.sha256',qualified.sha256+'  '+qualified.filename+'\n');
+          const notes=fs.readFileSync('CHANGELOG.md','utf8').split('## '+qualified.version+' — ')[1];
+          if(!notes)throw Error('Release notes are missing');
+          fs.writeFileSync('qualified/release-notes.md',notes.split('\n').slice(1).join('\n').split('\n## ')[0].trim()+'\n');
+          console.log('Verified qualified archive '+qualified.sha256+' for '+tag);
+          NODE
+      - run: npm ci
+      - name: Publish the qualified VSIX to Visual Studio Marketplace
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx --no-install vsce publish --skip-duplicate --packagePath "qualified/perfchecker-vscode-$RELEASE_VERSION.vsix"
+      - name: Publish the same qualified VSIX to OpenVSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npx --no-install ovsx publish --skip-duplicate "qualified/perfchecker-vscode-$RELEASE_VERSION.vsix"
+      - name: Verify public availability on both registries
+        run: |
+          node <<'NODE'
+          (async()=>{
+            const version=process.env.RELEASE_VERSION;
+            for(let attempt=0;attempt<30;attempt++){
+              const [marketplace,openvsx]=await Promise.all([
+                fetch(`https://marketplace.visualstudio.com/_apis/public/gallery/publishers/mirage-interactive-fr/vsextensions/perfchecker-vscode/${version}/vspackage`),
+                fetch(`https://open-vsx.org/api/mirage-interactive-fr/perfchecker-vscode/${version}`)]);
+              // Marketplace rejects HEAD even for published versions; GET validates the exact version without retaining its download.
+              await marketplace.body?.cancel();
+              if(marketplace.ok&&openvsx.ok&&(await openvsx.json()).version===version){console.log('Both registries serve '+version);return;}
+              await new Promise(resolve=>setTimeout(resolve,10000));
+            }
+            throw Error('The new version is not publicly available on both registries');
+          })().catch(error=>{console.error(error);process.exitCode=1;});
+          NODE
+      - name: Publish the GitHub release with the exact qualified bytes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v$RELEASE_VERSION" --verify-tag --title "PerfChecker for VS Code $RELEASE_VERSION" \
+            --notes-file qualified/release-notes.md \
+            "qualified/perfchecker-vscode-$RELEASE_VERSION.vsix" \
+            "qualified/perfchecker-vscode-$RELEASE_VERSION.vsix.sha256" \
+            qualified/candidate.provenance.json

@@ -14,7 +14,7 @@ import {nativeCoreContract,CORE111_CANDIDATE} from './native-core-contract.mjs';
 import {nativePlatformContract,assertNativeJuliaArchitecture,nativeFullCasePartition} from './native-platform-contract.mjs';
 import {nativeVSCodeApplication} from './native-vscode-application.mjs';
 import {createCoalescingObserver,beforeDeadline} from './native-landscape-controls.cjs';
-import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
+import {candidateGitSetupScript,candidateCheckoutPermissionsScript,controllerCachePreparationScript,controllerPreflightScript,parseControllerImportReceipt,parseControllerTestItemDiscoveryReceipt,controllerInspectionFailure,createControllerImageInspectionSurvey,revalidateQualifiedLinuxExecutable,waitForMacProcessExit,captureControllerInventory,controllerReadinessObserved,assertNativeDiscoveryDiagnostic,verifyNativeSampleSyntax} from './native-controller-preflight.mjs';
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const {NATIVE_READINESS_MS,NATIVE_ACTIVITY_MINUTES,nativeReadinessPolicy,createNativeActivityBudget,waitForNativeAvailability}=readiness;
@@ -60,6 +60,9 @@ const discoveryDiagnostic=process.env.PERFCHECKER_NATIVE_DISCOVERY_DIAGNOSTIC===
 const fullCasePartition=nativeFullCasePartition({partition:process.env.PERFCHECKER_NATIVE_FULL_PARTITION||'all',stage,artifact:mode});
 if(!['smoke','full','targeted','focused','core-external'].includes(stage))throw new Error('Choose smoke, full, targeted lifecycle/protocol, focused native controls, or the explicit Core-only external-process regression.');
 const caseGroup=process.env.PERFCHECKER_NATIVE_CASE_GROUP||'narrative';
+const positiveOptionalAnalyzers=stage==='full'&&fullCasePartition.cases.includes('native-investigation-controls')||
+  stage==='focused'&&['investigation','diagnosis'].includes(caseGroup);
+const snoopProject=positiveOptionalAnalyzers?path.join(session,'snoop-environment'):undefined;
 if(stage==='focused'&&!['bootstrap','general100','narrative','mcp','mcp-stdio','mcp-documented-install','mcp-pluto','pluto-plots','pluto','pluto-start-stop','workbench','advisor','saved-report','investigation','investigation-limits','diagnosis','studio','suite','studio-ordering','editor','testitems','testitems-ready','restricted','landscape','studio-color'].includes(caseGroup))throw new Error('Choose one of the explicit native-control groups.');
 const bootstrapOnly=stage==='focused'&&caseGroup==='bootstrap';
 if(bootstrapOnly&&(mode!=='candidate'||coreMode!=='general'))throw new Error('Fresh production bootstrap requires the candidate VSIX and published General Core, without Git source overrides.');
@@ -228,6 +231,9 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
     if(/^Z/.test(row.state))return undefined;
     assert(Number.isFinite(Date.parse(row.started)),'macOS supplies a real process start date');
     const before=await macCurrent(row.pid);if(!before)return undefined;assert.equal(before.parent,row.parent);assert.equal(before.group,row.group);assert.equal(before.started,row.started);
+    const waitForExit=identity=>waitForMacProcessExit({identity,deadlineAt:cleanupUntil,readCurrent:macCurrent,
+      record:observation=>(receipt.ownership.revalidations??=[]).push(observation)});
+    if(before.state.slice(1).includes('E'))return waitForExit(before);
     let mappings;
     try{const current=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(3000)});assert(!current.stderr.trim(),'Mapped-executable inspection has no stderr error');mappings=current.stdout.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));}
     catch(error){
@@ -238,6 +244,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
     }
     const after=await macCurrent(row.pid);if(!after)return undefined;
     for(const key of ['parent','group','started'])assert.equal(after[key],before[key],'The process keeps its real identity while mapped executable paths are read');
+    if(!mappings.length&&after.state.slice(1).includes('E'))return waitForExit(after);
     if(!mappings.length){
       const observation={stage:'mapped-executable-empty',pid:row.pid,before,after,startedAt:new Date().toISOString(),rechecks:[]};
       (receipt.ownership.inconclusive??=[]).push(observation);
@@ -250,6 +257,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
         observation.rechecks.push({at:new Date().toISOString(),current:current??null});
         if(!current){observation.resolution='proved-absent-or-zombie';return undefined;}
         for(const key of ['parent','group','started'])assert.equal(current[key],before[key],'An inconclusive mapped-executable observation must retain the same incarnation');
+        if(current.state.slice(1).includes('E')){await waitForExit(current);observation.resolution='proved-absent-or-zombie';return undefined;}
         try{
           const value=await inspectCommand('lsof',['-a','-p',String(row.pid),'-d','txt','-Fn'],{timeout:limit(Math.max(1,until-Date.now()))});
           assert(!value.stderr.trim(),'Mapped-executable revalidation must not hide an inspection error');
@@ -262,6 +270,7 @@ async function executeControllerPreflight(executable,args,receipt,{timeoutMs=NAT
         observation.rechecks.at(-1).after=checked??null;observation.rechecks.at(-1).mappings=mappings;
         if(!checked){observation.resolution='proved-absent-or-zombie';return undefined;}
         for(const key of ['parent','group','started'])assert.equal(checked[key],before[key],'Mapped paths still belong to the original incarnation');
+        if(!mappings.length&&checked.state.slice(1).includes('E')){await waitForExit(checked);observation.resolution='proved-absent-or-zombie';return undefined;}
         if(mappings.length){observation.resolution='mapped-executable-restored';break;}
       }
       if(!mappings.length)observation.resolution='live-executable-unqualified';
@@ -735,6 +744,7 @@ try {
         ...(diagnosticTemporaryRoot?{TMPDIR:diagnosticTemporaryRoot,PERFCHECKER_NATIVE_DIAGNOSTIC_TEMP:diagnosticTemporaryRoot}:{}),
         PERFCHECKER_NATIVE_PHASE: phase, PERFCHECKER_NATIVE_INVOCATION:randomUUID(),PERFCHECKER_NATIVE_OUTPUT: output, PERFCHECKER_NATIVE_PROFILE: phaseProfile,
         PERFCHECKER_NATIVE_SESSION:session,PERFCHECKER_NATIVE_WORKSPACE: workspace, PERFCHECKER_NATIVE_CONTROLLER: controller,
+        ...(snoopProject?{PERFCHECKER_NATIVE_SNOOP_PROJECT:snoopProject}:{}),
         ...(phase==='pluto-start-stop'?{PERFCHECKER_NATIVE_PLUTO_ENVIRONMENT:JSON.stringify(artifactRecord.plutoEnvironment)}:{}),
         ...(phase==='editor'&&process.platform==='linux'?{PERFCHECKER_NATIVE_EDITOR_DEADLINE_AT:new Date(nativeActivity.deadlineAt).toISOString()}:{}),
         PERFCHECKER_NATIVE_ACTIVITY_DEADLINE_AT:String(nativeActivity.deadlineAt),
@@ -913,8 +923,12 @@ try {
     }
   }
   if(!landscapeOnly&&!savedReportOnly){
-  if(stage==='full'||stage==='focused'&&['investigation','diagnosis'].includes(caseGroup))await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.add(["Aqua","SnoopCompile"]);using Aqua,SnoopCompile;println("OPTIONAL_ANALYZER_INSTALL Aqua=",Base.pkgversion(Aqua)," SnoopCompile=",Base.pkgversion(SnoopCompile))',controller]);
+  if(positiveOptionalAnalyzers)await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.add("Aqua");using Aqua;println("OPTIONAL_ANALYZER_INSTALL Aqua=",Base.pkgversion(Aqua))',controller]);
   await execute(julia, ['--startup-file=no', '-e', 'using Pkg; Pkg.activate(ARGS[1]); Pkg.add(["BenchmarkTools","Chairmarks","TestItems"]); Pkg.activate(ARGS[2]); Pkg.add("TestItems")', target, workspace]);
+  // Current JET and SnoopCompile declare incompatible weak-dependency ranges.
+  // Keep both positive campaigns; select a separate real worker environment
+  // for SnoopCompile instead of allowing resolution to an obsolete 1.x build.
+  if(snoopProject)await execute(julia,['--startup-file=no','-e','using Pkg;Pkg.activate(ARGS[1]);Pkg.add(PackageSpec(name="SnoopCompile",version="3.2.10"));Pkg.develop(path=ARGS[2]);using SnoopCompile;@assert Base.pkgversion(SnoopCompile)==v"3.2.10";println("ISOLATED_SNOOPCOMPILE_INSTALL ",Base.pkgversion(SnoopCompile))',snoopProject,workspace]);
   await fs.mkdir(path.join(workspace, 'perf'), {recursive: true});
   // Fresh first-use evidence belongs to the starter; the prepared campaign uses its own reports.
   await fs.rm(path.join(workspace,'perf','results'),{recursive:true,force:true});

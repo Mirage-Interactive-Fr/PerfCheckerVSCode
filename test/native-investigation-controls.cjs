@@ -254,6 +254,22 @@ async function measure(context) {
 
 async function diagnose(context) {
   await selectScenario(context, 'ui_adopted', 'ui');
+  const snoopProject=process.env.PERFCHECKER_NATIVE_SNOOP_PROJECT;
+  if(snoopProject){
+    const settings=context.vscode.workspace.getConfiguration('perfchecker',context.vscode.Uri.file(context.workspace));
+    const previous=settings.inspect('scenarioProject')?.workspaceFolderValue;
+    try{
+      await settings.update('scenarioProject',snoopProject,context.vscode.ConfigurationTarget.WorkspaceFolder);
+      await selectTools(context,['snoopcompile']);
+      const positive=await action(context,'Diagnose selected','diagnose',NATIVE_READINESS_MS);
+      assert.equal(positive.report.schema_version,'perfchecker-diagnosis/1');assert.equal(positive.report.records.length,1);
+      const record=positive.report.records[0];assert.equal(record.tool,'snoopcompile');assert.equal(record.status,'complete');
+      assert.equal(record.correctness,'passed');assert.equal(record.tool_version,'3.2.10');
+      context.proof('investigation-analyzer-snoopcompile',{status:record.status,correctness:record.correctness,
+        version:record.tool_version,isolatedWorkerProject:true,actualScenarioOracle:true});
+    }finally{await settings.update('scenarioProject',previous,context.vscode.ConfigurationTarget.WorkspaceFolder);}
+    await selectScenario(context,'ui_adopted','ui');
+  }
   const tools = ['jet', 'aqua', 'alloccheck', 'snoopcompile', 'latency', 'gc', 'memory', 'heap', 'locks'];
   await selectTools(context, tools);
   // Positive analyzer availability and execution use the requested one-hour
@@ -279,10 +295,11 @@ async function diagnose(context) {
     }
     if (record.status === 'unavailable') assert(String(record.message || '').trim(), `${tool} unavailable status explains its prerequisite`);
     if (['latency', 'gc', 'memory'].includes(tool)) assert.equal(record.status, 'complete', `${tool} built-in worker actually executes`);
-    if (['investigation','diagnosis'].includes(process.env.PERFCHECKER_NATIVE_PHASE) && ['aqua', 'snoopcompile'].includes(tool))
+    if ((snoopProject||['investigation','diagnosis'].includes(process.env.PERFCHECKER_NATIVE_PHASE)) &&
+      (tool==='aqua'||tool==='snoopcompile'&&!snoopProject))
       assert.equal(record.status, 'complete', `${tool} is explicitly installed for this positive optional-analyzer campaign`);
     if (['heap','locks'].includes(tool) && record.status === 'unavailable') assert.match(String(record.message), tool === 'heap' ? /snapshot|redact|unsupported|not supported|runtime/i : /counter|1\.11|not exposed|unsupported|runtime/i, `${tool} has a concrete runtime prerequisite`);
-    context.proof(`investigation-analyzer-${tool}`, {status: record.status, correctness: record.correctness, quality: record.quality, version: record.tool_version, prerequisite: record.status === 'complete' ? undefined : record.message});
+    context.proof(`investigation-analyzer-${tool}${tool==='snoopcompile'&&snoopProject?'-primary-project':''}`, {status: record.status, correctness: record.correctness, quality: record.quality, version: record.tool_version, prerequisite: record.status === 'complete' ? undefined : record.message});
   }
   const current = await tab(context, 'Findings & advice');
   const artifactRecord = result.report.records.find(record => record.artifacts?.length);

@@ -626,9 +626,26 @@ export function registerInvestigations(context: vscode.ExtensionContext): void {
     command('perfchecker.chatState', () => chat.state()),
     command('perfchecker.chatClear', evidenceId => chat.clear(evidenceId)),
     command('perfchecker.chatCancel', () => chat.cancel()),
-    command('perfchecker.prepareImplementation', () => chat.implement()),
+    command('perfchecker.analyzeSelectedResults', async input => {
+      const folder = selected();
+      if (input?.workspace && input.workspace.toString() !== folder.uri.toString()) throw new Error('Reopen results for the selected workspace.');
+      if (input?.source) {
+        await chat.open(); await chat.selectSavedResults(input.source, input.selections);
+        return input.analyze !== false ? chat.analyze({instructions: input.instructions}) : undefined;
+      }
+      await suiteEvidence.refresh(folder.uri.toString(), folder.uri.fsPath,
+        vscode.workspace.getConfiguration('perfchecker', folder.uri).get('reports', 'perf/results/vscode'));
+      const option = suiteEvidence.options(folder.uri.toString()).find(item => {
+        if (item.unavailable || !item.id.startsWith('suite:')) return false;
+        return !input?.runId || JSON.parse(item.id.slice(6))[1] === input.runId;
+      });
+      if (!option) throw new Error('This execution is no longer the current saved result. Choose it from the agent workflow history.');
+      await chat.open(); await chat.selectResults(option.id, input?.selections);
+      if (input?.analyze !== false) return chat.analyze({instructions: input?.instructions});
+    }),
+    command('perfchecker.prepareImplementation', (id, instructions) => chat.trySuggestion(id, instructions)),
     command('perfchecker.applyImplementation', () => chat.apply()),
-    command('perfchecker.restoreImplementation', () => chat.apply(true)),
+    command('perfchecker.restoreImplementation', () => chat.restoreTrial()),
     vscode.window.createTreeView('perfchecker.scenarios', {treeDataProvider: controller, showCollapseAll: true}),
     vscode.languages.registerCodeLensProvider({language: 'julia', scheme: 'file'}, controller),
     vscode.languages.registerCodeActionsProvider({language: 'julia', scheme: 'file'}, controller, {providedCodeActionKinds: [vscode.CodeActionKind.QuickFix]}),

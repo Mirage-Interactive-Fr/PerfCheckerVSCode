@@ -628,6 +628,8 @@ async function measuredEvidence(context) {
 
 exports.run = async (context,options={}) => {
   assert.equal(process.env.CI, 'true');
+  const product=context.vscode.extensions.getExtension('mirage-interactive-fr.perfchecker-vscode').packageJSON.version.split('.').map(Number);
+  if(product[0]>1||product[0]===1&&product[1]>=1)return require('./native-guided-workflow.cjs').run(context,options);
   const general100=options.general100===true;
   const documentedInstall=options.documentedInstall===true;
   let installation;

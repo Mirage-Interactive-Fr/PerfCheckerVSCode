@@ -315,6 +315,13 @@ test('real webviews preserve full selection, handle Git targets and render inter
     assert.equal(dragConfiguration.selection.run_ids.length,1000);
     await page.setViewportSize({width:420,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
     await load('perfchecker.output');assert.equal(await page.locator('.distribution .sample').count(),911);assert.equal(await page.locator('.pie-slice').count(),1);
+    await page.getByRole('button',{name:'Analyze these results',exact:true}).click();
+    const allResults=await page.evaluate(()=>window.messages.at(-1));
+    assert.equal(allResults.type,'analyze');assert.match(allResults.viewToken,/^[0-9a-f-]{36}$/);assert.equal(allResults.index,undefined);
+    const rowAction=page.locator('[data-analyze="0"]').first();await rowAction.click();
+    assert.deepEqual(await page.evaluate(()=>window.messages.at(-1)),{type:'analyze',viewToken:allResults.viewToken,index:0});
+    await page.getByRole('button',{name:'JSON',exact:true}).click();
+    assert.deepEqual(await page.evaluate(()=>window.messages.at(-1)),{type:'report',name:'suite-result.json',viewToken:allResults.viewToken});
     assert.equal(await page.locator('.pie-slice').getAttribute('fill'),'#4f8cff');assert.match(await page.locator('.pie-slice').getAttribute('d'),/A82 82 0 1 1 100 182/);
     await page.locator('.pie-slice').focus();assert.match(await page.locator('#allocation-0').innerText(),/64 B · 100.00%/);
     const charts=page.locator('.normalized-plot'),firstChart=charts.nth(0),chart=charts.nth(1);

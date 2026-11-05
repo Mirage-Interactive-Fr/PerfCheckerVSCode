@@ -92,8 +92,9 @@ function render() {
   const runs = visibleRuns();
   const selectedVisible = runs.filter(run => selected.has(run.id)).length;
   byId('count').textContent = `${selected.size} selected · ${runs.length}/${plan.runs.length} visible · ${selected.size - selectedVisible} selected outside filters`;
-  byId('run').textContent = `Run ${selected.size} selected`;
+  byId('run').textContent = `Run & analyze ${selected.size} selected`;
   byId('run').disabled = busy || selected.size === 0;
+  if(byId('run-only'))byId('run-only').disabled = busy || selected.size === 0;
   byId('clear-all').disabled = busy || selected.size === 0;
   renderSelectionPreview();
   const groups = [];
@@ -328,7 +329,8 @@ byId('refresh').addEventListener('click', () => vscode.postMessage({type: 'refre
 byId('results').addEventListener('click', () => vscode.postMessage({type: 'output'}));
 byId('select-visible').addEventListener('click', () => { visibleRuns().forEach(run => selected.add(run.id)); render(); });
 byId('clear-visible').addEventListener('click', () => { visibleRuns().forEach(run => selected.delete(run.id)); render(); });
-byId('run').addEventListener('click', () => vscode.postMessage({type: 'run', ids: order.filter(id => selected.has(id)), reveal: byId('open-after-run').checked}));
+byId('run').addEventListener('click', () => vscode.postMessage({type: 'run', ids: order.filter(id => selected.has(id)), reveal: true, analyze: true}));
+byId('run-only')?.addEventListener('click', () => vscode.postMessage({type: 'run', ids: order.filter(id => selected.has(id)), reveal: byId('open-after-run').checked}));
 byId('save').addEventListener('click', () => vscode.postMessage({type: 'save', configuration: configuration()}));
 byId('target-package').addEventListener('change', () => {
   renderTargetCompatibility();
@@ -453,7 +455,7 @@ window.addEventListener('message', event => {
   }
   if (event.data.type === 'designerBusy') {
     busy=Boolean(event.data.busy);
-    for(const id of ['run','refresh','save','add-target','add-comparison'])byId(id).disabled=busy;
+    for(const id of ['run','run-only','refresh','save','add-target','add-comparison'])byId(id).disabled=busy;
     if(busy){byId('designer-error').hidden=true;byId('progress').hidden=false;byId('progress').querySelector('span').textContent='PerfChecker is working…';}
     else byId('progress').hidden=true;
     render();

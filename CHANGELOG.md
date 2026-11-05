@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.0 — Guided result analysis
+
+- Guide connected agents through selected check results, structured analyses,
+  individual suggestions, diff review, package tests and repeated measurements.
+- Connect installed Vibe, Claude and other ACP v1 agents through a shared MCP
+  bridge. Negotiate native forks instead of inferring support from agent names.
+- Preserve execution snapshots and branch history, including the original
+  inputs, agent responses and verification feedback. Use native Codex advice
+  forks when supported, with portable context replay for other connections.
+- Compare matching operation measurements across trials and keep profile weights
+  separate. Require passing verification before keeping a trial; retain Git
+  checkpoints and exact restore.
+- Expose analysis from the suite editor and result cards. Select implementation
+  tools graphically for HTTP connections as well as local stdio connections.
+- Preserve controller cleanup failures when a suite is cancelled; a cancellation
+  request cannot hide retained inventories or produce a successful stop.
+- Bind plot actions to their displayed execution so a retained view cannot
+  analyze a different result while the next view is loading.
+
 ## 1.0.3 — ARM-compatible setup
 
 - Install PerfChecker.jl 1.1.1 or newer in the 1.x series when creating a controller

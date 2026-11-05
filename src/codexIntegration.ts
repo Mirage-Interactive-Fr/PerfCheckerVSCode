@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import {CodexConnector, inspectCodex, shutdownCodexPreflights} from './codexConnector';
+import {CodexConnector, inspectCodex, supportsCodexFork, shutdownCodexPreflights} from './codexConnector';
 import {localAdvisorConnection, setLocalAdvisorConnection, disconnectLocalAdvisorConnection, beginLocalAdvisorConnectionOperation} from './advisorConnection';
 import {currentWorkspaceFolder} from './workspace-root';
 
@@ -47,7 +47,8 @@ export function registerCodexConnections(context: vscode.ExtensionContext, busy:
       if (!workspaceUnchanged(key, signal)) throw new Error('Workspace changed. Connect Codex again.');
       await disconnectLocalAdvisorConnection(key);
       const timeout = Math.min(Math.max(Number(settings.get('advisorTimeout', 90)) || 90, 1), 3600);
-      const connector = await new CodexConnector({cli, root: selected.uri.fsPath, timeoutMs: timeout * 1000}).start();
+      const connector = await new CodexConnector({cli, root: selected.uri.fsPath, timeoutMs: timeout * 1000,
+        nativeFork: supportsCodexFork(cli, selected.uri.fsPath)}).start();
       if (!workspaceUnchanged(key, signal)) {await connector.dispose(); throw new Error('Workspace changed before Codex connected. Reopen or select it, then connect again.');}
       connectors.set(key, connector);
       setLocalAdvisorConnection(key, {kind: 'codex', label: `${version} · local connector`,

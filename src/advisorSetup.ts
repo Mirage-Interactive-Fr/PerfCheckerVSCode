@@ -5,8 +5,9 @@ import * as os from 'node:os';
 import {spawn, ChildProcess} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {currentWorkspaceFolder, resolveControllerProject} from './workspace-root';
-import {assertSavedAdvisorConfiguration, localAdvisorConnection, onLocalAdvisorConnectionChanged} from './advisorConnection';
+import {assertSavedAdvisorConfiguration, implementationMcpArguments, localAdvisorConnection, onLocalAdvisorConnectionChanged} from './advisorConnection';
 import {cancellableJulia,controllerCancellation} from './controllerCancellation';
+import {resolveAcpPreset} from './acpAgent';
 
 const mapping: Record<string, [string, unknown]> = {
   endpoint: ['advisorEndpoint', 'http://127.0.0.1:8081/v1/chat/completions'], model: ['advisorModel', 'local'],
@@ -66,15 +67,18 @@ export class AdvisorSetup implements vscode.Disposable {
     const settings = this.settings(), file = settings.get<string>('advisorConfig', '');
     const config = await readAdvisorConfiguration(this.folder());
     const local = localAdvisorConnection(this.folder().uri.toString());
-    return {config: local?.connectionConfiguration ?? config, stdioSupported: true,
+    return {config: local?.connectionConfiguration ?? {...config, implementation: {
+      tool: settings.get('advisorImplementationMcpTool', ''), promptArgument: settings.get('advisorImplementationMcpPromptArgument', 'prompt'),
+      workspaceArgument: settings.get('advisorImplementationMcpWorkspaceArgument', 'workspace'), arguments: settings.get('advisorImplementationMcpArguments', {}),
+    }}, stdioSupported: true,
       config_location: local ? `Temporary ${local.label}; disconnect before editing saved settings` : path.resolve(this.root(), file || 'perf/advisor.json'), enabled: local ? true : settings.get('advisorEnabled', true), investigates: local ? false : settings.get('advisorInvestigates', false),
       max_experiments: settings.get('investigationMaxExperiments', 4), budget_seconds: settings.get('investigationBudgetSeconds', 300)};
   }
-  async open(options?: {stdio?: boolean}) {
+  async open(options?: {stdio?: boolean; acp?: boolean; preset?: 'vibe' | 'claude'}) {
     const workspace = this.folder().uri.toString();
     if (this.panel && this.panelWorkspace !== workspace) this.panel.dispose();
     if (this.panel) {
-      if (!options?.stdio) {this.panel.reveal(); return;}
+      if (!options?.stdio && !options?.acp) {this.panel.reveal(); return;}
       if (this.busy) throw new Error('Finish or cancel the current connection setup before opening local MCP settings.');
       this.panel.dispose();
     }
@@ -85,6 +89,13 @@ export class AdvisorSetup implements vscode.Disposable {
       initial.config = {...initial.config, protocol: 'mcp_stdio',
         stdio_command: this.settings().get('advisorMcpStdioCommand', ''), stdio_args: this.settings().get('advisorMcpStdioArguments', []),
         stdio_cwd: this.settings().get('advisorMcpStdioDirectory', '') || this.root()};
+    }
+    if (options?.acp && !localAdvisorConnection(workspace)) {
+      const executable = options.preset ? await resolveAcpPreset(options.preset) : undefined;
+      initial.enabled = true;
+      initial.config = {...initial.config, protocol: 'acp', stdio_command: executable?.command ?? '', stdio_args: executable?.args ?? [],
+        stdio_cwd: this.root(), mcp_tool: 'ask_perfchecker', mcp_prompt_argument: 'prompt', mcp_version: '2026-07-28',
+        implementation: {tool: 'implement_perfchecker', promptArgument: 'prompt', workspaceArgument: 'workspace', arguments: {}}};
     }
     this.assertWorkspace(workspace);
     if (generation !== this.connectionGeneration(workspace)) throw new Error('Advisor connection changed. Reopen settings to load your provider.');
@@ -119,7 +130,7 @@ export class AdvisorSetup implements vscode.Disposable {
     const folder = this.folder(), workspace = folder.uri.toString(), root = folder.uri.fsPath;
     const settings = vscode.workspace.getConfiguration('perfchecker', folder.uri), generation = this.connectionGeneration(workspace);
     const file = path.resolve(root, settings.get<string>('advisorConfig', '') || 'perf/advisor.json');
-    if (input?.config?.protocol === 'mcp_stdio') {
+    if (['mcp_stdio', 'acp'].includes(input?.config?.protocol)) {
       if (!vscode.workspace.isTrusted || this.busy) throw new Error('Trust the workspace and finish the current setup operation.');
       if (!['probe', 'save'].includes(input.action)) throw new Error('Local MCP supports discovery and an explicit session connection.');
       this.busy = true; this.stdioActive = true; this.stdioWorkspace = workspace;
@@ -129,6 +140,14 @@ export class AdvisorSetup implements vscode.Disposable {
     const local = localAdvisorConnection(workspace);
     if (local) throw new Error(`Disconnect ${local.label} before editing or testing saved provider settings. Its temporary endpoint must not be saved.`);
     assertSavedAdvisorConfiguration(input?.config);
+    const implementation = input?.config?.protocol === 'mcp_http' ? input.implementation : undefined;
+    if (implementation !== undefined) {
+      if (!implementation || typeof implementation.tool !== 'string' ||
+          (implementation.tool && !/^[A-Za-z0-9_.-]{1,128}$/.test(implementation.tool)) ||
+          ![implementation.promptArgument, implementation.workspaceArgument].every(value => typeof value === 'string' && /^[A-Za-z_][A-Za-z_0-9.-]{0,127}$/.test(value)) ||
+          implementation.promptArgument === implementation.workspaceArgument) throw new Error('Choose an implementation tool and distinct prompt and checkout arguments.');
+      implementation.arguments = implementationMcpArguments({}, implementation.arguments, implementation.promptArgument, implementation.workspaceArgument);
+    }
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before connecting an advisor.');
     if (this.busy) throw new Error('A setup operation is already running.');
     if (!['save', 'probe', 'models', 'pull', 'delete', 'unload'].includes(input?.action)) throw new Error('Unknown advisor action.');
@@ -166,6 +185,12 @@ export class AdvisorSetup implements vscode.Disposable {
         await settings.update('advisorInvestigates', Boolean(input.investigates), vscode.ConfigurationTarget.WorkspaceFolder);
         await settings.update('investigationMaxExperiments', max, vscode.ConfigurationTarget.WorkspaceFolder);
         await settings.update('investigationBudgetSeconds', budget, vscode.ConfigurationTarget.WorkspaceFolder);
+        if (implementation) {
+          await settings.update('advisorImplementationMcpTool', implementation.tool, vscode.ConfigurationTarget.WorkspaceFolder);
+          await settings.update('advisorImplementationMcpPromptArgument', implementation.promptArgument, vscode.ConfigurationTarget.WorkspaceFolder);
+          await settings.update('advisorImplementationMcpWorkspaceArgument', implementation.workspaceArgument, vscode.ConfigurationTarget.WorkspaceFolder);
+          await settings.update('advisorImplementationMcpArguments', implementation.arguments, vscode.ConfigurationTarget.WorkspaceFolder);
+        }
         return {status: 'complete', message: `Configuration saved: ${file}. No generation request was made.`};
       }
       return result;

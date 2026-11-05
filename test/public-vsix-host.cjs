@@ -663,7 +663,8 @@ exports.run = async () => {
         if(allCommands.includes('workbench.action.toggleFullScreen')){
           await vscode.commands.executeCommand('workbench.action.toggleFullScreen').catch(error=>log('native-recording-layout-warning',{fallback:String(error)}));
         }
-        await eventually(async()=>await windowPage.evaluate(()=>innerWidth>=1800),'The asynchronous native fullscreen action reaches the recording width',NATIVE_READINESS_MS)
+        // Optional recording layout must not consume an hour of functional-test availability.
+        await eventually(async()=>await windowPage.evaluate(()=>innerWidth>=1800),'The asynchronous native fullscreen action reaches the recording width',5000)
           .catch(error=>log('native-recording-layout-warning',{fallback:String(error),functionalTestsContinue:true}));
         log('native-recording-viewport',{dimensions:await windowPage.evaluate(()=>({width:innerWidth,height:innerHeight})),fallback:'actual-workbench-fullscreen-command'});
       }finally{await target?.detach().catch(()=>{});await cdp?.detach().catch(()=>{});}

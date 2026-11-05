@@ -2,10 +2,13 @@ import {promises as fs} from 'node:fs';
 import * as path from 'node:path';
 import {createHash} from 'node:crypto';
 import {workspacePath} from './investigationModel';
+import type {AnalysisContext, AnalysisResult} from './guidedAnalysis';
 
 export interface SuiteChatSource {
   kind: 'suite-bundle'; workspace: string; root: string; reports: string; directory: string;
   runId: string; fingerprint: string;
+  /** Captured reports belong to this execution even when the latest report changes. */
+  snapshot?: {suite: string; series: string};
 }
 const documents = ['manifest.json', 'measurement-definitions.json', 'observations.jsonl',
   'diagnostics.jsonl', 'artifacts.json', 'integrity.json'];
@@ -23,11 +26,15 @@ export async function validateSuiteChatSource(source: SuiteChatSource, verifyDoc
   workspacePath(root, directory);
   workspacePath(root, source.reports);
   const reportBytes: string[] = [];
-  for (const name of ['suite-result.json', 'version-series.json']) {
-    const file = path.join(source.reports, name);
-    workspacePath(source.reports, await fs.realpath(file));
-    reportBytes.push(await bounded(file));
-  }
+  if (source.snapshot) {
+    if ([source.snapshot.suite, source.snapshot.series].some(value => typeof value !== 'string' || Buffer.byteLength(value) > 32_000_000))
+      throw new Error('Saved result snapshot exceeds the attachment size limit.');
+    reportBytes.push(source.snapshot.suite, source.snapshot.series);
+  } else for (const name of ['suite-result.json', 'version-series.json']) {
+      const file = path.join(source.reports, name);
+      workspacePath(source.reports, await fs.realpath(file));
+      reportBytes.push(await bounded(file));
+    }
   let total = 0;
   for (const name of documents) {
     const file = path.join(directory, name);
@@ -58,6 +65,52 @@ export async function validateSuiteChatSource(source: SuiteChatSource, verifyDoc
   const fingerprint = createHash('sha256').update(manifestBytes).update('\0').update(integrityBytes)
     .update('\0').update(reportBytes[0]).update('\0').update(reportBytes[1]).digest('hex');
   if (fingerprint !== source.fingerprint) throw new Error('Saved suite evidence changed. Reopen Chat.');
+}
+
+/** Capture only a validated, explicitly selected run; never adopt the newest directory. */
+export async function captureSuiteChatSource(source: SuiteChatSource): Promise<SuiteChatSource> {
+  await validateSuiteChatSource(source, true);
+  const snapshot = source.snapshot ?? {
+    suite: await bounded(path.join(source.reports, 'suite-result.json')),
+    series: await bounded(path.join(source.reports, 'version-series.json')),
+  };
+  const captured = {...source, snapshot: {...snapshot}};
+  // Detect a report replacement between the initial validation and the copy.
+  await validateSuiteChatSource(captured, true);
+  return captured;
+}
+
+export async function suiteAnalysisContext(source: SuiteChatSource, evidenceId: string): Promise<AnalysisContext> {
+  if (!source.snapshot) throw new Error('Select and capture an execution before analyzing it.');
+  await validateSuiteChatSource(source, true);
+  const suite = JSON.parse(source.snapshot.suite);
+  const manifest = JSON.parse(await bounded(path.join(source.directory, 'manifest.json'), 1_000_000));
+  if (!Array.isArray(suite.runs) || suite.runs.length > 10_000) throw new Error('Invalid saved check results.');
+  const seen = new Set<string>();
+  const results: AnalysisResult[] = suite.runs.map((run: any) => {
+    if (!run || ['package', 'feature', 'version', 'status', 'target_kind', 'comparison_key'].some(key => typeof run[key] !== 'string' || !run[key]))
+      throw new Error('A saved check result has an invalid identity.');
+    const matching = (manifest.plan?.runs ?? []).filter((planned: any) => planned.package === run.package &&
+      planned.feature === run.feature && planned.version === run.version && planned.target_kind === run.target_kind &&
+      planned.comparison_key === run.comparison_key);
+    if (matching.length > 1) throw new Error('A saved check result has ambiguous plan metadata.');
+    const planned = matching[0];
+    const provenance = (manifest.source_provenance ?? []).filter((item: any) => item.target_label === run.version);
+    const sourceState = provenance.length === 1 ? provenance[0] : undefined;
+    const id = JSON.stringify([source.runId, run.package, run.feature, run.version, run.target_kind, run.comparison_key]);
+    if (seen.has(id)) throw new Error('A saved execution contains duplicate check results.');
+    seen.add(id);
+    const summary = run.summary && typeof run.summary === 'object' && !Array.isArray(run.summary) ? run.summary : {};
+    return {id, package: run.package, feature: run.feature, workload: run.workload,
+      check: planned?.backend, target: run.version, targetKind: run.target_kind, revision: planned?.target_revision ?? sourceState?.revision ?? undefined,
+      source: sourceState ? {captureScope: sourceState.capture_scope, dirty: sourceState.dirty, fingerprint: sourceState.dirty_state_sha256} : undefined,
+      status: run.status, summary,
+      qualification: Object.fromEntries(['verdict', 'correctness', 'performance', 'allocation_profile']
+        .filter(key => run.qualification?.[key] !== undefined).map(key => [key, run.qualification[key]])),
+      message: typeof run.message === 'string' ? run.message.split('\n').slice(0, 8).join('\n').slice(0, 1200) : undefined};
+  });
+  return {evidenceId, runId: source.runId, fingerprint: source.fingerprint,
+    label: `${suite.suite} · ${suite.finished_at}`, results, environment: manifest.environment};
 }
 
 /** Inventory contains only the run explicitly referenced by the saved suite's series report. */
